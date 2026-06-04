@@ -1,0 +1,24 @@
+# Edge smoke config — work-unit is the CPU plumbing harness, not OpenPCDet.
+
+name = "edge"
+vendor = "nvidia"
+metric = "frames_per_second"
+warm_window_s = 5000
+seeds = [42, 43, 44]
+spread_tolerance = 0.02
+gpu_active_ceiling = 0.85
+target_direction = "ge"
+
+[dataset]
+root = "edge"
+manifest = "manifest.yaml"
+
+[work_unit]
+command = "python ../_smoke_harness.py --config bench.toml --benchmark edge --seed {seed} --warm {warm_window_s}"
+description = "SMOKE plumbing harness (replace with the real OpenPCDet harness)"
+
+[expected_stall]
+cpu = { lo = 0.0, hi = 0.07 }
+data_stall = { lo = 0.20, hi = 0.35 }
+sync = { lo = 0.10, hi = 0.20 }
+gpu_active = { lo = 0.50, hi = 0.65 }

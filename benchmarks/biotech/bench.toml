@@ -1,0 +1,31 @@
+# Biotech benchmark — AlphaFold2 inference on 50 k+ proteins.
+# The only domain-specific config; the shared gitm.bench tooling reads this.
+
+name = "biotech"
+vendor = "nvidia"                 # nsys for profiling
+metric = "structures_per_hour"
+warm_window_s = 1000              # warm window = 1000 proteins (passed to harness)
+seeds = [42, 43, 44]
+spread_tolerance = 0.02
+gpu_active_ceiling = 0.85         # this benchmark MUST stay well under — headroom is the story
+# No hard baseline_target: the point is low GPU active %, not a throughput floor.
+target_direction = "ge"
+
+[dataset]
+root = "biotech"                  # $GITM_S3_ROOT/datasets/biotech/
+manifest = "manifest.yaml"
+
+[work_unit]
+# OpenFold v1.0.1 inference harness (harness.py) — pinned commit + weight hashes.
+# Single-seed, 5 recycles, 1 model, length <= 384. Prints one JSON line with
+# metric_value. {warm_window_s} is the protein count of the warm window; the
+# staged dataset dir comes from $GITM_BENCH_STAGE (exported by the Makefile).
+command = "python harness.py --seed {seed} --warm-proteins {warm_window_s} --max-len 384"
+description = "MSA load + featurize -> Evoformer -> structure module (5 recycles)"
+
+# Expected stall profile (fractions). Must match spec.md section 4.
+[expected_stall]
+cpu = { lo = 0.0, hi = 0.05 }
+data_stall = { lo = 0.30, hi = 0.50 }
+sync = { lo = 0.05, hi = 0.10 }
+gpu_active = { lo = 0.40, hi = 0.55 }

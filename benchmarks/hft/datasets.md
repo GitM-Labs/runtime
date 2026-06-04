@@ -1,48 +1,46 @@
-# HFT Benchmark Datasets
+# HFT benchmark — datasets
 
-## Overview
-Synthetic limit order book (LOB) dataset generated via a Hawkes process arrival
-model with a book-state machine. Three seeds produce independent, reproducible
-1B-event datasets.
+> Owner: Erin (Leo) — dataset + reproducibility. Fill the TODOs as data lands.
 
-## Fields
+## Sources
+- **Generator:** [`generate.py`](generate.py) — a seed-deterministic synthetic
+  LOB generator (the GITM stand-in for GoMask; swap in the real GoMask binary at
+  the `generate.py` call site if/when adopted). Same command at every scale —
+  only `--events` changes.
+- **Config:** 1×10⁹ order events per seed, seeds `{42, 43, 44}`.
+- **Invocation:**
+  ```bash
+  # full scale (cluster, ~3.2 TB raw / ~600 GB zstd per seed):
+  python generate.py --events 1_000_000_000 --seed 42 --out $GITM_SCRATCH/staging/hft/hft_1b_seed42
+  # laptop smoke (drives the whole freeze/verify/baseline/reproduce loop):
+  make smoke
+  ```
 
-| Field | Type | Unit | Description |
-|---|---|---|---|
-| ts_ns | int64 | nanoseconds | Event timestamp from Hawkes arrival process |
-| symbol_id | int32 | - | Synthetic symbol index (0–99) |
-| side | int8 | - | 0 = bid, 1 = ask |
-| price | int64 | ticks | Mid-price random walk ± 1 tick per trade |
-| size | int32 | lots | Order size, uniform [1, 1000] |
-| type | int8 | - | 0 = add, 1 = cancel, 2 = trade |
+## Fields & units
+Per-event row (Parquet, row-group 128 MiB, zstd-1):
 
-## Hawkes Process Parameters
+| Field | Type | Unit |
+| --- | --- | --- |
+| `ts_ns` | int64 | nanoseconds since session open (globally monotonic) |
+| `symbol_id` | int32 | dense symbol index |
+| `side` | int8 | 0 = bid, 1 = ask |
+| `price` | int64 | integer ticks |
+| `size` | int32 | lots |
+| `type` | int8 | 0 add / 1 cancel / 2 trade |
 
-| Parameter | Value | Description |
-|---|---|---|
-| mu | 100.0 | Baseline arrival rate (events/sec) |
-| alpha | 0.6 | Excitation magnitude per event |
-| beta | 0.8 | Decay rate |
+First-row sample (seed 42): `{'ts_ns': 179, 'symbol_id': 376, 'side': 1,
+'price': 12584, 'size': 285, 'type': 0}`
 
-## Seed Protocol
-- Seeds {42, 43, 44} produce independent, byte-for-byte reproducible datasets
-- Same seed + same binary = identical output
-- Seeds are passed as CLI argument: `hft_gen <n_events> <seed> <out_path>`
+## Scale target
+- ~3.2 TB raw, ~600 GB compressed **per seed**.
+- 1×10⁹ events per seed.
 
-## Storage Format
-- Parquet, row-group size 500,000 rows (~128 MiB uncompressed)
-- Compression: zstd level 1
-- Location: `$GITM_DATA_ROOT/datasets/hft/hft_1b_seed{42,43,44}/part0.parquet`
+## Seed protocol
+`{42, 43, 44}` → `$GITM_S3_ROOT/datasets/hft/{hft_1b_seed42, hft_1b_seed43, hft_1b_seed44}/`.
 
-## Scale
-- 1,000,000,000 events per seed
-- ~7.3 GB compressed per seed
-- ~22 GB total across 3 seeds
-
-## Generation
+## Freeze & verify
 ```bash
-cd benchmarks/hft/generator/build
-./hft_gen 1000000000 42 $GITM_DATA_ROOT/datasets/hft/hft_1b_seed42/part0.parquet
-./hft_gen 1000000000 43 $GITM_DATA_ROOT/datasets/hft/hft_1b_seed43/part0.parquet
-./hft_gen 1000000000 44 $GITM_DATA_ROOT/datasets/hft/hft_1b_seed44/part0.parquet
+make manifest      # -> manifest.yaml (sha256 + byte count per Parquet file)
+make verify        # re-hash $GITM_SCRATCH/staging/hft and confirm byte-identical
 ```
+Manifest sha256: <!-- TODO: paste after first freeze -->

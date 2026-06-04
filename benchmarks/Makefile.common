@@ -1,0 +1,81 @@
+# Shared benchmark machinery. Each benchmarks/<name>/Makefile sets NAME and
+# does `include ../Makefile.common`. Every target delegates to the shared
+# systems layer (`python -m gitm.bench`) so all three benchmarks behave
+# identically — the benchmark layer stays dumb, the runtime layer does the work.
+#
+# Datasets live in S3 ($GITM_S3_ROOT/datasets/<name>/) and are staged locally
+# only while in use. STAGE is that bounded local landing zone; RUNS is the
+# ephemeral run-output dir. Both default under $GITM_SCRATCH (see gitm/_paths.py).
+#
+# CONFIG selects the bench config. `make smoke` overrides it to bench.smoke.toml
+# (work-unit = the CPU smoke harness) so the full loop runs without a GPU.
+
+NAME    ?= $(error set NAME in the per-benchmark Makefile)
+SCRATCH ?= $(shell echo $${GITM_SCRATCH:-$$HOME/.cache/gitm})
+STAGE   ?= $(SCRATCH)/staging/$(NAME)
+RUNS    ?= $(SCRATCH)/runs
+CONFIG  ?= bench.toml
+PY      ?= python -m gitm.bench
+
+# The smoke harness reads the staged dataset via this env var.
+export GITM_BENCH_STAGE = $(STAGE)
+
+.PHONY: help manifest verify run-% profile-% baseline results reproduce smoke smoke-data clean
+
+help:
+	@echo "$(NAME) benchmark targets:"
+	@echo "  make smoke       generate a tiny local dataset + run the whole loop (no GPU)"
+	@echo "  make manifest    freeze the staged dataset into manifest.yaml"
+	@echo "  make verify      re-hash $(STAGE) against manifest.yaml"
+	@echo "  make run-SEED    run one seed's work-unit -> a BaselineRun JSON"
+	@echo "  make profile-SEED  wrap the work-unit in nsys/rocprof + py-spy/sar"
+	@echo "  make baseline    run all seeds, gate, render results.md (sign-off path)"
+	@echo "  make reproduce   reproducibility test: byte-identity + baseline re-run"
+	@echo "  make results     re-gate existing run JSONs and re-render results.md"
+	@echo ""
+	@echo "  STAGE=$(STAGE)"
+	@echo "  RUNS=$(RUNS)"
+	@echo "  CONFIG=$(CONFIG)"
+
+# Freeze the staged dataset. Run on the box that generated/staged the bytes.
+manifest:
+	$(PY) manifest build --root "$(STAGE)" --benchmark $(NAME) --out bench.yaml.tmp \
+		&& mv bench.yaml.tmp manifest.yaml
+
+verify:
+	$(PY) manifest verify --manifest manifest.yaml --root "$(STAGE)"
+
+# Run a single seed: `make run-42`.
+run-%:
+	$(PY) run --config $(CONFIG) --seed $* --out "$(RUNS)/$(NAME)_seed$*.json"
+
+# Profile a single seed: `make profile-42`.
+profile-%:
+	$(PY) profile --config $(CONFIG) --seed $* --out "$(RUNS)/$(NAME)_profile_seed$*"
+
+# Sign-off path: all seeds -> gate -> results.md.
+baseline:
+	$(PY) baseline --config $(CONFIG) --runs-dir "$(RUNS)" \
+		--results results.md --manifest manifest.yaml
+
+# Friday reproducibility test: dataset byte-identity + baseline re-run in budget.
+# A non-author runs exactly this on a clean box.
+reproduce:
+	$(PY) reproduce --config $(CONFIG) --stage "$(STAGE)" \
+		--manifest manifest.yaml --runs-dir "$(RUNS)" --limit-minutes 60
+
+# Re-gate already-produced run JSONs without re-running the work-unit.
+results:
+	$(PY) gate --config $(CONFIG) $(RUNS)/$(NAME)_baseline_*.json \
+		--results results.md --manifest manifest.yaml
+
+# End-to-end laptop loop: tiny dataset -> freeze -> verify -> baseline -> reproduce.
+# `smoke-data` is provided per-benchmark (generator / fetch --smoke).
+smoke: smoke-data
+	$(MAKE) manifest
+	$(MAKE) verify
+	$(MAKE) baseline CONFIG=bench.smoke.toml
+	$(MAKE) reproduce CONFIG=bench.smoke.toml
+
+clean:
+	rm -f bench.yaml.tmp

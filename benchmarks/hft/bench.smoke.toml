@@ -1,0 +1,26 @@
+# HFT smoke config — work-unit is the CPU plumbing harness, not the real kernels.
+# Used by `make smoke` so the full loop runs on a laptop. No baseline_target:
+# the smoke metric is synthetic and only exercises the spread/saturation gates.
+
+name = "hft"
+vendor = "nvidia"
+metric = "events_per_second"
+warm_window_s = 60
+seeds = [42, 43, 44]
+spread_tolerance = 0.02
+gpu_active_ceiling = 0.85
+target_direction = "ge"
+
+[dataset]
+root = "hft"
+manifest = "manifest.yaml"
+
+[work_unit]
+command = "python ../_smoke_harness.py --config bench.toml --benchmark hft --seed {seed} --warm {warm_window_s}"
+description = "SMOKE plumbing harness (replace with the real CUDA LOB harness)"
+
+[expected_stall]
+cpu = { lo = 0.0, hi = 0.05 }
+data_stall = { lo = 0.10, hi = 0.25 }
+sync = { lo = 0.05, hi = 0.15 }
+gpu_active = { lo = 0.60, hi = 0.80 }

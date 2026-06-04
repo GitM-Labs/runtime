@@ -1,0 +1,29 @@
+# Edge/robotics benchmark — nuScenes + KITTI 3D perception batch.
+# The only domain-specific config; the shared gitm.bench tooling reads this.
+
+name = "edge"
+vendor = "nvidia"                 # nsys for profiling
+metric = "frames_per_second"
+warm_window_s = 5000              # warm window = 5000 frames (passed to harness)
+seeds = [42, 43, 44]
+spread_tolerance = 0.02
+gpu_active_ceiling = 0.85
+target_direction = "ge"
+
+[dataset]
+root = "edge"                     # $GITM_S3_ROOT/datasets/edge/
+manifest = "manifest.yaml"        # sha256 manifest; keyframe list is manifest.jsonl (see Makefile)
+
+[work_unit]
+# OpenPCDet CenterPoint on PointPillars (harness.py) — pinned commit + config hash.
+# Iterates the combined manifest.jsonl. Prints one JSON line with metric_value;
+# the staged dataset dir comes from $GITM_BENCH_STAGE (exported by the Makefile).
+command = "python harness.py --seed {seed} --warm-frames {warm_window_s}"
+description = "voxelization -> 3D backbone -> BEV head -> NMS -> mAP accumulation"
+
+# Expected stall profile (fractions). Must match spec.md section 4.
+[expected_stall]
+cpu = { lo = 0.0, hi = 0.07 }
+data_stall = { lo = 0.20, hi = 0.35 }
+sync = { lo = 0.10, hi = 0.20 }
+gpu_active = { lo = 0.50, hi = 0.65 }

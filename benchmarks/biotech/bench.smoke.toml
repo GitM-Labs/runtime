@@ -1,0 +1,24 @@
+# Biotech smoke config — work-unit is the CPU plumbing harness, not OpenFold.
+
+name = "biotech"
+vendor = "nvidia"
+metric = "structures_per_hour"
+warm_window_s = 1000
+seeds = [42, 43, 44]
+spread_tolerance = 0.02
+gpu_active_ceiling = 0.85
+target_direction = "ge"
+
+[dataset]
+root = "biotech"
+manifest = "manifest.yaml"
+
+[work_unit]
+command = "python ../_smoke_harness.py --config bench.toml --benchmark biotech --seed {seed} --warm {warm_window_s}"
+description = "SMOKE plumbing harness (replace with the real OpenFold harness)"
+
+[expected_stall]
+cpu = { lo = 0.0, hi = 0.05 }
+data_stall = { lo = 0.30, hi = 0.50 }
+sync = { lo = 0.05, hi = 0.10 }
+gpu_active = { lo = 0.40, hi = 0.55 }

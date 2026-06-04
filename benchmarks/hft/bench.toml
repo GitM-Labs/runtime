@@ -1,0 +1,30 @@
+# HFT benchmark — synthetic limit-order-book at 1 B+ events.
+# The only domain-specific config; the shared gitm.bench tooling reads this.
+
+name = "hft"
+vendor = "nvidia"                 # nsys for profiling
+metric = "events_per_second"
+warm_window_s = 60                # 60 s warm window
+seeds = [42, 43, 44]
+spread_tolerance = 0.02           # three seeds must agree within 2 %
+gpu_active_ceiling = 0.85         # > this trips the swap rule (-> 500 M shard)
+baseline_target = 25000000        # >= 25 M events/s on a single A100
+target_direction = "ge"
+
+[dataset]
+root = "hft"                      # $GITM_S3_ROOT/datasets/hft/
+manifest = "manifest.yaml"
+
+[work_unit]
+# GPU LOB replay on cuDF/CuPy (harness.py) — pandas/NumPy fallback off-GPU.
+# Prints one JSON line with metric_value. {seed}/{warm_window_s} substituted;
+# the staged dataset dir comes from $GITM_BENCH_STAGE (exported by the Makefile).
+command = "python harness.py --seed {seed} --warm-seconds {warm_window_s}"
+description = "ingest -> order-book update -> top-of-book snapshot -> microprice + VWAP-1s"
+
+# Expected stall profile (fractions). Must match spec.md section 4.
+[expected_stall]
+cpu = { lo = 0.0, hi = 0.05 }
+data_stall = { lo = 0.10, hi = 0.25 }
+sync = { lo = 0.05, hi = 0.15 }
+gpu_active = { lo = 0.60, hi = 0.80 }
