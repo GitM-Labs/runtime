@@ -1,0 +1,39 @@
+# GITM convention: scratch/data dirs live outside the repo (see gitm/_paths.py:
+# $GITM_S3_ROOT / $GITM_SCRATCH). Leading slash anchors these to the repo ROOT so
+# they don't also match code packages like gitm/telemetry/.
+/datasets/
+/runs/
+/traces/
+/telemetry/
+/data/
+
+# Python
+/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.env
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+
+.claude
+venv
