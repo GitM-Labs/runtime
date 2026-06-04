@@ -1,0 +1,16 @@
+datasets:
+- bytes: 7763865521
+  path: /home/ash/gitm-data/datasets/hft/hft_1b_seed42/part0.parquet
+  rows: 1000000000
+  seed: 42
+  sha256: 69857a2c41130aed20d12e34353259c95b49ee7c1134393cca858330873ba7bf
+- bytes: 7767347789
+  path: /home/ash/gitm-data/datasets/hft/hft_1b_seed43/part0.parquet
+  rows: 1000000000
+  seed: 43
+  sha256: 1ff57b1b485d08d636b6d7bc6ce785eb8d822f82ed7e1a04699381099fca72df
+- bytes: 7771192742
+  path: /home/ash/gitm-data/datasets/hft/hft_1b_seed44/part0.parquet
+  rows: 1000000000
+  seed: 44
+  sha256: 4391dd934ce09f5b8f475cb16ecb43efec0233d98d91747cdd67a3c14fb718ef
