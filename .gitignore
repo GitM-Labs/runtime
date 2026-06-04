@@ -33,4 +33,7 @@ htmlcov/
 .idea/
 *.swp
 .DS_Store
+
+
 .claude
+venv
