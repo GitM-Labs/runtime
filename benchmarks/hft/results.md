@@ -23,8 +23,8 @@
 | 44 | 30.9M | 29.8M | 30.8M | 30.5M |
 
 - 3-seed mean: 30.2M events/sec
-- Target: >=25M events/sec ✅
-- Seed variance: ~2% ✅ (target: within 2%)
+- Target: >=25M events/sec 
+- Seed variance: ~2%  (target: within 2%)
 
 ## Stall Profile (seed 42, nsys profile)
 
