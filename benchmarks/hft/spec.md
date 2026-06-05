@@ -47,3 +47,33 @@ Results saved to:
 
 View with:
 nsys stats /root/data/hft_baseline_1.nsys-rep
+
+## 6. Reproduction Steps
+
+1. Clone repo and checkout branch:
+   git clone git@github.com:GitM-Labs/runtime.git
+   cd runtime && git checkout hft_datageneration
+   pip install -e ".[dev]"
+
+2. Build the generator:
+   cd benchmarks/hft/generator && mkdir -p build && cd build
+   export ARROW_LIB=$(python3 -c "import pyarrow; print(pyarrow.get_library_dirs()[0])")
+   ln -sf $ARROW_LIB/libparquet.so.2400 $ARROW_LIB/libparquet.so
+   cmake .. && make -j$(nproc)
+
+3. Generate datasets (on a machine with enough disk space):
+   export LD_LIBRARY_PATH=$ARROW_LIB:$LD_LIBRARY_PATH
+   ./hft_gen 1000000000 42 /root/data/hft_1b_seed42/part-00000.parquet
+   ./hft_gen 1000000000 43 /root/data/hft_1b_seed43/part-00000.parquet
+   ./hft_gen 1000000000 44 /root/data/hft_1b_seed44/part-00000.parquet
+
+4. Run baseline (3x per seed, take means):
+   export GITM_BENCH_STAGE="/root/data"
+   python3 benchmarks/hft/harness.py --seed 42 --stage /root/data --max-events 25000000
+
+5. Run nsys profile:
+   nsys profile --trace cuda,nvtx,osrt --output /root/data/hft_baseline_1 \
+     python3 benchmarks/hft/harness.py --seed 42 --stage /root/data --max-events 25000000
+
+6. View results:
+   nsys stats /root/data/hft_baseline_1.nsys-rep
