@@ -6,7 +6,7 @@ seeds = [42, 43, 44]
 files = []
 
 for seed in seeds:
-    p = data_root / f"datasets/hft/hft_1b_seed{seed}/part0.parquet"
+    p = data_root / f"datasets/hft/hft_1b_seed{seed}/part-00000.parquet"
     sha256 = hashlib.sha256(p.read_bytes()).hexdigest()
     size   = p.stat().st_size
     files.append({
