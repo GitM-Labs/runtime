@@ -19,7 +19,7 @@ set -euo pipefail
 OPENPCDET_DIR="${OPENPCDET_DIR:-/workspace/edge/OpenPCDet}"
 CKPT_DIR="${CKPT_DIR:-/workspace/edge/checkpoints}"
 CKPT_PATH="$CKPT_DIR/pointpillar_7728.pth"
-CKPT_EXPECTED_SHA="c9c84e5cf1059b84fb37a4d47f8e58fc16b22e2c3e9ddf47ed59700d7b0e9ccd"
+CKPT_EXPECTED_SHA="4c83fc0fa02575b9b3e9dec676f698e7a70bb5a795e89f91df8a96b916fa19e2"
 # Set CKPT_URL to the download URL Adit provides (Google Drive / S3 pre-signed link).
 CKPT_URL="${CKPT_URL:-}"
 
