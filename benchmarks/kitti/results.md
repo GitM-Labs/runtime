@@ -42,5 +42,5 @@ invariant has no signal for this workload and the benchmark needs review.
 - CUDA version: TBD
 - OpenPCDet commit: TBD
 - Config sha256: TBD
-- Checkpoint sha256: c9c84e5cf1059b84fb37a4d47f8e58fc16b22e2c3e9ddf47ed59700d7b0e9ccd
+- Checkpoint sha256: 4c83fc0fa02575b9b3e9dec676f698e7a70bb5a795e89f91df8a96b916fa19e2
 - Date: TBD

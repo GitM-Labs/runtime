@@ -30,7 +30,7 @@ from typing import Any
 
 # SHA256 of pointpillar_7728.pth (OpenPCDet KITTI PointPillars checkpoint).
 # Confirm with: sha256sum pointpillar_7728.pth
-CHECKPOINT_SHA256 = "4c83fc0fa02575b9b3e9dec676f698e7a70bb5a795e89f91df8a96b916fa19e2"
+CHECKPOINT_SHA256 = "c9c84e5cf1059b84fb37a4d47f8e58fc16b22e2c3e9ddf47ed59700d7b0e9ccd"
 
 # SHA256 of the pinned tools/cfgs/kitti_models/pointpillar.yaml.
 # Fill in after cloning OpenPCDet at the pinned commit:
@@ -106,7 +106,25 @@ class WorkUnit:
                 "  # Ask Adit for the checkpoint URL or pull from S3"
             ) from exc
 
-        cfg_from_yaml_file(str(cfg_path), cfg)
+        # OpenPCDet resolves _BASE_CONFIG_ entries (e.g.
+        # cfgs/dataset_configs/kitti_dataset.yaml) relative to the current
+        # working directory, which is the tools/ dir holding the top-level
+        # cfgs/ folder. Temporarily chdir there so config loading works no
+        # matter where the caller runs from, then restore the CWD.
+        import os
+
+        cfg_path = Path(cfg_path)
+        parts = cfg_path.resolve().parts
+        if "cfgs" in parts:
+            tools_dir = Path(*parts[: parts.index("cfgs")])
+        else:
+            tools_dir = cfg_path.resolve().parent
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(tools_dir)
+            cfg_from_yaml_file(str(cfg_path.resolve()), cfg)
+        finally:
+            os.chdir(prev_cwd)
 
         # Minimal dataset wrapper for single-frame inference.
         # DatasetTemplate.prepare_data handles the voxelization pipeline;
@@ -134,7 +152,9 @@ class WorkUnit:
             dataset=dataset,
         )
         model.load_params_from_file(
-            filename=str(ckpt_path), logger=None, to_cpu=True
+            filename=str(ckpt_path),
+            logger=logging.getLogger("gitm.kitti"),
+            to_cpu=True,
         )
         model.cuda()
         model.eval()

@@ -12,7 +12,9 @@ One keyframe through:
 `voxelization → 3D backbone → BEV head → NMS → mAP accumulation`.
 Baseline harness: **OpenPCDet CenterPoint on PointPillars** — pinned commit,
 pinned config hash. Phases above are the rows of the stall table.
-<!-- TODO: pin OpenPCDet commit + config hash. -->
+
+- OpenPCDet commit: `233f849829b6ac19afb8af8837a0246890908755`
+- pointpillar.yaml sha256: `170a9ffe76cfd8509d1044cfbcf1cbd44c5d320fda81bf0089a8d5efaf1c91c8`
 
 ## 3. Success metric
 `frames_per_second` over a 5 000-frame warm window across nuScenes + KITTI
