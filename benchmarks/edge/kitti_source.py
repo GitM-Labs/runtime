@@ -19,8 +19,9 @@ import os
 from pathlib import Path
 from typing import Iterator
 
-# KITTI Object Detection canonical layout, relative to GITM_DATA_ROOT.
-KITTI_ROOT = Path("datasets/edge/kitti/training")
+# KITTI Object Detection canonical layout, relative to GITM_DATA_ROOT
+# (GITM_DATA_ROOT/kitti/training -> /workspace/edge/data/kitti/training).
+KITTI_ROOT = Path("kitti/training")
 VELODYNE_SUBDIR = "velodyne"  # NNNNNN.bin  (lidar point clouds)
 LABEL_SUBDIR = "label_2"      # NNNNNN.txt  (ground truth boxes, camera frame)
 

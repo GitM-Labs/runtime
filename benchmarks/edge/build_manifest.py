@@ -3,14 +3,14 @@
 Consumes one or more dataset "source" modules -- each exposing
 ``iter_rows(data_root) -> Iterator[dict]`` -- chains their rows, validates the
 shared schema, guards against duplicate frame IDs, and streams everything to
-``$GITM_DATA_ROOT/datasets/edge/manifest.jsonl`` as line-delimited JSON.
+``$GITM_DATA_ROOT/manifest.jsonl`` as line-delimited JSON.
 
 Each source is responsible for its own dataset-specific path resolution; this
 orchestrator only knows the common row schema and how to write it. Adding a new
 dataset (e.g. nuScenes) is a one-line change to SOURCES below.
 
 Rows are written one at a time so memory stays flat regardless of manifest size
-(~47k rows for the full nuScenes + KITTI batch).
+(~42k rows for the full nuScenes v1.0-trainval + KITTI batch).
 """
 
 from __future__ import annotations
@@ -30,8 +30,9 @@ import nuscenes_source  # noqa: E402
 # Every row must carry exactly these keys. Sources that deviate are a bug.
 REQUIRED_KEYS = frozenset({"scene_id", "frame_id", "lidar_path", "gt_path"})
 
-# Output location relative to GITM_DATA_ROOT.
-MANIFEST_REL = Path("datasets/edge/manifest.jsonl")
+# Output location relative to GITM_DATA_ROOT
+# (GITM_DATA_ROOT/manifest.jsonl -> /workspace/edge/data/manifest.jsonl).
+MANIFEST_REL = Path("manifest.jsonl")
 
 # Registered dataset sources. nuScenes runs first so its (slower, devkit-backed)
 # load surfaces config/path errors before KITTI's cheap filesystem walk.

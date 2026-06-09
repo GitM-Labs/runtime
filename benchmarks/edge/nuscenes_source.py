@@ -1,6 +1,6 @@
 """nuScenes manifest source.
 
-Reads the frozen nuScenes v1.0 metadata via the official devkit and yields one
+Reads the frozen nuScenes metadata via the official devkit and yields one
 manifest row per keyframe (sample) in the schema shared with the KITTI source:
 
     {scene_id, frame_id, lidar_path, gt_path}
@@ -15,10 +15,16 @@ table, sample_annotation.json. So instead of a per-frame path we do:
     IDENTICAL for every nuScenes row (still a non-empty string, so it passes
     build_manifest's per-field validation).
 
-The version is NOT hardcoded: it is read from GITM_NUSCENES_VERSION at call
-time (e.g. "v1.0-mini" for early iteration, "v1.0-trainval" later). Both mini
-and trainval carry real annotations and back a valid gt_path; only v1.0-test
-ships an empty sample_annotation.json, so test cannot back a gt_path.
+The version is read from GITM_NUSCENES_VERSION at call time, defaulting to
+"v1.0-trainval" (the full batch). Set the env var to override (e.g.
+"v1.0-mini" for early iteration). Both mini and trainval carry real
+annotations and back a valid gt_path; only v1.0-test ships an empty
+sample_annotation.json, so test cannot back a gt_path.
+
+DISK-LEAN LAYOUT: this source only ever reads the keyframe LIDAR_TOP blobs
+(under samples/LIDAR_TOP/) and the metadata tables. Camera, radar, and the
+non-keyframe sweeps/ blobs are never touched, so a nuScenes tree pruned to just
+metadata + samples/LIDAR_TOP/ is sufficient here.
 
 Paths in each row are RELATIVE to GITM_DATA_ROOT so the manifest is portable
 across machines (local dev box, GPU box, Friday clean-box re-run).
@@ -29,7 +35,8 @@ writes the manifest; a separate script handles input hashing.
 
 NOTE: unlike the streaming JSONL writer (which keeps memory flat), the nuScenes
 devkit loads all metadata tables into RAM for the duration of iter_rows() --
-notably sample_annotation (~1.4M rows). That is the cost of using the devkit.
+notably sample_annotation (~1.4M rows on trainval). That is the cost of using
+the devkit.
 """
 
 from __future__ import annotations
@@ -38,14 +45,15 @@ import os
 from pathlib import Path
 from typing import Iterator
 
-# nuScenes canonical layout, relative to GITM_DATA_ROOT.
-NUSCENES_ROOT = Path("datasets/edge/nuscenes")
+# nuScenes canonical layout, relative to GITM_DATA_ROOT
+# (GITM_DATA_ROOT/nuscenes -> /workspace/edge/data/nuscenes).
+NUSCENES_ROOT = Path("nuscenes")
 
-# Env var naming the metadata version to read (e.g. "v1.0-mini",
-# "v1.0-trainval"). Required, no default: the version determines which
-# keyframes and which GT you get, so it must be a deliberate, recorded choice
-# rather than a silent fallback -- important for the clean-box re-run.
+# Env var naming the metadata version to read. Defaults to the full batch;
+# the resolved version is still printed/recorded, so the clean-box re-run keeps
+# a deliberate, observable choice rather than a hidden one.
 VERSION_ENV = "GITM_NUSCENES_VERSION"
+DEFAULT_VERSION = "v1.0-trainval"
 
 LIDAR_CHANNEL = "LIDAR_TOP"            # keyframe lidar sensor channel
 ANNOTATION_FILE = "sample_annotation.json"
@@ -54,14 +62,8 @@ FRAME_PREFIX = "nuscenes_"            # prefix so frame_ids never collide with K
 
 
 def _resolve_version() -> str:
-    """Return the nuScenes version from the environment, or fail loud."""
-    version = os.environ.get(VERSION_ENV)
-    if not version:
-        raise RuntimeError(
-            f"{VERSION_ENV} is not set. Set it to the nuScenes version to read "
-            f'(e.g. "v1.0-mini" now, "v1.0-trainval" for the full batch).'
-        )
-    return version
+    """Return the nuScenes version from the environment, or the default."""
+    return os.environ.get(VERSION_ENV) or DEFAULT_VERSION
 
 
 def iter_rows(data_root: str) -> Iterator[dict]:
@@ -140,7 +142,8 @@ def iter_rows(data_root: str) -> Iterator[dict]:
 
         # Fail loud on a missing blob -- mirrors the KITTI source. A keyframe
         # whose lidar file is absent signals a broken/partial extraction, not
-        # something to silently skip.
+        # something to silently skip. (Only samples/LIDAR_TOP/ is required;
+        # sweeps/ and other sensors are never read.)
         lidar_file = nuscenes_root / lidar_rel
         if not lidar_file.is_file():
             raise FileNotFoundError(
