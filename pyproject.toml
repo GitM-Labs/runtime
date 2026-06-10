@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "gitm-labs"
 version = "0.0.1"
-description = "Behavioral compiler and intervention runtime for vLLM decode workloads."
+description = "Autonomous GPU kernel optimizer"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "GITM" }]
