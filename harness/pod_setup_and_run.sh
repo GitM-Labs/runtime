@@ -104,7 +104,8 @@ fi
 # ── 3. Install gitm package ──────────────────────────────────────────────────
 
 step "Installing gitm package ..."
-pip install -e "$REPO_ROOT[dev,bench,nvidia]" --no-build-isolation -q
+pip install hatchling -q   # build backend required by pyproject.toml
+pip install -e "$REPO_ROOT[dev,bench,nvidia]" -q
 echo "  gitm package installed."
 
 # ── 4. Pull + verify checkpoint ─────────────────────────────────────────────
