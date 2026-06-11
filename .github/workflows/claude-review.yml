@@ -1,0 +1,98 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD \
+            -- '*.py' '*.sh' '*.md' '*.yaml' '*.yml' \
+            > pr_diff.txt
+          echo "Diff size: $(wc -c < pr_diff.txt) bytes"
+
+      - name: Run Claude Review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          DIFF_SIZE=$(wc -c < pr_diff.txt)
+
+          if [ "$DIFF_SIZE" -eq 0 ]; then
+            echo "No reviewable changes."
+            exit 0
+          fi
+
+          if [ "$DIFF_SIZE" -gt 75000 ]; then
+            echo "Diff too large (${DIFF_SIZE} bytes), truncating to first 75KB..."
+            head -c 75000 pr_diff.txt > pr_diff_trimmed.txt
+            mv pr_diff_trimmed.txt pr_diff.txt
+          fi
+
+          python3 << 'EOF'
+          import json, os, subprocess, sys, urllib.request
+
+          with open("pr_diff.txt") as f:
+              diff = f.read()
+
+          payload = {
+              "model": "claude-sonnet-4-6",
+              "max_tokens": 16384,
+              "messages": [{
+                  "role": "user",
+                  "content": (
+                      "You are reviewing a GPU compute / ML benchmarking repo "
+                      "(Python, CUDA, CuPy, PyTorch, OpenPCDet, bash). "
+                      "Review this diff and give concise feedback. Use these sections "
+                      "(skip any with nothing to report):\n\n"
+                      "**🐛 Bugs** — logic errors, off-by-ones, wrong assumptions\n"
+                      "**🔒 Security** — shell injection, hardcoded secrets, unsafe paths\n"
+                      "**⚡ Performance** — unnecessary CPU↔GPU transfers, missed parallelism\n"
+                      "**📊 Reproducibility** — seed handling, non-determinism risks\n"
+                      "**💡 Suggestions** — missing error handling, untested edge cases\n\n"
+                      f"```diff\n{diff}\n```"
+                  )
+              }]
+          }
+
+          req = urllib.request.Request(
+              "https://api.anthropic.com/v1/messages",
+              data=json.dumps(payload).encode(),
+              headers={
+                  "x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                  "anthropic-version": "2023-06-01",
+                  "content-type": "application/json",
+                  "anthropic-beta": "output-128k-2025-02-19"
+              }
+          )
+
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  data = json.load(resp)
+                  comment = data["content"][0]["text"]
+          except urllib.error.HTTPError as e:
+              print(f"API error {e.code}: {e.read().decode()}", file=sys.stderr)
+              sys.exit(1)
+
+          body = f"## 🤖 Claude Code Review\n\n{comment}"
+          subprocess.run([
+              "gh", "pr", "comment",
+              os.environ["PR_NUMBER"],
+              "--repo", os.environ["REPO"],
+              "--body", body
+          ], check=True)
+          EOF
