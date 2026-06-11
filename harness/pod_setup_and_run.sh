@@ -91,15 +91,13 @@ fi
 
 pip install -r "$OPENPCDET_DIR/requirements.txt" -q
 
-# Check if pcdet is already importable; if so, skip the editable install.
-if python -c "import pcdet; print('  pcdet', pcdet.__version__, 'already installed')" 2>/dev/null; then
-  echo "  OpenPCDet already installed -- skipping editable install"
-else
-  # --no-build-isolation lets setup.py see the pre-installed torch so the
-  # CUDA version check in setup.py does not fail with ModuleNotFoundError.
-  echo "  pip install -e OpenPCDet (no-build-isolation) ..."
-  pip install -e "$OPENPCDET_DIR" --no-build-isolation -q
-fi
+# Always install from OPENPCDET_DIR so pcdet CUDA extensions (.so files) are
+# built from this exact path. A stale editable install from a prior session
+# at a different path will pass "import pcdet" but fail at model load time.
+# If extensions are already compiled, setup.py skips recompilation (~30s).
+echo "  pip install -e OpenPCDet (no-build-isolation) ..."
+pip install -e "$OPENPCDET_DIR" --no-build-isolation -q
+python -c "import pcdet; print('  pcdet', pcdet.__version__, 'ready')"
 
 # ── 3. Install gitm package ──────────────────────────────────────────────────
 
