@@ -45,6 +45,66 @@ NVML_SAMPLE_HZ = 5
 # KITTI canonical layout relative to GITM_DATA_ROOT, matching kitti_source.py
 _KITTI_VELODYNE_SUBDIR = Path("kitti") / "training" / "velodyne"
 
+_STAGE_NAMES = ["load", "preprocess", "inference", "postprocess"]
+
+
+def _stage_spread(
+    load_s: list[float],
+    preprocess_s: list[float],
+    inference_s: list[float],
+    postprocess_s: list[float],
+) -> dict:
+    """Compute p50/p95 latency and % of frame for each pipeline stage.
+
+    Surfaces the runtime's kernel-level spread signal: high p95/p50 ratio on a
+    stage means long-tail invocations that are good intervention targets.
+    Mirrors the shape of headroom_kernel_rank.render_roi_table() but for
+    PointPillars pipeline stages rather than CUDA kernel families.
+    """
+    import statistics
+
+    totals = [l + p + i + q for l, p, i, q in
+              zip(load_s, preprocess_s, inference_s, postprocess_s)]
+    mean_total = statistics.mean(totals) if totals else 1.0
+
+    def _stats(xs: list[float]) -> dict:
+        s = sorted(xs)
+        n = len(s)
+        p50 = s[int(0.50 * (n - 1))] if n else 0.0
+        p95 = s[int(0.95 * (n - 1))] if n else 0.0
+        mean = statistics.mean(xs) if xs else 0.0
+        return {
+            "mean_ms": round(mean * 1000, 3),
+            "p50_ms": round(p50 * 1000, 3),
+            "p95_ms": round(p95 * 1000, 3),
+            "p95_p50_ratio": round(p95 / p50, 2) if p50 > 0 else None,
+            "mean_pct": round(mean / mean_total * 100, 2) if mean_total > 0 else 0.0,
+        }
+
+    return {
+        "load": _stats(load_s),
+        "preprocess": _stats(preprocess_s),
+        "inference": _stats(inference_s),
+        "postprocess": _stats(postprocess_s),
+    }
+
+
+def render_stage_spread(spread: dict) -> str:
+    """Human-readable stage spread table (stdout + saved as stage_spread_report.txt)."""
+    lines = ["PointPillars stage spread (p50 / p95 latency per stage):", ""]
+    hdr = f"{'stage':<14} {'mean_ms':>9} {'p50_ms':>9} {'p95_ms':>9} {'p95/p50':>8} {'% frame':>8}"
+    lines += [hdr, "-" * len(hdr)]
+    for stage in _STAGE_NAMES:
+        s = spread.get(stage, {})
+        ratio = s.get("p95_p50_ratio")
+        lines.append(
+            f"{stage:<14} {s.get('mean_ms', 0):>9.3f} {s.get('p50_ms', 0):>9.3f} "
+            f"{s.get('p95_ms', 0):>9.3f} {ratio if ratio else 'N/A':>8} "
+            f"{s.get('mean_pct', 0):>7.1f}%"
+        )
+    lines += ["", "High p95/p50 ratio = long-tail invocations = intervention target."]
+    return "\n".join(lines)
+
 
 def _load_frame_paths(data_root: Path) -> list[Path]:
     """Return sorted velodyne .bin paths from $GITM_DATA_ROOT/kitti/training/velodyne/.
@@ -184,6 +244,12 @@ def run_baseline(
     gpu_active_fracs: list[float] = []
     total_detections = 0
 
+    # Per-frame stage timings for spread analysis
+    t_load_list: list[float] = []
+    t_preprocess_list: list[float] = []
+    t_inference_list: list[float] = []
+    t_postprocess_list: list[float] = []
+
     for i, path in enumerate(warm_paths):
         if i % 500 == 0:
             print(f"  {i}/{len(warm_paths)}")
@@ -192,6 +258,10 @@ def run_baseline(
         sync_stall_fracs.append(result.sync_stall_frac)
         gpu_active_fracs.append(result.gpu_active_frac)
         total_detections += result.n_detections
+        t_load_list.append(result.t_load_s)
+        t_preprocess_list.append(result.t_preprocess_s)
+        t_inference_list.append(result.t_inference_s)
+        t_postprocess_list.append(result.t_postprocess_s)
 
     t_wall_end = time.perf_counter()
     stop_event.set()
@@ -205,6 +275,11 @@ def run_baseline(
     sync_stall_pct = sum(sync_stall_fracs) / n_warm * 100
     gpu_active_pct = sum(gpu_active_fracs) / n_warm * 100
     cpu_pct = max(0.0, 100.0 - data_stall_pct - sync_stall_pct - gpu_active_pct)
+
+    # Stage spread — kernel-level spread signal for PointPillars pipeline stages
+    spread = _stage_spread(t_load_list, t_preprocess_list, t_inference_list, t_postprocess_list)
+    spread_report = render_stage_spread(spread)
+    print("\n" + spread_report)
 
     # GPU headroom from NVML samples via gitm.optimizer.headroom_kernel_rank
     headroom_dict: dict[str, Any] = {}
@@ -236,6 +311,7 @@ def run_baseline(
         "sync_stall_pct": round(sync_stall_pct, 2),
         "cpu_pct": round(cpu_pct, 2),
         **headroom_dict,
+        "stage_spread": spread,
         "total_detections": total_detections,
         "elapsed_s": round(elapsed, 3),
         "hostname": socket.gethostname(),
@@ -247,6 +323,9 @@ def run_baseline(
     }
 
     output_path.write_text(json.dumps(output, indent=2))
+    # Save stage spread report alongside the JSON for easy review
+    report_path = output_path.with_name(output_path.stem + "_stage_spread.txt")
+    report_path.write_text(spread_report)
     print(
         f"\nResult: {fps:.1f} fps | GPU active {gpu_active_pct:.1f}% "
         f"| data stall {data_stall_pct:.1f}% | wrote {output_path}"
