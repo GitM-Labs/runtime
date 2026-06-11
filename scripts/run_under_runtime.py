@@ -119,9 +119,53 @@ def _stream_hft(stage: Path, seed: int, shards_per_batch: int, max_shards: int |
     return work, n, kind, gpu_name, device_count, len(shards), len(batches)
 
 
+
+def _load_edge(cfg_path: Path, ckpt_path: Path, n_frames: int, seed: int,
+               data_root: str, max_sweeps: int):
+    """nuScenes CenterPoint-PointPillar via gitm.benchmarks.edge (10-sweep keyframes)."""
+    import random
+
+    import torch
+
+    from gitm.benchmarks.edge.workunit import NuScenesWorkUnit
+
+    unit = NuScenesWorkUnit.from_checkpoint(
+        cfg_path=cfg_path, ckpt_path=ckpt_path,
+        data_root=data_root, max_sweeps=max_sweeps,
+    )
+    rng = random.Random(seed)
+    indices = list(range(len(unit)))
+    rng.shuffle(indices)
+    run_indices = indices[:n_frames]
+
+    gpu_name = torch.cuda.get_device_name(0)
+    device_count = torch.cuda.device_count()
+
+    # Warmup outside the capture window (context init, cudnn autotune).
+    for idx in run_indices[:10]:
+        unit.run(idx)
+    torch.cuda.synchronize()
+
+    def work() -> dict:
+        total_dets = 0
+        for i, idx in enumerate(run_indices):
+            r = unit.run(idx)
+            total_dets += r.n_detections
+            if i % 100 == 0:
+                print(f"  frame {i}/{len(run_indices)}", flush=True)
+        return {"frames": len(run_indices), "detections": total_dets}
+
+    return work, len(run_indices), "torch", gpu_name, device_count
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Run a workload under the GITM runtime.")
-    ap.add_argument("--workload", default="hft", choices=["hft"])
+    ap.add_argument("--workload", default="hft", choices=["hft", "edge"])
+    ap.add_argument("--cfg", type=Path, default=None, help="edge: OpenPCDet model yaml")
+    ap.add_argument("--ckpt", type=Path, default=None, help="edge: checkpoint .pth")
+    ap.add_argument("--frames", type=int, default=500, help="edge: frames to trace")
+    ap.add_argument("--data-root", default="/workspace/edge/OpenPCDet/data/nuscenes")
+    ap.add_argument("--max-sweeps", type=int, default=10)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--stage", type=Path, default=None)
     ap.add_argument("--max-events", type=int, default=None)
@@ -149,9 +193,14 @@ def main(argv: list[str] | None = None) -> int:
     stage = args.stage or Path(os.environ.get("GITM_BENCH_STAGE", "/workspace/hft/staging/hft"))
     args.outdir.mkdir(parents=True, exist_ok=True)
 
-    if args.workload != "hft":  # pragma: no cover
-        raise SystemExit(f"unwired workload: {args.workload}")
-    if args.stream:
+    if args.workload == "edge":
+        if not (args.cfg and args.ckpt):
+            raise SystemExit("--workload edge requires --cfg and --ckpt")
+        work, n, kind, gpu_name, device_count = _load_edge(
+            args.cfg, args.ckpt, args.frames, args.seed,
+            args.data_root, args.max_sweeps,
+        )
+    elif args.stream:
         work, n, kind, gpu_name, device_count, n_shards, n_batches = _stream_hft(
             stage, args.seed, args.shards_per_batch, args.max_shards
         )
@@ -161,7 +210,8 @@ def main(argv: list[str] | None = None) -> int:
 
     wl = f"{args.workload}-seed{args.seed}-{n}ev"
     print(f"workload={wl} backend={kind} gpu={gpu_name} x{device_count}")
-    print(f"loaded {n:,} events from {stage}")
+    if args.workload == "hft":
+        print(f"loaded {n:,} events from {stage}")
 
     trace_path = args.outdir / f"{args.workload}_seed{args.seed}_trace.jsonl"
     tele_path = args.outdir / f"{args.workload}_seed{args.seed}_telemetry.jsonl"
@@ -189,10 +239,13 @@ def main(argv: list[str] | None = None) -> int:
         tele.stop()
     ended_ns = time.time_ns()
 
-    events_per_second = summary["events"] / elapsed
+    units = summary.get("events", summary.get("frames", 0))
+    events_per_second = units / elapsed
+    extra = (f", {summary['vwap_buckets']:,} vwap buckets" if "vwap_buckets" in summary
+             else f", {summary.get('detections', 0):,} detections")
     print(
-        f"events/sec = {events_per_second:,.0f}  "
-        f"({summary['events']:,} events in {elapsed:.3f}s, {summary['vwap_buckets']:,} vwap buckets)"
+        f"units/sec = {events_per_second:,.2f}  "
+        f"({units:,} units in {elapsed:.3f}s{extra})"
     )
 
     # --- runtime: residuals -> invariants -> attribution --------------------
@@ -205,10 +258,11 @@ def main(argv: list[str] | None = None) -> int:
         "backend": kind,
         "gpu_name": gpu_name,
         "device_count": device_count,
-        "events": summary["events"],
+        "events": units,
         "elapsed_s": elapsed,
         "events_per_second": events_per_second,
-        "vwap_buckets": summary["vwap_buckets"],
+        "vwap_buckets": summary.get("vwap_buckets"),
+        "detections": summary.get("detections"),
         "n_kernels": len(kernels),
         "n_memcpy": len(memcpys),
         "trace_path": str(trace_path),
@@ -316,8 +370,10 @@ def main(argv: list[str] | None = None) -> int:
                 measured_delta=None,
             )
         )
+    wl_desc = ("HFT cuDF/CuPy" if args.workload == "hft"
+               else "nuScenes CenterPoint-PointPillar (10-sweep)")
     run_summary = (
-        f"HFT cuDF/CuPy on {gpu_name}: {events_per_second:,.0f} events/s over {n:,} events; "
+        f"{wl_desc} on {gpu_name}: {events_per_second:,.2f} units/s over {n:,} units; "
         f"{len(kernels):,} kernels captured, {len(violations)} invariant deviation(s), "
         f"serialized-concurrency={sc:.3f}. Measurement run — no interventions applied."
     )
