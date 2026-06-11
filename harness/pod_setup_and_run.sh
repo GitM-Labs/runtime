@@ -73,20 +73,33 @@ step "Installing OpenPCDet deps ..."
 # on the pod. Installing a mismatched torch breaks torchaudio/torchvision.
 python -c "import torch; print('  torch', torch.__version__, '| CUDA', torch.version.cuda)"
 
-# spconv: pick wheel matching the pod's CUDA version (12.x -> cu120 or cu121)
-CUDA_SHORT=$(python -c "import torch; v=torch.version.cuda or '12.0'; print(''.join(v.split('.')[:2]))" 2>/dev/null || echo "120")
-echo "  Installing spconv-cu${CUDA_SHORT} ..."
-pip install spconv-cu"${CUDA_SHORT}" -q 2>/dev/null || {
-  echo "  spconv-cu${CUDA_SHORT} not found, falling back to spconv-cu120 ..."
-  pip install spconv-cu120 -q
-}
+# spconv: check if already importable (pod may have it from prior work), else
+# try versioned wheels newest-to-oldest, fall back to building from source.
+# spconv does not publish cu128 wheels; cu122 is the closest and is ABI-compatible
+# with CUDA 12.x when torch is pre-installed.
+if python -c "import spconv; print('  spconv', spconv.__version__, 'already installed')" 2>/dev/null; then
+  echo "  spconv already present -- skipping install"
+else
+  echo "  Installing spconv (trying pre-built wheels then source) ..."
+  pip install spconv-cu122 -q 2>/dev/null || \
+  pip install spconv-cu121 -q 2>/dev/null || \
+  pip install spconv-cu118 -q 2>/dev/null || {
+    echo "  No pre-built wheel found -- building spconv from source (~10 min) ..."
+    pip install "spconv @ git+https://github.com/traveller59/spconv.git@v2.3.6" --no-build-isolation -q
+  }
+fi
 
 pip install -r "$OPENPCDET_DIR/requirements.txt" -q
 
-# --no-build-isolation: lets the editable install see the already-installed
-# torch so setup.py's torch.cuda version check doesn't fail.
-echo "  pip install -e OpenPCDet (no-build-isolation) ..."
-pip install -e "$OPENPCDET_DIR" --no-build-isolation -q
+# Check if pcdet is already importable; if so, skip the editable install.
+if python -c "import pcdet; print('  pcdet', pcdet.__version__, 'already installed')" 2>/dev/null; then
+  echo "  OpenPCDet already installed -- skipping editable install"
+else
+  # --no-build-isolation lets setup.py see the pre-installed torch so the
+  # CUDA version check in setup.py does not fail with ModuleNotFoundError.
+  echo "  pip install -e OpenPCDet (no-build-isolation) ..."
+  pip install -e "$OPENPCDET_DIR" --no-build-isolation -q
+fi
 
 # ── 3. Install gitm package ──────────────────────────────────────────────────
 
