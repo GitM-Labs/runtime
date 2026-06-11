@@ -83,7 +83,7 @@ The monitor checks observed-vs-predicted against three invariants:
 2. **Memory-traffic** — per-kernel bytes-moved must match predicted.
 3. **Stream-concurrency** — predicted-concurrent kernels must overlap.
 
-See [docs/invariants.md](docs/invariants.md).
+See [docs/invariants.md](https://github.com/GitM-Labs/runtime/blob/main/docs/invariants.md).
 
 ### Module responsibilities
 
@@ -100,8 +100,6 @@ See [docs/invariants.md](docs/invariants.md).
 | `gitm.kernels` | Curated intervention library — 15–20 levers with applicability + safety |
 | `gitm.agents` | Autonomous policy — selects interventions, drives rollback |
 | `gitm.scheduler` | 24-hour loop phase orchestration |
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
 ## Data layout
 
