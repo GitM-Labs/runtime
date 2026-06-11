@@ -29,3 +29,5 @@ jobs:
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@v1.12.4
         # No API token needed — OIDC handles auth automatically
+        with:
+          verbose: true
