@@ -137,11 +137,13 @@ def load_events(stage: Path, seed: int, dflib, *, max_events: int | None):
     paths = sorted(_seed_dir(stage, seed).glob("part-*.parquet"))
     if not paths:
         raise FileNotFoundError(f"no parquet shards in {_seed_dir(stage, seed)}")
+    if max_events is not None:
+        n_files = max(1, (max_events + 4_999_999) // 5_000_000)
+        paths = paths[:n_files]
     df = dflib.read_parquet(paths if len(paths) > 1 else paths[0])
     if max_events is not None and len(df) > max_events:
         df = df.iloc[:max_events]
     return df
-
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="HFT LOB replay harness (cuDF/CuPy).")
