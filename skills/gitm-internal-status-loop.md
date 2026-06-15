@@ -10,22 +10,27 @@ Internal meta-loop skill for Git.M's GTM sprint. Runs three output modes: a dail
 
 Mode 1 runs on a cron schedule. Modes 2 and 3 are event-driven but also poll as a fallback.
 
-To register the cron job on the VM:
+Use Hermes native cron — do not use crontab. hermes chat requires an interactive terminal and cannot be invoked from crontab.
+
+Register the three jobs:
 
 ```bash
-crontab -e
-```
+hermes cron create --skill gitm-internal-status-loop --prompt "run standup mode" --schedule "0 9 * * 1-5" --name "gitm-standup"
 
-Add:
-```
-0 9 * * 1-5 hermes chat --skill gitm-internal-status-loop "run standup mode"
-*/10 * * * 1-5 hermes chat --skill gitm-internal-status-loop "check approval queue"
-*/10 * * * 1-5 hermes chat --skill gitm-internal-status-loop "check airtable changes"
+hermes cron create --skill gitm-internal-status-loop --prompt "check approval queue" --schedule "*/10 * * * 1-5" --name "gitm-approval-queue"
+
+hermes cron create --skill gitm-internal-status-loop --prompt "check airtable changes" --schedule "*/10 * * * 1-5" --name "gitm-airtable-sync"
 ```
 
 Verify:
 ```bash
-crontab -l
+hermes cron list
+hermes cron status
+```
+
+The Hermes gateway must be running for cron jobs to execute:
+```bash
+hermes gateway run &
 ```
 
 ---
