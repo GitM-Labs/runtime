@@ -41,8 +41,15 @@ Each vector has metadata:
 ```
 PINECONE_API_KEY
 PINECONE_INDEX_NAME=gitm-context-store
-OPENAI_API_KEY        # for embeddings (text-embedding-3-small)
+OPENROUTER_API_KEY          # already active in Hermes env
+OPENROUTER_EMBEDDING_MODEL=openai/text-embedding-3-small
 ```
+
+Note: OpenRouter is used instead of OpenAI directly. The embedding model `openai/text-embedding-3-small` is available via OpenRouter's OpenAI-compatible endpoint at `https://openrouter.ai/api/v1/embeddings`. Use the value of the `OPENROUTER_API_KEY` environment variable as the bearer token.
+
+Dimension compatibility: OpenRouter routes `openai/text-embedding-3-small` to OpenAI's model directly, so vector dimensions (1536) and normalization are identical to calling OpenAI's API directly. Do not mix embedding providers mid-index — if you switch providers, re-seed the entire Pinecone index from scratch to avoid silent semantic inconsistency.
+
+OPENAI_API_KEY is not used by this skill. If other skills reference it, they are unaffected — this skill uses OPENROUTER_API_KEY exclusively.
 
 ---
 
@@ -207,7 +214,7 @@ Reference wins for social proof in messaging.
 To seed the context store, run inside a Hermes chat session:
 
 ```
-Seed the gitm-context-store. For each table in context_voice_rules, context_sender_personas, context_copy_variants, context_product_state, and context_objection_responses: read the seed data from the gitm-context-store skill, write each row to Airtable, generate an embedding for each record using OpenAI text-embedding-3-small, and upsert into the Pinecone index gitm-context-store with the correct metadata fields (record_type, record_id, label, sender, vertical).
+Seed the gitm-context-store. For each table in context_voice_rules, context_sender_personas, context_copy_variants, context_product_state, and context_objection_responses: read the seed data from the gitm-context-store skill, write each row to Airtable, generate an embedding for each record using OpenRouter (endpoint: https://openrouter.ai/api/v1/embeddings, model: the value of OPENROUTER_EMBEDDING_MODEL env var, bearer token: the value of the OPENROUTER_API_KEY environment variable), and upsert into the Pinecone index gitm-context-store with the correct metadata fields (record_type, record_id, label, sender, vertical).
 ```
 
 ---
