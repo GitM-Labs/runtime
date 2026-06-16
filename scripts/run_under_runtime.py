@@ -218,6 +218,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--outdir", type=Path, default=Path("/workspace/hft/runs"))
     args = ap.parse_args(argv)
 
+    if args.workload in ("edge", "kitti") and args.frames <= 0:
+        raise SystemExit(f"--frames must be > 0 for {args.workload}, got {args.frames}")
+
     import numpy as np
 
     from gitm import __version__
@@ -249,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
         work, n, kind, gpu_name, device_count = _load_kitti(
             args.cfg, args.ckpt, args.frames, args.seed, data_root,
         )
-    elif args.stream:
+    elif args.workload == "hft" and args.stream:
         work, n, kind, gpu_name, device_count, n_shards, n_batches = _stream_hft(
             stage, args.seed, args.shards_per_batch, args.max_shards
         )
