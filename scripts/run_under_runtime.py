@@ -168,7 +168,12 @@ def _load_kitti(cfg_path: Path, ckpt_path: Path, n_frames: int, seed: int, data_
     from gitm.benchmarks.kitti.baseline import _load_frame_paths
 
     unit = WorkUnit.from_checkpoint(cfg_path=cfg_path, ckpt_path=ckpt_path)
-    all_paths = _load_frame_paths(data_root)
+    # _load_frame_paths returns paths sorted by stem, so the seeded shuffle below
+    # is reproducible across machines regardless of filesystem iteration order.
+    all_paths = _load_frame_paths(Path(data_root))
+    if n_frames > len(all_paths):
+        print(f"  WARNING: requested {n_frames} frames but only {len(all_paths)} "
+              f"available; using all {len(all_paths)}.", flush=True)
     rng = random.Random(seed)
     paths = list(all_paths)
     rng.shuffle(paths)
@@ -439,13 +444,15 @@ def main(argv: list[str] | None = None) -> int:
             f"{len(kernels):,} kernels captured, {len(violations)} invariant deviation(s), "
             f"serialized-concurrency={sc:.3f}. Measurement run — no interventions applied."
         )
-    else:
+    elif args.workload == "kitti":
         run_summary = (
             f"KITTI PointPillars on {gpu_name}: "
             f"{events_per_second:,.2f} frames/s over {n:,} frames; "
             f"{len(kernels):,} kernels captured, {len(violations)} invariant deviation(s), "
             f"serialized-concurrency={sc:.3f}. Measurement run — no interventions applied."
         )
+    else:
+        raise AssertionError(f"unhandled workload: {args.workload}")
     report_md = write_report(
         claims,
         prov,
