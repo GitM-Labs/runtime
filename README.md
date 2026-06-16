@@ -1,5 +1,8 @@
 # gitm-labs
 
+<img width="1062" height="356" alt="image" src="https://github.com/user-attachments/assets/ffee3fc3-c42f-4fe5-9e31-c6a62a245f44" />
+
+
 Behavioral compiler + intervention runtime for GPU-intensive workloads. Given a workload and a time budget, gitm-labs autonomously profiles, attributes, and applies kernel-level interventions to hit a target performance improvement — and produces a provenance report showing exactly what it changed and why.
 
 ## Install
