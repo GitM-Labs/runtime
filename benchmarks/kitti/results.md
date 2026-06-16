@@ -1,5 +1,13 @@
 # KITTI edge benchmark results
 
+> **Status: baselines pending compute.** All harness code (manifest gen,
+> WorkUnit, 6-seed baseline runner, disk pre-warm convergence fix, GPU-headroom
+> + stage-spread integration, predicted execution graph, `run_under_runtime`
+> wiring) is complete and verified locally. The `TBD` cells below are filled
+> automatically by `harness/fill_results.py` after a GPU run of
+> `bash harness/pod_setup_and_run.sh`. Awaiting a live CUDA pod to execute the
+> ~90 min 6-seed run.
+
 ## Baseline measurements
 
 | Run | Seed | fps | GPU active % | Data stall % | Sync % | CPU % | Compute headroom % |
