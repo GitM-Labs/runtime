@@ -11,7 +11,7 @@ its one-line throughput contract), this driver runs the workload's CUDA work
   * causal attribution— Granger on the residual subgraph
   * provenance report — markdown summary of everything measured
 
-Currently wired for the HFT cuDF/CuPy workload (the only fully-real harness).
+Wired workloads: HFT (cuDF/CuPy), edge (nuScenes CenterPoint-PointPillar), kitti (PointPillars).
 Emits: <outdir>/<wl>_trace.jsonl, _telemetry.jsonl, _measure.json, _report.md.
 
     python scripts/run_under_runtime.py --workload hft --seed 42 \
@@ -158,13 +158,50 @@ def _load_edge(cfg_path: Path, ckpt_path: Path, n_frames: int, seed: int,
     return work, len(run_indices), "torch", gpu_name, device_count
 
 
+def _load_kitti(cfg_path: Path, ckpt_path: Path, n_frames: int, seed: int, data_root: str):
+    """KITTI PointPillars via gitm.benchmarks.kitti (single-frame Velodyne inference)."""
+    import random
+
+    import torch
+
+    from gitm.benchmarks.kitti import WorkUnit
+    from gitm.benchmarks.kitti.baseline import _load_frame_paths
+
+    unit = WorkUnit.from_checkpoint(cfg_path=cfg_path, ckpt_path=ckpt_path)
+    all_paths = _load_frame_paths(data_root)
+    rng = random.Random(seed)
+    paths = list(all_paths)
+    rng.shuffle(paths)
+    run_paths = paths[:n_frames]
+
+    gpu_name = torch.cuda.get_device_name(0)
+    device_count = torch.cuda.device_count()
+
+    # Warmup outside the capture window.
+    for p in run_paths[:10]:
+        unit.run(p)
+    torch.cuda.synchronize()
+
+    def work() -> dict:
+        total_dets = 0
+        for i, p in enumerate(run_paths):
+            r = unit.run(p)
+            total_dets += r.n_detections
+            if i % 100 == 0:
+                print(f"  frame {i}/{len(run_paths)}", flush=True)
+        return {"frames": len(run_paths), "detections": total_dets}
+
+    return work, len(run_paths), "torch", gpu_name, device_count
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Run a workload under the GITM runtime.")
-    ap.add_argument("--workload", default="hft", choices=["hft", "edge"])
-    ap.add_argument("--cfg", type=Path, default=None, help="edge: OpenPCDet model yaml")
-    ap.add_argument("--ckpt", type=Path, default=None, help="edge: checkpoint .pth")
-    ap.add_argument("--frames", type=int, default=500, help="edge: frames to trace")
-    ap.add_argument("--data-root", default="/workspace/edge/OpenPCDet/data/nuscenes")
+    ap.add_argument("--workload", default="hft", choices=["hft", "edge", "kitti"])
+    ap.add_argument("--cfg", type=Path, default=None, help="edge/kitti: OpenPCDet model yaml")
+    ap.add_argument("--ckpt", type=Path, default=None, help="edge/kitti: checkpoint .pth")
+    ap.add_argument("--frames", type=int, default=500, help="edge/kitti: frames to trace")
+    ap.add_argument("--data-root", default=None,
+                    help="edge: nuscenes root; kitti: GITM_DATA_ROOT (velodyne parent)")
     ap.add_argument("--max-sweeps", type=int, default=10)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--stage", type=Path, default=None)
@@ -196,9 +233,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.workload == "edge":
         if not (args.cfg and args.ckpt):
             raise SystemExit("--workload edge requires --cfg and --ckpt")
+        data_root = args.data_root or "/workspace/edge/OpenPCDet/data/nuscenes"
         work, n, kind, gpu_name, device_count = _load_edge(
             args.cfg, args.ckpt, args.frames, args.seed,
-            args.data_root, args.max_sweeps,
+            data_root, args.max_sweeps,
+        )
+    elif args.workload == "kitti":
+        if not (args.cfg and args.ckpt):
+            raise SystemExit("--workload kitti requires --cfg and --ckpt")
+        data_root = args.data_root or os.environ.get("GITM_DATA_ROOT", "/workspace/edge/data")
+        work, n, kind, gpu_name, device_count = _load_kitti(
+            args.cfg, args.ckpt, args.frames, args.seed, data_root,
         )
     elif args.stream:
         work, n, kind, gpu_name, device_count, n_shards, n_batches = _stream_hft(
@@ -212,6 +257,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"workload={wl} backend={kind} gpu={gpu_name} x{device_count}")
     if args.workload == "hft":
         print(f"loaded {n:,} events from {stage}")
+    elif args.workload in ("edge", "kitti"):
+        print(f"loaded {n:,} frames")
 
     trace_path = args.outdir / f"{args.workload}_seed{args.seed}_trace.jsonl"
     tele_path = args.outdir / f"{args.workload}_seed{args.seed}_telemetry.jsonl"
@@ -251,6 +298,11 @@ def main(argv: list[str] | None = None) -> int:
             f"frames/sec = {events_per_second:,.2f}  "
             f"({units:,} frames in {elapsed:.3f}s, {summary.get('detections', 0):,} detections)"
         )
+    if args.workload == "kitti":
+        from gitm.planner import predict_kitti_graph, render_kitti_graph
+        from gitm.planner.roofline import HardwareSpec
+        kitti_graph = predict_kitti_graph(HardwareSpec(name=gpu_name))
+        print(render_kitti_graph(kitti_graph))
 
     # --- runtime: residuals -> invariants -> attribution --------------------
     kernels = [e for e in tr.events if e.kind == "kernel"]
@@ -380,9 +432,16 @@ def main(argv: list[str] | None = None) -> int:
             f"{len(kernels):,} kernels captured, {len(violations)} invariant deviation(s), "
             f"serialized-concurrency={sc:.3f}. Measurement run — no interventions applied."
         )
-    else:
+    elif args.workload == "edge":
         run_summary = (
             f"nuScenes CenterPoint-PointPillar (10-sweep) on {gpu_name}: "
+            f"{events_per_second:,.2f} frames/s over {n:,} frames; "
+            f"{len(kernels):,} kernels captured, {len(violations)} invariant deviation(s), "
+            f"serialized-concurrency={sc:.3f}. Measurement run — no interventions applied."
+        )
+    else:
+        run_summary = (
+            f"KITTI PointPillars on {gpu_name}: "
             f"{events_per_second:,.2f} frames/s over {n:,} frames; "
             f"{len(kernels):,} kernels captured, {len(violations)} invariant deviation(s), "
             f"serialized-concurrency={sc:.3f}. Measurement run — no interventions applied."
