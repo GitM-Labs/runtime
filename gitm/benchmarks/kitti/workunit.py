@@ -97,11 +97,9 @@ class WorkUnit:
             from pcdet.models import build_network
         except ImportError as exc:
             raise ImportError(
-                "OpenPCDet not installed. On the RunPod dev box:\n"
-                "  git clone https://github.com/open-mmlab/OpenPCDet.git\n"
-                "  cd OpenPCDet && pip install -e .\n"
-                "Then pull the checkpoint:\n"
-                "  # Ask Adit for the checkpoint URL or pull from S3"
+                f"OpenPCDet import failed: {exc}\n"
+                "  Make sure OpenPCDet CUDA extensions are compiled:\n"
+                "    cd $OPENPCDET_DIR && python setup.py build_ext --inplace"
             ) from exc
 
         # OpenPCDet resolves _BASE_CONFIG_ entries (e.g.

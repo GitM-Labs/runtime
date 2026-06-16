@@ -91,12 +91,19 @@ fi
 
 pip install -r "$OPENPCDET_DIR/requirements.txt" -q
 
-# Always install from OPENPCDET_DIR so pcdet CUDA extensions (.so files) are
-# built from this exact path. A stale editable install from a prior session
-# at a different path will pass "import pcdet" but fail at model load time.
-# If extensions are already compiled, setup.py skips recompilation (~30s).
+# Install pcdet editable from OPENPCDET_DIR, then explicitly compile CUDA
+# extensions if the .so files are missing (pip may skip build_ext on a
+# re-install when it sees pcdet is "already satisfied" at a different path).
 echo "  pip install -e OpenPCDet (no-build-isolation) ..."
 pip install -e "$OPENPCDET_DIR" --no-build-isolation -q
+
+SO_COUNT=$(find "$OPENPCDET_DIR/pcdet/ops" -name "*.so" 2>/dev/null | wc -l)
+if [ "$SO_COUNT" -eq 0 ]; then
+  echo "  No .so files found — building CUDA extensions (~5-10 min) ..."
+  (cd "$OPENPCDET_DIR" && python setup.py build_ext --inplace 2>&1 | tail -5)
+else
+  echo "  CUDA extensions OK ($SO_COUNT .so files found)"
+fi
 python -c "import pcdet; print('  pcdet', pcdet.__version__, 'ready')"
 
 # ── 3. Install gitm package ──────────────────────────────────────────────────
