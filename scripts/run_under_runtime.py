@@ -233,7 +233,6 @@ def main(argv: list[str] | None = None) -> int:
     from gitm.tracer import capture
 
     stage = args.stage or Path(os.environ.get("GITM_BENCH_STAGE", "/workspace/hft/staging/hft"))
-    args.outdir.mkdir(parents=True, exist_ok=True)
 
     if args.workload == "edge":
         if not (args.cfg and args.ckpt):
@@ -257,6 +256,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"streaming {n_shards} shards in {n_batches} batches of {args.shards_per_batch}")
     else:
         work, n, kind, gpu_name, device_count = _load_hft(stage, args.seed, args.max_events)
+
+    # Created after workload dispatch so an arg-validation error (missing
+    # --cfg/--ckpt) surfaces before we touch the filesystem.
+    args.outdir.mkdir(parents=True, exist_ok=True)
 
     wl = f"{args.workload}-seed{args.seed}-{n}ev"
     print(f"workload={wl} backend={kind} gpu={gpu_name} x{device_count}")
@@ -306,8 +309,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.workload == "kitti":
         from gitm.planner import predict_kitti_graph, render_kitti_graph
         from gitm.planner.roofline import HardwareSpec
+        # HardwareSpec carries A100-SXM4-80GB peak FLOPS/bandwidth defaults (no
+        # GPU catalogue yet). Overriding only `name` leaves those peaks at A100
+        # values, so flag when the detected GPU differs — the predicted ms are
+        # shape-only, not calibrated, on other hardware.
         kitti_graph = predict_kitti_graph(HardwareSpec(name=gpu_name))
         print(render_kitti_graph(kitti_graph))
+        if "A100" not in gpu_name:
+            print(f"  NOTE: roofline peaks are A100-SXM4-80GB reference values; "
+                  f"detected GPU is {gpu_name}. Predicted ms are shape-only here.")
 
     # --- runtime: residuals -> invariants -> attribution --------------------
     kernels = [e for e in tr.events if e.kind == "kernel"]
