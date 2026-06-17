@@ -338,15 +338,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # --- provenance report ---------------------------------------------------
-    def _git_sha() -> str:
-        import subprocess
-
-        try:
-            return subprocess.check_output(
-                ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL, text=True
-            ).strip()
-        except Exception:
-            return "unknown"
+    # Reuse the canonical helper rather than re-implement it (it resolves the SHA
+    # from the cwd, falling back to "unknown" off-repo — fine for provenance).
+    from gitm.optimizer.report import _git_sha
 
     prov = Provenance(
         workload_id=wl,
