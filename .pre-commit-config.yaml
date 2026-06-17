@@ -1,0 +1,42 @@
+# Pre-commit gate: fast lint + hygiene on every commit, full test suite before
+# push. Mirrors CI (.github/workflows/tests.yml) so red never reaches GitHub.
+#
+# One-time setup (after `pip install -e ".[dev]"`):
+#   pre-commit install -t pre-commit -t pre-push
+# Run manually against everything:
+#   pre-commit run --all-files
+#
+# NB: `ruff format` is intentionally NOT enabled — the repo isn't ruff-formatted
+# (most files would churn). We lint only, matching [tool.ruff.lint] in pyproject.
+minimum_pre_commit_version: "3.5.0"
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^tests/golden/        # byte-exact snapshot fixture
+      - id: end-of-file-fixer
+        exclude: ^tests/golden/
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files     # keep generated parquet out of git
+
+  - repo: local
+    hooks:
+      # Uses the ruff/pytest from the installed [dev] extra, so versions match
+      # pyproject rather than drifting from a separately pinned hook.
+      - id: ruff
+        name: ruff (lint + autofix)
+        entry: ruff check --fix --force-exclude
+        language: system
+        types: [python]
+        require_serial: true
+
+      - id: pytest
+        name: pytest (full suite, pre-push)
+        entry: pytest
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
