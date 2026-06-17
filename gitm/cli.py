@@ -84,11 +84,14 @@ def main(argv: list[str] | None = None) -> int:
             target=_parse_target(args.target),
             scratch=args.scratch,
         )
+        summary = result.get("summary", {})
         if args.report is not None:
             args.report.write_text(result.get("report_md", ""))
         else:
-            print(json.dumps(result.get("summary", {}), indent=2))
-        return 0
+            print(json.dumps(summary, indent=2))
+        # Non-zero so automation notices a run that measured nothing (no GPU /
+        # CUPTI shim, or the workload never ran) instead of seeing a fake pass.
+        return 3 if summary.get("status") == "no_data" else 0
 
     if args.cmd == "replay":
         from gitm.optimizer.replay import predict_delta_from_files
