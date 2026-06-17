@@ -45,6 +45,10 @@ Implementation: `gitm.benchmarks.kitti.WorkUnit`
 - GPU saturation check: GPU active % must be < 85%
 - Auxiliary: `total_detections` per run (regression sentinel, not a target)
 
+> **Status: pending compute.** Harness is complete and verified locally; the
+> table below is auto-filled by `harness/fill_results.py` after a GPU run.
+> Convergence (≤ 2% 6-seed fps spread) is gated on that run.
+
 Baseline result (fill after running `bash harness/run_baselines.sh`):
 
 | Seed | fps | GPU active % | Data stall % | Sync % | CPU % | Compute headroom % |

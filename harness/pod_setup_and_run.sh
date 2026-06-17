@@ -91,13 +91,31 @@ fi
 
 pip install -r "$OPENPCDET_DIR/requirements.txt" -q
 
-# Always install from OPENPCDET_DIR so pcdet CUDA extensions (.so files) are
-# built from this exact path. A stale editable install from a prior session
-# at a different path will pass "import pcdet" but fail at model load time.
-# If extensions are already compiled, setup.py skips recompilation (~30s).
+# Install pcdet editable from OPENPCDET_DIR, then explicitly compile CUDA
+# extensions if the .so files are missing (pip may skip build_ext on a
+# re-install when it sees pcdet is "already satisfied" at a different path).
 echo "  pip install -e OpenPCDet (no-build-isolation) ..."
 pip install -e "$OPENPCDET_DIR" --no-build-isolation -q
-python -c "import pcdet; print('  pcdet', pcdet.__version__, 'ready')"
+
+SO_COUNT=$(find "$OPENPCDET_DIR/pcdet/ops" -name "*.so" 2>/dev/null | wc -l)
+if [ "$SO_COUNT" -eq 0 ]; then
+  echo "  No .so files found — building CUDA extensions (~5-10 min) ..."
+  # Log to a file and surface the full log on failure; piping to `tail` would
+  # both hide the real compile error and mask the non-zero exit status.
+  build_log=$(mktemp)
+  if ! ( cd "$OPENPCDET_DIR" && python setup.py build_ext --inplace ) >"$build_log" 2>&1; then
+    echo "  ERROR: CUDA extension build failed. Full log:" >&2
+    cat "$build_log" >&2
+    exit 1
+  fi
+  rm -f "$build_log"
+else
+  echo "  CUDA extensions OK ($SO_COUNT .so files found)"
+fi
+# Verify pcdet AND a CUDA op import — a count-based .so check can't catch
+# extensions built against a different Python/CUDA ABI, which is exactly the
+# stale-install failure mode this step guards against.
+python -c "import pcdet; from pcdet.ops.iou3d_nms import iou3d_nms_utils; print('  pcdet', pcdet.__version__, 'ready (CUDA ops import OK)')"
 
 # ── 3. Install gitm package ──────────────────────────────────────────────────
 

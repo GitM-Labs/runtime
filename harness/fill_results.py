@@ -114,8 +114,23 @@ def build_summary(runs: list[dict]) -> dict:
     }
 
 
+def _strip_status_banner(text: str) -> str:
+    """Remove the '> **Status: ... pending compute**' blockquote.
+
+    Once measured numbers are filled in, the pending-compute banner is stale
+    and contradicts the populated tables, so drop it (and its trailing blank
+    line) when filling results.
+    """
+    return re.sub(
+        r"> \*\*Status:.*?\n\n",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+
+
 def _update_spec(path: Path, s: dict) -> str:
-    text = path.read_text()
+    text = _strip_status_banner(path.read_text())
 
     # Build 6-seed table rows
     def row(r: dict) -> str:
@@ -201,7 +216,7 @@ def _update_spec(path: Path, s: dict) -> str:
 
 
 def _update_results(path: Path, s: dict) -> str:
-    text = path.read_text()
+    text = _strip_status_banner(path.read_text())
 
     for r in s["rows"]:
         seed = r["seed"]

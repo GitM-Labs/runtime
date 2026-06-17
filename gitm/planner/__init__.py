@@ -9,12 +9,17 @@ the optimization-worthy kernels.
 from __future__ import annotations
 
 from gitm.planner.graph import Graph, PredictedNode, predict_graph
+from gitm.planner.kitti_graph import KittiGraph, KittiNode, predict_kitti_graph, render_kitti_graph
 from gitm.planner.roofline import HardwareSpec, ModelSpec, BatchConfig, roofline
 
 __all__ = [
     "Graph",
     "PredictedNode",
     "predict_graph",
+    "KittiGraph",
+    "KittiNode",
+    "predict_kitti_graph",
+    "render_kitti_graph",
     "HardwareSpec",
     "ModelSpec",
     "BatchConfig",
