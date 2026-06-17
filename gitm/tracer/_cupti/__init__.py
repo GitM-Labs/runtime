@@ -64,9 +64,12 @@ def load_shim() -> ModuleType | None:
     shim = _import_shim()
     if shim is not None:
         return shim
-    if _maybe_autobuild():
-        return _import_shim()
-    return None
+    # Not built yet. Attempt a one-time build, then re-import unconditionally:
+    # a thread that lost the build race blocks on the lock inside
+    # _maybe_autobuild and must still pick up the .so the winner just built
+    # (so we can't gate the re-import on this call having done the build).
+    _maybe_autobuild()
+    return _import_shim()
 
 
 def available() -> bool:
