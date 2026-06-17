@@ -24,9 +24,11 @@ if command -v apt-get >/dev/null 2>&1; then
     echo "WARN: apt-get deps step skipped/failed (may already be present)"
 fi
 
-echo "==> python package (+ dev, bench, nvidia extras)"
+echo "==> python package (+ dev + full GPU stack: cuDF/CuPy/CUPTI/NVML)"
 pip install -q -U pip
-pip install -q -e ".[dev,bench,nvidia]"
+# The [gpu] extra pulls cuDF/CuPy + the CUPTI/runtime wheels; cuDF/CuPy resolve
+# from NVIDIA's index, hence --extra-index-url.
+pip install -q --extra-index-url=https://pypi.nvidia.com -e ".[dev,bench,gpu]"
 
 echo "==> CUPTI matching the driver's CUDA version"
 # CUPTI's Activity API needs libcupti's major to match the *driver* (else
@@ -44,6 +46,11 @@ pip install -q --extra-index-url=https://pypi.nvidia.com cudf-cu12 cupy-cuda12x 
   || echo "WARN: cuDF/CuPy install failed — HFT harness will fall back to pandas"
 
 echo "==> build CUPTI tracer shim (toolkit or wheels, whichever is present)"
+# Explicit build so a missing toolchain fails here, not on first run. (gitm also
+# auto-builds the shim on first capture, so this step is belt-and-suspenders.)
 python -m gitm.tracer._cupti.build
 
-echo "==> done. Now run: ./scripts/verify_infra.sh"
+echo "==> done."
+echo "    Smoke check : ./scripts/verify_infra.sh"
+echo "    Real run    : gitm run --workload hft-lob   # auto-stages a smoke dataset"
+echo "    Full driver : gitm-run-workload --workload hft --seed 42 --stage \$GITM_BENCH_STAGE"

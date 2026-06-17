@@ -13,6 +13,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from gitm._paths import runs_dir, traces_dir
@@ -26,6 +27,7 @@ from gitm.optimizer.qualification import qualify
 from gitm.optimizer.report import Claim, build_provenance, write_report
 from gitm.planner.graph import predict_graph
 from gitm.tracer.capture import capture
+from gitm.workloads import WorkloadRunner, get_factory, sync_device
 
 _BUDGET_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd])\s*$")
 
@@ -46,6 +48,9 @@ class LoopConfig:
     target: float = 0.15
     scratch: str | None = None
     top_n_interventions: int = 5
+    # Optional explicit driver for the embedded/engine path. When unset, the
+    # loop looks up ``workload`` in the workload registry (gitm.workloads).
+    workload_runner: WorkloadRunner | None = None
 
 
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
@@ -60,10 +65,29 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     trace_path = traces_dir(cfg.scratch) / f"{run_id}.jsonl"
 
     # Phase 1 — capture, fingerprint, predict graph
+    # Resolve a workload runner: an explicit one wins, else the registry. The
+    # runner launches GPU work *inside* the capture window so the trace reflects
+    # the real workload instead of an empty no-op. Resolution happens outside
+    # capture (data loading / warmup shouldn't be traced).
+    runner = cfg.workload_runner
+    runner_error: str | None = None
+    if runner is None:
+        factory = get_factory(workload)
+        if factory is not None:
+            try:
+                runner = factory(cfg)
+            except Exception as exc:  # missing deps/data on this box — degrade, don't crash
+                runner_error = f"workload runner unavailable for {workload!r}: {exc}"
+        else:
+            runner_error = f"no workload runner registered for {workload!r}"
+
     with capture(trace_path, workload_id=workload, run_id=run_id) as trace:
-        # The capture context normally runs the workload here; in the embedded
-        # path the caller already drives the workload outside the loop.
-        pass
+        if runner is not None:
+            try:
+                runner()
+                sync_device()  # ensure all kernels land in the trace before stop
+            except Exception as exc:
+                runner_error = f"workload run failed: {exc}"
 
     qual = qualify(trace, target_floor=cfg.target)
     (run_dir / "qualification.json").write_text(
@@ -77,6 +101,24 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             indent=2,
         )
     )
+
+    # Guard: if the tracer captured nothing (no GPU/shim, or the workload never
+    # ran), do NOT proceed to attribution + emit claims — that fabricates a
+    # result from an empty trace. Report no-data honestly instead.
+    if trace.vendor == "none" or not trace.kernels():
+        diagnostic = runner_error or qual.diagnostic or (
+            "Tracer captured no GPU kernels. Either no GPU/CUPTI shim is present, "
+            "or the workload did not run under the runtime."
+        )
+        return _no_data_result(
+            run_dir=run_dir,
+            run_id=run_id,
+            workload=workload,
+            qual=qual,
+            started_ns=started_ns,
+            trace_path=trace_path,
+            diagnostic=diagnostic,
+        )
 
     graph = predict_graph()
     (run_dir / "predicted_graph.json").write_text(
@@ -194,12 +236,59 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     summary = {
         "run_id": run_id,
         "workload": workload,
+        "status": "ok",
         "fingerprint": qual.fingerprint,
         "commit": qual.commit,
         "floor": qual.floor,
         "n_claims": len(claims),
         "n_rolled_back": len(rolled_back),
         "n_rejected": len(rejected),
+        "report_path": str(run_dir / "report.md"),
+    }
+    return {"summary": summary, "report_md": report_md, "run_dir": str(run_dir)}
+
+
+def _no_data_result(
+    *,
+    run_dir: Path,
+    run_id: str,
+    workload: str,
+    qual: Any,
+    started_ns: int,
+    trace_path: Path,
+    diagnostic: str,
+) -> dict[str, Any]:
+    """Write an honest no-data report and return its summary (status=no_data).
+
+    Used when the trace has no kernels — a misconfigured box or a workload that
+    never ran. We emit zero claims rather than fabricating results from nothing.
+    """
+    provenance = build_provenance(
+        workload_id=workload,
+        fingerprint=qual.fingerprint,
+        run_id=run_id,
+        started_at_ns=started_ns,
+        trace_path=str(trace_path),
+    )
+    report_md = write_report(
+        claims=[],
+        provenance=provenance,
+        qualification_diagnostic=diagnostic,
+        summary="NO DATA — tracer captured no GPU kernels; nothing was measured.",
+    )
+    (run_dir / "report.md").write_text(report_md)
+
+    summary = {
+        "run_id": run_id,
+        "workload": workload,
+        "status": "no_data",
+        "fingerprint": qual.fingerprint,
+        "commit": False,
+        "floor": qual.floor,
+        "n_claims": 0,
+        "n_rolled_back": 0,
+        "n_rejected": 0,
+        "diagnostic": diagnostic,
         "report_path": str(run_dir / "report.md"),
     }
     return {"summary": summary, "report_md": report_md, "run_dir": str(run_dir)}
