@@ -22,12 +22,13 @@ the length histogram are pure and used by both paths.
 from __future__ import annotations
 
 import argparse
-import shutil
 import os
-import numpy as np
+import shutil
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+
+import numpy as np
 
 # Pinned sources. Replace placeholders with the exact pinned URLs/commands.
 CASP_SOURCES = {
@@ -123,7 +124,6 @@ def filter_uniprot(uniprot_fasta: str | Path, out: str | Path, *, count: int = U
 def build_msas(fasta: str | Path, out_dir: str | Path) -> list[Path]:
     """Build `.a3m` MSAs via the OpenFold precompute_alignments script."""
     import subprocess
-    import shutil
 
     fasta = Path(fasta)
     out_dir = Path(out_dir)

@@ -7,10 +7,7 @@ path so any regression in the scaffold is caught on commit.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-
-import pytest
 
 
 def test_version_importable():

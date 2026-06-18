@@ -41,7 +41,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 WARM_FRAMES = 100        # discarded before the timing window
 NVML_SAMPLE_HZ = 5
 GPU_ACTIVE_WARN_PCT = 85.0
@@ -240,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--ckpt", required=True, help="path to cbgs_pp_centerpoint_nds6070.pth")
     p.add_argument("--seed", type=int, required=True)
     p.add_argument("--frames", type=int, default=5100,
-                   help="total frames incl. %d warmup (window = frames - warmup)" % WARM_FRAMES)
+                   help=f"total frames incl. {WARM_FRAMES} warmup (window = frames - warmup)")
     p.add_argument("--output", required=True, help="output JSON path")
     p.add_argument("--data-root", default="/workspace/edge/OpenPCDet/data/nuscenes",
                    help="NuScenesDataset root (VERSION is appended)")

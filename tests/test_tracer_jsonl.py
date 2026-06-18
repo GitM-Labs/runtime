@@ -19,7 +19,6 @@ from gitm.tracer.schema import KernelEvent, MemcpyEvent, SyncEvent, Trace
 
 from .conftest import make_kernel, make_memcpy, make_sync, make_trace
 
-
 # ── per-event-type round trip ─────────────────────────────────────────────────
 
 

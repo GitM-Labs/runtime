@@ -126,7 +126,7 @@ def _update_spec(path: Path, s: dict) -> str:
             f"| {_fmt(r['cpu_pct'])}   | {h}               |"
         )
 
-    seed_rows_new = "\n".join(row(r) for r in s["rows"])
+    "\n".join(row(r) for r in s["rows"])
     mean_row = (
         f"| Mean | {_fmt(s['mean_fps'])} | {_fmt(s['mean_gpu'])}          "
         f"| {_fmt(s['mean_data'])}         | {_fmt(s['mean_sync'])}    "
@@ -192,9 +192,9 @@ def _update_spec(path: Path, s: dict) -> str:
             )
 
     # Environment
-    text = text.replace("- GPU: TBD", f"- GPU: TBD (check nvidia-smi on pod)")
-    text = text.replace("- Driver: TBD", f"- Driver: TBD (check nvidia-smi)")
-    text = text.replace("- CUDA: TBD", f"- CUDA: TBD (check nvcc --version)")
+    text = text.replace("- GPU: TBD", "- GPU: TBD (check nvidia-smi on pod)")
+    text = text.replace("- Driver: TBD", "- Driver: TBD (check nvidia-smi)")
+    text = text.replace("- CUDA: TBD", "- CUDA: TBD (check nvcc --version)")
     text = text.replace("- Date: TBD", f"- Date: {s['date']}")
 
     return text

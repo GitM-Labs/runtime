@@ -20,7 +20,6 @@ from gitm.optimizer.qualification import fingerprint
 
 from .conftest import make_kernel, make_trace
 
-
 # ── stability ────────────────────────────────────────────────────────────────
 
 

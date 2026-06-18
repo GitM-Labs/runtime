@@ -23,7 +23,6 @@ from pathlib import Path
 
 import yaml
 
-
 META_TABLES = [
     "attribute.json", "calibrated_sensor.json", "category.json", "ego_pose.json",
     "instance.json", "log.json", "map.json", "sample.json",

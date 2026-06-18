@@ -58,7 +58,7 @@ class Collector:
             except Exception:
                 pass
 
-    def __enter__(self) -> "Collector":
+    def __enter__(self) -> Collector:
         self.start()
         return self
 

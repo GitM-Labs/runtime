@@ -22,7 +22,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-
 DEFAULT_SCRATCH = "~/.cache/gitm"
 
 # Local scratch subdirectories. Note: no ``datasets`` — datasets are never

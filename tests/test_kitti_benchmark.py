@@ -10,10 +10,6 @@ Tests cover:
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
-
 # ── WorkUnitResult ────────────────────────────────────────────────────────────
 
 def test_workunit_result_stall_fracs_sum_to_one():
@@ -70,8 +66,9 @@ def test_workunit_from_checkpoint_raises_import_error_without_openpcdet(
 
     monkeypatch.setattr(builtins, "__import__", _block_pcdet)
 
-    from gitm.benchmarks.kitti.workunit import WorkUnit
     import pytest
+
+    from gitm.benchmarks.kitti.workunit import WorkUnit
 
     with pytest.raises(ImportError):
         WorkUnit.from_checkpoint(cfg_path="dummy.yaml", ckpt_path="dummy.pth")

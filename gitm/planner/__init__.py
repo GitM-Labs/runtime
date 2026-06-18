@@ -9,7 +9,7 @@ the optimization-worthy kernels.
 from __future__ import annotations
 
 from gitm.planner.graph import Graph, PredictedNode, predict_graph
-from gitm.planner.roofline import HardwareSpec, ModelSpec, BatchConfig, roofline
+from gitm.planner.roofline import BatchConfig, HardwareSpec, ModelSpec, roofline
 
 __all__ = [
     "Graph",

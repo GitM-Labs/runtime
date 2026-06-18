@@ -17,8 +17,9 @@ target), so it lives in ``gitm.optimizer`` and is exported for the run loop.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
+
 import re
+from dataclasses import dataclass
 
 # Mangled CUDA kernel names -> a small set of stable families, so durations
 # aggregate per kernel *type* rather than per template instantiation. Shared
@@ -57,10 +58,10 @@ def _percentile(sorted_xs: list[int], q: float) -> float:
 class KernelROI:
     family: str
     calls: int
-    total_ns: int 
+    total_ns: int
     median_ns: float
     floor_ns: float
-    recoverable_ns: float 
+    recoverable_ns: float
     share: float # total_ns / all kernel time
     recoverable_share: float # recoverable_ns / all kernel time
 
