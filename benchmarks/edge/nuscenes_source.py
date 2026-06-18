@@ -42,8 +42,8 @@ the devkit.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 # nuScenes canonical layout, relative to GITM_DATA_ROOT
 # (GITM_DATA_ROOT/nuscenes -> /workspace/edge/data/nuscenes).

@@ -1,5 +1,7 @@
-from gitm.routing.scorer_v0 import score_prospect, score_dataframe
 import pandas as pd
+
+from gitm.routing.scorer_v0 import score_dataframe, score_prospect
+
 
 def test_score_prospect_basic():
     score = score_prospect(

@@ -36,7 +36,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-
 # SHA256 of cbgs_pp_centerpoint_nds6070.pth (OpenPCDet nuScenes
 # CenterPoint-PointPillar checkpoint). Confirm with:
 #   sha256sum cbgs_pp_centerpoint_nds6070.pth
@@ -111,7 +110,7 @@ class NuScenesWorkUnit:
         ckpt_path: str | Path,
         data_root: str | Path = DEFAULT_DATA_ROOT,
         max_sweeps: int = DEFAULT_MAX_SWEEPS,
-    ) -> "NuScenesWorkUnit":
+    ) -> NuScenesWorkUnit:
         """Load OpenPCDet config + checkpoint + NuScenesDataset (val split).
 
         Raises ImportError with install instructions if OpenPCDet is absent.

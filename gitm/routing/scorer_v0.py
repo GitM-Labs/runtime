@@ -1,5 +1,5 @@
 import pandas as pd
-import numpy as np
+
 
 def score_prospect(
     warmth: float,

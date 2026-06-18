@@ -18,7 +18,6 @@ import pytest
 
 from gitm.planner.roofline import HardwareSpec, roofline
 
-
 # ── memory-bound reference: 1 MiB over A100 HBM ──────────────────────────────
 
 

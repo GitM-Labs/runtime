@@ -18,7 +18,6 @@ from pathlib import Path
 
 import yaml
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = REPO_ROOT / "benchmarks" / "kitti" / "manifest.yaml"
 

@@ -26,7 +26,6 @@ from dataclasses import dataclass, field
 
 from gitm.planner.roofline import HardwareSpec, RooflinePrediction, roofline
 
-
 # ── PointPillars KITTI frame shape constants ──────────────────────────────────
 # Based on OpenPCDet pointpillar.yaml (kitti_models) defaults.
 # These are per-frame averages; real variance is captured in stage_spread.

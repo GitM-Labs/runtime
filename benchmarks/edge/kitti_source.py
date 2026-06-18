@@ -16,8 +16,8 @@ writes the manifest; a separate script handles input hashing.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 # KITTI Object Detection canonical layout, relative to GITM_DATA_ROOT
 # (GITM_DATA_ROOT/kitti/training -> /workspace/edge/data/kitti/training).

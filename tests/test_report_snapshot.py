@@ -24,7 +24,6 @@ from pathlib import Path
 
 from gitm.optimizer.report import Claim, Provenance, write_report
 
-
 GOLDEN_PATH = Path(__file__).parent / "golden" / "report_basic.md"
 
 # A fixed nanosecond timestamp the template's ``now_ns`` will be pinned to.

@@ -106,7 +106,7 @@ def main(argv=None) -> int:
     cp.cuda.runtime.deviceSynchronize()
 
     def serial():
-        return float(sum(float((a @ b).sum()) for a, b in zip(A, B)))
+        return float(sum(float((a @ b).sum()) for a, b in zip(A, B, strict=False)))
 
     def parallel():
         streams = [cp.cuda.Stream(non_blocking=True) for _ in range(args.streams)]

@@ -18,8 +18,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Callable, Iterator
 
 # Make sibling source modules importable when run as a script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))

@@ -38,7 +38,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 WARM_FRAMES = 100  # discard before timing window
 NVML_SAMPLE_HZ = 5
 
@@ -63,8 +62,8 @@ def _stage_spread(
     """
     import statistics
 
-    totals = [l + p + i + q for l, p, i, q in
-              zip(load_s, preprocess_s, inference_s, postprocess_s)]
+    totals = [load + p + i + q for load, p, i, q in
+              zip(load_s, preprocess_s, inference_s, postprocess_s, strict=False)]
     mean_total = statistics.mean(totals) if totals else 1.0
 
     def _stats(xs: list[float]) -> dict:

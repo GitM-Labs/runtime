@@ -27,7 +27,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-
 # SHA256 of pointpillar_7728.pth (OpenPCDet KITTI PointPillars checkpoint).
 # Confirm with: sha256sum pointpillar_7728.pth
 CHECKPOINT_SHA256 = "4c83fc0fa02575b9b3e9dec676f698e7a70bb5a795e89f91df8a96b916fa19e2"
@@ -83,7 +82,7 @@ class WorkUnit:
         cls,
         cfg_path: str | Path,
         ckpt_path: str | Path,
-    ) -> "WorkUnit":
+    ) -> WorkUnit:
         """Load OpenPCDet config + checkpoint and return a ready WorkUnit.
 
         Raises ImportError with install instructions if OpenPCDet is not found.

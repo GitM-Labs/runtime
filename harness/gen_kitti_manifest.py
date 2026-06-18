@@ -25,7 +25,6 @@ from pathlib import Path
 
 import yaml
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_OUT = REPO_ROOT / "benchmarks" / "kitti" / "manifest.yaml"
 EXPECTED_FRAMES = 7481
@@ -60,8 +59,8 @@ def main(argv: list[str] | None = None) -> int:
         if not d.is_dir():
             print(f"ERROR: expected directory missing: {d}", file=sys.stderr)
             print(
-                f"  Set --root to the KITTI training dir "
-                f"(contains velodyne/, calib/, label_2/).",
+                "  Set --root to the KITTI training dir "
+                "(contains velodyne/, calib/, label_2/).",
                 file=sys.stderr,
             )
             return 1
