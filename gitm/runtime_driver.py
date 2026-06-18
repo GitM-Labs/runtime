@@ -62,14 +62,27 @@ def _kernel_family(name: str) -> str:
 
 def _load_hft(stage: Path, seed: int, max_events: int | None):
     from gitm.benchmarks.hft.harness import _gpu_name, load_events, run_pipeline, select_backend
+    from gitm.benchmarks.hft.optimize import run_pipeline_fast, verify_equivalent
 
     kind, dflib, _xp = select_backend()
     gpu_name, device_count = _gpu_name(kind)
     df = load_events(stage, seed, dflib, max_events=max_events)
     n = int(len(df))
 
+    # Realize the gain on the actual run: use the verified-faster pipeline when
+    # it is byte-identical on THIS backend/data (one-time check, outside the
+    # timed/captured window); otherwise fall back to baseline — never silently
+    # wrong. So a normal `gitm-run-workload --workload hft` runs the optimized
+    # path, not just the `--optimize` A/B.
+    pipeline = run_pipeline
+    if verify_equivalent(df, dflib):
+        pipeline = run_pipeline_fast
+        print("optimization verified identical on this backend → running fewer-scan pipeline")
+    else:
+        print("optimization NOT identical on this backend → running baseline pipeline")
+
     def work() -> dict:
-        return run_pipeline(df, dflib)
+        return pipeline(df, dflib)
 
     return work, n, kind, gpu_name, device_count
 
@@ -161,6 +174,42 @@ def _load_edge(cfg_path: Path, ckpt_path: Path, n_frames: int, seed: int,
     return work, len(run_indices), "torch", gpu_name, device_count
 
 
+def _optimize_hft_cmd(args) -> int:
+    """Verified baseline-vs-optimized A/B for HFT: measure → apply → prove."""
+    from gitm.benchmarks.hft.harness import _gpu_name, load_events, select_backend
+    from gitm.benchmarks.hft.optimize import optimize_hft
+
+    stage = args.stage or Path(os.environ.get("GITM_BENCH_STAGE", "/workspace/hft/staging/hft"))
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    kind, dflib, _xp = select_backend()
+    gpu_name, device_count = _gpu_name(kind)
+    df = load_events(stage, args.seed, dflib, max_events=args.max_events)
+    print(f"optimize hft: {len(df):,} events on {gpu_name} ({kind}) — measuring baseline vs candidate")
+
+    r = optimize_hft(df, dflib, reps=3, sync=_sync)
+
+    print(f"  baseline : {r.baseline_eps:,.0f} events/s")
+    print(f"  candidate: {r.candidate_eps:,.0f} events/s  ({r.speedup:.2f}x)")
+    print(f"  identical output: {r.identical}")
+    print(f"  VERDICT: {r.verdict}")
+
+    out = args.outdir / f"hft_seed{args.seed}_optimize.json"
+    out.write_text(json.dumps({
+        "gpu_name": gpu_name,
+        "device_count": device_count,
+        "backend": kind,
+        "events": int(len(df)),
+        "baseline_events_per_second": r.baseline_eps,
+        "candidate_events_per_second": r.candidate_eps,
+        "speedup": r.speedup,
+        "identical_output": r.identical,
+        "kept": r.kept,
+        "verdict": r.verdict,
+    }, indent=2) + "\n")
+    print(f"wrote {out}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Run a workload under the GITM runtime.")
     ap.add_argument("--workload", default="hft", choices=["hft", "edge"])
@@ -177,7 +226,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--shards-per-batch", type=int, default=30)
     ap.add_argument("--max-shards", type=int, default=None)
     ap.add_argument("--outdir", type=Path, default=Path("/workspace/hft/runs"))
+    ap.add_argument("--optimize", action="store_true",
+                    help="hft: run the verified baseline-vs-optimized A/B and report the speedup.")
     args = ap.parse_args(argv)
+
+    if args.optimize:
+        if args.workload != "hft":
+            raise SystemExit("--optimize currently supports --workload hft")
+        return _optimize_hft_cmd(args)
 
     import numpy as np
 

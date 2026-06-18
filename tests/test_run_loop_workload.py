@@ -71,6 +71,64 @@ def test_runner_runs_inside_capture_and_produces_real_trace(tmp_path: Path, monk
     assert Path(summary["report_path"]).exists()
 
 
+_VLLM_KNOBS = (
+    "max_num_batched_tokens",
+    "gpu_memory_utilization",
+    "max_num_seqs",
+    "scheduling_policy",
+    "swap_space",
+)
+
+
+def _fake_capture_with_kernels(prefix: str):
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [
+            make_kernel(f"{prefix}_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 90 + (i % 9))
+            for i in range(80)
+        ]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    return fake_capture
+
+
+def test_non_vllm_workload_emits_measurement_not_vllm_claims(tmp_path: Path, monkeypatch):
+    """HFT (no intervention library) must report real kernels, never vLLM knobs."""
+    import gitm.scheduler.loop as loop
+
+    monkeypatch.setattr(loop, "capture", _fake_capture_with_kernels("cudf_groupby_scan"))
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    from gitm import optimize
+
+    result = optimize(
+        workload="hft-lob", budget="1s", scratch=str(tmp_path), workload_runner=lambda: {"events": 1}
+    )
+    summary, md = result["summary"], result["report_md"]
+
+    assert summary["status"] == "ok"
+    assert summary["mode"] == "measurement"
+    assert summary["n_claims"] == 0
+    assert "Measurement run" in md
+    for knob in _VLLM_KNOBS:
+        assert knob not in md, f"measurement report must not contain vLLM knob {knob!r}"
+
+
+def test_vllm_workload_still_uses_intervention_path(tmp_path: Path, monkeypatch):
+    """vllm-decode keeps the intervention/claims pipeline (the library applies)."""
+    import gitm.scheduler.loop as loop
+
+    monkeypatch.setattr(loop, "capture", _fake_capture_with_kernels("paged_attention"))
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    from gitm import optimize
+
+    result = optimize(
+        workload="vllm-decode", budget="1s", scratch=str(tmp_path), workload_runner=lambda: {}
+    )
+    assert result["summary"]["mode"] == "intervention"
+
+
 def test_cli_run_returns_nonzero_on_no_data(tmp_path: Path, capsys):
     """Automation must see a failure exit when a run measures nothing."""
     from gitm.cli import main

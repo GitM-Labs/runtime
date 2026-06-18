@@ -22,6 +22,7 @@ from gitm.kernels.library import load_library
 from gitm.optimizer.apply import DryRunApplicator, apply_intervention
 from gitm.optimizer.attribution import attribute
 from gitm.optimizer.dr import attribute_dr
+from gitm.optimizer.measure import measure_trace, measurement_claims, measurement_summary
 from gitm.optimizer.monitor import check_invariants, residuals
 from gitm.optimizer.qualification import qualify
 from gitm.optimizer.report import Claim, build_provenance, write_report
@@ -30,6 +31,11 @@ from gitm.tracer.capture import capture
 from gitm.workloads import WorkloadRunner, get_factory, sync_device
 
 _BUDGET_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd])\s*$")
+
+# Workloads the predicted graph + intervention library actually model. Anything
+# else gets a measurement-only report (see _measurement_result) rather than
+# vLLM-specific intervention claims that wouldn't apply.
+_LIBRARY_WORKLOADS = {"vllm-decode"}
 
 
 def _parse_budget_s(budget: str) -> float:
@@ -118,6 +124,21 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             started_ns=started_ns,
             trace_path=trace_path,
             diagnostic=diagnostic,
+        )
+
+    # The predicted graph + intervention library model vLLM decode specifically.
+    # For any other workload, pairing the real trace with that transformer graph
+    # produces vLLM serving-knob "claims" that don't apply. Instead, emit an
+    # honest measurement report computed from the actual captured kernels.
+    if workload not in _LIBRARY_WORKLOADS:
+        return _measurement_result(
+            run_dir=run_dir,
+            run_id=run_id,
+            workload=workload,
+            trace=trace,
+            qual=qual,
+            started_ns=started_ns,
+            trace_path=trace_path,
         )
 
     graph = predict_graph()
@@ -237,12 +258,84 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         "run_id": run_id,
         "workload": workload,
         "status": "ok",
+        "mode": "intervention",
         "fingerprint": qual.fingerprint,
         "commit": qual.commit,
         "floor": qual.floor,
         "n_claims": len(claims),
         "n_rolled_back": len(rolled_back),
         "n_rejected": len(rejected),
+        "report_path": str(run_dir / "report.md"),
+    }
+    return {"summary": summary, "report_md": report_md, "run_dir": str(run_dir)}
+
+
+def _measurement_result(
+    *,
+    run_dir: Path,
+    run_id: str,
+    workload: str,
+    trace: Any,
+    qual: Any,
+    started_ns: int,
+    trace_path: Path,
+) -> dict[str, Any]:
+    """Honest measurement report for a workload with no intervention library.
+
+    Computes residuals/attribution from the *actual* captured kernels and emits
+    observations (not optimization claims) — so an HFT or edge run describes its
+    real cuDF/CUB kernels instead of fabricating vLLM serving-knob claims.
+    """
+    result = measure_trace(trace)
+    claims = measurement_claims(result)
+
+    (run_dir / "measurement.json").write_text(
+        json.dumps(
+            {
+                "n_kernels": result.n_kernels,
+                "n_memcpy": result.n_memcpy,
+                "serialized_concurrency_fraction": result.serialized_fraction,
+                "n_violations": len(result.violations),
+                "families": result.families,
+                "top_hypotheses": [
+                    {"cause": h.cause_op, "effect": h.effect_op, "p_value": h.p_value}
+                    for h in result.top_hypotheses
+                ],
+            },
+            indent=2,
+        )
+    )
+
+    provenance = build_provenance(
+        workload_id=workload,
+        fingerprint=qual.fingerprint,
+        run_id=run_id,
+        started_at_ns=started_ns,
+        trace_path=str(trace_path),
+    )
+    report_md = write_report(
+        claims=claims,
+        provenance=provenance,
+        qualification_diagnostic=(
+            "Measurement-only run: the runtime observed the workload and reports "
+            "its real kernels. No intervention library applies to this workload."
+        ),
+        summary=measurement_summary(workload, result),
+    )
+    (run_dir / "report.md").write_text(report_md)
+
+    summary = {
+        "run_id": run_id,
+        "workload": workload,
+        "status": "ok",
+        "mode": "measurement",
+        "fingerprint": qual.fingerprint,
+        "commit": False,
+        "floor": qual.floor,
+        "n_observations": len(claims),
+        "n_claims": 0,
+        "n_rolled_back": 0,
+        "n_rejected": 0,
         "report_path": str(run_dir / "report.md"),
     }
     return {"summary": summary, "report_md": report_md, "run_dir": str(run_dir)}
