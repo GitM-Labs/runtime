@@ -31,3 +31,19 @@ jobs:
 
       - name: Run pytest
         run: pytest
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff==0.12.11
+
+      - name: Run ruff
+        run: ruff check .
