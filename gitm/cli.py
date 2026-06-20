@@ -30,6 +30,23 @@ def _parser() -> argparse.ArgumentParser:
         help="Override $GITM_SCRATCH (local ephemeral run dir; datasets stay in S3).",
     )
     run.add_argument("--report", type=Path, default=None, help="Write report markdown here.")
+    # hft-only data-selection flags (mapped onto the GITM_BENCH_* env the
+    # workload factory reads). No-ops for other workloads — using them there errors.
+    run.add_argument("--seed", type=int, default=None, help="hft: dataset seed.")
+    run.add_argument("--stage", type=Path, default=None, help="hft: staged dataset dir.")
+    run.add_argument(
+        "--max-events",
+        type=lambda s: int(s.replace("_", "")),
+        default=None,
+        help="hft: cap events processed (single-frame).",
+    )
+    run.add_argument(
+        "--stream",
+        action="store_true",
+        help="hft: stream the sharded dataset in batches (for data too big for one frame).",
+    )
+    run.add_argument("--shards-per-batch", type=int, default=None, help="hft: shards per streamed batch.")
+    run.add_argument("--max-shards", type=int, default=None, help="hft: cap shards streamed.")
 
     replay = sub.add_parser("replay", help="Counterfactual replay of an intervention on a trace.")
     replay.add_argument("trace", type=Path, help="Captured trace file.")
@@ -62,6 +79,36 @@ def _parse_target(s: str) -> float:
     return float(s)
 
 
+_HFT_WORKLOADS = {"hft", "hft-lob"}
+
+
+def _apply_hft_run_flags(args) -> None:
+    """Map the hft-only run flags onto the ``GITM_BENCH_*`` env the workload
+    factory reads. Errors if they're used with a non-hft workload, where they
+    have no meaning (rather than silently ignoring them)."""
+    import os
+
+    flags = {
+        "GITM_BENCH_SEED": None if args.seed is None else str(args.seed),
+        "GITM_BENCH_STAGE": None if args.stage is None else str(args.stage),
+        "GITM_BENCH_MAX_EVENTS": None if args.max_events is None else str(args.max_events),
+        "GITM_BENCH_SHARDS_PER_BATCH": (
+            None if args.shards_per_batch is None else str(args.shards_per_batch)
+        ),
+        "GITM_BENCH_MAX_SHARDS": None if args.max_shards is None else str(args.max_shards),
+        "GITM_BENCH_STREAM": "1" if args.stream else None,
+    }
+    used = sorted(k for k, v in flags.items() if v is not None)
+    if used and args.workload not in _HFT_WORKLOADS:
+        raise SystemExit(
+            "--seed/--stage/--max-events/--stream/--shards-per-batch/--max-shards apply to "
+            f"--workload hft only (got {args.workload!r})"
+        )
+    for k, v in flags.items():
+        if v is not None:
+            os.environ[k] = v
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
 
@@ -78,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "run":
         from gitm import optimize
 
+        _apply_hft_run_flags(args)
         result = optimize(
             workload=args.workload,
             budget=args.budget,

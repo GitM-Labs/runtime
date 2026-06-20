@@ -29,6 +29,7 @@ import json
 import os
 import re
 import time
+from contextlib import closing
 from pathlib import Path
 
 
@@ -174,31 +175,102 @@ def _load_edge(cfg_path: Path, ckpt_path: Path, n_frames: int, seed: int,
     return work, len(run_indices), "torch", gpu_name, device_count
 
 
+def _stream_ab_batches(stage: Path, seed: int, dflib, shards_per_batch: int,
+                       max_shards: int | None):
+    """Yield (n_events_total, n_batches, batch_generator) for a streaming A/B.
+
+    Mirrors :func:`_stream_hft`'s sharding, but the generator yields each batch's
+    *device frame* (not a summary) so :func:`optimize_hft_streaming` can run both
+    pipelines on it. The frame is freed after the consumer finishes the batch.
+    """
+    from gitm.benchmarks.hft.harness import _seed_dir
+
+    shards = sorted(_seed_dir(stage, seed).glob("part-*.parquet"))
+    if max_shards is not None:
+        shards = shards[:max_shards]
+    if not shards:
+        raise FileNotFoundError(f"no parquet shards for seed {seed} under {stage}")
+
+    import pyarrow.parquet as pq
+
+    n = sum(pq.ParquetFile(str(p)).metadata.num_rows for p in shards)
+    batches = [shards[i : i + shards_per_batch] for i in range(0, len(shards), shards_per_batch)]
+
+    def gen():
+        for batch in batches:
+            df = dflib.read_parquet(batch if len(batch) > 1 else batch[0])
+            try:
+                yield df
+            finally:
+                del df
+                _free_gpu_pool()
+
+    return n, len(batches), gen()
+
+
+def _optimize_out_path(args, n_events: int) -> Path:
+    """Per-size output filename so a smaller run never clobbers a larger one.
+
+    The old fixed ``hft_seed{seed}_optimize.json`` meant a 200M run and a 400M
+    run overwrote each other; encode the event count (and stream mode) instead.
+    """
+    tag = f"{n_events}ev" + ("_stream" if args.stream else "")
+    return args.outdir / f"hft_seed{args.seed}_optimize_{tag}.json"
+
+
 def _optimize_hft_cmd(args) -> int:
-    """Verified baseline-vs-optimized A/B for HFT: measure → apply → prove."""
+    """Verified baseline-vs-optimized A/B for HFT: measure → apply → prove.
+
+    Single-frame by default; ``--stream`` runs the A/B batch-by-batch so the full
+    (e.g. 1B-event) dataset is verified without fitting both pipelines in memory.
+    """
     from gitm.benchmarks.hft.harness import _gpu_name, load_events, select_backend
-    from gitm.benchmarks.hft.optimize import optimize_hft
+    from gitm.benchmarks.hft.optimize import optimize_hft, optimize_hft_streaming
 
     stage = args.stage or Path(os.environ.get("GITM_BENCH_STAGE", "/workspace/hft/staging/hft"))
     args.outdir.mkdir(parents=True, exist_ok=True)
     kind, dflib, _xp = select_backend()
     gpu_name, device_count = _gpu_name(kind)
-    df = load_events(stage, args.seed, dflib, max_events=args.max_events)
-    print(f"optimize hft: {len(df):,} events on {gpu_name} ({kind}) — measuring baseline vs candidate")
 
-    r = optimize_hft(df, dflib, reps=3, sync=_sync)
+    if args.stream:
+        n, n_batches, batch_gen = _stream_ab_batches(
+            stage, args.seed, dflib, args.shards_per_batch, args.max_shards
+        )
+        print(f"optimize hft (streaming): {n:,} events on {gpu_name} ({kind}) in "
+              f"{n_batches} batches of {args.shards_per_batch} shards — baseline vs candidate")
+
+        def _progress(i, info):
+            print(f"  batch {i}/{n_batches}: +{info['events']:,} events "
+                  f"(identical so far: {info['identical']})", flush=True)
+
+        # closing() guarantees the batch generator's finally (del df +
+        # _free_gpu_pool) runs even if the A/B raises mid-stream, instead of
+        # waiting on GC to reclaim the device frame.
+        with closing(batch_gen):
+            r = optimize_hft_streaming(batch_gen, dflib, sync=_sync, on_batch=_progress)
+    else:
+        df = load_events(stage, args.seed, dflib, max_events=args.max_events)
+        n = int(len(df))
+        print(f"optimize hft: {n:,} events on {gpu_name} ({kind}) — measuring baseline vs candidate")
+        r = optimize_hft(df, dflib, reps=3, sync=_sync)
+
+    # Filename/JSON reflect events *actually processed* (from the A/B result), not
+    # the pre-scan metadata count, so a shard changed between scan and run can't
+    # mislabel the output.
+    n = int(r.baseline_summary.get("events", n))
 
     print(f"  baseline : {r.baseline_eps:,.0f} events/s")
     print(f"  candidate: {r.candidate_eps:,.0f} events/s  ({r.speedup:.2f}x)")
     print(f"  identical output: {r.identical}")
     print(f"  VERDICT: {r.verdict}")
 
-    out = args.outdir / f"hft_seed{args.seed}_optimize.json"
+    out = _optimize_out_path(args, n)
     out.write_text(json.dumps({
         "gpu_name": gpu_name,
         "device_count": device_count,
         "backend": kind,
-        "events": int(len(df)),
+        "events": n,
+        "streamed": bool(args.stream),
         "baseline_events_per_second": r.baseline_eps,
         "candidate_events_per_second": r.candidate_eps,
         "speedup": r.speedup,

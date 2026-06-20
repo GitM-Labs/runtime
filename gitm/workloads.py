@@ -72,21 +72,87 @@ def _hft_factory(cfg: LoopConfig) -> WorkloadRunner:
     Parquet decode. If no dataset is staged, a small smoke dataset is generated
     once (so ``pip install`` + ``gitm run`` works with no manual data step)."""
     from gitm.benchmarks.hft.harness import load_events, run_pipeline, select_backend
+    from gitm.benchmarks.hft.optimize import HftFewerScansApplicator, HftStreamingApplicator
 
     stage = Path(os.environ.get("GITM_BENCH_STAGE", "/workspace/hft/staging/hft"))
     seed = int(os.environ.get("GITM_BENCH_SEED", "42"))
     max_events_env = os.environ.get("GITM_BENCH_MAX_EVENTS")
     max_events = int(max_events_env) if max_events_env else None
+    stream = os.environ.get("GITM_BENCH_STREAM", "0") == "1"
+    shards_per_batch = int(os.environ.get("GITM_BENCH_SHARDS_PER_BATCH", "30"))
+    max_shards_env = os.environ.get("GITM_BENCH_MAX_SHARDS")
+    max_shards = int(max_shards_env) if max_shards_env else None
 
     _ensure_hft_data(stage, seed)
-
     _kind, dflib, _xp = select_backend()
+
+    # Streaming: process the sharded dataset batch-by-batch so a set too big for
+    # one frame still runs end-to-end. The observe runner and the apply+prove A/B
+    # each iterate their own fresh batch generator.
+    if stream:
+        make_batches = _hft_batches_factory(stage, seed, dflib, shards_per_batch, max_shards)
+
+        def run() -> dict[str, Any]:
+            total_events = 0
+            total_vwap = 0
+            for df in make_batches():
+                s = run_pipeline(df, dflib)
+                total_events += s["events"]
+                total_vwap += s["vwap_buckets"]
+            return {"events": total_events, "vwap_buckets": total_vwap}
+
+        run.applicator = HftStreamingApplicator(make_batches, dflib, sync=sync_device)
+        return run
+
     df = load_events(stage, seed, dflib, max_events=max_events)
 
     def run() -> dict[str, Any]:
         return run_pipeline(df, dflib)
 
+    # Carry the rollback-gated intervention prover on the runner so the loop can
+    # apply+prove the fewer-scan top-of-book on this exact frame. The A/B runs on
+    # the active backend (cuDF on GPU, pandas on a laptop), so the speedup is a
+    # real measurement, not a prediction.
+    run.applicator = HftFewerScansApplicator(df, dflib, sync=sync_device)
     return run
+
+
+def _free_gpu_pool() -> None:
+    """Release cached GPU blocks so streaming stays memory-bounded. Best-effort."""
+    try:
+        import cupy
+
+        cupy.get_default_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+
+
+def _hft_batches_factory(stage: Path, seed: int, dflib, shards_per_batch: int,
+                         max_shards: int | None):
+    """Return a zero-arg callable yielding a *fresh* batch generator each call.
+
+    Each batch is ``shards_per_batch`` parquet shards read into one device frame,
+    freed before the next batch — so a 1B-event set never holds more than one
+    batch resident. A fresh generator per call lets the observe pass and the A/B
+    iterate the dataset independently (generators are one-shot)."""
+    from gitm.benchmarks.hft.harness import _seed_dir
+
+    def make():
+        shards = sorted(_seed_dir(stage, seed).glob("part-*.parquet"))
+        if max_shards is not None:
+            shards = shards[:max_shards]
+        if not shards:
+            raise FileNotFoundError(f"no parquet shards for seed {seed} under {stage}")
+        for i in range(0, len(shards), shards_per_batch):
+            batch = shards[i : i + shards_per_batch]
+            df = dflib.read_parquet(batch if len(batch) > 1 else batch[0])
+            try:
+                yield df
+            finally:
+                del df
+                _free_gpu_pool()
+
+    return make
 
 
 def _ensure_hft_data(stage: Path, seed: int) -> None:
