@@ -54,3 +54,40 @@ def test_optimize_rolls_back_a_divergent_candidate(monkeypatch):
     assert r.identical is False
     assert r.kept == "baseline"
     assert "rolled back" in r.verdict
+
+
+def _batches(df, k: int):
+    """Split a frame into k row-chunks — the in-memory stand-in for sharded reads."""
+    step = (len(df) + k - 1) // k
+    for i in range(0, len(df), step):
+        yield df.iloc[i : i + step].reset_index(drop=True)
+
+
+def test_streaming_ab_matches_and_counts_all_events():
+    from gitm.benchmarks.hft.optimize import optimize_hft_streaming
+
+    df = _make_df(n=6000, seed=1)
+    seen = []
+    r = optimize_hft_streaming(
+        _batches(df, 3), pd, on_batch=lambda i, info: seen.append(info["events"])
+    )
+    assert r.identical is True  # every batch's candidate output matched baseline
+    assert sum(seen) == len(df)  # the whole dataset was processed, not just one frame
+    assert r.baseline_summary["events"] == len(df)
+    assert r.baseline_eps > 0 and r.candidate_eps > 0
+    assert r.kept in {"candidate", "baseline"}  # CPU may not show the GPU speedup
+
+
+def test_streaming_ab_rolls_back_when_any_batch_diverges(monkeypatch):
+    import gitm.benchmarks.hft.optimize as opt
+
+    # A single divergent batch must fail the whole-run gate.
+    monkeypatch.setattr(
+        opt,
+        "run_pipeline_fast",
+        lambda d, lib: {"events": int(len(d)), "mean_microprice": -1.0, "vwap_buckets": 0},
+    )
+    r = opt.optimize_hft_streaming(_batches(_make_df(n=3000), 3), pd)
+    assert r.identical is False
+    assert r.kept == "baseline"
+    assert "rolled back" in r.verdict

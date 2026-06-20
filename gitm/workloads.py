@@ -72,6 +72,7 @@ def _hft_factory(cfg: LoopConfig) -> WorkloadRunner:
     Parquet decode. If no dataset is staged, a small smoke dataset is generated
     once (so ``pip install`` + ``gitm run`` works with no manual data step)."""
     from gitm.benchmarks.hft.harness import load_events, run_pipeline, select_backend
+    from gitm.benchmarks.hft.optimize import HftFewerScansApplicator
 
     stage = Path(os.environ.get("GITM_BENCH_STAGE", "/workspace/hft/staging/hft"))
     seed = int(os.environ.get("GITM_BENCH_SEED", "42"))
@@ -86,6 +87,11 @@ def _hft_factory(cfg: LoopConfig) -> WorkloadRunner:
     def run() -> dict[str, Any]:
         return run_pipeline(df, dflib)
 
+    # Carry the rollback-gated intervention prover on the runner so the loop can
+    # apply+prove the fewer-scan top-of-book on this exact frame. The A/B runs on
+    # the active backend (cuDF on GPU, pandas on a laptop), so the speedup is a
+    # real measurement, not a prediction.
+    run.applicator = HftFewerScansApplicator(df, dflib, sync=sync_device)
     return run
 
 
