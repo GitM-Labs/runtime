@@ -43,6 +43,10 @@ _LIBRARY_WORKLOADS = {"vllm-decode"}
 # prove with a *measured* delta instead of a measurement-only report.
 _HFT_INTERVENTION_WORKLOADS = {"hft", "hft-lob"}
 
+# OpenFold/AF2 has a real, plDDT-gated intervention (bf16 inference) applied
+# through the same rollback gate. Its runner carries an ``.applicator``.
+_OPENFOLD_INTERVENTION_WORKLOADS = {"openfold", "alphafold", "af2"}
+
 
 def _parse_budget_s(budget: str) -> float:
     m = _BUDGET_RE.match(budget.lower())
@@ -122,6 +126,24 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         applicator = getattr(runner, "applicator", None)
         if applicator is not None:
             return _hft_intervention_result(
+                run_dir=run_dir,
+                run_id=run_id,
+                workload=workload,
+                trace=trace,
+                qual=qual,
+                applicator=applicator,
+                started_ns=started_ns,
+                trace_path=trace_path,
+            )
+
+    # OpenFold/AF2 carries the bf16 intervention on its runner. Same pattern as
+    # HFT: apply+prove through the rollback gate (measure() runs the fp32-vs-bf16
+    # A/B, gated on plDDT-equivalence). Before the empty-trace guard so the A/B
+    # still runs on a box without CUPTI; attribution is included if kernels exist.
+    if workload in _OPENFOLD_INTERVENTION_WORKLOADS:
+        applicator = getattr(runner, "applicator", None)
+        if applicator is not None:
+            return _openfold_intervention_result(
                 run_dir=run_dir,
                 run_id=run_id,
                 workload=workload,
@@ -481,6 +503,141 @@ def _hft_intervention_result(
         qualification_diagnostic=qual.diagnostic,
         summary=(
             f"HFT intervention {spec.name!r}: {verdict}. "
+            f"{mres.n_kernels:,} kernels observed, serialized-concurrency="
+            f"{mres.serialized_fraction:.3f}."
+        ),
+    )
+    (run_dir / "report.md").write_text(report_md)
+
+    summary = {
+        "run_id": run_id,
+        "workload": workload,
+        "status": "ok",
+        "mode": "intervention",
+        "fingerprint": qual.fingerprint,
+        "commit": qual.commit,
+        "floor": qual.floor,
+        "n_claims": len(claims),
+        "n_rolled_back": len(rolled_back),
+        "n_rejected": 0,
+        "speedup": getattr(ab, "speedup", None),
+        "kept": getattr(ab, "kept", None),
+        "report_path": str(run_dir / "report.md"),
+    }
+    return {"summary": summary, "report_md": report_md, "run_dir": str(run_dir)}
+
+
+def _openfold_intervention_result(
+    *,
+    run_dir: Path,
+    run_id: str,
+    workload: str,
+    trace: Any,
+    qual: Any,
+    applicator: Any,
+    started_ns: int,
+    trace_path: Path,
+) -> dict[str, Any]:
+    """Full observe → attribute → select → apply → prove for AF2 (OpenFold).
+
+    Mirrors :func:`_hft_intervention_result` but the gate is plDDT-equivalence,
+    not byte-identical output: the applicator's measure() runs the fp32-vs-bf16
+    A/B and keeps bf16 only if median plDDT stays within tolerance AND it is
+    faster, else rolls back to fp32. The claim's ``measured_delta`` is the
+    measured speedup, so a quality regression is never reported as a win.
+    """
+    from benchmarks.biotech.optimize import openfold_intervention_spec
+    from gitm.optimizer.apply import apply_intervention
+    from gitm.optimizer.replay import predict_delta
+
+    mres = measure_trace(trace)
+
+    spec = openfold_intervention_spec()
+    predicted = predict_delta(trace, spec) if trace.kernels() else spec.expected_delta_mean
+    (run_dir / "ranked_candidates.json").write_text(
+        json.dumps(
+            [{"name": spec.name, "predicted_delta": predicted, "rejected_reason": None}],
+            indent=2,
+        )
+    )
+
+    apply_res = apply_intervention(spec, applicator, min_keep_delta=0.0)
+    ab = applicator.last_result  # AF2ABResult
+
+    top = mres.top_hypotheses
+    if top:
+        evidence = (
+            f"top hypothesis: {top[0].cause_op[:30]} → {top[0].effect_op[:30]} "
+            f"(p={top[0].p_value:.3g}); serialized-concurrency={mres.serialized_fraction:.3f}"
+        )
+    elif mres.n_kernels:
+        evidence = (
+            f"serialized-concurrency={mres.serialized_fraction:.3f} over "
+            f"{mres.n_kernels} kernels"
+        )
+    else:
+        evidence = (
+            "no CUPTI trace captured on this box; intervention proven by the "
+            "on-backend fp32-vs-bf16 A/B"
+        )
+
+    claims: list[Claim] = []
+    rolled_back: list[str] = []
+    if ab is not None:
+        claims.append(
+            Claim(
+                summary=spec.summary,
+                residual_invariant="kernel_time",
+                residual_value=float(mres.serialized_fraction),
+                causal_evidence=evidence,
+                intervention_name=spec.name,
+                # plDDT-equivalence is the AF2 correctness gate (vs byte-identical).
+                measured_delta=(ab.speedup - 1.0) if ab.equivalent else None,
+                predicted_delta=predicted,
+                rolled_back=apply_res.rolled_back,
+            )
+        )
+        if apply_res.rolled_back:
+            rolled_back.append(spec.name)
+
+    (run_dir / "apply_result.json").write_text(
+        json.dumps(
+            {
+                "intervention": spec.name,
+                "applied": apply_res.applied,
+                "rolled_back": apply_res.rolled_back,
+                "measured_delta": apply_res.measured_delta,
+                "error": apply_res.error,
+                "plddt_equivalent": getattr(ab, "equivalent", None),
+                "plddt_delta": getattr(ab, "plddt_delta", None),
+                "plddt_tol": getattr(ab, "plddt_tol", None),
+                "kept": getattr(ab, "kept", None),
+                "verdict": getattr(ab, "verdict", None),
+                "baseline_structures_per_hour": getattr(ab, "baseline_sph", None),
+                "candidate_structures_per_hour": getattr(ab, "candidate_sph", None),
+                "speedup": getattr(ab, "speedup", None),
+                "serialized_concurrency_fraction": mres.serialized_fraction,
+                "families": mres.families,
+            },
+            indent=2,
+        )
+    )
+
+    provenance = build_provenance(
+        workload_id=workload,
+        fingerprint=qual.fingerprint,
+        run_id=run_id,
+        started_at_ns=started_ns,
+        trace_path=str(trace_path),
+    )
+    provenance.rolled_back = rolled_back
+    verdict = getattr(ab, "verdict", "no A/B result")
+    report_md = write_report(
+        claims=claims,
+        provenance=provenance,
+        qualification_diagnostic=qual.diagnostic,
+        summary=(
+            f"AF2 intervention {spec.name!r}: {verdict}. "
             f"{mres.n_kernels:,} kernels observed, serialized-concurrency="
             f"{mres.serialized_fraction:.3f}."
         ),

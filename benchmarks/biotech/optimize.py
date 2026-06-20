@@ -33,6 +33,7 @@ from pathlib import Path
 
 from benchmarks.biotech.fetch import read_fasta
 from benchmarks.biotech.harness import _msa_path, load_openfold_runner
+from gitm.kernels.spec import Applicability, InterventionSpec, SafetyGate
 
 
 def _select(stage: Path, *, max_len: int, n: int) -> list[tuple]:
@@ -127,6 +128,88 @@ def optimize_af2(stage: Path, seed: int, *, n_proteins: int, max_len: int,
         equivalent=equivalent,
         kept=kept,
     )
+
+
+# --- wired into the autonomous loop -----------------------------------------
+#
+# The standalone A/B above proves the lever; the pieces below express it as a
+# curated intervention the runtime applies through the same rollback gate as the
+# HFT path (gitm.optimizer.apply.apply_intervention), so `gitm run --workload
+# openfold` runs observe → attribute → select → apply → prove end-to-end.
+
+
+class CorrectnessError(RuntimeError):
+    """bf16 moved plDDT past tolerance. Raised in measure() so the apply gate
+    rolls back to fp32 — a speedup is never kept on degraded structures."""
+
+
+def openfold_intervention_spec() -> InterventionSpec:
+    """The curated AF2 lever: bf16 inference. Expected-delta range is for ranking
+    only; the real number comes from the rollback-gated A/B."""
+    return InterventionSpec(
+        name="af2_bf16_inference",
+        summary="Run AF2 inference in bf16 (autocast) — Blackwell tensor cores are far "
+        "faster in bf16; kept only if median plDDT stays within tolerance.",
+        knob="inference_dtype",
+        value="bf16",
+        applies_to_kernels=["gemm", "cutlass", "attn", "softmax", "layer_norm"],
+        expected_delta_mean=0.40,
+        expected_delta_lo=0.0,
+        expected_delta_hi=0.80,
+        source="benchmarks/biotech/optimize.py — fp32-vs-bf16 A/B, gated on plDDT-equivalence.",
+        applicability=Applicability(workloads=["openfold", "alphafold", "af2"]),
+        safety=SafetyGate(
+            tier="moderate",
+            requires_rollback_window_s=0,
+            forbid_if_oom_history=False,
+            notes="bf16 shifts logits slightly; gate on |Δ median plDDT| ≤ tol before keep.",
+        ),
+        review=None,
+    )
+
+
+class AF2Bf16Applicator:
+    """Apply bf16 AF2 inference through the standard rollback gate.
+
+    :meth:`measure` runs the real fp32-vs-bf16 A/B (:func:`optimize_af2`): it
+    raises :class:`CorrectnessError` when bf16 moves median plDDT past tolerance
+    (forcing a rollback to fp32), otherwise returns the signed speedup so the gate
+    keeps bf16 only when it is genuinely faster. The full :class:`AF2ABResult` is
+    stashed on :attr:`last_result` for the report.
+
+    Implements the :class:`gitm.optimizer.apply.Applicator` protocol structurally.
+    """
+
+    def __init__(self, stage: Path, seed: int, *, n_proteins: int, max_len: int,
+                 warmup: int, plddt_tol: float):
+        self._stage = Path(stage)
+        self._seed = seed
+        self._n = n_proteins
+        self._max_len = max_len
+        self._warmup = warmup
+        self._tol = plddt_tol
+        self.active = "baseline"
+        self.last_result: AF2ABResult | None = None
+
+    def snapshot(self) -> str:
+        return self.active
+
+    def apply(self, spec: InterventionSpec) -> None:
+        self.active = "candidate"
+
+    def restore(self, snapshot: str) -> None:
+        self.active = snapshot
+
+    def measure(self, spec: InterventionSpec) -> float:
+        r = optimize_af2(self._stage, self._seed, n_proteins=self._n, max_len=self._max_len,
+                         warmup=self._warmup, plddt_tol=self._tol)
+        self.last_result = r
+        if not r.equivalent:
+            raise CorrectnessError(
+                f"bf16 shifted median plDDT by {r.plddt_delta:+.2f} "
+                f"(> ±{r.plddt_tol} tolerance) — rolling back to fp32"
+            )
+        return r.speedup - 1.0
 
 
 def main(argv: list[str] | None = None) -> int:
