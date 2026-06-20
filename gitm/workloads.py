@@ -267,14 +267,17 @@ def _openfold_factory(cfg: LoopConfig) -> WorkloadRunner:
             f"missing {fasta} — stage the biotech dataset (proteins_50k.fasta + msas/) "
             "or point GITM_BENCH_STAGE at one."
         )
-    # Filter to proteins that are both short enough AND have precomputed MSAs,
-    # then take the first n — robust whether the stage is the full 50k set or a
-    # smoke subset (we never compute MSAs here).
-    eligible = [
-        r for r in read_fasta(fasta)
-        if len(r.seq) <= max_len and _msa_path(stage, r) is not None
-    ]
-    proteins = eligible[:n_proteins]
+    # Take the first n proteins that are both short enough AND have precomputed
+    # MSAs — robust whether the stage is the full 50k set or a smoke subset (we
+    # never compute MSAs here). Early-exit so we don't stat all 50k records, and
+    # cache the resolved MSA path so it's looked up once, not again per fold.
+    # read_fasta yields records in file order, so the selection is deterministic.
+    proteins: list[tuple[Any, Path]] = []
+    for r in read_fasta(fasta):
+        if len(r.seq) <= max_len and (p := _msa_path(stage, r)) is not None:
+            proteins.append((r, p))
+            if len(proteins) >= n_proteins:
+                break
     if not proteins:
         raise FileNotFoundError(
             f"no proteins (len<={max_len}) with precomputed MSAs under {stage}/msas"
@@ -284,19 +287,23 @@ def _openfold_factory(cfg: LoopConfig) -> WorkloadRunner:
 
     # Warmup outside the capture window: first-call kernel autotune + allocator
     # growth must not pollute the trace.
-    for r in proteins[: min(warmup, len(proteins))]:
-        runner.predict(r, _msa_path(stage, r))
+    for r, msa in proteins[: min(warmup, len(proteins))]:
+        runner.predict(r, msa)
     sync_device()
 
     def run() -> dict[str, Any]:
         plddts: list[float] = []
-        for r in proteins:
-            out = runner.predict(r, _msa_path(stage, r))
+        for r, msa in proteins:
+            out = runner.predict(r, msa)
             if "plddt" in out:
                 plddts.append(float(out["plddt"]))
+        if not plddts:
+            # Every fold omitted plDDT — a silent instrumentation failure (e.g. a
+            # runner version mismatch). Surface it rather than report None as ok.
+            print("WARNING: no plDDT returned by any fold — runner output contract "
+                  "may have changed; structures still folded under the trace.")
         return {
             "structures": len(proteins),
-            "events": len(proteins),  # generic count for the loop's throughput line
             "median_plddt": statistics.median(plddts) if plddts else None,
         }
 
