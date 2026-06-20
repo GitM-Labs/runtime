@@ -49,8 +49,16 @@ class Runner(Protocol):
     def predict(self, record: FastaRecord, msa_path: Path | None) -> dict: ...
 
 
-def load_openfold_runner(seed: int, *, recycles: int = RECYCLES, chunk_size: int | None = None):
-    """Build the real OpenFold runner (pinned commit + weights). GPU-only."""
+def load_openfold_runner(seed: int, *, recycles: int = RECYCLES, chunk_size: int | None = None,
+                         bf16: bool = False):
+    """Build the real OpenFold runner (pinned commit + weights). GPU-only.
+
+    ``bf16=True`` runs the forward pass under ``torch.autocast(bfloat16)`` — the
+    candidate lever for the Blackwell A/B (:mod:`benchmarks.biotech.optimize`).
+    Weights stay fp32; autocast casts the matmul-heavy ops to bf16 (fast on
+    Blackwell tensor cores) while keeping reductions/softmax/layernorm in fp32.
+    Output differs slightly, so the optimizer gates on plDDT-equivalence.
+    """
     try:
         import numpy as np  # type: ignore
         import openfold  # type: ignore  # noqa: F401
@@ -125,7 +133,13 @@ def load_openfold_runner(seed: int, *, recycles: int = RECYCLES, chunk_size: int
                     torch.cuda.synchronize()
                 t1 = time.perf_counter()  # data_stall boundary (MSA load + featurize + H2D)
 
-                with torch.no_grad():
+                import contextlib
+                autocast = (
+                    torch.autocast("cuda", dtype=torch.bfloat16)
+                    if (bf16 and device.type == "cuda")
+                    else contextlib.nullcontext()
+                )
+                with torch.no_grad(), autocast:
                     out = model(batch)
                 if device.type == "cuda":
                     torch.cuda.synchronize()
