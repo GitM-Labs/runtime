@@ -226,6 +226,83 @@ def _edge_factory(cfg: LoopConfig) -> WorkloadRunner:
     return run
 
 
+@register("openfold", "alphafold", "af2")
+def _openfold_factory(cfg: LoopConfig) -> WorkloadRunner:
+    """AlphaFold2 inference via OpenFold (the biotech benchmark), wired for the loop.
+
+    Builds the real OpenFold runner and runs warmup folds *outside* the capture
+    window; the returned runner folds ``GITM_BENCH_PROTEINS`` proteins (length
+    <= ``GITM_BENCH_MAX_LEN`` that have precomputed MSAs under ``$STAGE/msas``),
+    so the trace is the Evoformer + structure-module compute — not MSA load or
+    first-call autotune.
+
+    **Inference only** — MSAs must be precomputed; this never runs mmseqs2, so
+    the GPU does only the work the GPU is for. No intervention library applies to
+    AF2 yet, so the loop emits an honest *measurement* report (the real kernels),
+    the AF2 analog of the hft/edge measurement run — it does not fabricate a
+    speedup. Weights come from ``OPENFOLD_WEIGHTS``; GPU-only, degrades to a
+    no-data report where OpenFold/torch/data are absent.
+
+    Env:
+        GITM_BENCH_STAGE     staged dir with proteins_50k.fasta + msas/
+        GITM_BENCH_SEED      inference seed (default 42)
+        GITM_BENCH_PROTEINS  proteins to fold under capture (default 8)
+        GITM_BENCH_MAX_LEN   max residue length (default 384)
+        GITM_BENCH_WARMUP    untimed warmup folds before capture (default 2)
+    """
+    import statistics
+
+    from benchmarks.biotech.fetch import read_fasta
+    from benchmarks.biotech.harness import _msa_path, load_openfold_runner
+
+    stage = Path(os.environ.get("GITM_BENCH_STAGE", "/workspace/biotech/staging/biotech"))
+    seed = int(os.environ.get("GITM_BENCH_SEED", "42"))
+    n_proteins = int(os.environ.get("GITM_BENCH_PROTEINS", "8"))
+    max_len = int(os.environ.get("GITM_BENCH_MAX_LEN", "384"))
+    warmup = int(os.environ.get("GITM_BENCH_WARMUP", "2"))
+
+    fasta = stage / "proteins_50k.fasta"
+    if not fasta.exists():
+        raise FileNotFoundError(
+            f"missing {fasta} — stage the biotech dataset (proteins_50k.fasta + msas/) "
+            "or point GITM_BENCH_STAGE at one."
+        )
+    # Filter to proteins that are both short enough AND have precomputed MSAs,
+    # then take the first n — robust whether the stage is the full 50k set or a
+    # smoke subset (we never compute MSAs here).
+    eligible = [
+        r for r in read_fasta(fasta)
+        if len(r.seq) <= max_len and _msa_path(stage, r) is not None
+    ]
+    proteins = eligible[:n_proteins]
+    if not proteins:
+        raise FileNotFoundError(
+            f"no proteins (len<={max_len}) with precomputed MSAs under {stage}/msas"
+        )
+
+    runner = load_openfold_runner(seed)
+
+    # Warmup outside the capture window: first-call kernel autotune + allocator
+    # growth must not pollute the trace.
+    for r in proteins[: min(warmup, len(proteins))]:
+        runner.predict(r, _msa_path(stage, r))
+    sync_device()
+
+    def run() -> dict[str, Any]:
+        plddts: list[float] = []
+        for r in proteins:
+            out = runner.predict(r, _msa_path(stage, r))
+            if "plddt" in out:
+                plddts.append(float(out["plddt"]))
+        return {
+            "structures": len(proteins),
+            "events": len(proteins),  # generic count for the loop's throughput line
+            "median_plddt": statistics.median(plddts) if plddts else None,
+        }
+
+    return run
+
+
 def sync_device() -> None:
     """Block until queued GPU work completes, so all kernels land in the trace
     before capture stops. Best-effort — a no-op without CuPy/torch."""
