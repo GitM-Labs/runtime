@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from .conftest import make_kernel, make_trace
 
@@ -61,6 +62,9 @@ def test_applicator_rolls_back_a_divergent_candidate(monkeypatch):
         lambda d, lib: {"events": 1, "mean_microprice": -999.0, "vwap_buckets": 0},
     )
     app = opt.HftFewerScansApplicator(_make_df(n=2000), pd, reps=1)
+    # This encodes apply_intervention's contract: a CorrectnessError raised in
+    # measure() is caught and converted to a rollback (not propagated). If that
+    # contract changes, this call would raise instead of returning a result.
     res = apply_intervention(opt.hft_intervention_spec(), app, min_keep_delta=0.0)
 
     assert app.last_result.identical is False
@@ -135,3 +139,55 @@ def test_loop_hft_without_applicator_stays_measurement(tmp_path: Path, monkeypat
     )
     assert result["summary"]["mode"] == "measurement"
     assert result["summary"]["n_claims"] == 0
+
+
+# --- the --seed/--stage/--max-events/--stream run flags ----------------------
+
+
+def test_cli_run_rejects_hft_flags_on_non_hft_workload():
+    """The hft data-selection flags are meaningless on other workloads → error,
+    don't silently ignore."""
+    from gitm.cli import main
+
+    with pytest.raises(SystemExit, match="workload hft only"):
+        main(["run", "--workload", "vllm-decode", "--stream"])
+
+
+def test_cli_run_hft_stream_end_to_end(tmp_path: Path, monkeypatch):
+    """`gitm run --workload hft --stream …` drives the streaming apply+prove path
+    end-to-end: CLI flags → GITM_BENCH_* env → factory → HftStreamingApplicator."""
+    monkeypatch.setenv("GITM_BENCH_EVENTS", "3000")  # tiny autogen smoke dataset
+
+    from gitm.cli import main
+
+    report = tmp_path / "report.md"
+    rc = main([
+        "run", "--workload", "hft", "--stream", "--shards-per-batch", "1",
+        "--stage", str(tmp_path / "stage"), "--scratch", str(tmp_path / "scratch"),
+        "--report", str(report),
+    ])
+    assert rc == 0
+    md = report.read_text()
+    assert "hft_top_of_book_fewer_scans" in md  # the streaming A/B ran and was claimed
+
+
+def test_streaming_factory_builds_streaming_applicator(tmp_path: Path, monkeypatch):
+    """The factory wires a streaming applicator that verifies over batches."""
+    from gitm.benchmarks.hft.optimize import HftStreamingApplicator, hft_intervention_spec
+    from gitm.optimizer.apply import apply_intervention
+    from gitm.scheduler.loop import LoopConfig
+    from gitm.workloads import get_factory
+
+    monkeypatch.setenv("GITM_BENCH_STAGE", str(tmp_path / "stage"))
+    monkeypatch.setenv("GITM_BENCH_SEED", "42")
+    monkeypatch.setenv("GITM_BENCH_EVENTS", "3000")
+    monkeypatch.setenv("GITM_BENCH_STREAM", "1")
+    monkeypatch.setenv("GITM_BENCH_SHARDS_PER_BATCH", "1")
+
+    runner = get_factory("hft")(LoopConfig(workload="hft"))
+    assert isinstance(runner.applicator, HftStreamingApplicator)
+    assert runner()["events"] > 0  # observe pass streams the data
+
+    res = apply_intervention(hft_intervention_spec(), runner.applicator, min_keep_delta=0.0)
+    assert runner.applicator.last_result.identical is True  # verified over all batches
+    assert res.measured_delta is not None

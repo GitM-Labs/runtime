@@ -152,11 +152,23 @@ def optimize_hft_streaming(batches, dflib, *, sync=None, on_batch=None) -> ABRes
     them). ``sync`` is the device-sync callable (so GPU timing is honest). The
     overall run is "identical" iff *every* batch matched — a single divergent
     batch rolls the whole thing back, same gate as the single-frame path.
-    ``on_batch(i, ABResult-like dict)`` is an optional progress callback.
+    ``on_batch(i, ABResult-like dict)`` is an optional progress callback whose
+    ``identical`` field is the *running* AND (True until the first divergence),
+    not a per-batch verdict.
+
+    Timing measures **pipeline compute throughput**: only the two pipeline calls
+    are timed, so the speedup is verified over the whole dataset's *compute*, not
+    wall-clock — any per-batch I/O the caller does between yields is excluded by
+    design. Within a batch the baseline runs before the candidate; the candidate
+    does strictly less work, so warm-cache ordering can only *understate* its win.
+
+    Raises ``ValueError`` on an empty ``batches`` iterable — an empty A/B would
+    vacuously report ``identical=True`` with zero throughput, which is a silent
+    no-op, not a verified result.
     """
     sync = sync or (lambda: None)
-    total_events = 0
-    total_vwap = 0
+    base_events = cand_events = 0
+    base_vwap = cand_vwap = 0
     base_t = 0.0
     cand_t = 0.0
     identical = True
@@ -176,26 +188,32 @@ def optimize_hft_streaming(batches, dflib, *, sync=None, on_batch=None) -> ABRes
 
         if _signature(bs) != _signature(cs):
             identical = False
-        total_events += int(bs["events"])
-        total_vwap += int(cs["vwap_buckets"])
+        base_events += int(bs["events"])
+        base_vwap += int(bs["vwap_buckets"])
+        cand_events += int(cs["events"])
+        cand_vwap += int(cs["vwap_buckets"])
         if on_batch is not None:
             on_batch(n_batches, {"events": int(bs["events"]), "identical": identical})
 
-    base_eps = total_events / max(base_t, 1e-9)
-    cand_eps = total_events / max(cand_t, 1e-9)
+    if n_batches == 0:
+        raise ValueError("optimize_hft_streaming: no batches to process (empty iterable)")
+
+    base_eps = base_events / max(base_t, 1e-9)
+    cand_eps = cand_events / max(cand_t, 1e-9)
     speedup = cand_eps / base_eps if base_eps else 0.0
     kept = "candidate" if (identical and cand_eps > base_eps) else "baseline"
-    # Aggregate counts only — the identical verdict is the per-batch AND above,
-    # not a signature over these sums (mean_microprice isn't summable).
-    agg = {"events": total_events, "vwap_buckets": total_vwap}
+    # Per-pipeline count aggregates (kept separate so a divergent run never reports
+    # the candidate's counts as the baseline's). The identical verdict is the
+    # per-batch AND above, not a signature over these sums (mean_microprice isn't
+    # summable across batches).
     return ABResult(
         baseline_eps=base_eps,
         candidate_eps=cand_eps,
         speedup=speedup,
         identical=identical,
         kept=kept,
-        baseline_summary=agg,
-        candidate_summary=agg,
+        baseline_summary={"events": base_events, "vwap_buckets": base_vwap},
+        candidate_summary={"events": cand_events, "vwap_buckets": cand_vwap},
     )
 
 
@@ -250,12 +268,20 @@ def hft_intervention_spec() -> InterventionSpec:
 class HftFewerScansApplicator:
     """Apply the fewer-scans top-of-book through the standard rollback gate.
 
-    The 'live state' is which top-of-book pipeline is active. :meth:`measure`
-    runs the real baseline-vs-candidate A/B (:func:`optimize_hft`): it raises
-    :class:`CorrectnessError` when the candidate's output is not byte-identical
-    (forcing a rollback), otherwise returns the signed speedup delta so the gate
-    keeps the candidate only when it is genuinely faster. The full
-    :class:`ABResult` is stashed on :attr:`last_result` for the report.
+    :meth:`measure` runs the real baseline-vs-candidate A/B (:func:`optimize_hft`):
+    it raises :class:`CorrectnessError` when the candidate's output is not
+    byte-identical (forcing a rollback), otherwise returns the signed speedup
+    delta so the gate keeps the candidate only when it is genuinely faster. The
+    full :class:`ABResult` is stashed on :attr:`last_result` for the report.
+
+    Note on the protocol seam: ``apply_intervention`` calls ``measure`` exactly
+    once, so the baseline must be established *inside* ``measure`` — hence it runs
+    both pipelines (a self-contained A/B) rather than timing only whichever
+    pipeline ``apply`` selected. :attr:`active` therefore tracks *intent* (which
+    pipeline the gate decided to keep) for inspectability; it does not gate what
+    ``measure`` times. This is correct for a pure-compute rewrite where the only
+    honest baseline is a fresh run on the same frame; a live-engine applicator
+    (where state genuinely persists) would instead time the active config.
 
     Implements the :class:`gitm.optimizer.apply.Applicator` protocol structurally.
     """
@@ -279,6 +305,45 @@ class HftFewerScansApplicator:
 
     def measure(self, spec: InterventionSpec) -> float:
         r = optimize_hft(self._df, self._dflib, reps=self._reps, sync=self._sync)
+        self.last_result = r
+        if not r.identical:
+            raise CorrectnessError(
+                "candidate top-of-book output differs from baseline — rolling back"
+            )
+        return r.speedup - 1.0
+
+
+class HftStreamingApplicator:
+    """Streaming variant of :class:`HftFewerScansApplicator` for datasets too big
+    to hold one frame. :meth:`measure` runs the batched A/B
+    (:func:`optimize_hft_streaming`) over a *fresh* batch generator, so the whole
+    sharded dataset is verified+timed without ever materialising more than one
+    batch. Same rollback gate: raises :class:`CorrectnessError` if any batch
+    diverges, otherwise returns the signed speedup delta.
+
+    ``batches_factory`` is a zero-arg callable returning a fresh iterable of
+    device frames each time it is called (one for ``measure``'s A/B, independent
+    of the observe pass the runner does).
+    """
+
+    def __init__(self, batches_factory, dflib, *, sync=None):
+        self._batches_factory = batches_factory
+        self._dflib = dflib
+        self._sync = sync
+        self.active = "baseline"
+        self.last_result: ABResult | None = None
+
+    def snapshot(self) -> str:
+        return self.active
+
+    def apply(self, spec: InterventionSpec) -> None:
+        self.active = "candidate"
+
+    def restore(self, snapshot: str) -> None:
+        self.active = snapshot
+
+    def measure(self, spec: InterventionSpec) -> float:
+        r = optimize_hft_streaming(self._batches_factory(), self._dflib, sync=self._sync)
         self.last_result = r
         if not r.identical:
             raise CorrectnessError(

@@ -29,6 +29,7 @@ import json
 import os
 import re
 import time
+from contextlib import closing
 from pathlib import Path
 
 
@@ -242,12 +243,21 @@ def _optimize_hft_cmd(args) -> int:
             print(f"  batch {i}/{n_batches}: +{info['events']:,} events "
                   f"(identical so far: {info['identical']})", flush=True)
 
-        r = optimize_hft_streaming(batch_gen, dflib, sync=_sync, on_batch=_progress)
+        # closing() guarantees the batch generator's finally (del df +
+        # _free_gpu_pool) runs even if the A/B raises mid-stream, instead of
+        # waiting on GC to reclaim the device frame.
+        with closing(batch_gen):
+            r = optimize_hft_streaming(batch_gen, dflib, sync=_sync, on_batch=_progress)
     else:
         df = load_events(stage, args.seed, dflib, max_events=args.max_events)
         n = int(len(df))
         print(f"optimize hft: {n:,} events on {gpu_name} ({kind}) — measuring baseline vs candidate")
         r = optimize_hft(df, dflib, reps=3, sync=_sync)
+
+    # Filename/JSON reflect events *actually processed* (from the A/B result), not
+    # the pre-scan metadata count, so a shard changed between scan and run can't
+    # mislabel the output.
+    n = int(r.baseline_summary.get("events", n))
 
     print(f"  baseline : {r.baseline_eps:,.0f} events/s")
     print(f"  candidate: {r.candidate_eps:,.0f} events/s  ({r.speedup:.2f}x)")

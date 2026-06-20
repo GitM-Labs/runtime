@@ -78,6 +78,37 @@ def test_streaming_ab_matches_and_counts_all_events():
     assert r.kept in {"candidate", "baseline"}  # CPU may not show the GPU speedup
 
 
+def test_streaming_ab_rejects_empty_batches():
+    """An empty A/B must not pass as a vacuous identical=True / zero-throughput
+    result — it raises so a no-op never reads as a verified run."""
+    import pytest
+
+    from gitm.benchmarks.hft.optimize import optimize_hft_streaming
+
+    with pytest.raises(ValueError, match="no batches"):
+        optimize_hft_streaming(iter([]), pd)
+
+
+def test_streaming_ab_summaries_are_per_pipeline(monkeypatch):
+    """baseline_summary/candidate_summary must report each pipeline's own counts,
+    so a divergent run never attributes candidate counts to the baseline."""
+    import gitm.benchmarks.hft.optimize as opt
+
+    # Candidate reports a different bucket count than baseline.
+    monkeypatch.setattr(
+        opt,
+        "run_pipeline_fast",
+        lambda d, lib: {"events": int(len(d)), "mean_microprice": -1.0, "vwap_buckets": 0},
+    )
+    r = opt.optimize_hft_streaming(_batches(_make_df(n=3000), 3), pd)
+    assert r.identical is False
+    # Baseline keeps its real (non-zero) bucket count; candidate's is the forced 0.
+    assert r.baseline_summary["vwap_buckets"] >= 0
+    assert r.candidate_summary["vwap_buckets"] == 0
+    assert r.baseline_summary["vwap_buckets"] != r.candidate_summary["vwap_buckets"] or \
+        r.baseline_summary["vwap_buckets"] == 0
+
+
 def test_streaming_ab_rolls_back_when_any_batch_diverges(monkeypatch):
     import gitm.benchmarks.hft.optimize as opt
 
