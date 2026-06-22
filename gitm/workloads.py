@@ -240,14 +240,25 @@ def _positive_int_env(name: str, default: int) -> int:
     return val
 
 
+def _frame_dets(res: Any) -> list[dict[str, Any]]:
+    """One frame's detections in the gate's shape: name + score + 3D center.
+
+    The gate matches boxes per frame by class and center distance, so it needs
+    the center (first three of the 7-number box) and the class name per box, not
+    just the score.
+    """
+    return [
+        {"name": d["name"], "score": float(d["score"]), "center": tuple(d["box3d"][:3])}
+        for d in res.detections
+    ]
+
+
 def _make_edge_run_mode(unit: Any, items: list) -> Callable[[str], dict[str, Any]]:
     """Build the fp32/fp16 ``run_mode`` closure for the edge fp16 A/B.
 
     Runs ``items`` through ``unit.run`` in fp32, or under fp16 autocast when
-    called with ``"fp16"``, and returns a detection summary the A/B gate compares
-    (count + sorted confidence scores). Same model + weights either way — only
-    the autocast context differs — so the only legitimate difference is fp16
-    rounding, which the gate tolerates within ``score_atol``.
+    called with ``"fp16"``, and returns a per-frame detection summary the gate
+    compares. Same model + weights either way; only the autocast context differs.
     """
     import contextlib
 
@@ -260,16 +271,12 @@ def _make_edge_run_mode(unit: Any, items: list) -> Callable[[str], dict[str, Any
             else contextlib.nullcontext()
         )
         # unit.run() already syncs per frame (it does .cpu() on the outputs), and
-        # optimize_edge's _timed syncs after each rep — so no extra sync here. The
-        # gate (detections_equivalent) sorts, so scores stay in collection order.
-        n_det = 0
-        scores: list[float] = []
+        # optimize_edge's _timed syncs after each rep — so no extra sync here.
+        frames: list[list[dict[str, Any]]] = []
         with torch.no_grad(), ctx:
             for it in items:
-                res = unit.run(it)
-                n_det += res.n_detections
-                scores.extend(float(d["score"]) for d in res.detections)
-        return {"n_frames": len(items), "n_detections": n_det, "scores": scores}
+                frames.append(_frame_dets(unit.run(it)))
+        return {"n_frames": len(items), "frames": frames}
 
     return run_mode
 
@@ -282,24 +289,20 @@ def _make_edge_batch_run_mode(
     ``"serial"`` runs ``items`` one at a time through ``unit.run``; ``"batched"``
     runs them ``batch_size`` at a time through ``unit.run_batch`` (one forward per
     chunk). Same model + weights; batching only changes how many frames share a
-    launch, so per-frame detections are equivalent in eval mode and the gate
-    tolerates float rounding within ``score_atol``.
+    launch, so per-frame detections are equivalent in eval mode. Returns the
+    per-frame detection summary the gate compares (frames stay in item order).
     """
 
     def run_mode(mode: str) -> dict[str, Any]:
-        n_det = 0
-        scores: list[float] = []
+        frames: list[list[dict[str, Any]]] = []
         if mode == "batched":
             for i in range(0, len(items), batch_size):
                 for res in unit.run_batch(items[i : i + batch_size]):
-                    n_det += res.n_detections
-                    scores.extend(float(d["score"]) for d in res.detections)
+                    frames.append(_frame_dets(res))
         else:  # serial baseline
             for it in items:
-                res = unit.run(it)
-                n_det += res.n_detections
-                scores.extend(float(d["score"]) for d in res.detections)
-        return {"n_frames": len(items), "n_detections": n_det, "scores": scores}
+                frames.append(_frame_dets(unit.run(it)))
+        return {"n_frames": len(items), "frames": frames}
 
     return run_mode
 
