@@ -254,12 +254,14 @@ def _openfold_factory(cfg: LoopConfig) -> WorkloadRunner:
 
     from benchmarks.biotech.fetch import read_fasta
     from benchmarks.biotech.harness import _msa_path, load_openfold_runner
+    from benchmarks.biotech.optimize import AF2Bf16Applicator
 
     stage = Path(os.environ.get("GITM_BENCH_STAGE", "/workspace/biotech/staging/biotech"))
     seed = int(os.environ.get("GITM_BENCH_SEED", "42"))
     n_proteins = int(os.environ.get("GITM_BENCH_PROTEINS", "8"))
     max_len = int(os.environ.get("GITM_BENCH_MAX_LEN", "384"))
     warmup = int(os.environ.get("GITM_BENCH_WARMUP", "2"))
+    plddt_tol = float(os.environ.get("GITM_BENCH_PLDDT_TOL", "1.5"))
 
     fasta = stage / "proteins_50k.fasta"
     if not fasta.exists():
@@ -307,6 +309,12 @@ def _openfold_factory(cfg: LoopConfig) -> WorkloadRunner:
             "median_plddt": statistics.median(plddts) if plddts else None,
         }
 
+    # Carry the rollback-gated bf16 prover so the loop can apply+prove the
+    # intervention on the same proteins it observed. measure() re-runs the
+    # fp32-vs-bf16 A/B and gates on plDDT-equivalence — a real measured speedup.
+    run.applicator = AF2Bf16Applicator(
+        stage, seed, n_proteins=n_proteins, max_len=max_len, warmup=warmup, plddt_tol=plddt_tol
+    )
     return run
 
 

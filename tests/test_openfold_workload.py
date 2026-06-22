@@ -78,6 +78,119 @@ def test_openfold_routes_to_measurement_not_intervention(tmp_path: Path, monkeyp
         assert knob not in md, f"measurement report must not contain vLLM knob {knob!r}"
 
 
+def _fake_capture_with(entered, prefix="cutlass_sm90_gemm"):
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        entered["capture"] = True
+        kernels = [
+            make_kernel(f"{prefix}_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 90 + (i % 9))
+            for i in range(80)
+        ]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    return fake_capture
+
+
+def test_openfold_loop_runs_intervention_with_applicator(tmp_path: Path, monkeypatch):
+    """A runner carrying the bf16 applicator drives the FULL apply+prove path:
+    `gitm run --workload openfold` does observe→attribute→select→apply→prove and
+    emits a verified provenance claim (the no-corners loop, like HFT)."""
+    import gitm.scheduler.loop as loop
+    from benchmarks.biotech.optimize import AF2ABResult
+
+    entered: dict = {}
+    monkeypatch.setattr(loop, "capture", _fake_capture_with(entered))
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    class FakeApplicator:
+        def __init__(self):
+            self.active = "baseline"
+            self.last_result = None
+
+        def snapshot(self):
+            return self.active
+
+        def apply(self, spec):
+            self.active = "candidate"
+
+        def restore(self, s):
+            self.active = s
+
+        def measure(self, spec):  # bf16 faster, plDDT within tolerance
+            self.last_result = AF2ABResult(
+                400.0, 600.0, 1.5, 89.0, 90.0, 1.0, 1.5, equivalent=True, kept="candidate"
+            )
+            return 0.5
+
+    def runner():
+        return {"structures": 3}
+
+    runner.applicator = FakeApplicator()
+
+    from gitm import optimize
+
+    result = optimize(
+        workload="openfold", budget="1s", scratch=str(tmp_path), workload_runner=runner
+    )
+    s, md = result["summary"], result["report_md"]
+
+    assert entered.get("capture")
+    assert s["mode"] == "intervention"
+    assert s["n_claims"] == 1
+    assert s["speedup"] == 1.5
+    assert s["kept"] == "candidate"
+    assert "af2_bf16_inference" in md
+    for knob in ("max_num_batched_tokens", "gpu_memory_utilization", "max_num_seqs"):
+        assert knob not in md
+    assert (Path(result["run_dir"]) / "apply_result.json").exists()
+
+
+def test_openfold_loop_rolls_back_on_plddt_regression(tmp_path: Path, monkeypatch):
+    """If bf16 moves plDDT past tolerance the applicator raises; the loop rolls
+    back to fp32 and lists it rolled-back — no speedup reported on degraded
+    structures."""
+    import gitm.scheduler.loop as loop
+    from benchmarks.biotech.optimize import AF2ABResult, CorrectnessError
+
+    entered: dict = {}
+    monkeypatch.setattr(loop, "capture", _fake_capture_with(entered))
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    class FakeApplicator:
+        def __init__(self):
+            self.active = "baseline"
+            self.last_result = None
+
+        def snapshot(self):
+            return self.active
+
+        def apply(self, spec):
+            self.active = "candidate"
+
+        def restore(self, s):
+            self.active = s
+
+        def measure(self, spec):  # plDDT regressed → gate must roll back
+            self.last_result = AF2ABResult(
+                400.0, 600.0, 1.5, 89.0, 80.0, -9.0, 1.5, equivalent=False, kept="baseline"
+            )
+            raise CorrectnessError("bf16 degraded plDDT")
+
+    def runner():
+        return {"structures": 3}
+
+    runner.applicator = FakeApplicator()
+
+    from gitm import optimize
+
+    result = optimize(
+        workload="openfold", budget="1s", scratch=str(tmp_path), workload_runner=runner
+    )
+    s = result["summary"]
+    assert s["mode"] == "intervention"
+    assert s["n_rolled_back"] == 1
+
+
 def test_openfold_factory_filters_by_len_and_msa(tmp_path: Path, monkeypatch):
     """Protein selection (len + MSA filter, the 'no proteins' guard) is exercised
     without OpenFold/torch — it runs before the model is built. Here max_len=0
