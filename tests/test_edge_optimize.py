@@ -78,6 +78,77 @@ def test_applicator_rolls_back_on_detection_divergence():
         app.measure(app.spec)
 
 
+def _fake_batch_run_mode(*, batched_count: int, serial_count: int = 5,
+                         batched_sleep: float = 0.002, serial_sleep: float = 0.012):
+    """serial is the slow baseline; batched is faster (fewer launches). batched_count
+    controls whether batched detections stay equivalent (== serial_count) or diverge."""
+    def run_mode(mode: str) -> dict:
+        if mode == "batched":
+            time.sleep(batched_sleep)
+            n = batched_count
+        else:
+            time.sleep(serial_sleep)
+            n = serial_count
+        return {"n_frames": 8, "n_detections": n, "scores": [0.9] * n}
+    return run_mode
+
+
+def test_batching_spec_applies_to_edge_workloads():
+    from gitm.benchmarks.edge.optimize import edge_batching_spec
+
+    spec = edge_batching_spec()
+    assert spec.name == "edge_frame_batching"
+    assert set(spec.applicability.workloads) >= {"edge", "kitti", "nuscenes"}
+
+
+def test_batching_applicator_keeps_faster_equivalent():
+    from gitm.benchmarks.edge.optimize import EdgeBatchingApplicator
+
+    app = EdgeBatchingApplicator(_fake_batch_run_mode(batched_count=5), reps=1)
+    delta = app.measure(app.spec)
+    assert delta > 0
+    assert app.last_result is not None and app.last_result.identical
+    assert app.last_result.kept == "candidate"
+
+
+def test_batching_applicator_rolls_back_on_divergence():
+    from gitm.benchmarks.edge.optimize import DetectionDivergenceError, EdgeBatchingApplicator
+
+    app = EdgeBatchingApplicator(_fake_batch_run_mode(batched_count=4), reps=1)
+    with pytest.raises(DetectionDivergenceError):
+        app.measure(app.spec)
+
+
+def test_batch_run_mode_chunks_non_divisible_length():
+    """The serial and batched modes must cover every frame, including a trailing
+    partial chunk (len=7, batch=4 → chunks of 4 + 3)."""
+    from gitm.workloads import _make_edge_batch_run_mode
+
+    class _Det(dict):
+        pass
+
+    class _Res:
+        def __init__(self, n):
+            self.n_detections = n
+            self.detections = [{"score": 0.9} for _ in range(n)]
+
+    class _FakeUnit:
+        def run(self, it):
+            return _Res(2)
+
+        def run_batch(self, items):  # one det per frame fewer than serial would be a bug
+            return [_Res(2) for _ in items]
+
+    items = list(range(7))
+    rm = _make_edge_batch_run_mode(_FakeUnit(), items, batch_size=4)
+    serial = rm("serial")
+    batched = rm("batched")
+    assert serial["n_frames"] == 7 and batched["n_frames"] == 7
+    # every frame covered in both modes → 7 frames × 2 dets
+    assert serial["n_detections"] == 14
+    assert batched["n_detections"] == 14
+
+
 def test_attach_skips_applicator_when_no_frames():
     """No frames → no A/B → no applicator, so the loop falls back to
     measurement-only instead of a noise verdict over an empty comparison."""

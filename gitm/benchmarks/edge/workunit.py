@@ -237,3 +237,57 @@ class NuScenesWorkUnit:
             t_postprocess_s=t4 - t3,
             t_total_s=t4 - t0,
         )
+
+    def run_batch(self, indices: list) -> list[WorkUnitResult]:
+        """Process a batch of keyframes in ONE forward pass (detections only).
+
+        Collates B keyframes (each with its 10-sweep accumulation) and launches
+        the network once, amortizing per-kernel launch overhead. Per-frame
+        equivalent to :meth:`run` in eval mode (BatchNorm running stats; conv is
+        per-sample), so detections match the single-frame path within float
+        tolerance — the batching intervention's correctness gate. Stage timings
+        are omitted (the A/B times wall-clock around this call).
+        """
+        if not indices:
+            return []
+
+        import torch
+        from pcdet.models import load_data_to_gpu
+
+        frame_ids: list[str] = []
+        data_dicts = []
+        for index in indices:
+            info = self.dataset.infos[index]
+            fid = info.get("token", str(index))
+            frame_ids.append(fid)
+            points = self.dataset.get_lidar_with_sweeps(index, max_sweeps=self._max_sweeps)
+            data_dicts.append(
+                self.dataset.prepare_data(data_dict={"points": points, "frame_id": fid})
+            )
+        batch = self.dataset.collate_batch(data_dicts)
+        load_data_to_gpu(batch)
+        with torch.no_grad():
+            pred_dicts, _ = self._model.forward(batch)
+        torch.cuda.synchronize()
+
+        results: list[WorkUnitResult] = []
+        for fid, pred in zip(frame_ids, pred_dicts, strict=True):
+            scores = pred["pred_scores"].cpu().numpy()
+            labels = pred["pred_labels"].cpu().numpy()
+            boxes = pred["pred_boxes"].cpu().numpy()
+            n = len(scores)
+            results.append(
+                WorkUnitResult(
+                    frame_id=fid,
+                    n_detections=n,
+                    detections=[
+                        {
+                            "name": self._class_names[int(labels[i]) - 1],
+                            "score": float(scores[i]),
+                            "box3d": boxes[i].tolist(),
+                        }
+                        for i in range(n)
+                    ],
+                )
+            )
+        return results
