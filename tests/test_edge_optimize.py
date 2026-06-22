@@ -1,9 +1,11 @@
-"""Edge fp16 intervention: the apply→prove A/B and its correctness gate.
+"""Edge interventions (fp16 and batching): the apply→prove A/B and its per-frame
+correctness gate.
 
-GPU-free — the A/B is driven by an injected fake run_mode, exactly the seam the
-real OpenPCDet runner plugs into on the pod. Mirrors tests/test_hft_intervention
-in spirit: prove the gate keeps a faster-and-equivalent candidate and rolls back
-a divergent one.
+GPU-free. The A/B is driven by an injected fake run_mode, exactly the seam the
+real OpenPCDet runner plugs into on the pod. The gate matches detections per
+frame by class and 3D center distance, tolerating a small amount of churn (the
+rounding-level flips fp16 / batching cause) while still catching a real
+divergence.
 """
 
 from __future__ import annotations
@@ -14,139 +16,123 @@ import pytest
 
 from gitm.benchmarks.edge.optimize import (
     DetectionDivergenceError,
+    EdgeBatchingApplicator,
     EdgeFp16Applicator,
     detections_equivalent,
+    edge_batching_spec,
     edge_intervention_spec,
     optimize_edge,
 )
 
 
-def _fake_run_mode(*, fp16_count: int, fp32_count: int = 5,
-                   fp16_sleep: float = 0.001, fp32_sleep: float = 0.012):
-    """fp32 is the slow baseline; fp16 is faster. fp16_count controls whether the
-    candidate's detections stay equivalent (== fp32_count) or diverge."""
+def _frames(n_frames: int = 8, n_det: int = 5, *, shift: float = 0.0, drop: int = 0) -> dict:
+    """Per-frame summary: each frame has the same boxes, one car per integer x.
+    ``shift`` moves every box (to break the center match); ``drop`` removes boxes
+    (to simulate detections flipping out)."""
+    out = []
+    for _ in range(n_frames):
+        out.append([
+            {"name": "car", "score": 0.9, "center": (float(i) + shift, 0.0, 0.0)}
+            for i in range(max(0, n_det - drop))
+        ])
+    return {"n_frames": n_frames, "frames": out}
+
+
+def _fake_run_mode(*, equivalent: bool = True, fast_sleep: float = 0.001,
+                   slow_sleep: float = 0.012):
+    """Baseline (slow) vs candidate (fast). Candidate is the fp16/batched mode.
+    When not equivalent, the candidate's boxes are shifted far enough that none
+    match by center, which the gate must reject."""
+    base = _frames()
+    cand = _frames() if equivalent else _frames(shift=10.0)
+
     def run_mode(mode: str) -> dict:
-        if mode == "fp16":
-            time.sleep(fp16_sleep)
-            n = fp16_count
-        else:
-            time.sleep(fp32_sleep)
-            n = fp32_count
-        return {"n_frames": 8, "n_detections": n, "scores": [0.9] * n}
+        if mode in ("fp16", "batched"):       # candidate
+            time.sleep(fast_sleep)
+            return cand
+        time.sleep(slow_sleep)                # baseline
+        return base
     return run_mode
 
 
-def test_detections_equivalent_gate():
-    base = {"n_detections": 3, "scores": [0.9, 0.8, 0.7]}
-    assert detections_equivalent(base, {"n_detections": 3, "scores": [0.91, 0.79, 0.71]})
-    # count mismatch → not equivalent
-    assert not detections_equivalent(base, {"n_detections": 2, "scores": [0.9, 0.8]})
-    # score drift beyond tolerance → not equivalent
-    assert not detections_equivalent(base, {"n_detections": 3, "scores": [0.5, 0.8, 0.7]})
+def test_detections_equivalent_matches_per_frame():
+    base = _frames(n_frames=2, n_det=3)
+    # identical boxes → equivalent
+    assert detections_equivalent(base, _frames(n_frames=2, n_det=3))
+    # one borderline detection flipping out per frame is tolerated
+    assert detections_equivalent(base, _frames(n_frames=2, n_det=3, drop=1))
+    # every box moved beyond the center tolerance → real divergence, rejected
+    assert not detections_equivalent(base, _frames(n_frames=2, n_det=3, shift=10.0))
+    # all detections gone → rejected
+    assert not detections_equivalent(base, _frames(n_frames=2, n_det=0))
+    # frame count mismatch → rejected
+    assert not detections_equivalent(base, _frames(n_frames=1, n_det=3))
 
 
-def test_spec_applies_to_edge_workloads():
-    spec = edge_intervention_spec()
-    assert spec.name == "edge_fp16_autocast"
-    assert set(spec.applicability.workloads) >= {"edge", "kitti", "nuscenes"}
+def test_specs_apply_to_edge_workloads():
+    for spec in (edge_intervention_spec(), edge_batching_spec()):
+        assert set(spec.applicability.workloads) >= {"edge", "kitti", "nuscenes"}
+    assert edge_intervention_spec().name == "edge_fp16_autocast"
+    assert edge_batching_spec().name == "edge_frame_batching"
 
 
 def test_optimize_edge_keeps_faster_equivalent_candidate():
-    rm = _fake_run_mode(fp16_count=5)  # equivalent to fp32 + faster
-    r = optimize_edge(rm, reps=1)
-    assert r.identical
-    assert r.speedup > 1.0
-    assert r.kept == "candidate"
+    r = optimize_edge(_fake_run_mode(equivalent=True), reps=1)
+    assert r.identical and r.speedup > 1.0 and r.kept == "candidate"
     assert "faster" in r.verdict
 
 
-def test_applicator_measure_returns_positive_delta_when_equivalent():
-    app = EdgeFp16Applicator(_fake_run_mode(fp16_count=5), reps=1)
-    snap = app.snapshot()
-    app.apply(app.spec)
-    delta = app.measure(app.spec)
-    assert delta > 0
-    assert app.last_result is not None and app.last_result.identical
-    app.restore(snap)
-    assert app.active == "fp32"
+def test_fp16_applicator_keeps_when_equivalent_and_rolls_back_when_not():
+    keep = EdgeFp16Applicator(_fake_run_mode(equivalent=True), reps=1)
+    snap = keep.snapshot()
+    keep.apply(keep.spec)
+    assert keep.measure(keep.spec) > 0
+    assert keep.last_result is not None and keep.last_result.identical
+    keep.restore(snap)
+    assert keep.active == "fp32"
 
-
-def test_applicator_rolls_back_on_detection_divergence():
-    # fp16 drops a detection → gate must refuse the speedup
-    app = EdgeFp16Applicator(_fake_run_mode(fp16_count=4), reps=1)
+    drift = EdgeFp16Applicator(_fake_run_mode(equivalent=False), reps=1)
     with pytest.raises(DetectionDivergenceError):
-        app.measure(app.spec)
+        drift.measure(drift.spec)
 
 
-def _fake_batch_run_mode(*, batched_count: int, serial_count: int = 5,
-                         batched_sleep: float = 0.002, serial_sleep: float = 0.012):
-    """serial is the slow baseline; batched is faster (fewer launches). batched_count
-    controls whether batched detections stay equivalent (== serial_count) or diverge."""
-    def run_mode(mode: str) -> dict:
-        if mode == "batched":
-            time.sleep(batched_sleep)
-            n = batched_count
-        else:
-            time.sleep(serial_sleep)
-            n = serial_count
-        return {"n_frames": 8, "n_detections": n, "scores": [0.9] * n}
-    return run_mode
+def test_batching_applicator_keeps_when_equivalent_and_rolls_back_when_not():
+    keep = EdgeBatchingApplicator(_fake_run_mode(equivalent=True), reps=1)
+    assert keep.measure(keep.spec) > 0
+    assert keep.last_result is not None and keep.last_result.kept == "candidate"
 
-
-def test_batching_spec_applies_to_edge_workloads():
-    from gitm.benchmarks.edge.optimize import edge_batching_spec
-
-    spec = edge_batching_spec()
-    assert spec.name == "edge_frame_batching"
-    assert set(spec.applicability.workloads) >= {"edge", "kitti", "nuscenes"}
-
-
-def test_batching_applicator_keeps_faster_equivalent():
-    from gitm.benchmarks.edge.optimize import EdgeBatchingApplicator
-
-    app = EdgeBatchingApplicator(_fake_batch_run_mode(batched_count=5), reps=1)
-    delta = app.measure(app.spec)
-    assert delta > 0
-    assert app.last_result is not None and app.last_result.identical
-    assert app.last_result.kept == "candidate"
-
-
-def test_batching_applicator_rolls_back_on_divergence():
-    from gitm.benchmarks.edge.optimize import DetectionDivergenceError, EdgeBatchingApplicator
-
-    app = EdgeBatchingApplicator(_fake_batch_run_mode(batched_count=4), reps=1)
+    drift = EdgeBatchingApplicator(_fake_run_mode(equivalent=False), reps=1)
     with pytest.raises(DetectionDivergenceError):
-        app.measure(app.spec)
+        drift.measure(drift.spec)
 
 
 def test_batch_run_mode_chunks_non_divisible_length():
-    """The serial and batched modes must cover every frame, including a trailing
+    """serial and batched modes must cover every frame, including a trailing
     partial chunk (len=7, batch=4 → chunks of 4 + 3)."""
     from gitm.workloads import _make_edge_batch_run_mode
-
-    class _Det(dict):
-        pass
 
     class _Res:
         def __init__(self, n):
             self.n_detections = n
-            self.detections = [{"score": 0.9} for _ in range(n)]
+            self.detections = [
+                {"name": "car", "score": 0.9, "box3d": [float(i), 0, 0, 1, 1, 1, 0]}
+                for i in range(n)
+            ]
 
     class _FakeUnit:
         def run(self, it):
             return _Res(2)
 
-        def run_batch(self, items):  # one det per frame fewer than serial would be a bug
+        def run_batch(self, items):
             return [_Res(2) for _ in items]
 
     items = list(range(7))
     rm = _make_edge_batch_run_mode(_FakeUnit(), items, batch_size=4)
-    serial = rm("serial")
-    batched = rm("batched")
+    serial, batched = rm("serial"), rm("batched")
     assert serial["n_frames"] == 7 and batched["n_frames"] == 7
     # every frame covered in both modes → 7 frames × 2 dets
-    assert serial["n_detections"] == 14
-    assert batched["n_detections"] == 14
+    assert sum(len(f) for f in serial["frames"]) == 14
+    assert sum(len(f) for f in batched["frames"]) == 14
 
 
 def test_attach_skips_applicator_when_no_frames():
@@ -162,15 +148,14 @@ def test_attach_skips_applicator_when_no_frames():
 
 
 def test_applicator_runs_through_the_apply_gate():
-    """End-to-end through the real rollback gate: equivalent+faster is kept."""
+    """End-to-end through the real rollback gate: equivalent+faster is kept,
+    divergent is rolled back."""
     from gitm.optimizer.apply import apply_intervention
 
-    app = EdgeFp16Applicator(_fake_run_mode(fp16_count=5), reps=1)
-    res = apply_intervention(app.spec, app, min_keep_delta=0.0)
+    keep = EdgeBatchingApplicator(_fake_run_mode(equivalent=True), reps=1)
+    res = apply_intervention(keep.spec, keep, min_keep_delta=0.0)
     assert res.applied and not res.rolled_back
     assert res.measured_delta is not None and res.measured_delta > 0
 
-    # divergent candidate → gate rolls back, no speedup kept
-    app2 = EdgeFp16Applicator(_fake_run_mode(fp16_count=4), reps=1)
-    res2 = apply_intervention(app2.spec, app2, min_keep_delta=0.0)
-    assert res2.rolled_back
+    drift = EdgeBatchingApplicator(_fake_run_mode(equivalent=False), reps=1)
+    assert apply_intervention(drift.spec, drift, min_keep_delta=0.0).rolled_back
