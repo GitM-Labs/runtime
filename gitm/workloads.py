@@ -188,18 +188,111 @@ def _ensure_hft_data(stage: Path, seed: int) -> None:
     )
 
 
-@register("edge")
-def _edge_factory(cfg: LoopConfig) -> WorkloadRunner:
+# Per-workload OpenPCDet config + checkpoint defaults under the standard pod
+# layout (/workspace/edge/...). GITM_EDGE_CFG / GITM_EDGE_CKPT override either.
+_EDGE_MODEL_DEFAULTS = {
+    "kitti": (
+        "/workspace/edge/OpenPCDet/tools/cfgs/kitti_models/pointpillar.yaml",
+        "/workspace/edge/data/checkpoints/kitti/pointpillar_7728.pth",
+    ),
+    "nuscenes": (
+        "/workspace/edge/OpenPCDet/tools/cfgs/nuscenes_models/cbgs_dyn_pp_centerpoint.yaml",
+        "/workspace/edge/OpenPCDet/checkpoints/cbgs_pp_centerpoint_nds6070.pth",
+    ),
+}
+
+
+def _resolve_model(workload: str) -> tuple[Path, Path]:
+    """Resolve (cfg, ckpt) for an edge workload from env overrides + defaults.
+
+    Fails loud with the resolved path if either is missing, so a wrong default
+    or a forgotten env var yields an actionable message instead of a KeyError or
+    an opaque error deep inside OpenPCDet.
+    """
+    if workload not in _EDGE_MODEL_DEFAULTS:
+        raise KeyError(
+            f"no edge model defaults for {workload!r}; "
+            f"known: {sorted(_EDGE_MODEL_DEFAULTS)}"
+        )
+    default_cfg, default_ckpt = _EDGE_MODEL_DEFAULTS[workload]
+    cfg_path = Path(os.environ.get("GITM_EDGE_CFG", default_cfg))
+    ckpt_path = Path(os.environ.get("GITM_EDGE_CKPT", default_ckpt))
+    for env_name, p in (("GITM_EDGE_CFG", cfg_path), ("GITM_EDGE_CKPT", ckpt_path)):
+        if not p.exists():
+            raise FileNotFoundError(
+                f"{workload} workload: {env_name} resolves to {p}, which does not "
+                f"exist. Point {env_name} at the OpenPCDet path on this box."
+            )
+    return cfg_path, ckpt_path
+
+
+def _make_edge_run_mode(unit: Any, items: list) -> Callable[[str], dict[str, Any]]:
+    """Build the fp32/fp16 ``run_mode`` closure for the edge fp16 A/B.
+
+    Runs ``items`` through ``unit.run`` in fp32, or under fp16 autocast when
+    called with ``"fp16"``, and returns a detection summary the A/B gate compares
+    (count + sorted confidence scores). Same model + weights either way — only
+    the autocast context differs — so the only legitimate difference is fp16
+    rounding, which the gate tolerates within ``score_atol``.
+    """
+    import contextlib
+
+    import torch
+
+    def run_mode(mode: str) -> dict[str, Any]:
+        ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.float16)
+            if mode == "fp16"
+            else contextlib.nullcontext()
+        )
+        # unit.run() already syncs per frame (it does .cpu() on the outputs), and
+        # optimize_edge's _timed syncs after each rep — so no extra sync here. The
+        # gate (detections_equivalent) sorts, so scores stay in collection order.
+        n_det = 0
+        scores: list[float] = []
+        with torch.no_grad(), ctx:
+            for it in items:
+                res = unit.run(it)
+                n_det += res.n_detections
+                scores.extend(float(d["score"]) for d in res.detections)
+        return {"n_frames": len(items), "n_detections": n_det, "scores": scores}
+
+    return run_mode
+
+
+def _attach_edge_applicator(run: WorkloadRunner, unit: Any, items: list) -> None:
+    """Attach the fp16-autocast applicator so the loop runs apply→prove on edge.
+
+    The A/B is capped to a small frame count (GITM_EDGE_AB_FRAMES, default 30) so
+    the rollback-gated measure is fast regardless of the observe-phase frame count.
+    With no frames there is no A/B to run, so no applicator is attached and the
+    loop falls back to a measurement-only report rather than a noise verdict over
+    an empty comparison.
+    """
+    if not items:
+        return
+    from gitm.benchmarks.edge.optimize import EdgeFp16Applicator
+
+    ab_n = int(os.environ.get("GITM_EDGE_AB_FRAMES", "30"))
+    ab_items = items[:ab_n]
+    run.applicator = EdgeFp16Applicator(
+        _make_edge_run_mode(unit, ab_items), sync=sync_device
+    )
+
+
+@register("edge", "nuscenes")
+def _nuscenes_factory(cfg: LoopConfig) -> WorkloadRunner:
     """nuScenes CenterPoint-PointPillar. Warmup (context init, cudnn autotune)
-    runs here, outside the capture window; the runner replays the frames."""
+    runs here, outside the capture window; the runner replays the frames. Carries
+    the fp16 applicator so the loop runs the full apply→prove."""
     import random
+    import time
 
     import torch
 
     from gitm.benchmarks.edge.workunit import NuScenesWorkUnit
 
-    cfg_path = Path(os.environ["GITM_EDGE_CFG"])
-    ckpt_path = Path(os.environ["GITM_EDGE_CKPT"])
+    cfg_path, ckpt_path = _resolve_model("nuscenes")
     data_root = os.environ.get("GITM_EDGE_DATA_ROOT", "/workspace/edge/OpenPCDet/data/nuscenes")
     n_frames = int(os.environ.get("GITM_EDGE_FRAMES", "500"))
     max_sweeps = int(os.environ.get("GITM_EDGE_MAX_SWEEPS", "10"))
@@ -219,10 +312,66 @@ def _edge_factory(cfg: LoopConfig) -> WorkloadRunner:
 
     def run() -> dict[str, Any]:
         total_dets = 0
+        t0 = time.perf_counter()
         for idx in run_indices:
             total_dets += unit.run(idx).n_detections
-        return {"frames": len(run_indices), "detections": total_dets}
+        elapsed = max(time.perf_counter() - t0, 1e-9)
+        return {
+            "frames": len(run_indices),
+            "detections": total_dets,
+            "elapsed_s": elapsed,
+            "fps": len(run_indices) / elapsed,
+        }
 
+    _attach_edge_applicator(run, unit, run_indices)
+    return run
+
+
+@register("kitti")
+def _kitti_factory(cfg: LoopConfig) -> WorkloadRunner:
+    """KITTI PointPillars. Unlike nuScenes, the KITTI WorkUnit is iterated by
+    .bin file path (no dataset index), so frames come from the canonical velodyne
+    enumerator. Carries the fp16 applicator for the full apply→prove loop."""
+    import random
+    import time
+
+    import torch
+
+    from gitm.benchmarks.kitti.baseline import _load_frame_paths
+    from gitm.benchmarks.kitti.workunit import WorkUnit
+
+    cfg_path, ckpt_path = _resolve_model("kitti")
+    data_root = Path(
+        os.environ.get("GITM_EDGE_DATA_ROOT")
+        or os.environ.get("GITM_DATA_ROOT", "/workspace/edge")
+    )
+    n_frames = int(os.environ.get("GITM_EDGE_FRAMES", "500"))
+    seed = int(os.environ.get("GITM_BENCH_SEED", "42"))
+
+    unit = WorkUnit.from_checkpoint(cfg_path=cfg_path, ckpt_path=ckpt_path)
+    all_paths = _load_frame_paths(data_root)  # sorted velodyne *.bin; fails loud
+    rng = random.Random(seed)
+    rng.shuffle(all_paths)
+    run_paths = all_paths[:n_frames]
+
+    for p in run_paths[:10]:  # warmup outside capture
+        unit.run(p)
+    torch.cuda.synchronize()
+
+    def run() -> dict[str, Any]:
+        total_dets = 0
+        t0 = time.perf_counter()
+        for p in run_paths:
+            total_dets += unit.run(p).n_detections
+        elapsed = max(time.perf_counter() - t0, 1e-9)
+        return {
+            "frames": len(run_paths),
+            "detections": total_dets,
+            "elapsed_s": elapsed,
+            "fps": len(run_paths) / elapsed,
+        }
+
+    _attach_edge_applicator(run, unit, run_paths)
     return run
 
 

@@ -146,10 +146,25 @@ def load_openpcdet_runner(*, config_hash: str | None = None) -> _OpenPCDetRunner
             "  pip install -e /workspace/edge/OpenPCDet"
         ) from exc
 
-    cfg_path = os.environ.get("OPENPCDET_CFG", _OPENPCDET_DEFAULT_CFG)
+    cfg_path = Path(os.environ.get("OPENPCDET_CFG", _OPENPCDET_DEFAULT_CFG))
     ckpt_path = os.environ.get("OPENPCDET_CKPT", _OPENPCDET_DEFAULT_CKPT)
 
-    cfg_from_yaml_file(str(cfg_path), cfg)
+    # OpenPCDet resolves _BASE_CONFIG_ entries (e.g.
+    # cfgs/dataset_configs/kitti_dataset.yaml) relative to the tools/ dir that
+    # holds the top-level cfgs/ folder, not relative to the config file. chdir
+    # there for the load, then restore — mirrors gitm.benchmarks.kitti.workunit
+    # so the harness works regardless of the caller's CWD.
+    resolved_parts = cfg_path.resolve().parts
+    if "cfgs" in resolved_parts:
+        tools_dir = Path(*resolved_parts[: resolved_parts.index("cfgs")])
+    else:
+        tools_dir = cfg_path.resolve().parent
+    prev_cwd = os.getcwd()
+    try:
+        os.chdir(tools_dir)
+        cfg_from_yaml_file(str(cfg_path.resolve()), cfg)
+    finally:
+        os.chdir(prev_cwd)
 
     class _InferenceDataset(DatasetTemplate):
         def __init__(self) -> None:
@@ -173,7 +188,11 @@ def load_openpcdet_runner(*, config_hash: str | None = None) -> _OpenPCDetRunner
         num_class=len(cfg.CLASS_NAMES),
         dataset=dataset,
     )
-    model.load_params_from_file(filename=str(ckpt_path), logger=None, to_cpu=True)
+    # OpenPCDet's load_params_from_file calls logger.info() unconditionally, so
+    # a None logger raises AttributeError — pass a real one.
+    model.load_params_from_file(
+        filename=str(ckpt_path), logger=_logging.getLogger("gitm.edge"), to_cpu=True
+    )
     model.cuda().eval()
 
     return _OpenPCDetRunner(model, dataset, list(cfg.CLASS_NAMES))

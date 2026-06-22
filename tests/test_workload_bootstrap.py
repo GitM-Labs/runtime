@@ -53,6 +53,28 @@ def test_hft_factory_autostages_and_runs(tmp_path: Path, monkeypatch):
     assert summary["events"] > 0
 
 
+def test_edge_workloads_registered():
+    """kitti and nuscenes must be resolvable workload ids (README advertises
+    them); edge stays as the nuScenes alias for back-compat."""
+    from gitm.workloads import get_factory, registered
+
+    names = registered()
+    for name in ("kitti", "nuscenes", "edge"):
+        assert name in names, f"{name} not registered"
+        assert get_factory(name) is not None
+
+
+def test_resolve_model_fails_loud_on_missing_path(tmp_path: Path, monkeypatch):
+    """A missing cfg/ckpt yields an actionable FileNotFoundError naming the env
+    var and the resolved path — not a KeyError or an opaque OpenPCDet error."""
+    from gitm.workloads import _resolve_model
+
+    monkeypatch.setenv("GITM_EDGE_CFG", str(tmp_path / "nope.yaml"))
+    monkeypatch.setenv("GITM_EDGE_CKPT", str(tmp_path / "nope.pth"))
+    with pytest.raises(FileNotFoundError, match="GITM_EDGE_CFG"):
+        _resolve_model("kitti")
+
+
 def test_autobuild_skipped_without_gpu(monkeypatch):
     import gitm.tracer._cupti as c
 
