@@ -69,27 +69,29 @@ class EdgeABResult:
     @property
     def verdict(self) -> str:
         if not self.identical:
-            return "rolled back — fp16 detections differ from fp32 beyond tolerance"
+            return "rolled back — candidate detections differ from baseline beyond tolerance"
         if self.kept == "candidate":
             return f"kept candidate — verified +{(self.speedup - 1) * 100:.1f}% faster, detections equivalent"
-        return "kept baseline — fp16 not faster"
+        return "kept baseline — candidate not faster"
 
 
 def optimize_edge(
     run_mode: RunMode,
     *,
+    baseline_mode: str = "fp32",
+    candidate_mode: str = "fp16",
     reps: int = 2,
     sync: Callable[[], None] | None = None,
     score_atol: float = 0.02,
 ) -> EdgeABResult:
     """Run the measure→apply→prove A/B and return a gated verdict.
 
-    ``run_mode(mode)`` runs the frames in ``"fp32"`` or ``"fp16"`` — a single
-    callable dispatched by mode (the two precisions are the same code path on a
-    different autocast context, not two distinct functions). Each precision is
-    run ``reps`` times; the best (lowest) wall time is used to reduce launch
-    jitter. ``sync`` is invoked after each run so GPU timing is honest (pass a
-    device sync; default no-op for CPU/fake).
+    ``run_mode(mode)`` runs the frames in the given mode and returns a detection
+    summary — a single callable dispatched by mode (e.g. ``"fp32"``/``"fp16"`` for
+    the precision lever, ``"serial"``/``"batched"`` for the batching lever). Each
+    mode is run ``reps`` times; the best (lowest) wall time is used to reduce
+    launch jitter. ``sync`` is invoked after each run so GPU timing is honest
+    (pass a device sync; default no-op for CPU/fake).
     """
     sync = sync or (lambda: None)
 
@@ -104,8 +106,8 @@ def optimize_edge(
         n = max(int(summary.get("n_frames", 0)), 0)
         return summary, n / max(best, 1e-9)
 
-    base_summary, base_eps = _timed("fp32")
-    cand_summary, cand_eps = _timed("fp16")
+    base_summary, base_eps = _timed(baseline_mode)
+    cand_summary, cand_eps = _timed(candidate_mode)
 
     identical = detections_equivalent(base_summary, cand_summary, score_atol=score_atol)
     speedup = cand_eps / base_eps if base_eps else 0.0
@@ -214,6 +216,8 @@ class EdgeFp16Applicator:
     def measure(self, spec: InterventionSpec) -> float:
         r = optimize_edge(
             self._run_mode,
+            baseline_mode="fp32",
+            candidate_mode="fp16",
             reps=self._reps,
             sync=self._sync,
             score_atol=self._score_atol,
@@ -222,5 +226,107 @@ class EdgeFp16Applicator:
         if not r.identical:
             raise DetectionDivergenceError(
                 "fp16 detections differ from fp32 beyond tolerance — rolling back"
+            )
+        return r.speedup - 1.0
+
+
+def edge_batching_spec(batch_size: int = 4) -> InterventionSpec:
+    """The curated edge lever for a launch-bound profile: frame batching.
+
+    The KITTI/nuScenes trace shows serialized-concurrency ~1.0 over ~11k tiny
+    kernels — the run is launch-bound, so precision (fp16) doesn't help; cutting
+    *launches* does. Batching B frames into one forward pass amortizes per-kernel
+    launch overhead. Per-frame detections are equivalent in eval mode, gated at
+    apply time, so the expected-delta range here is only for ranking.
+
+    ``batch_size`` is recorded as the spec's ``value`` so the provenance reflects
+    the batch size actually run, not a hardcoded constant.
+    """
+    return InterventionSpec(
+        name="edge_frame_batching",
+        summary=f"Run inference on batches of {batch_size} frames in one forward "
+        "pass instead of one frame at a time — amortizes per-launch overhead on a "
+        "launch-bound workload (serialized-concurrency ~1.0). Kept only if per-frame "
+        "detections stay equivalent and throughput improves.",
+        knob="edge.batch_size",
+        value=batch_size,
+        applies_to_kernels=[
+            "conv", "bev", "backbone", "pillar", "voxel", "scatter", "nms",
+            "gemm", "elementwise",
+        ],
+        expected_delta_mean=0.30,
+        expected_delta_lo=0.0,
+        expected_delta_hi=2.00,
+        source="gitm/benchmarks/edge/optimize.py — frame-batching A/B, per-frame "
+        "detection-equivalence gated against the single-frame baseline.",
+        applicability=Applicability(workloads=["edge", "kitti", "nuscenes"]),
+        safety=SafetyGate(
+            tier="moderate",
+            requires_rollback_window_s=0,
+            forbid_if_oom_history=True,
+            notes="Batching raises peak memory; gated on detection-equivalence + "
+            "speedup, and forbidden after an OOM since larger batches can OOM.",
+        ),
+        review=None,
+    )
+
+
+class EdgeBatchingApplicator:
+    """Apply frame batching through the standard rollback gate.
+
+    The 'live state' is whether inference is serial or batched. :meth:`measure`
+    runs the real serial-vs-batched A/B (:func:`optimize_edge` with
+    ``serial``/``batched`` modes): it raises :class:`DetectionDivergenceError`
+    when batched detections diverge (forcing a rollback), otherwise returns the
+    signed throughput delta so the gate keeps batching only when it is faster.
+    The full :class:`EdgeABResult` is stashed on :attr:`last_result`.
+
+    ``run_mode(mode)`` runs the frames ``"serial"`` or ``"batched"`` and returns
+    a detection summary — injected so this is testable without a GPU. Carries its
+    own :attr:`spec` so the generalized loop can read it.
+    """
+
+    def __init__(
+        self,
+        run_mode: RunMode,
+        *,
+        batch_size: int = 4,
+        reps: int = 2,
+        sync: Callable[[], None] | None = None,
+        score_atol: float = 0.02,
+        spec: InterventionSpec | None = None,
+    ):
+        self._run_mode = run_mode
+        self._batch_size = batch_size
+        self._reps = reps
+        self._sync = sync
+        self._score_atol = score_atol
+        self.active = "serial"
+        self.last_result: EdgeABResult | None = None
+        # Default spec records the actual batch size, so provenance ≠ a constant.
+        self.spec = spec or edge_batching_spec(batch_size=batch_size)
+
+    def snapshot(self) -> str:
+        return self.active
+
+    def apply(self, spec: InterventionSpec) -> None:
+        self.active = "batched"
+
+    def restore(self, snapshot: str) -> None:
+        self.active = snapshot
+
+    def measure(self, spec: InterventionSpec) -> float:
+        r = optimize_edge(
+            self._run_mode,
+            baseline_mode="serial",
+            candidate_mode="batched",
+            reps=self._reps,
+            sync=self._sync,
+            score_atol=self._score_atol,
+        )
+        self.last_result = r
+        if not r.identical:
+            raise DetectionDivergenceError(
+                "batched detections differ from single-frame beyond tolerance — rolling back"
             )
         return r.speedup - 1.0

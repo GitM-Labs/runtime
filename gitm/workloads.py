@@ -226,6 +226,20 @@ def _resolve_model(workload: str) -> tuple[Path, Path]:
     return cfg_path, ckpt_path
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    """Parse a positive-int env var with a clear error (vs a bare ValueError)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a positive integer, got {raw!r}") from None
+    if val < 1:
+        raise ValueError(f"{name} must be >= 1, got {val}")
+    return val
+
+
 def _make_edge_run_mode(unit: Any, items: list) -> Callable[[str], dict[str, Any]]:
     """Build the fp32/fp16 ``run_mode`` closure for the edge fp16 A/B.
 
@@ -260,24 +274,73 @@ def _make_edge_run_mode(unit: Any, items: list) -> Callable[[str], dict[str, Any
     return run_mode
 
 
-def _attach_edge_applicator(run: WorkloadRunner, unit: Any, items: list) -> None:
-    """Attach the fp16-autocast applicator so the loop runs apply→prove on edge.
+def _make_edge_batch_run_mode(
+    unit: Any, items: list, batch_size: int
+) -> Callable[[str], dict[str, Any]]:
+    """Build the serial/batched ``run_mode`` closure for the edge batching A/B.
 
-    The A/B is capped to a small frame count (GITM_EDGE_AB_FRAMES, default 30) so
-    the rollback-gated measure is fast regardless of the observe-phase frame count.
-    With no frames there is no A/B to run, so no applicator is attached and the
-    loop falls back to a measurement-only report rather than a noise verdict over
-    an empty comparison.
+    ``"serial"`` runs ``items`` one at a time through ``unit.run``; ``"batched"``
+    runs them ``batch_size`` at a time through ``unit.run_batch`` (one forward per
+    chunk). Same model + weights; batching only changes how many frames share a
+    launch, so per-frame detections are equivalent in eval mode and the gate
+    tolerates float rounding within ``score_atol``.
+    """
+
+    def run_mode(mode: str) -> dict[str, Any]:
+        n_det = 0
+        scores: list[float] = []
+        if mode == "batched":
+            for i in range(0, len(items), batch_size):
+                for res in unit.run_batch(items[i : i + batch_size]):
+                    n_det += res.n_detections
+                    scores.extend(float(d["score"]) for d in res.detections)
+        else:  # serial baseline
+            for it in items:
+                res = unit.run(it)
+                n_det += res.n_detections
+                scores.extend(float(d["score"]) for d in res.detections)
+        return {"n_frames": len(items), "n_detections": n_det, "scores": scores}
+
+    return run_mode
+
+
+def _attach_edge_applicator(run: WorkloadRunner, unit: Any, items: list) -> None:
+    """Attach the edge intervention applicator so the loop runs apply→prove.
+
+    The lever defaults to **batching** (GITM_EDGE_INTERVENTION=batching) — the
+    right one for the launch-bound edge profile; set GITM_EDGE_INTERVENTION=fp16
+    for the precision lever instead. The A/B is capped to a small frame count
+    (GITM_EDGE_AB_FRAMES, default 30) so the rollback-gated measure is fast
+    regardless of the observe-phase frame count. With no frames there is no A/B,
+    so no applicator is attached and the loop falls back to measurement-only
+    rather than a noise verdict over an empty comparison.
     """
     if not items:
         return
-    from gitm.benchmarks.edge.optimize import EdgeFp16Applicator
 
-    ab_n = int(os.environ.get("GITM_EDGE_AB_FRAMES", "30"))
+    ab_n = _positive_int_env("GITM_EDGE_AB_FRAMES", 30)
     ab_items = items[:ab_n]
-    run.applicator = EdgeFp16Applicator(
-        _make_edge_run_mode(unit, ab_items), sync=sync_device
-    )
+    lever = os.environ.get("GITM_EDGE_INTERVENTION", "batching").lower()
+
+    if lever == "fp16":
+        from gitm.benchmarks.edge.optimize import EdgeFp16Applicator
+
+        run.applicator = EdgeFp16Applicator(
+            _make_edge_run_mode(unit, ab_items), sync=sync_device
+        )
+    elif lever == "batching":  # default — targets the launch-bound bottleneck
+        from gitm.benchmarks.edge.optimize import EdgeBatchingApplicator
+
+        batch_size = _positive_int_env("GITM_EDGE_BATCH_SIZE", 4)
+        run.applicator = EdgeBatchingApplicator(
+            _make_edge_batch_run_mode(unit, ab_items, batch_size),
+            batch_size=batch_size,
+            sync=sync_device,
+        )
+    else:
+        raise ValueError(
+            f"GITM_EDGE_INTERVENTION must be 'batching' or 'fp16', got {lever!r}"
+        )
 
 
 @register("edge", "nuscenes")
