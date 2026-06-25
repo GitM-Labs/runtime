@@ -1,4 +1,4 @@
-"""Doubly-robust causal attribution (GITM-008), alongside Granger.
+"""Doubly-robust causal attribution, alongside Granger.
 
 Granger ranks *temporal precedence* — does op A's residual help predict op B's?
 That's necessary but not sufficient for a causal effect. The doubly-robust

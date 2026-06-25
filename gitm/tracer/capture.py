@@ -33,8 +33,8 @@ def capture(
     """Capture a CUPTI/rocprof trace into ``out_path`` as JSONL.
 
     The yielded ``Trace`` is updated in-place as events arrive; the file is
-    flushed on context exit. Capture overhead target: <5% of workload runtime
-    (W2). The W1 target is <10%.
+    flushed on context exit. Capture overhead target: <10% of workload runtime today,
+    tightening to <5% on the roadmap.
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -55,7 +55,7 @@ def capture(
     # Enabling collection can fail at runtime (e.g. CUPTI returns
     # NOT_COMPATIBLE on a driver/CUPTI version skew). Degrade to a well-formed
     # no-op trace rather than taking down the whole run — the tracer is
-    # best-effort instrumentation, not load-bearing for the workload.
+    # best-effort instrumentation, not critical to the workload.
     if backend is not None:
         try:
             backend.start()

@@ -69,13 +69,13 @@ Baseline result (fill after running `bash harness/run_baselines.sh`):
 | GPU active | backbone + BEV head forward pass | 50-65% | TBD |
 | CPU overhead | Python dispatch, dataloader | ~5% | TBD |
 
-**Critical check:** GPU active must be < 85%. If saturated, flag Adit same day
+**Critical check:** GPU active must be < 85%. If saturated, flag for review same day
 for 500-frame shard fallback.
 
 **Stream-concurrency check (nsys):** host-side voxelization of frame N+1 should
 overlap device-side backbone inference on frame N. Capture nsys timeline and
 commit screenshot to `benchmarks/kitti/results.md`. If overlap is absent, the
-stream-concurrency invariant has no signal -- flag Adit immediately.
+stream-concurrency invariant has no signal -- flag for review immediately.
 
 ## Section 5: GPU headroom (runtime integration)
 

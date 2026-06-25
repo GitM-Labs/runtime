@@ -1,4 +1,4 @@
-"""Multi-basis anomaly confirmation (GITM-008).
+"""Multi-basis anomaly confirmation.
 
 A single large residual is a weak signal — measurement noise, a one-off
 scheduler hiccup, or a genuine deviation all look the same in raw position

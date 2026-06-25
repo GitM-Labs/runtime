@@ -116,7 +116,7 @@ def _load_frame_paths(data_root: Path) -> list[Path]:
         raise FileNotFoundError(
             f"KITTI velodyne directory not found: {velodyne_dir}\n"
             f"Expected extracted KITTI Object data at {data_root}/kitti/training/\n"
-            f"Ask Adit for the S3 path, or set GITM_DATA_ROOT correctly."
+            f"Set the S3 path, or set GITM_DATA_ROOT correctly."
         )
     paths = sorted(velodyne_dir.glob("*.bin"), key=lambda p: p.stem)
     if not paths:
@@ -338,7 +338,7 @@ def run_baseline(
     if headroom_dict.get("mean_util_pct", 0) > 85.0:
         print(
             f"\nWARNING: NVML util={headroom_dict['mean_util_pct']:.1f}% > 85% — "
-            "flag Adit: workload may be near-saturated. Consider the 500-frame fallback."
+            "flag for review: workload may be near-saturated. Consider the 500-frame fallback."
         )
 
     return output

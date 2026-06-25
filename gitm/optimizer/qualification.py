@@ -43,7 +43,7 @@ def qualify(trace: Trace, target_floor: float = 0.15) -> QualificationResult:
 
     Heuristic v0: refuse to commit when the trace looks already-tuned, where
     "already-tuned" is signaled by low residual headroom in the kernel mix.
-    The real fingerprint check lands W2 (GITM-010); this version routes the
+    A richer fingerprint check is on the roadmap; this version routes the
     plumbing end-to-end.
     """
     fp = fingerprint(trace)

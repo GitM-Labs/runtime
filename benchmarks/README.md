@@ -17,8 +17,8 @@ benchmarks/
   <name>/
     bench.toml           the ONLY domain config — metric, seeds, stall bands, work-unit
     Makefile             sets NAME, includes ../Makefile.common
-    datasets.md          dataset description + seed protocol  (intern writes)
-    spec.md              4-section spec                       (intern writes)
+    datasets.md          dataset description + seed protocol
+    spec.md              4-section spec
     manifest.yaml        frozen dataset sha256s               (generated)
     results.md           stall table + GPU-active gate        (generated)
 ```
@@ -45,7 +45,7 @@ make run-42            # one BaselineRun JSON
 make profile-42        # nsys/rocprof + py-spy/sar bundle
 ```
 
-`make baseline` is the load-bearing reproducibility command: a non-author runs
+`make baseline` is the core reproducibility command: a non-author runs
 exactly this on a clean box and must hit the recorded numbers within 2 %.
 
 ## The two sign-off gates (applied to every benchmark by `gitm.bench`)
@@ -81,7 +81,7 @@ manifest's own sha256) into the `<name>_baseline_N.json` contract. The
 per-phase timings + the profiler's GPU-busy time — see
 [`gitm/bench/profile.py`](../gitm/bench/profile.py).
 
-## Cross-cutting Friday deliverables (per benchmark)
+## Cross-cutting deliverables (per benchmark)
 
 1. `datasets.md` + frozen `manifest.yaml` on `main`.
 2. `spec.md` (4 sections).

@@ -1,4 +1,4 @@
-"""Validate the counterfactual replay engine against synthetic ground truth (GITM-009).
+"""Validate the counterfactual replay engine against synthetic ground truth.
 
 The replay engine (:func:`gitm.optimizer.replay.predict_delta`) predicts an
 intervention's wall-clock delta as ``coverage × expected_delta_mean`` — an

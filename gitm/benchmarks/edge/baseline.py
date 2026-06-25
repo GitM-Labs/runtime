@@ -226,7 +226,7 @@ def run_baseline(
     if nvml_mean is not None and nvml_mean > GPU_ACTIVE_WARN_PCT:
         print(
             f"\nWARNING: NVML util={nvml_mean:.1f}% > {GPU_ACTIVE_WARN_PCT}% — "
-            "near-saturated. Flag Adit / consider 500-frame fallback. "
+            "near-saturated. Flag for review / consider 500-frame fallback. "
             "(Expected with dyn GPU-voxelization; see voxelization decision.)"
         )
 

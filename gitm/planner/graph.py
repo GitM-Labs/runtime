@@ -4,8 +4,8 @@ A flat list of predicted nodes per decode step. v0 is intentionally simple:
 attention QKV projection, attention score (GQA-aware), attention output, MLP
 gate+up, MLP down, vocab projection — one decode step worth.
 
-Adit extends this Tue Day 2 (GITM-003) — current implementation is
-load-bearing v0, not a stub.
+v0 emits one decode step worth of nodes; multi-step and dependency-edge
+modeling are on the roadmap.
 """
 
 from __future__ import annotations

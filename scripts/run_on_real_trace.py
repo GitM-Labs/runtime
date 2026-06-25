@@ -1,6 +1,6 @@
-"""Run the W2 runtime (monitor + attribution) on a REAL captured A100 trace.
+"""Run the runtime (monitor + attribution) on a real captured A100 trace.
 
-Unit tests (tests/test_w2_runtime.py) prove the algorithms are correct on
+Unit tests (tests/test_runtime_on_trace.py) prove the algorithms are correct on
 synthetic inputs. This proves they *run on real GPU data*: it captures a live
 CUDA workload via the CUPTI tracer, derives a residual per kernel as its
 deviation from that kernel's own median duration, and feeds the real residual
@@ -45,7 +45,7 @@ def main() -> int:
     from gitm.tracer import capture
 
     out = Path("/tmp/w2_real_trace.jsonl")
-    with capture(out, workload_id="w2-real") as tr:
+    with capture(out, workload_id="real-trace") as tr:
         a = torch.randn(2048, 2048, device="cuda")
         b = torch.randn(2048, 2048, device="cuda")
         c = a
@@ -62,7 +62,7 @@ def main() -> int:
         return 1
     print(f"captured {len(kernels)} real kernels on {torch.cuda.get_device_name(0)}")
 
-    # Real stream-concurrency from the trace (was the hardcoded-0.0 stub).
+    # Real stream-concurrency computed from the trace stream IDs.
     sc = _serialized_fraction(kernels)
     print(f"serialized_concurrency_fraction (REAL): {sc:.3f}")
 
@@ -93,7 +93,7 @@ def main() -> int:
     print("top doubly-robust:",
           [(h.cause_op[:18], h.effect_op[:18], h.notes) for h in d.top(2)] or "none")
 
-    print("PASS: the W2 runtime ran end-to-end on real A100 kernel data")
+    print("PASS: the runtime ran end-to-end on real A100 kernel data")
     return 0
 
 

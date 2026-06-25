@@ -1,6 +1,6 @@
 # Edge/robotics benchmark — spec
 
-> Owner: Karthik — baseline + profiling + spec doc.
+> Scope: baseline + profiling + spec doc.
 
 ## 1. Input definition
 nuScenes v1.0 full + KITTI (raw + object), flattened to a ~47 k-row keyframe

@@ -27,7 +27,7 @@ non-keyframe sweeps/ blobs are never touched, so a nuScenes tree pruned to just
 metadata + samples/LIDAR_TOP/ is sufficient here.
 
 Paths in each row are RELATIVE to GITM_DATA_ROOT so the manifest is portable
-across machines (local dev box, GPU box, Friday clean-box re-run).
+across machines (local dev box, GPU box, clean-box re-run).
 
 This module ONLY yields rows. It does not download, does not write the JSONL,
 and does not compute hashes. A separate orchestrator consumes iter_rows() and

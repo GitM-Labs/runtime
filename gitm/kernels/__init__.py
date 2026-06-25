@@ -1,8 +1,8 @@
 """Intervention library — curated levers for vLLM decode workloads.
 
 Each entry in ``library.yaml`` has applicability conditions, expected delta
-range with cited source, and safety gate. Every entry is reviewed by Adit
-before commit. I2 curates entries in W2 (GITM-031..033).
+range with cited source, and safety gate. Every entry is reviewed and signed
+off before it can be applied to a live workload.
 """
 
 from __future__ import annotations

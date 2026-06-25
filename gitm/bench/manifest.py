@@ -2,7 +2,7 @@
 
 A manifest pins a dataset to bytes: every file with its sha256 and byte count.
 Anyone with ``manifest.yaml`` can re-fetch identical bytes and prove they did.
-This is the one-liner each dataset+reproducibility intern runs on Wednesday.
+This is the one-liner run to (re)generate each dataset manifest.
 
 Datasets are TB-scale (HFT alone is ~600 GB compressed per seed), so hashing
 streams in fixed chunks and never loads a file into memory. Generation happens

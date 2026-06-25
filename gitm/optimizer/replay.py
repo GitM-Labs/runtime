@@ -22,8 +22,8 @@ def predict_delta(trace: Trace, spec: InterventionSpec) -> float:
     """Predicted fractional delta in wall-clock time on this trace.
 
     v0 model: apply the spec's ``expected_delta_mean`` weighted by the
-    fraction of trace time spent in ops the spec is applicable to. Adit
-    replaces this with a real replay engine in W2 (GITM-009).
+    fraction of trace time spent in ops the spec is applicable to. The
+    trace-driven replay engine that replaces this v0 is on the roadmap.
     """
     total_ns = max(trace.duration_ns, 1)
     applicable_ns = 0

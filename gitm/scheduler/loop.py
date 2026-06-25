@@ -217,9 +217,9 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
 
     # Phase 2 — residuals + attribution
     res = residuals(trace, graph)
-    violations = check_invariants(res)  # multi-basis confirmed (GITM-008)
+    violations = check_invariants(res)  # multi-basis confirmed
     hypotheses = attribute(res, graph)  # Granger
-    dr_hypotheses = attribute_dr(res, graph)  # doubly-robust, corroborating (GITM-008)
+    dr_hypotheses = attribute_dr(res, graph)  # doubly-robust, corroborating
 
     (run_dir / "violations.json").write_text(
         json.dumps(
@@ -282,8 +282,8 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         if c.rejected_reason is not None:
             rejected.append(f"{c.spec.name} ({c.rejected_reason})")
             continue
-        # W1 skeleton: no live engine attached -> predict-only, unverified claims.
-        # A live run passes an engine applicator here (GITM-020).
+        # No live engine attached -> predict-only, unverified claims.
+        # A live run passes an engine applicator here.
         result = apply_intervention(c.spec, DryRunApplicator())
         if result.rolled_back:
             rolled_back.append(c.spec.name)

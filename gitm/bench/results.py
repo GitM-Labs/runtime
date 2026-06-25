@@ -1,7 +1,7 @@
 """Render ``benchmarks/<name>/results.md`` — deliverable #4.
 
 Folds the aggregated baseline summary and a representative stall breakdown into
-the markdown artifact Jalon's Friday demo expects: the canonical table plus the
+the markdown artifact the benchmark suite emits: the canonical table plus the
 GPU-active confirmation and the pass/fail of every sign-off gate.
 """
 

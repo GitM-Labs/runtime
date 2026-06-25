@@ -292,7 +292,7 @@ def main() -> int:
         print("  git commit -m 'KITTI: fill measured baseline numbers'")
         print("  git push")
     else:
-        print(f"WARNING: convergence FAIL — spread {_fmt(s['spread_pct'])}% > 2%. Flag Adit.")
+        print(f"WARNING: convergence FAIL — spread {_fmt(s['spread_pct'])}% > 2%. Flag for review.")
 
     return 0 if s["converged"] else 1
 

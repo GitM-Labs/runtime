@@ -6,7 +6,7 @@ one manifest row per keyframe in the schema shared with the nuScenes source:
     {scene_id, frame_id, lidar_path, gt_path}
 
 Paths in each row are RELATIVE to GITM_DATA_ROOT so the manifest is portable
-across machines (local dev box, GPU box, Friday clean-box re-run).
+across machines (local dev box, GPU box, clean-box re-run).
 
 This module ONLY yields rows. It does not download, does not write the JSONL,
 and does not compute hashes. A separate orchestrator consumes iter_rows() and

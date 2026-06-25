@@ -1,4 +1,4 @@
-"""Tests for the W2 runtime upgrades (GITM-008/009).
+"""Tests for the runtime monitor + attribution upgrades.
 
 Covers the four genuine gaps: real stream-concurrency, the multi-basis filter,
 the doubly-robust estimator, and the replay validation harness.

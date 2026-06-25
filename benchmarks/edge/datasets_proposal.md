@@ -1,6 +1,6 @@
 # Additional edge/robotics datasets — proposal
 
-> Author: Karthik — for review by Adit before adding to spec.
+> Draft proposal, for review before adding to the spec.
 
 Current scope: nuScenes v1.0 + KITTI Object (~47k keyframes combined).
 Below are the next candidates ranked by signal value for the Git.M invariants.
@@ -15,7 +15,7 @@ Below are the next candidates ranked by signal value for the Git.M invariants.
   range + higher annotation quality). Significantly harder for the backbone — GPU active % likely
   higher, which tightens the stream-concurrency signal.
 - **Concern:** Requires a data access agreement (Google form, ~1 week turnaround).
-  Also non-commercial only — verify with Adit before committing.
+  Also non-commercial only; verify licensing before committing.
 - **Manifest rows:** ~200k (5x current KITTI). Build time ~20 min.
 - **Blocker:** License approval.
 
