@@ -1,4 +1,4 @@
-"""Trace schema JSON round-trip — example-based coverage of the load-bearing
+"""Trace schema JSON round-trip — example-based coverage of the
 serialization contract.
 
 A trace is captured as JSONL: header on line 1, one event per subsequent

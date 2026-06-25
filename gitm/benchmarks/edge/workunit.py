@@ -15,7 +15,7 @@ Mirrors gitm.benchmarks.kitti.workunit, with three nuScenes differences:
     computed sweep time_lag (0.0 for the keyframe).
   * 10 nuScenes classes (taken from cfg.CLASS_NAMES, not hard-coded).
 
-STAGE-TIMING CAVEAT (load-bearing for the stall breakdown):
+STAGE-TIMING CAVEAT (important for the stall breakdown):
     Stage boundaries assume host-side voxelization. With the dyn config
     (DynamicPillarVFE), voxelization runs on the GPU inside model.forward(),
     so t_preprocess_s is near-empty and that work lands in t_inference_s.

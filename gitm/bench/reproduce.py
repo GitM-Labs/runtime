@@ -1,4 +1,4 @@
-"""The reproducibility test — intern-1's Friday deliverable, shared across benchmarks.
+"""The reproducibility test, shared across benchmarks.
 
 "A non-author re-ran `make baseline` on a clean box and hit the recorded numbers
 in under 60 minutes." This encodes exactly that, in two checks:
@@ -10,7 +10,7 @@ in under 60 minutes." This encodes exactly that, in two checks:
    spread gate still holds, within a wall-clock budget.
 
 Returns a structured report (pass/fail + time-to-reproduce) so it composes in CI
-and the Friday demo, rather than relying on a human reading log output.
+and CI, rather than relying on a human reading log output.
 """
 
 from __future__ import annotations

@@ -30,7 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
-# Pinned sources. Replace placeholders with the exact pinned URLs/commands.
+# Pinned sources. Fill in the exact pinned URLs/commands below.
 CASP_SOURCES = {
     "casp14": "https://predictioncenter.org/download_area/CASP14/sequences/casp14.seq.txt",
     "casp15": "https://predictioncenter.org/download_area/CASP15/sequences/casp15.seq.txt",
@@ -75,7 +75,7 @@ def write_fasta(records: list[FastaRecord], out: str | Path, *, wrap: int = 60) 
 
 
 def length_histogram(records: list[FastaRecord], *, bin_width: int = 50) -> dict[str, int]:
-    """Bucketed length histogram, e.g. ``{'50-99': 12, ...}`` — Tue deliverable."""
+    """Bucketed length histogram, e.g. ``{'50-99': 12, ...}``."""
     counter: Counter[str] = Counter()
     for r in records:
         lo = (len(r.seq) // bin_width) * bin_width

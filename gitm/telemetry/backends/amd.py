@@ -22,19 +22,19 @@ class AmdBackend:
         # so discover_backends() skips this vendor on the host.
         raise ImportError("ROCm SMI backend not yet implemented")
 
-    def device_count(self) -> int:  # pragma: no cover - stub
+    def device_count(self) -> int:  # pragma: no cover - not yet implemented
         return 0
 
     def sample(self, gpu_index: int, labels: WorkloadLabels | None = None) -> Sample:  # pragma: no cover
         return Sample(
             ts_ns=time.time_ns(),
             node=socket.gethostname(),
-            gpu_uuid=f"amd-stub-{gpu_index}",
+            gpu_uuid=f"amd-{gpu_index}",
             gpu_index=gpu_index,
             vendor=self.vendor,
             throttle_reasons=ThrottleReason.NONE,
             labels=labels,
         )
 
-    def close(self) -> None:  # pragma: no cover - stub
+    def close(self) -> None:  # pragma: no cover - not yet implemented
         return None

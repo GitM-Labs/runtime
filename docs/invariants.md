@@ -46,7 +46,7 @@ severity = clamp(|residual| / band_width, 0.0, 1.0)
 memory-traffic: traffic band; stream-concurrency: 1.0). The result is
 comparable across all three.
 
-## Tier system (W2)
+## Tier system
 
 - **Tier 1 — always check.** Kernel-time, memory-traffic for any decode workload.
 - **Tier 2 — workload-conditional.** Stream-concurrency (only for multi-stream configs).

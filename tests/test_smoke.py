@@ -1,4 +1,4 @@
-"""End-to-end smoke tests for the W1 skeleton.
+"""End-to-end smoke tests for the runtime loop.
 
 These run without a GPU. They exercise every public interface on the critical
 path so any regression in the scaffold is caught on commit.

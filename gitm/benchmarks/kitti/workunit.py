@@ -100,7 +100,7 @@ class WorkUnit:
                 "  git clone https://github.com/open-mmlab/OpenPCDet.git\n"
                 "  cd OpenPCDet && pip install -e .\n"
                 "Then pull the checkpoint:\n"
-                "  # Ask Adit for the checkpoint URL or pull from S3"
+                "  # Set the checkpoint URL or pull from S3"
             ) from exc
 
         # OpenPCDet resolves _BASE_CONFIG_ entries (e.g.

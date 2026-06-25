@@ -27,5 +27,5 @@ Matches `[expected_stall]` in [bench.toml](bench.toml):
 
 Data-stall is MSA load + featurization; sync is recycle barriers. **The whole
 point is GPU active % well under 85 %** — that residual headroom is the
-optimization story. If GPU active comes in high, flag Adit immediately: this
+optimization story. If GPU active comes in high, flag for review immediately: this
 benchmark must have headroom or it is swapped.

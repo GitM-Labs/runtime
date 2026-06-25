@@ -1,14 +1,13 @@
 # Curated intervention library for vLLM decode workloads.
 #
 # Every entry has applicability, an expected delta range with a cited source,
-# and a safety gate. I2 curates entries in W2 (GITM-031 easy, GITM-032 medium,
-# GITM-033 harder); every entry carries review: null until Adit signs it off in
-# the GITM-010 library review. Expected deltas are pre-review estimates from the
-# cited source, not measured on our workloads — the replay engine and the
-# rollback-gated live apply produce the real numbers.
+# and a safety gate. Every entry carries review: null until it is signed off in
+# library review. Expected deltas are estimates from the cited source, not yet
+# measured on our own workloads. The replay engine and the rollback-gated live
+# apply produce the measured numbers.
 
 interventions:
-  # --- Tier 1: easy levers (GITM-031) ---------------------------------------
+  # --- Tier 1: low-effort levers --------------------------------------------
   - name: kv_cache_block_size_16
     summary: Set PagedAttention block size to 16 for short-context decode.
     knob: block_size
@@ -118,7 +117,7 @@ interventions:
       notes: Watch for OOM during long-running decode; rollback to 0.85 on first OOM.
     review: null
 
-  # --- Tier 2: medium levers (GITM-032) -------------------------------------
+  # --- Tier 2: medium-effort levers -----------------------------------------
   - name: enable_chunked_prefill
     summary: Chunk prefill so it overlaps with decode instead of stalling it.
     knob: enable_chunked_prefill
@@ -228,7 +227,7 @@ interventions:
       notes: Comm-path change; verify the stream-concurrency invariant holds.
     review: null
 
-  # --- Tier 3: harder levers (GITM-033) -------------------------------------
+  # --- Tier 3: higher-effort levers -----------------------------------------
   - name: tensor_parallel_size_2
     summary: Reshape to TP=2 to fit larger batches / longer context per replica.
     knob: tensor_parallel_size

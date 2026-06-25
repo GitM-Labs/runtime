@@ -90,7 +90,7 @@ def wrap_command(
 ) -> tuple[list[str], ProfileBundle]:
     """Return ``(argv, bundle)`` — the GPU-profiler-wrapped command to run.
 
-    Pure: builds argv and the bundle skeleton without executing anything, so
+    Pure: builds argv and the bundle scaffold without executing anything, so
     the wrapping logic is testable. Host-side py-spy/sar run as separate
     siblings (see :func:`run_profile`) because they sample the process tree
     rather than wrapping it.

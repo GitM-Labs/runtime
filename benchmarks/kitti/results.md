@@ -35,7 +35,7 @@ Host-side voxelization overlaps device-side backbone inference: **TBD**
 Screenshot shows: CPU track (voxelization of frame N+1) running simultaneously
 with GPU track (backbone + BEV head on frame N).
 
-If overlap is absent: message Adit before proceeding. The stream-concurrency
+If overlap is absent: flag for review before proceeding. The stream-concurrency
 invariant has no signal for this workload and the benchmark needs review.
 
 ## Notes

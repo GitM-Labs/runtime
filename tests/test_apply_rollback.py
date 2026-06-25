@@ -1,4 +1,4 @@
-"""Tests for the rollback-gated intervention apply path (GITM-020/021).
+"""Tests for the rollback-gated intervention apply path.
 
 Covers the two forced-failure rollback cases the ticket requires (bad value,
 mid-apply crash) plus the regression rollback and the happy path, against both
@@ -147,7 +147,7 @@ def test_library_has_18_validated_levers_with_values():
 
 
 def test_measure_overhead_runs_and_reports():
-    from benchmarks.skeleton.measure_overhead import measure_overhead
+    from benchmarks.overhead.measure_overhead import measure_overhead
 
     result = measure_overhead(lambda: sum(range(10_000)), runs=3)
     assert result["runs"] == 3

@@ -14,7 +14,7 @@ cycle so a bad lever can never leave the workload worse than it started:
 Any exception in apply or measure also triggers a restore. The GPU-specific part
 is isolated behind the :class:`Applicator` seam — :class:`ConfigFileApplicator`
 edits a config file, :class:`DictApplicator` an in-memory dict (used in tests).
-The vLLM/engine applicator (GITM-020) implements the same three methods.
+The live vLLM/engine applicator implements the same three methods (roadmap).
 """
 
 from __future__ import annotations
@@ -105,7 +105,7 @@ def _set_knob(config: dict, spec: InterventionSpec) -> None:
 class DryRunApplicator:
     """No live target — predict-only. apply/restore are no-ops; measure is None.
 
-    Used by the embedded loop when no engine is attached (the W1 skeleton runs
+    Used by the embedded loop when no engine is attached (the loop runs
     end-to-end without a GPU): candidates flow through the pipeline and land in
     the report as *unverified* (measured_delta is None), never claimed as won.
     """
@@ -180,7 +180,7 @@ def apply_intervention_from_file(
     """CLI helper: apply an intervention YAML to a target ``config`` file.
 
     Without a ``config`` target there is nothing safe to mutate, so this reports
-    a no-op rather than pretending — a live engine applicator (GITM-020) is the
+    a no-op rather than pretending. A live engine applicator is the
     other implementation of the seam.
     """
     with open(path) as fh:
