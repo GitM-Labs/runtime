@@ -1,6 +1,7 @@
 # Git.M Runtime
 
-<img width="1062" height="356" alt="image" src="https://github.com/user-attachments/assets/ffee3fc3-c42f-4fe5-9e31-c6a62a245f44" />
+<img width="668" height="384" alt="gitm_logo" src="https://github.com/user-attachments/assets/9fff0bb8-f87a-4c8b-a9c8-576b9218160d" />
+
 
 
 Git.M is a job-level runtime that makes already-placed GPU workloads run closer to their hardware ceiling. It reads runtime and hardware telemetry, models how the workload should execute, attributes the gap between expected and actual performance to a cause, and applies runtime configuration changes to close that gap. No source code, model weights, or training data are accessed.
