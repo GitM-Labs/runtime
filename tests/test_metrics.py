@@ -18,7 +18,7 @@ def _trace() -> Trace:
         fingerprint="fp",
         run_id="r",
         device_count=1,
-        vendor="nVIDIA"
+        vendor="nVIDIA",
         captured_at_ns=0,
         duration_ns=200 * US,
         events=[
