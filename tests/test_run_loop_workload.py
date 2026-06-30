@@ -149,4 +149,7 @@ def test_hft_is_registered():
 
     assert "hft" in registered() and "hft-lob" in registered()
     assert get_factory("hft") is not None
-    assert get_factory("vllm-decode") is None
+    # vllm-decode now has a registered factory (Stream A task 1); an unknown id
+    # still resolves to None.
+    assert get_factory("vllm-decode") is not None
+    assert get_factory("not-a-workload") is None
