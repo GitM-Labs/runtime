@@ -20,7 +20,7 @@ class GateContext:
 
 def applicable(spec: InterventionSpec, ctx: GateContext) -> tuple[bool, str]:
     """Return (True, "") if spec applies to ctx, else (False, reason)
-    
+
     All conditions are and-ed, the first failure short circuits with its reason
     Unset spec conditions are treated as "no constraint"
     """
