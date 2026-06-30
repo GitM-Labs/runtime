@@ -94,7 +94,7 @@ def _schedulers(engine: Any) -> list[Any]:
     )
     if sched is None:
         return []
-    return list(sched) if isinstance(sched, (list, tuple)) else [sched]
+    return list(sched) if isinstance(sched, list | tuple) else [sched]
 
 
 def _max_num_seqs(engine: Any) -> int | None:

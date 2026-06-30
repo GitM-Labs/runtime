@@ -331,6 +331,9 @@ class LiveEngineApplicator:
             _, old_engine = self._prev
             self._shutdown(self.engine)  # drop the candidate engine we built
             self.engine = old_engine
+        # Consume the restore record so a second restore() can't re-undo (or
+        # re-shutdown the already-discarded candidate engine) a second time.
+        self._prev = None
 
     @staticmethod
     def _shutdown(engine: Any) -> None:
