@@ -5,7 +5,7 @@ us what the *engine scheduler* did: how deep the waiting queue got, how full eac
 decode batch was, whether sequences were preempted and recomputed. Those are the
 signals that explain *why* the kernels look the way they do — a half-empty decode
 batch is launch-bound for a scheduling reason, not a kernel reason — so this
-series feeds causal attribution (stream C).
+series feeds causal attribution.
 
 Usage mirrors :func:`gitm.tracer.capture.capture`: wrap the same window.
 

@@ -339,7 +339,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                     for h in dr_hypotheses.top(5)
                 ],
                 # Engine-scheduler causes (from the vLLM stats adapter) ranked
-                # alongside the kernel-level hypotheses — the "feeds C" link.
+                # alongside the kernel-level hypotheses (the engine-signal causal link).
                 "scheduler_causes": [
                     {"signal": c.signal, "effect": c.effect, "severity": c.severity,
                      "note": c.note, "motivates_knobs": c.motivates_knobs}
