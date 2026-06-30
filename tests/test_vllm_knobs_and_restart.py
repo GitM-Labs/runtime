@@ -1,5 +1,5 @@
-"""Stream A finishers — knob taxonomy, restart-apply for structural knobs, and
-scheduler-stats causal attribution (the "feeds C" link).
+"""Knob taxonomy, restart-apply for structural knobs, and
+scheduler-stats causal attribution.
 
 No GPU / no vLLM: fake engines stand in. These cover the two pieces that were
 still in progress — #4 (hot-swap vs restart-apply) and #2 (stats → attribution).
@@ -148,7 +148,7 @@ def test_structural_raises_typed_exception_directly():
 
 
 # --------------------------------------------------------------------------- #
-# scheduler-stats causal attribution (feeds C)                                #
+# scheduler-stats causal attribution                                #
 # --------------------------------------------------------------------------- #
 def _summary(**over) -> SchedulerStatsSummary:
     base = dict(
@@ -254,7 +254,7 @@ def test_run_loop_scheduler_stats_feed_attribution_and_claims(tmp_path, monkeypa
 
     run_dir = Path(out["run_dir"])
     residuals = json.loads((run_dir / "residuals.json").read_text())
-    # The engine signal reached attribution (C): under-filled-batch cause is present.
+    # The engine signal reached attribution: under-filled-batch cause is present.
     signals = {c["signal"] for c in residuals["scheduler_causes"]}
     assert "under_filled_batch" in signals
     # And it reached the claim that it motivates (max_num_seqs), in the report.

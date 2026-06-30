@@ -1,4 +1,4 @@
-"""Stream A — vLLM embodiment: gate-context, precondition gate, live-engine
+"""vLLM embodiment: gate-context, precondition gate, live-engine
 applicator, scheduler-stats adapter, and deviation-only tracing.
 
 These cover the new wiring added for the ``vllm-decode`` workload without needing

@@ -1,4 +1,4 @@
-"""Scheduler-stats → causal attribution (the "feeds C" half of the tracer adapter).
+"""Scheduler-stats → causal attribution (the engine-signal half of the tracer adapter).
 
 The CUPTI trace explains kernel-level effects; the engine scheduler explains the
 *scheduling* causes behind them — preemptions that force KV recompute, decode
@@ -7,7 +7,7 @@ throughput, KV-cache pressure. :func:`scheduler_causes` turns a
 :class:`~gitm.tracer.vllm_stats.SchedulerStatsSummary` into ranked
 :class:`SchedulerCause` hypotheses so those engine signals enter causal
 attribution alongside the kernel-level Granger hypotheses — and each cause names
-the library knobs it motivates, linking attribution (C) to selection (B).
+the library knobs it motivates, linking attribution to intervention selection.
 
 These are rule-based, severity-ranked observations grounded in vLLM scheduler
 semantics, deliberately *not* dressed up as Granger p-values: the honest signal
