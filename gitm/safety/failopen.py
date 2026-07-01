@@ -32,6 +32,9 @@ class FailOpenGuard:
         self._fired = False
         self._install = install_signal_handlers
         self._prev_handlers: dict[int, Any] = {}
+        #: Names whose revert raised during :meth:`fire`. A non-empty list means
+        #: fail-open did NOT fully clean up — the workload may still be mutated.
+        self.failures: list[str] = []
 
     def register(self, name: str, revert_fn: Callable[[], None], *, cause: str = "") -> None:
         """Register a revert to run if we exit before it is disarmed."""
@@ -42,7 +45,13 @@ class FailOpenGuard:
         self._reverts = [r for r in self._reverts if r[0] != name]
 
     def fire(self) -> list[str]:
-        """Run all pending reverts in LIFO order; return the names reverted."""
+        """Run all pending reverts in LIFO order; return the names reverted.
+
+        Best-effort: one revert failing must not block the others. But a failure
+        is never swallowed silently — it is the most page-worthy event here (the
+        workload may be left mutated), so it is recorded to the audit trail and
+        surfaced on :attr:`failures`.
+        """
         if self._fired:
             return []
         self._fired = True
@@ -50,14 +59,23 @@ class FailOpenGuard:
         for name, fn, cause in reversed(self._reverts):
             try:
                 fn()
-                done.append(name)
-                if self._audit is not None:
-                    self._audit.record_revert(name, reason="fail-open", cause=cause or "guard exit")
-            except Exception:
-                # Best-effort: one revert failing must not block the others.
+            except Exception as exc:
+                self.failures.append(name)
+                self._record("revert_failed", name, cause or "guard exit", error=repr(exc))
                 continue
+            done.append(name)
+            self._record("revert", name, cause or "guard exit", reason="fail-open")
         self._reverts.clear()
         return done
+
+    def _record(self, event: str, name: str, cause: str, **detail: Any) -> None:
+        """Audit best-effort — a broken audit sink must not abort fail-open."""
+        if self._audit is None:
+            return
+        try:
+            self._audit.record(event, name, cause, **detail)
+        except Exception:
+            pass
 
     def _signal_handler(self, signum: int, frame: Any) -> None:
         self.fire()
@@ -67,6 +85,7 @@ class FailOpenGuard:
 
     def __enter__(self) -> FailOpenGuard:
         self._fired = False
+        self.failures = []
         if self._install:
             for sig in (signal.SIGTERM, signal.SIGINT):
                 try:
