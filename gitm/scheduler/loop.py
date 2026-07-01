@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from gitm._paths import runs_dir, traces_dir
+from gitm.agents.autoresearch import AutoresearchRun, autoresearch, classify_bottleneck
 from gitm.agents.policy import Policy, select_interventions
 from gitm.kernels.library import load_library
 from gitm.optimizer.apply import DryRunApplicator, apply_intervention
@@ -59,6 +60,18 @@ def _parse_budget_s(budget: str) -> float:
         raise ValueError(f"unparseable budget: {budget!r} (use 24h, 90m, 3600s, 1d)")
     value, unit = float(m.group(1)), m.group(2)
     return value * {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}[unit]
+
+
+def _write_report(run_dir: Path, report_md: str) -> Path:
+    """Write the run report as UTF-8.
+
+    The report carries non-ASCII (e.g. ``Δ`` in deltas); a plain ``write_text``
+    uses the platform default (cp1252 on Windows) and raises on it. Every report
+    write goes through here so the encoding is fixed in one place.
+    """
+    path = run_dir / "report.md"
+    path.write_text(report_md, encoding="utf-8")
+    return path
 
 
 @dataclass
@@ -278,6 +291,27 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     claims: list[Claim] = []
     rolled_back: list[str] = []
     rejected: list[str] = []
+
+    # Causal evidence is the same for every claim in this run (it summarizes the
+    # trace-level attribution), so build it once and reuse it for catalog and
+    # autoresearch claims alike.
+    causal_evidence = ", ".join(
+        f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
+    ) or "no strong causal signal"
+
+    def _claim(spec: Any, predicted_delta: float, measured_delta: float | None,
+               was_rolled_back: bool) -> Claim:
+        return Claim(
+            summary=spec.summary,
+            residual_invariant="kernel_time",
+            residual_value=0.0,
+            causal_evidence=causal_evidence,
+            intervention_name=spec.name,
+            predicted_delta=predicted_delta,
+            measured_delta=measured_delta,
+            rolled_back=was_rolled_back,
+        )
+
     for c in ranked:
         if c.rejected_reason is not None:
             rejected.append(f"{c.spec.name} ({c.rejected_reason})")
@@ -287,23 +321,49 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         result = apply_intervention(c.spec, DryRunApplicator())
         if result.rolled_back:
             rolled_back.append(c.spec.name)
-        claims.append(
-            Claim(
-                summary=c.spec.summary,
-                residual_invariant="kernel_time",
-                residual_value=0.0,
-                causal_evidence=", ".join(
-                    f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
-                )
-                or "no strong causal signal",
-                intervention_name=c.spec.name,
-                predicted_delta=c.predicted_delta,
-                measured_delta=result.measured_delta,
-                rolled_back=result.rolled_back,
-            )
-        )
+        claims.append(_claim(c.spec, c.predicted_delta, result.measured_delta, result.rolled_back))
         if time.time_ns() - started_ns >= int(budget_s * 1e9):
             break
+
+    # Phase 4b — agentic autoresearch. When budget remains, propose non-catalog
+    # levers within the attributed bottleneck class and route each through the
+    # SAME gate + rollback path as the catalog (see gitm.agents.autoresearch).
+    # It shares the applicator seam, so with no live engine its claims land
+    # unverified — a candidate source, never a bypass.
+    if time.time_ns() - started_ns < int(budget_s * 1e9):
+        ar_run = autoresearch(trace, applicator=DryRunApplicator(), policy=policy)
+    else:
+        # Budget spent on the catalog pass — skip the search, still report the
+        # class we would have searched.
+        ar_run = AutoresearchRun(bottleneck_class=classify_bottleneck(trace), results=[])
+    for r in ar_run.results:
+        if not r.applicable:
+            rejected.append(f"{r.spec.name} ({r.rejected_reason})")
+            continue
+        if r.rolled_back:
+            rolled_back.append(r.spec.name)
+        claims.append(_claim(r.spec, r.predicted_delta, r.measured_delta, r.rolled_back))
+    (run_dir / "autoresearch.json").write_text(
+        json.dumps(
+            {
+                "bottleneck_class": ar_run.bottleneck_class,
+                "results": [
+                    {
+                        "name": r.spec.name,
+                        "knob": r.spec.knob,
+                        "value": r.spec.value,
+                        "applicable": r.applicable,
+                        "rejected_reason": r.rejected_reason,
+                        "predicted_delta": r.predicted_delta,
+                        "measured_delta": r.measured_delta,
+                        "rolled_back": r.rolled_back,
+                    }
+                    for r in ar_run.results
+                ],
+            },
+            indent=2,
+        )
+    )
 
     # Phase 5 — stabilize + write report
     provenance = build_provenance(
@@ -321,7 +381,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         provenance=provenance,
         qualification_diagnostic=qual.diagnostic,
     )
-    (run_dir / "report.md").write_text(report_md)
+    _write_report(run_dir, report_md)
 
     summary = {
         "run_id": run_id,
@@ -334,6 +394,8 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         "n_claims": len(claims),
         "n_rolled_back": len(rolled_back),
         "n_rejected": len(rejected),
+        "bottleneck_class": ar_run.bottleneck_class,
+        "n_autoresearch": len(ar_run.results),
         "report_path": str(run_dir / "report.md"),
     }
     return {"summary": summary, "report_md": report_md, "run_dir": str(run_dir)}
@@ -391,7 +453,7 @@ def _measurement_result(
         ),
         summary=measurement_summary(workload, result),
     )
-    (run_dir / "report.md").write_text(report_md)
+    _write_report(run_dir, report_md)
 
     summary = {
         "run_id": run_id,
@@ -530,7 +592,7 @@ def _hft_intervention_result(
             f"{mres.serialized_fraction:.3f}."
         ),
     )
-    (run_dir / "report.md").write_text(report_md)
+    _write_report(run_dir, report_md)
 
     summary = {
         "run_id": run_id,
@@ -665,7 +727,7 @@ def _openfold_intervention_result(
             f"{mres.serialized_fraction:.3f}."
         ),
     )
-    (run_dir / "report.md").write_text(report_md)
+    _write_report(run_dir, report_md)
 
     summary = {
         "run_id": run_id,
@@ -800,7 +862,7 @@ def _edge_intervention_result(
             f"{mres.serialized_fraction:.3f}."
         ),
     )
-    (run_dir / "report.md").write_text(report_md)
+    _write_report(run_dir, report_md)
 
     summary = {
         "run_id": run_id,
@@ -848,7 +910,7 @@ def _no_data_result(
         qualification_diagnostic=diagnostic,
         summary="NO DATA — tracer captured no GPU kernels; nothing was measured.",
     )
-    (run_dir / "report.md").write_text(report_md)
+    _write_report(run_dir, report_md)
 
     summary = {
         "run_id": run_id,
