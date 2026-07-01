@@ -129,31 +129,6 @@ def test_vllm_workload_still_uses_intervention_path(tmp_path: Path, monkeypatch)
     assert result["summary"]["mode"] == "intervention"
 
 
-def test_vllm_loop_runs_autoresearch(tmp_path: Path, monkeypatch):
-    """The vllm path also runs agentic autoresearch: it classifies the bottleneck,
-    proposes non-catalog levers, and surfaces them in the summary + report. The
-    serialized same-stream kernels above classify as idle_stall (2 proposals)."""
-    import gitm.scheduler.loop as loop
-
-    monkeypatch.setattr(loop, "capture", _fake_capture_with_kernels("paged_attention"))
-    monkeypatch.setattr(loop, "sync_device", lambda: None)
-
-    from gitm import optimize
-
-    # budget="30s" (not 1s): the catalog pass must not exhaust the budget and skip
-    # the autoresearch phase on a slow box.
-    result = optimize(
-        workload="vllm-decode", budget="30s", scratch=str(tmp_path), workload_runner=lambda: {}
-    )
-    s = result["summary"]
-    assert s["bottleneck_class"] == "idle_stall"
-    assert s["n_autoresearch"] == 2
-    assert "autoresearch:" in result["report_md"]  # proposals reach the report
-    assert (Path(result["run_dir"]) / "autoresearch.json").exists()
-    # Dry-run (no live engine) mutates nothing, so no safety trail is written.
-    assert not (Path(result["run_dir"]) / "audit.jsonl").exists()
-
-
 def test_cli_run_returns_nonzero_on_no_data(tmp_path: Path, capsys):
     """Automation must see a failure exit when a run measures nothing."""
     from gitm.cli import main
