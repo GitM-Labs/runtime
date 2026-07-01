@@ -143,6 +143,12 @@ def test_openfold_loop_runs_intervention_with_applicator(tmp_path: Path, monkeyp
     for knob in ("max_num_batched_tokens", "gpu_memory_utilization", "max_num_seqs"):
         assert knob not in md
     assert (Path(result["run_dir"]) / "apply_result.json").exists()
+    # The live bf16 apply is recorded on the durable safety trail.
+    from gitm.safety import AuditLog
+
+    audit_path = Path(result["run_dir"]) / "audit.jsonl"
+    assert audit_path.exists()
+    assert "apply" in [e.event for e in AuditLog(audit_path).entries()]
 
 
 def test_openfold_loop_rolls_back_on_plddt_regression(tmp_path: Path, monkeypatch):
@@ -189,6 +195,11 @@ def test_openfold_loop_rolls_back_on_plddt_regression(tmp_path: Path, monkeypatc
     s = result["summary"]
     assert s["mode"] == "intervention"
     assert s["n_rolled_back"] == 1
+    # The trail shows the bf16 apply and its rollback, in order.
+    from gitm.safety import AuditLog
+
+    events = [e.event for e in AuditLog(Path(result["run_dir"]) / "audit.jsonl").entries()]
+    assert events == ["apply", "revert"]
 
 
 def test_openfold_factory_filters_by_len_and_msa(tmp_path: Path, monkeypatch):
