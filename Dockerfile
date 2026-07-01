@@ -20,10 +20,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Python 3.12 (matches the tested stack) + build toolchain for the CUPTI shim.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        software-properties-common ca-certificates git build-essential \
+    software-properties-common ca-certificates git build-essential \
     && add-apt-repository ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
-        python3.12 python3.12-dev python3.12-venv curl \
+    python3.12 python3.12-dev python3.12-venv curl \
     && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 \
     && rm -rf /var/lib/apt/lists/*
@@ -37,9 +37,9 @@ ARG CUDF_VERSION=24.10.01
 ARG CUPY_VERSION=13.3.0
 RUN python -m pip install --upgrade pip \
     && python -m pip install "torch==${TORCH_VERSION}" \
-         --index-url https://download.pytorch.org/whl/cu124 \
+    --index-url https://download.pytorch.org/whl/cu124 \
     && python -m pip install --extra-index-url=https://pypi.nvidia.com \
-         "cudf-cu12==${CUDF_VERSION}" "cupy-cuda12x==${CUPY_VERSION}"
+    "cudf-cu12==${CUDF_VERSION}" "cupy-cuda12x==${CUPY_VERSION}"
 
 # The package + its CPU deps, pinned via constraints.txt for reproducibility.
 COPY pyproject.toml constraints.txt README.md ./
@@ -55,5 +55,13 @@ RUN python -m gitm.tracer._cupti.build
 
 # Freeze the fully-resolved stack into the image for auditing / exact re-pin.
 RUN python -m pip freeze > /opt/gitm/requirements.lock
+
+# Sealed / least-privilege runtime: drop to an unprivileged user. No root at
+# run time, no driver replacement, no phone-home — the runtime only reads CUPTI
+# and emits telemetry in-cluster. Build steps above need root (apt/pip/nvcc);
+# everything from here runs as uid 10001.
+RUN useradd --create-home --uid 10001 gitm \
+    && chown -R gitm:gitm /opt/gitm
+USER gitm
 
 CMD ["./scripts/verify_infra.sh"]

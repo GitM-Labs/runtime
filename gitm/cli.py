@@ -45,7 +45,9 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="hft: stream the sharded dataset in batches (for data too big for one frame).",
     )
-    run.add_argument("--shards-per-batch", type=int, default=None, help="hft: shards per streamed batch.")
+    run.add_argument(
+        "--shards-per-batch", type=int, default=None, help="hft: shards per streamed batch."
+    )
     run.add_argument("--max-shards", type=int, default=None, help="hft: cap shards streamed.")
 
     replay = sub.add_parser("replay", help="Counterfactual replay of an intervention on a trace.")
@@ -65,6 +67,20 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Roll back if the measured delta is below this fraction.",
+    )
+
+    attach = sub.add_parser("attach", help="Attach to a running job (user-space, no root).")
+    attach.add_argument("--job", required=True, help="Job identifier to attach to.")
+    attach.add_argument(
+        "--workload", default=None, help="Optional workload hint, e.g. vllm-decode."
+    )
+    attach.add_argument(
+        "--pid", type=int, default=None, help="Explicit target PID (else resolved locally)."
+    )
+    attach.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan the attach without touching the live process.",
     )
 
     sub.add_parser("doctor", help="Probe environment, GPUs, and data locations.")
@@ -156,6 +172,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, indent=2))
         return 0
+
+    if args.cmd == "attach":
+        from gitm.deploy import attach_job
+
+        plan = attach_job(args.job, workload=args.workload, dry_run=args.dry_run, pid=args.pid)
+        print(json.dumps(plan, indent=2))
+        # no_target is an operator-actionable miss, not a crash — signal it.
+        return 0 if plan.get("status") in {"attached", "planned"} else 4
 
     if args.cmd == "doctor":
         from gitm.doctor import doctor
