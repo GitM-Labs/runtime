@@ -49,7 +49,7 @@ def test_intervention_library_loads_and_validates():
     assert len(specs) >= 2
     for spec in specs:
         assert spec.expected_delta_lo <= spec.expected_delta_mean <= spec.expected_delta_hi
-        assert spec.source.startswith(("http://", "https://"))
+        assert spec.source.startswith(("http://", "https://", "benchmarks/"))
 
 
 def test_qualification_returns_diagnostic_on_empty_trace():

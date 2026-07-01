@@ -342,3 +342,60 @@ interventions:
       requires_rollback_window_s: 300
       notes: Execution-backend swap with restart; validate end-to-end before keep.
     review: null
+
+  # unified non vLLM levels 
+  # catalog workloads levels, workload tagged load_library + the gate keep them scoped
+  # the measure delta still comes from each benchmarks A/B
+  - name: edge_fp16_autocast
+    summary: Run PointPillars/CenterPoint inference under fp16 autocast, gated on
+      detection-equivalence (count + sorted scores within tolerance).
+    knob: edge.inference_dtype
+    value: fp16
+    applies_to_kernels: [conv, pointpillars, centerpoint]
+    expected_delta_mean: 0.40
+    expected_delta_lo: 0.00
+    expected_delta_hi: 1.00
+    source: benchmarks/edge/optimize.py (detection-equivalence A/B)
+    applicability:
+      workloads: [edge, kitti, nuscenes]
+    safety:
+      tier: moderate
+      requires_rollback_window_s: 60
+      notes: fp16 can shift detections; keep only if detection-equivalent and faster.
+    review: null
+
+  - name: edge_frame_batching
+    summary: Run inference on batches of frames in one forward pass instead of one
+      frame at a time.
+    knob: edge.batch_size
+    value: 4
+    applies_to_kernels: [conv, pointpillars, centerpoint]
+    expected_delta_mean: 0.30
+    expected_delta_lo: 0.00
+    expected_delta_hi: 2.00
+    source: benchmarks/edge/optimize.py (detection-equivalence A/B)
+    applicability:
+      workloads: [edge, kitti, nuscenes]
+    safety:
+      tier: moderate
+      requires_rollback_window_s: 60
+      notes: Batching changes latency profile; gate on detection-equivalence.
+    review: null
+
+  - name: hft_top_of_book_fewer_scans
+    summary: Carry per-symbol top-of-book in 2 grouped scans instead of 4, gated on
+      byte-identical VWAP/microprice output.
+    knob: hft.top_of_book_grouped_scans
+    value: 2
+    applies_to_kernels: [cudf_groupby_scan, reduce, scan]
+    expected_delta_mean: 0.10
+    expected_delta_lo: 0.00
+    expected_delta_hi: 0.50
+    source: benchmarks/hft/optimize.py (byte-identical A/B)
+    applicability:
+      workloads: [hft, hft-lob]
+    safety:
+      tier: low_risk
+      requires_rollback_window_s: 30
+      notes: Pure reduction in scans; output must be byte-identical to keep.
+    review: null

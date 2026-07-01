@@ -18,6 +18,9 @@ class Applicability(BaseModel):
     requires_hardware: list[str] | None = None  # e.g. ["A100", "H100"]
     min_kv_cache_len: int | None = None
     max_kv_cache_len: int | None = None
+    min_gpus: int | None = None
+    requires_collective: bool = False
+    requires_interconnect: bool = False
     other: str | None = None  # free-form caveat
 
 
