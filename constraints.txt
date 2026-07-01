@@ -20,5 +20,5 @@ pyarrow==21.0.0
 pandas==2.3.2
 
 # dev
-pytest==7.4.4
+pytest==9.0.3
 ruff==0.12.11
