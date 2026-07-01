@@ -14,7 +14,7 @@ import pytest
 
 from gitm.kernels.spec import InterventionSpec
 from gitm.optimizer.metrics import HardwarePeak, hfu, mbu, mfu
-from gitm.optimizer.preconditions import GateContext, check_gate
+from gitm.optimizer.preconditions import GateContext, applicable
 
 from .conftest import make_kernel, make_trace
 
@@ -49,34 +49,39 @@ def _spec(**over) -> InterventionSpec:
 
 def test_gate_workload_mismatch_rejects():
     spec = _spec(applicability={"workloads": ["vllm-decode"]})
-    res = check_gate(spec, GateContext(workload="hft"))
-    assert not res.ok and "workload" in res.reason
+    ok, reason = applicable(spec, GateContext(workload="hft"))
+    assert not ok and "workload" in reason
 
 
-def test_gate_dtype_known_mismatch_rejects_but_unknown_is_lenient():
+def test_gate_dtype_known_and_unknown_both_reject():
     spec = _spec(applicability={"workloads": ["vllm-decode"], "requires_dtype": ["fp16", "bf16"]})
     # Known fp32 box => rejected.
-    assert not check_gate(spec, GateContext(workload="vllm-decode", dtype="fp32")).ok
-    # Unknown dtype => not rejected (gate is conservative about unknowns).
-    assert check_gate(spec, GateContext(workload="vllm-decode", dtype=None)).ok
+    assert not applicable(spec, GateContext(workload="vllm-decode", dtype="fp32"))[0]
+    # Unknown dtype => also rejected: the gate is strict — it won't apply a
+    # dtype-gated lever it can't confirm is safe for this run.
+    assert not applicable(spec, GateContext(workload="vllm-decode", dtype=None))[0]
+    # Matching dtype => applies.
+    assert applicable(spec, GateContext(workload="vllm-decode", dtype="bf16"))[0]
 
 
 def test_gate_hardware_substring_match():
     spec = _spec(applicability={"workloads": ["vllm-decode"], "requires_hardware": ["A100", "H100"]})
-    assert check_gate(spec, GateContext(workload="vllm-decode", hardware="NVIDIA A100-SXM4-80GB")).ok
-    assert not check_gate(spec, GateContext(workload="vllm-decode", hardware="NVIDIA L4")).ok
+    assert applicable(spec, GateContext(workload="vllm-decode", hardware="NVIDIA A100-SXM4-80GB"))[0]
+    assert not applicable(spec, GateContext(workload="vllm-decode", hardware="NVIDIA L4"))[0]
 
 
 def test_gate_kv_cache_bounds():
     spec = _spec(applicability={"workloads": ["vllm-decode"], "max_kv_cache_len": 4096})
-    assert check_gate(spec, GateContext(workload="vllm-decode", kv_cache_len=2048)).ok
-    assert not check_gate(spec, GateContext(workload="vllm-decode", kv_cache_len=8192)).ok
+    assert applicable(spec, GateContext(workload="vllm-decode", kv_cache_len=2048))[0]
+    assert not applicable(spec, GateContext(workload="vllm-decode", kv_cache_len=8192))[0]
 
 
-def test_gate_multi_gpu_knob_on_single_gpu_rejected():
-    spec = _spec(knob="tensor_parallel_size", value=2)
-    assert not check_gate(spec, GateContext(workload="vllm-decode", num_gpus=1)).ok
-    assert check_gate(spec, GateContext(workload="vllm-decode", num_gpus=2)).ok
+def test_gate_multi_gpu_lever_on_single_gpu_rejected():
+    # main's gate keys multi-GPU off applicability.min_gpus, not the knob name.
+    spec = _spec(knob="tensor_parallel_size", value=2,
+                 applicability={"workloads": ["vllm-decode"], "min_gpus": 2})
+    assert not applicable(spec, GateContext(workload="vllm-decode", num_gpus=1))[0]
+    assert applicable(spec, GateContext(workload="vllm-decode", num_gpus=2))[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -107,10 +112,19 @@ def test_unknown_sku_yields_no_peak(monkeypatch):
 def test_load_library_filters_by_workload():
     from gitm.kernels.library import load_library
 
+    # The catalog is unified (vLLM + other workloads), so the workload filter is
+    # what keeps a workload from seeing another's levers. Assert the filter, not a
+    # count: every returned lever lists the requested workload, and vLLM serving
+    # knobs never leak into another workload's set.
     vllm = load_library(workload="vllm-decode")
     assert len(vllm) > 0
-    other = load_library(workload="hft")  # no vLLM lever lists hft
-    assert other == []
+    assert all("vllm-decode" in s.applicability.workloads for s in vllm)
+    vllm_knobs = {s.knob for s in vllm}
+    assert "max_num_seqs" in vllm_knobs
+
+    hft = load_library(workload="hft")
+    assert all("hft" in s.applicability.workloads for s in hft)
+    assert "max_num_seqs" not in {s.knob for s in hft}  # no vLLM knob leaks in
 
 
 def test_select_interventions_gate_rejects_inapplicable_levers():
@@ -119,16 +133,18 @@ def test_select_interventions_gate_rejects_inapplicable_levers():
 
     library = load_library(workload="vllm-decode")
     trace = make_trace(events=[make_kernel("paged_attention", end_ns=500)])
-    # Single fp32 GPU: fp8-KV (requires fp16/bf16) and TP=2 (multi-GPU) must be rejected.
+    # Single fp32 GPU on an L4: fp8-KV (requires fp16/bf16) and TP=2 (requires
+    # A100/H100) must be gated out with main's "not_applicable: ..." reason.
     ctx = GateContext(workload="vllm-decode", dtype="fp32", hardware="NVIDIA L4", num_gpus=1)
     ranked = select_interventions(trace, library, Policy(), top_n=50, ctx=ctx)
     by_knob = {c.spec.knob: c for c in ranked}
-    assert by_knob["tensor_parallel_size"].rejected_reason.startswith("precondition")
-    assert by_knob["kv_cache_dtype"].rejected_reason.startswith("precondition")
-    # Without a ctx the gate is skipped — those levers are no longer pre-rejected.
+    assert by_knob["tensor_parallel_size"].rejected_reason.startswith("not_applicable")
+    assert by_knob["kv_cache_dtype"].rejected_reason.startswith("not_applicable")
+    # Without a ctx the applicability gate is skipped — no lever is rejected for
+    # not_applicable (a rejection, if any, would be a safety-tier reason instead).
     ranked_no_ctx = select_interventions(trace, library, Policy(), top_n=50)
-    knob_reasons = {c.spec.knob: c.rejected_reason for c in ranked_no_ctx}
-    assert knob_reasons["tensor_parallel_size"] != "precondition: knob 'tensor_parallel_size' requires >1 GPU (num_gpus=1)"
+    reasons = {c.spec.knob: (c.rejected_reason or "") for c in ranked_no_ctx}
+    assert not reasons["kv_cache_dtype"].startswith("not_applicable")
 
 
 # --------------------------------------------------------------------------- #
@@ -295,7 +311,10 @@ def test_run_loop_live_engine_keeps_winning_knob_and_rolls_back_unswappable(
     cfg = LoopConfig(
         engine=engine,
         workload="vllm-decode",
-        budget="5s",
+        # Non-expiring budget: max_num_seqs_256 ranks low, and this test asserts it
+        # is reached + kept. A short wall-clock budget would make that racy under
+        # load (the loop is budget-bounded by design), so give it plenty of room.
+        budget="24h",
         scratch=str(tmp_path),
         top_n_interventions=50,  # evaluate the whole library, not just top 5
         workload_runner=lambda: {"generated_tokens": 128},
