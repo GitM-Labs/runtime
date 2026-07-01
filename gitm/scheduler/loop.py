@@ -27,7 +27,7 @@ from gitm.optimizer.monitor import check_invariants, residuals
 from gitm.optimizer.qualification import qualify
 from gitm.optimizer.report import Claim, build_provenance, write_report
 from gitm.planner.graph import predict_graph
-from gitm.safety.audit import AuditLog
+from gitm.safety.audit import AuditLog, _write_report
 from gitm.tracer.capture import capture
 from gitm.workloads import WorkloadRunner, get_factory, sync_device
 
@@ -60,18 +60,6 @@ def _parse_budget_s(budget: str) -> float:
         raise ValueError(f"unparseable budget: {budget!r} (use 24h, 90m, 3600s, 1d)")
     value, unit = float(m.group(1)), m.group(2)
     return value * {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}[unit]
-
-
-def _write_report(run_dir: Path, report_md: str) -> Path:
-    """Write the run report as UTF-8.
-
-    The report carries non-ASCII (e.g. ``Δ`` in deltas); a plain ``write_text``
-    uses the platform default (cp1252 on Windows) and raises on it. Every report
-    write goes through here so the encoding is fixed in one place.
-    """
-    path = run_dir / "report.md"
-    path.write_text(report_md, encoding="utf-8")
-    return path
 
 
 @dataclass

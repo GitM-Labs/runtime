@@ -72,3 +72,15 @@ class AuditLog:
             if line:
                 out.append(AuditEvent(**json.loads(line)))
         return out
+
+
+def _write_report(run_dir: Path, report_md: str) -> Path:
+    """Write the run report to ``run_dir/report.md`` as UTF-8.
+
+    The report carries non-ASCII (e.g. ``Δ`` in deltas); a plain ``write_text``
+    uses the platform default (cp1252 on Windows) and raises on it. Every report
+    write goes through here so the encoding is fixed in one place.
+    """
+    path = run_dir / "report.md"
+    path.write_text(report_md, encoding="utf-8")
+    return path
