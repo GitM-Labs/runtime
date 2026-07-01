@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+
 from gitm.optimizer.metrics import HardwarePeak, compute_metrics
 from gitm.tracer.schema import KernelEvent, MemcpyEvent, Trace
 
@@ -10,7 +11,7 @@ US = 1000 # ns per microsecond
 PEAK = HardwarePeak(name="TEST", peak_flops=1e14, peak_bw_bytes_s=1e10)
 
 
-def _trace() -> Trace: 
+def _trace() -> Trace:
     # Two 50us kernels, non-overlapping; one 1MB memcpy; 200us wall.
 
     return Trace(

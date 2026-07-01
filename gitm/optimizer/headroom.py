@@ -15,6 +15,7 @@ metrics → one report-ready object.
 """
 
 from __future__ import annotations
+
 from dataclasses import asdict, dataclass, field
 
 from gitm.optimizer.metrics import MetricsResult
