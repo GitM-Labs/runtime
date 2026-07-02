@@ -121,5 +121,4 @@ so the trail stays free of no-op entries.
 In the loop (`gitm/scheduler/loop.py`) the real-apply workload paths
 (hft / openfold / edge) pass an `AuditLog(run_dir / "audit.jsonl")`, so a live A/B
 apply and any rollback land on a durable per-run trail. The `vllm-decode` catalog
-and autoresearch paths run dry (no live engine), so they write no trail. See
-[autoresearch.md](autoresearch.md).
+path runs dry (no live engine), so it writes no trail.
