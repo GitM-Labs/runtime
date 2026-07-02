@@ -23,11 +23,14 @@ import copy
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import yaml
 
 from gitm.kernels.spec import InterventionSpec
+
+if TYPE_CHECKING:
+    from gitm.safety.audit import AuditLog
 
 #: A measurement callback: returns the signed fractional delta after an apply
 #: (``+0.08`` = 8% faster), or ``None`` if no measurement was taken (apply-only).
@@ -56,12 +59,18 @@ def apply_intervention(
     applicator: Applicator,
     *,
     min_keep_delta: float = 0.0,
+    audit: AuditLog | None = None,
 ) -> ApplyResult:
     """Apply ``spec`` through ``applicator`` behind a rollback gate.
 
     ``min_keep_delta`` is the regression threshold: a measured delta below it
     (e.g. a slowdown) is rolled back. With no measurement (``measure`` returns
     ``None``) the change is kept — apply-only mode.
+
+    When an ``audit`` log is supplied, every live mutation and every rollback is
+    recorded to the durable safety trail (best-effort — a broken audit sink never
+    blocks the apply). Pass one only where the applicator mutates a real target;
+    a dry-run leaves it ``None`` so the trail stays free of no-op entries.
     """
     snapshot = applicator.snapshot()
 
@@ -70,25 +79,42 @@ def apply_intervention(
         applicator.apply(spec)
     except Exception as exc:
         applicator.restore(snapshot)
+        _audit(audit, "revert", spec, cause=f"apply failed, restored: {exc}")
         return ApplyResult(False, rolled_back=True, measured_delta=None,
                            error=f"apply failed, restored: {exc}")
+    _audit(audit, "apply", spec, cause="applied live", knob=spec.knob, value=spec.value)
 
     # Step 3: measure. A crash mid-measurement also rolls back.
     try:
         delta = applicator.measure(spec)
     except Exception as exc:
         applicator.restore(snapshot)
+        _audit(audit, "revert", spec, cause=f"measure failed, restored: {exc}")
         return ApplyResult(False, rolled_back=True, measured_delta=None,
                            error=f"measure failed, restored: {exc}")
 
     # Step 4: keep-or-rollback on the regression threshold.
     if delta is not None and delta < min_keep_delta:
         applicator.restore(snapshot)
+        _audit(audit, "revert", spec,
+               cause=f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}")
         return ApplyResult(True, rolled_back=True, measured_delta=delta,
                            error=f"regression {delta:+.3f} < keep threshold "
                                  f"{min_keep_delta:+.3f}, restored")
 
     return ApplyResult(True, rolled_back=False, measured_delta=delta)
+
+
+def _audit(
+    audit: AuditLog | None, event: str, spec: InterventionSpec, *, cause: str, **detail: Any
+) -> None:
+    """Record one apply/revert to the safety trail — best-effort, never raises."""
+    if audit is None:
+        return
+    try:
+        audit.record(event, spec.name, cause, **detail)
+    except Exception:
+        pass
 
 
 # --- reference applicators ---------------------------------------------------

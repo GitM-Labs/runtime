@@ -27,6 +27,7 @@ from gitm.optimizer.monitor import check_invariants, residuals
 from gitm.optimizer.qualification import qualify
 from gitm.optimizer.report import Claim, build_provenance, write_report
 from gitm.planner.graph import predict_graph
+from gitm.safety.audit import AuditLog, _write_report
 from gitm.tracer.capture import capture
 from gitm.workloads import WorkloadRunner, get_factory, sync_device
 
@@ -321,7 +322,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         provenance=provenance,
         qualification_diagnostic=qual.diagnostic,
     )
-    (run_dir / "report.md").write_text(report_md)
+    _write_report(run_dir, report_md)
 
     summary = {
         "run_id": run_id,
@@ -391,7 +392,7 @@ def _measurement_result(
         ),
         summary=measurement_summary(workload, result),
     )
-    (run_dir / "report.md").write_text(report_md)
+    _write_report(run_dir, report_md)
 
     summary = {
         "run_id": run_id,
@@ -451,7 +452,9 @@ def _hft_intervention_result(
     # Apply behind the rollback gate — measure() runs the verified baseline-vs-
     # candidate A/B and returns the signed speedup (raises → rollback if output
     # diverges; negative delta → rollback if slower).
-    apply_res = apply_intervention(spec, applicator, min_keep_delta=0.0)
+    apply_res = apply_intervention(
+        spec, applicator, min_keep_delta=0.0, audit=AuditLog(run_dir / "audit.jsonl")
+    )
     ab = applicator.last_result
 
     # Prove: one claim carrying the measured delta, gated on identical output.
@@ -530,7 +533,7 @@ def _hft_intervention_result(
             f"{mres.serialized_fraction:.3f}."
         ),
     )
-    (run_dir / "report.md").write_text(report_md)
+    _write_report(run_dir, report_md)
 
     summary = {
         "run_id": run_id,
@@ -584,7 +587,9 @@ def _openfold_intervention_result(
         )
     )
 
-    apply_res = apply_intervention(spec, applicator, min_keep_delta=0.0)
+    apply_res = apply_intervention(
+        spec, applicator, min_keep_delta=0.0, audit=AuditLog(run_dir / "audit.jsonl")
+    )
     ab = applicator.last_result  # AF2ABResult
 
     top = mres.top_hypotheses
@@ -665,7 +670,7 @@ def _openfold_intervention_result(
             f"{mres.serialized_fraction:.3f}."
         ),
     )
-    (run_dir / "report.md").write_text(report_md)
+    _write_report(run_dir, report_md)
 
     summary = {
         "run_id": run_id,
@@ -721,7 +726,9 @@ def _edge_intervention_result(
         )
     )
 
-    apply_res = apply_intervention(spec, applicator, min_keep_delta=0.0)
+    apply_res = apply_intervention(
+        spec, applicator, min_keep_delta=0.0, audit=AuditLog(run_dir / "audit.jsonl")
+    )
     ab = applicator.last_result  # EdgeABResult
 
     top = mres.top_hypotheses
@@ -800,7 +807,7 @@ def _edge_intervention_result(
             f"{mres.serialized_fraction:.3f}."
         ),
     )
-    (run_dir / "report.md").write_text(report_md)
+    _write_report(run_dir, report_md)
 
     summary = {
         "run_id": run_id,
@@ -848,7 +855,7 @@ def _no_data_result(
         qualification_diagnostic=diagnostic,
         summary="NO DATA — tracer captured no GPU kernels; nothing was measured.",
     )
-    (run_dir / "report.md").write_text(report_md)
+    _write_report(run_dir, report_md)
 
     summary = {
         "run_id": run_id,

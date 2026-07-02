@@ -90,6 +90,39 @@ def test_rollback_on_regression():
     assert cfg == {"block_size": 8}  # restored
 
 
+# --- safety audit trail on the apply seam -----------------------------------
+
+
+def test_apply_audits_kept_change(tmp_path):
+    from gitm.safety import AuditLog
+
+    log = AuditLog(tmp_path / "audit.jsonl")
+    cfg = {"block_size": 8}
+    apply_intervention(_spec(), DictApplicator(cfg, measure_fn=lambda s: +0.08), audit=log)
+
+    events = [e.event for e in log.entries()]
+    assert events == ["apply"]  # kept -> one apply, no revert
+    assert log.entries()[0].detail == {"knob": "block_size", "value": 16}
+
+
+def test_apply_audits_apply_then_revert_on_regression(tmp_path):
+    from gitm.safety import AuditLog
+
+    log = AuditLog(tmp_path / "audit.jsonl")
+    cfg = {"block_size": 8}
+    apply_intervention(_spec(), DictApplicator(cfg, measure_fn=lambda s: -0.05), audit=log)
+
+    # A regressing change is applied then reverted — both must be on the trail.
+    assert [e.event for e in log.entries()] == ["apply", "revert"]
+
+
+def test_apply_without_audit_writes_nothing(tmp_path):
+    """No audit arg -> no trail (dry-run/no-op applies stay off the record)."""
+    log_path = tmp_path / "audit.jsonl"
+    apply_intervention(_spec(), DictApplicator({"block_size": 8}, measure_fn=lambda s: +0.1))
+    assert not log_path.exists()
+
+
 # --- config-file applicator + CLI helper ------------------------------------
 
 
