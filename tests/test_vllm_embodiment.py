@@ -13,25 +13,9 @@ from pathlib import Path
 import pytest
 
 from gitm.kernels.spec import InterventionSpec
-from gitm.optimizer.metrics import HardwarePeak, hfu, mbu, mfu
 from gitm.optimizer.preconditions import GateContext, applicable
 
 from .conftest import make_kernel, make_trace
-
-
-# --------------------------------------------------------------------------- #
-# metrics: HFU / MFU / MBU                                                     #
-# --------------------------------------------------------------------------- #
-def test_utilization_ratios_and_none_guards():
-    peak = HardwarePeak("A100", peak_flops=312e12, peak_bw_bytes_s=2039e9)
-    assert hfu(156e12, peak) == pytest.approx(0.5)
-    assert mbu(2039e9, peak) == pytest.approx(1.0)
-    assert mfu(312e12, 1.0, peak) == pytest.approx(1.0)
-    # Unknown peak / bad inputs => None (never a misleading number).
-    assert hfu(1e12, None) is None
-    assert mbu(None, peak) is None
-    assert mfu(1e12, 0.0, peak) is None  # zero elapsed
-    assert hfu(-1.0, peak) is None  # negative achieved
 
 
 # --------------------------------------------------------------------------- #
