@@ -9,26 +9,37 @@ partial run is still useful; the durable copy is synced to S3 afterwards.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from gitm._paths import runs_dir, traces_dir
 from gitm.agents.policy import Policy, select_interventions
 from gitm.kernels.library import load_library
-from gitm.optimizer.apply import DryRunApplicator, apply_intervention
+from gitm.optimizer.apply import (
+    Applicator,
+    DryRunApplicator,
+    LiveEngineApplicator,
+    apply_intervention,
+)
 from gitm.optimizer.attribution import attribute
+from gitm.optimizer.deviation import deviation_summary, deviation_trace, write_deviation_jsonl
 from gitm.optimizer.dr import attribute_dr
 from gitm.optimizer.measure import measure_trace, measurement_claims, measurement_summary
 from gitm.optimizer.monitor import check_invariants, residuals
 from gitm.optimizer.qualification import qualify
 from gitm.optimizer.report import Claim, build_provenance, write_report
+from gitm.optimizer.scheduler_attribution import scheduler_causes
+from gitm.optimizer.vllm_knobs import knob_kind
+from gitm.planner.context import build_planner_context
 from gitm.planner.graph import predict_graph
 from gitm.safety.audit import AuditLog, _write_report
 from gitm.tracer.capture import capture
+from gitm.tracer.vllm_stats import sample_scheduler_stats
 from gitm.workloads import WorkloadRunner, get_factory, sync_device
 
 _BUDGET_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd])\s*$")
@@ -60,6 +71,62 @@ def _parse_budget_s(budget: str) -> float:
         raise ValueError(f"unparseable budget: {budget!r} (use 24h, 90m, 3600s, 1d)")
     value, unit = float(m.group(1)), m.group(2)
     return value * {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}[unit]
+
+def _engine_throughput_fn(engine: Any, runner: Any) -> Any:
+    """Resolve a decode-throughput probe for the live A/B.
+
+    Prefers an explicit ``engine.gitm_throughput_fn`` (the engine owns what "a
+    decode" means); otherwise times the workload ``runner`` and divides generated
+    tokens by elapsed seconds. Re-running the runner re-runs the decode under the
+    engine's current config, so an in-place hot-swap is reflected in the measurement.
+
+    Contract: this default probe re-runs the (potentially expensive) full workload
+    and is bound to the *original* engine, so it is only valid for in-place
+    hot-swap A/Bs. A deployment that supplies ``gitm_restart_fn`` (structural-knob
+    restart-apply, which swaps in a *new* engine) MUST also supply an engine-aware
+    ``gitm_throughput_fn`` — the default cannot measure the restarted engine.
+    """
+    explicit = getattr(engine, "gitm_throughput_fn", None)
+    if callable(explicit):
+        return explicit
+
+    def _tps(_engine: Any) -> float:
+        t0 = time.perf_counter()
+        out = runner() if runner is not None else {}
+        dt = max(time.perf_counter() - t0, 1e-9)
+        # First key that is actually present wins — `or` would treat a legitimate
+        # 0 (a window that produced no tokens) as missing and fabricate a count.
+        toks: float = 1.0
+        if isinstance(out, dict):
+            for key in ("generated_tokens", "decode_steps", "events"):
+                if out.get(key) is not None:
+                    toks = float(out[key])
+                    break
+        return toks / dt
+
+    return _tps
+
+
+def _scheduler_note(s: Any) -> str | None:
+    """One-line scheduler-stats sentence for the report, or None if no samples.
+
+    ``s`` is a :class:`gitm.tracer.vllm_stats.SchedulerStatsSummary`; read
+    duck-typed so an empty/absent summary degrades to no note rather than a crash.
+    """
+    if s is None or getattr(s, "n_samples", 0) == 0:
+        return None
+    parts: list[str] = []
+    if s.peak_queue_depth is not None:
+        parts.append(f"peak queue depth {s.peak_queue_depth}")
+    if s.mean_batch_occupancy is not None:
+        parts.append(f"mean batch occupancy {s.mean_batch_occupancy:.0%}")
+    if s.total_preemptions is not None:
+        parts.append(f"{s.total_preemptions} preemption(s)")
+    if s.peak_gpu_cache_usage is not None:
+        parts.append(f"peak KV-cache {s.peak_gpu_cache_usage:.0%}")
+    if not parts:
+        return None
+    return "Engine scheduler: " + ", ".join(parts) + f" (over {s.n_samples} samples)."
 
 
 @dataclass
@@ -103,13 +170,32 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         else:
             runner_error = f"no workload runner registered for {workload!r}"
 
-    with capture(trace_path, workload_id=workload, run_id=run_id) as trace:
+    # Sample the engine scheduler (queue depth, batch occupancy, preemptions)
+    # over the same window as the CUPTI capture — engine-level telemetry the GPU
+    # trace can't see. A no-op when no engine is attached (empty series).
+    with (
+        capture(trace_path, workload_id=workload, run_id=run_id) as trace,
+        sample_scheduler_stats(cfg.engine) as sched_stats,
+    ):
         if runner is not None:
             try:
                 runner()
                 sync_device()  # ensure all kernels land in the trace before stop
             except Exception as exc:
                 runner_error = f"workload run failed: {exc}"
+
+    # Persist the scheduler series + summary when an engine actually produced one.
+    # Turn the summary into ranked causal hypotheses (feeds attribution / claim
+    # evidence below) — empty when no engine produced samples.
+    sched_summary = sched_stats.summary()
+    sched_causes = scheduler_causes(sched_summary)
+    if sched_stats.samples:
+        (run_dir / "scheduler_stats.json").write_text(
+            json.dumps(
+                {"summary": asdict(sched_summary), "samples": sched_stats.to_records()},
+                indent=2,
+            )
+        )
 
     qual = qualify(trace, target_floor=cfg.target)
     (run_dir / "qualification.json").write_text(
@@ -252,15 +338,35 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                      "notes": h.notes}
                     for h in dr_hypotheses.top(5)
                 ],
+                # Engine-scheduler causes (from the vLLM stats adapter) ranked
+                # alongside the kernel-level hypotheses (the engine-signal causal link).
+                "scheduler_causes": [
+                    {"signal": c.signal, "effect": c.effect, "severity": c.severity,
+                     "note": c.note, "motivates_knobs": c.motivates_knobs}
+                    for c in sched_causes
+                ],
             },
             indent=2,
         )
     )
 
+    # Deviation-only tracing: record only the kernels that *departed* from the
+    # predicted graph — trace storage scales with deviation, not duration. We
+    # always write the compact summary (n_kept, reduction, which ops departed);
+    # the full reduced JSONL is written only under GITM_DEVIATION_ONLY=1 (it is
+    # the storage-saving artifact, off by default while capture-time integration
+    # is still on the roadmap).
+    (run_dir / "deviations.json").write_text(
+        json.dumps(deviation_summary(trace, graph), indent=2)
+    )
+    if os.environ.get("GITM_DEVIATION_ONLY") == "1":
+        write_deviation_jsonl(deviation_trace(trace, graph), run_dir / "deviation_trace.jsonl")
+
     # Phase 3 — library + counterfactual replay ranking
-    library = load_library()
+    pctx = build_planner_context(cfg.engine, workload = workload)
+    library = load_library(workload = workload)
     policy = Policy(require_qualification_commit=qual.commit, skip_high_risk=not qual.commit)
-    ranked = select_interventions(trace, library, policy, top_n=cfg.top_n_interventions)
+    ranked = select_interventions(trace, library, policy, top_n=cfg.top_n_interventions, ctx=pctx.gate)
     (run_dir / "ranked_candidates.json").write_text(
         json.dumps(
             [
@@ -275,7 +381,25 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         )
     )
 
-    # Phase 4 — apply with rollback gates
+    # Phase 4 — apply with rollback gates.
+    # With a live engine attached, each candidate runs the rollback-gated decode-
+    # throughput A/B (LiveEngineApplicator): snapshot baseline tps → hot-swap the
+    # knob → measure candidate tps → keep only on a non-negative delta, else
+    # restore. Scheduling knobs are hot-swapped; structural knobs are routed
+    # through ``engine.gitm_restart_fn`` (if the deployment provides one) or
+    # rolled back rather than silently no-op'd. With no engine it's predict-only
+    # (DryRunApplicator): candidates land in the report as unverified
+    # (measured_delta=None), never claimed as won.
+    live_restart_fn = getattr(cfg.engine, "gitm_restart_fn", None) if cfg.engine else None
+    if cfg.engine is not None:
+        applicator: Applicator = LiveEngineApplicator(
+            cfg.engine,
+            throughput_fn=_engine_throughput_fn(cfg.engine, runner),
+            restart_fn=live_restart_fn,
+        )
+    else:
+        applicator = DryRunApplicator()
+
     claims: list[Claim] = []
     rolled_back: list[str] = []
     rejected: list[str] = []
@@ -283,20 +407,42 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         if c.rejected_reason is not None:
             rejected.append(f"{c.spec.name} ({c.rejected_reason})")
             continue
-        # No live engine attached -> predict-only, unverified claims.
-        # A live run passes an engine applicator here.
-        result = apply_intervention(c.spec, DryRunApplicator())
+        # Live + structural knob + no restart hook → it *cannot* be enacted on the
+        # running engine, so it's "not evaluable here", not a regression. Mark it
+        # rejected (honest) instead of attempting an apply that would roll back and
+        # read as "tried and lost" — and skip the wasted baseline benchmark.
+        if cfg.engine is not None and live_restart_fn is None and knob_kind(c.spec.knob) == "structural":
+            rejected.append(f"{c.spec.name} (structural knob: needs engine restart, no restart_fn)")
+            continue
+        result = apply_intervention(c.spec, applicator, min_keep_delta=0.0)
+        ab = getattr(applicator, "last_result", None)
         if result.rolled_back:
             rolled_back.append(c.spec.name)
+        # Causal evidence: the measured A/B verdict when live, else the Granger
+        # signal that motivated the candidate. The kept/rolled-back wording comes
+        # from the authoritative ApplyResult (the real gate decision), not from
+        # EngineABResult.kept (a measure-time delta>=0 indicator).
+        if ab is not None:
+            outcome = "rolled back" if result.rolled_back else "kept"
+            causal_evidence = (
+                f"live A/B: {outcome} ({ab.speedup - 1.0:+.1%} decode throughput, via {ab.via}); "
+                f"baseline {ab.baseline_tps:.1f} → candidate {ab.candidate_tps:.1f} tok/s"
+            )
+        else:
+            causal_evidence = ", ".join(
+                f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
+            ) or "no strong causal signal"
+        # Attach the top scheduler cause that argues for *this* knob — the
+        # engine-level signal (C) tied to the specific lever it motivates (B).
+        motivating = next((sc for sc in sched_causes if c.spec.knob in sc.motivates_knobs), None)
+        if motivating is not None:
+            causal_evidence += f"; scheduler[{motivating.signal}]: {motivating.note}"
         claims.append(
             Claim(
                 summary=c.spec.summary,
                 residual_invariant="kernel_time",
                 residual_value=0.0,
-                causal_evidence=", ".join(
-                    f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
-                )
-                or "no strong causal signal",
+                causal_evidence=causal_evidence,
                 intervention_name=c.spec.name,
                 predicted_delta=c.predicted_delta,
                 measured_delta=result.measured_delta,
@@ -317,10 +463,17 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     provenance.rejected_candidates = rejected
     provenance.rolled_back = rolled_back
 
+    sched_note = _scheduler_note(sched_summary)
     report_md = write_report(
         claims=claims,
         provenance=provenance,
         qualification_diagnostic=qual.diagnostic,
+        summary=(
+            f"vLLM decode on {pctx.sku or 'unknown SKU'}: {len(claims)} candidate(s) "
+            f"evaluated, {len(rolled_back)} rolled back. {sched_note}"
+            if sched_note
+            else None
+        ),
     )
     _write_report(run_dir, report_md)
 
@@ -335,6 +488,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         "n_claims": len(claims),
         "n_rolled_back": len(rolled_back),
         "n_rejected": len(rejected),
+        "scheduler_stats": asdict(sched_summary) if sched_stats.samples else None,
         "report_path": str(run_dir / "report.md"),
     }
     return {"summary": summary, "report_md": report_md, "run_dir": str(run_dir)}

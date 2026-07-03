@@ -532,6 +532,67 @@ def _openfold_factory(cfg: LoopConfig) -> WorkloadRunner:
     )
     return run
 
+@register("vllm-decode")
+def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
+    """Launch a vLLM decode job inside the tracer capture window.
+
+    The heavy engine build (weight load, CUDA graph capture) happens here in the
+    factory, outside the capture window. The returned runner only issues the
+    decode ``llm.generate``, so the trace is the decode compute, not the model load.
+
+    Reads its config from the environment:
+        GITM_VLLM_MODEL       HF model id (default facebook/opt-125m)
+        GITM_VLLM_PROMPTS     number of prompts to decode (default 64)
+        GITM_VLLM_MAX_TOKENS  tokens to generate per prompt (default 128)
+        GITM_VLLM_SYNTHETIC   "1" -> CPU-only decode stand-in instead of vLLM
+                              (exercises the wire/registry path with no GPU or
+                              vLLM; produces no GPU kernels)
+
+    On a box without vLLM/GPU the import raises; ``run_loop`` catches it and the
+    empty-trace guard reports "no-data" rather than fabricating a result.
+    """
+    model = os.environ.get("GITM_VLLM_MODEL", "facebook/opt-125m")
+    n_prompts = int(os.environ.get("GITM_VLLM_PROMPTS", "64"))
+    max_tokens = int(os.environ.get("GITM_VLLM_MAX_TOKENS", "128"))
+
+    if os.environ.get("GITM_VLLM_SYNTHETIC") == "1":
+        return _vllm_synthetic_runner(n_prompts, max_tokens)
+
+    from vllm import LLM, SamplingParams
+
+    llm = LLM(model=model)
+    prompts = [f"Benchmark decode prompt {i}." for i in range(n_prompts)]
+    params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
+
+    def run() -> dict[str, Any]:
+        outputs = llm.generate(prompts, params)
+        produced = sum(len(o.outputs[0].token_ids) for o in outputs)
+        sync_device()
+        return {"prompts": len(prompts), "generated_tokens": produced, "model": model}
+    return run
+
+def _vllm_synthetic_runner(n_prompts: int, max_tokens: int) -> WorkloadRunner:
+    """A CPU-only stand-in for the decode loop (no vLLM, no GPU).
+
+    Exercises the registry → runner → capture path so the end-to-end wire can be
+    tested without GPU hardware. It does real CPU work (small matmuls per "token")
+    so the runner isn't an instant no-op, but emits no GPU kernels — the loop's
+    empty-trace guard then reports no-data, which is the honest outcome here.
+    """
+    import numpy as np
+
+    def run() -> dict[str, Any]:
+        steps = 0
+        a = np.ones((32, 32), dtype=np.float32)
+        for _ in range(max_tokens):
+            # A real (small) matmul per "token" so the runner isn't an instant
+            # no-op; the product is discarded — we only want CPU cycles, and `a`
+            # stays bounded (all-ones) rather than overflowing across iterations.
+            _ = a @ a
+            steps += 1
+        return {"prompts": n_prompts, "decode_steps": steps, "synthetic": True}
+
+    return run
 
 def sync_device() -> None:
     """Block until queued GPU work completes, so all kernels land in the trace
