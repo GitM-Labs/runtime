@@ -5,8 +5,9 @@ weights, or data access. For each run it answers three things:
 
 ceiling distance — the recoverable fraction between observed wall time and
   the predicted roofline floor (0 = already at the floor);
-gap by stall class — that recoverable fraction split across idle/stall,
-  memory-bound, and compute-bound, from the metrics module;
+gap by stall class — that recoverable fraction split across the idle causes
+  (sync-wait, transfer-bound, launch-latency, idle) plus memory-bound and
+  compute-bound, from the metrics module;
 already-optimized flag — set when the distance is within a small threshold,
   so we never bill for headroom that isn't there.
 
@@ -56,16 +57,17 @@ def build_headroom(
         ceiling_distance = 0.0
     already_optimized = ceiling_distance < optimized_threshold
 
-    # Split the recoverable distance across stall classes. Idle is the GPU-idle
-    # fraction; the busy remainder is attributed memory- vs compute-bound by which
-    # utilization dominates (MBU vs HFU). Shares scale to the ceiling distance.
-    idle = metrics.stall_fraction
+    # Split the recoverable distance across stall classes. The idle side comes
+    # straight from the metrics stall breakdown (sync_wait/transfer_bound/
+    # launch_latency/idle, which sum to stall_fraction); the busy remainder is
+    # attributed memory- vs compute-bound by which utilization dominates (MBU vs
+    # HFU). Shares scale to the ceiling distance.
     hfu = metrics.hfu or 0.0
     denom = metrics.mbu + hfu
     mem_share = (metrics.mbu / denom) if denom > 0 else 0.5
-    busy = max(0.0, 1.0 - idle)
+    busy = max(0.0, 1.0 - metrics.stall_fraction)
     shares = {
-        "idle_stall": idle,
+        **metrics.stall_breakdown,
         "memory_bound": busy * mem_share,
         "compute_bound": busy * (1.0 - mem_share),
     }
