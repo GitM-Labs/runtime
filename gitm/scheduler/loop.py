@@ -142,6 +142,55 @@ class LoopConfig:
     workload_runner: WorkloadRunner | None = None
 
 
+def _model_spec_from_engine(engine: Any):
+    """Build a ``ModelSpec`` from a live vLLM engine's HF config, or ``None``.
+
+    ``predict_graph()`` with no model defaults to Llama-2-7B (32 layers). A run
+    of a *different* model (e.g. opt-125m, 12 layers) is then scored against the
+    wrong predicted graph, which makes residuals and deviation meaningless. When
+    the loop has the live engine, read the real architecture off its HF config so
+    the predicted graph matches the model that actually ran. Duck-typed across
+    vLLM version drift; any failure returns ``None`` and the caller falls back to
+    the default graph rather than crashing.
+    """
+    if engine is None:
+        return None
+    hf: Any = None
+    for path in (
+        "llm_engine.model_config.hf_config",
+        "llm_engine.vllm_config.model_config.hf_config",
+        "model_config.hf_config",
+    ):
+        obj: Any = engine
+        for attr in path.split("."):
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if obj is not None:
+            hf = obj
+            break
+    if hf is None:
+        return None
+    try:
+        from gitm.planner.roofline import ModelSpec
+
+        hidden = int(hf.hidden_size)
+        n_heads = int(hf.num_attention_heads)
+        n_kv = int(getattr(hf, "num_key_value_heads", n_heads) or n_heads)
+        head_dim = int(getattr(hf, "head_dim", 0) or (hidden // n_heads))
+        return ModelSpec(
+            hidden=hidden,
+            n_layers=int(hf.num_hidden_layers),
+            n_heads=n_heads,
+            num_kv_heads=n_kv,
+            head_dim=head_dim,
+            intermediate=int(getattr(hf, "intermediate_size", 4 * hidden)),
+            vocab=int(hf.vocab_size),
+        )
+    except Exception:
+        return None
+
+
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     """Execute the 24-hour loop and return ``{summary, report_md, ...}``."""
     workload = cfg.workload or (getattr(cfg.engine, "workload_id", None) or "vllm-decode")
@@ -169,6 +218,14 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 runner_error = f"workload runner unavailable for {workload!r}: {exc}"
         else:
             runner_error = f"no workload runner registered for {workload!r}"
+
+    # If the workload built a live engine (e.g. vLLM), expose it so the
+    # scheduler-stats sampler AND the Phase-4 live A/B can drive it. The runner
+    # carries it as ``.engine`` (see the vllm-decode factory). Without this the
+    # loop stays predict-only (DryRunApplicator, live=False) — the engine is
+    # built but never handed to the applicator.
+    if cfg.engine is None and runner is not None:
+        cfg.engine = getattr(runner, "engine", None)
 
     # Sample the engine scheduler (queue depth, batch occupancy, preemptions)
     # over the same window as the CUPTI capture — engine-level telemetry the GPU
@@ -297,7 +354,12 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             trace_path=trace_path,
         )
 
-    graph = predict_graph()
+    # Predict against the model that ACTUALLY ran (read from the live engine),
+    # not the Llama-2-7B default — otherwise residuals/deviation score the real
+    # kernels against the wrong graph. Falls back to the default graph when there
+    # is no engine or its config can't be read (CPU boxes, tests, dry-run).
+    _spec = _model_spec_from_engine(cfg.engine)
+    graph = predict_graph(model=_spec) if _spec is not None else predict_graph()
     (run_dir / "predicted_graph.json").write_text(
         json.dumps({"nodes": len(graph.nodes), "total_pred_s": graph.total_pred_s}, indent=2)
     )

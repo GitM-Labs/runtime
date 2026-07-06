@@ -569,6 +569,14 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         produced = sum(len(o.outputs[0].token_ids) for o in outputs)
         sync_device()
         return {"prompts": len(prompts), "generated_tokens": produced, "model": model}
+
+    # Expose the live engine so the loop can (a) sample its scheduler stats and
+    # (b) run the Phase-4 decode-throughput A/B on it (LiveEngineApplicator).
+    # Without this the engine is built but never handed to the loop, so every
+    # run is predict-only (live=False). ``run.engine`` mirrors the ``.applicator``
+    # convention the hft/edge/openfold factories already use.
+    run.engine = llm
+    run.workload_id = "vllm-decode"
     return run
 
 def _vllm_synthetic_runner(n_prompts: int, max_tokens: int) -> WorkloadRunner:
