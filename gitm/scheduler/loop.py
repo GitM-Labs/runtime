@@ -174,18 +174,18 @@ def _model_spec_from_engine(engine: Any):
     try:
         from gitm.planner.roofline import ModelSpec
 
-        hidden = int(getattr(hf, "hidden_size"))
-        n_heads = int(getattr(hf, "num_attention_heads"))
+        hidden = int(hf.hidden_size)
+        n_heads = int(hf.num_attention_heads)
         n_kv = int(getattr(hf, "num_key_value_heads", n_heads) or n_heads)
         head_dim = int(getattr(hf, "head_dim", 0) or (hidden // n_heads))
         return ModelSpec(
             hidden=hidden,
-            n_layers=int(getattr(hf, "num_hidden_layers")),
+            n_layers=int(hf.num_hidden_layers),
             n_heads=n_heads,
             num_kv_heads=n_kv,
             head_dim=head_dim,
             intermediate=int(getattr(hf, "intermediate_size", 4 * hidden)),
-            vocab=int(getattr(hf, "vocab_size")),
+            vocab=int(hf.vocab_size),
         )
     except Exception:
         return None
