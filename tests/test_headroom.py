@@ -35,7 +35,11 @@ def test_ceiling_distance_and_gap_split():
     assert not r.already_optimized
     # gap classes sum to the ceiling distance
     assert sum(r.gap_by_stall_class.values()) == pytest.approx(0.5, abs=1e-3)
-    assert set(r.gap_by_stall_class) == {"idle_stall", "memory_bound", "compute_bound"}
+    # idle side now comes from the real stall breakdown, not one lumped "idle_stall".
+    assert set(r.gap_by_stall_class) == {
+        "sync_wait", "transfer_bound", "launch_latency", "idle",
+        "memory_bound", "compute_bound",
+    }
 
 
 def test_already_optimized_flag_when_near_floor():
