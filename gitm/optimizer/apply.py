@@ -212,11 +212,29 @@ class EngineABResult:
     # the caller's min_keep_delta. Report verdicts derive from ApplyResult, not this.
     kept: bool
     via: str = "hot-swap"  # "hot-swap" (scheduling knob) | "restart" (structural knob)
+    # Confidence over ``reps`` A/B repetitions (GITM_AB_REPS). At reps=1 std is 0,
+    # the noise band is 0, and ``significant`` reduces to delta>0 (pre-reps behaviour).
+    baseline_std: float = 0.0
+    candidate_std: float = 0.0
+    reps: int = 1
+    significant: bool = True  # the gain cleared the measurement noise band
+
+    @property
+    def rel_std(self) -> float:
+        """Combined relative scatter of baseline+candidate — the noise band."""
+        return (self.baseline_std + self.candidate_std) / self.baseline_tps if self.baseline_tps else 0.0
 
     @property
     def verdict(self) -> str:
         d = self.speedup - 1.0
-        return f"{'kept' if self.kept else 'rolled back'} ({d:+.1%} decode throughput, via {self.via})"
+        conf = "" if self.reps < 2 else (
+            f", ±{self.rel_std:.1%} over {self.reps} reps"
+            f" ({'significant' if self.significant else 'within noise'})"
+        )
+        return (
+            f"{'kept' if self.kept else 'rolled back'} "
+            f"({d:+.1%} decode throughput, via {self.via}{conf})"
+        )
 
 
 class StructuralKnobRequiresRestart(RuntimeError):
@@ -264,6 +282,7 @@ class LiveEngineApplicator:
         getter: Callable[[Any, str], Any] | None = None,
         setter: Callable[[Any, str, Any], None] | None = None,
         reps: int = 1,
+        force_restart: bool = False,
     ) -> None:
         self.engine = engine
         self._tps = throughput_fn
@@ -271,13 +290,31 @@ class LiveEngineApplicator:
         self._getter = getter or get_knob
         self._setter = setter or set_knob
         self._reps = max(1, reps)
+        # force_restart: apply scheduling knobs via the restart path too, for
+        # engines that don't honor a live scheduler-config mutation (vLLM V1 reads
+        # scheduler_config at construction). Requires a restart_fn.
+        self._force_restart = force_restart
         self._baseline_tps: float | None = None
+        self._baseline_std: float = 0.0
         # Restore record: ("hotswap", knob, old_value) | ("restart", old_engine) | None.
         self._prev: tuple[Any, ...] | None = None
         self.last_result: EngineABResult | None = None
 
     def _bench(self) -> float:
         return sum(self._tps(self.engine) for _ in range(self._reps)) / self._reps
+
+    def _bench_stats(self) -> tuple[float, float]:
+        """(mean, sample stdev) of decode throughput over ``reps`` runs.
+
+        stdev is 0.0 for a single rep → the noise band is 0 and keep falls back to
+        ``delta > 0``, i.e. reps=1 behaves exactly as before reps were added.
+        """
+        samples = [self._tps(self.engine) for _ in range(self._reps)]
+        mean = sum(samples) / len(samples)
+        if len(samples) < 2:
+            return mean, 0.0
+        var = sum((s - mean) ** 2 for s in samples) / (len(samples) - 1)
+        return mean, var**0.5
 
     def snapshot(self) -> dict[str, Any]:
         # Reset both the restore record AND last_result: snapshot() runs at the
@@ -286,14 +323,14 @@ class LiveEngineApplicator:
         # runs) must not leave the *previous* candidate's A/B result visible.
         self._prev = None
         self.last_result = None
-        self._baseline_tps = self._bench()
+        self._baseline_tps, self._baseline_std = self._bench_stats()
         return {"baseline_tps": self._baseline_tps}
 
     def apply(self, spec: InterventionSpec) -> None:
         if spec.value is None:
             raise ValueError(f"intervention {spec.name!r} has no value for knob {spec.knob!r}")
 
-        if knob_kind(spec.knob) == "scheduling":
+        if not self._force_restart and knob_kind(spec.knob) == "scheduling":
             # Hot-swap in place. Record the restore point only AFTER a successful
             # set: if the knob can't be located the setter raises, _prev stays
             # None, and restore() is a no-op (nothing changed → nothing to undo).
@@ -352,7 +389,7 @@ class LiveEngineApplicator:
                 return
 
     def measure(self, spec: InterventionSpec) -> float | None:
-        baseline = self._baseline_tps if self._baseline_tps is not None else self._bench()
+        baseline = self._baseline_tps if self._baseline_tps is not None else self._bench_stats()[0]
         # A non-positive baseline means the A/B has no valid reference — an idle
         # engine, a probe that returned 0, no tokens produced. Raising (vs forcing
         # speedup=1.0) makes apply_intervention roll the candidate back instead of
@@ -362,15 +399,23 @@ class LiveEngineApplicator:
                 f"baseline decode throughput is {baseline}; cannot run a valid A/B "
                 f"for knob {spec.knob!r}"
             )
-        candidate = self._bench()
+        candidate, cand_std = self._bench_stats()
         speedup = candidate / baseline
         delta = speedup - 1.0
+        # Noise band = combined relative scatter of baseline+candidate. A gain is
+        # kept only if it clears the band: returning (delta - band) makes the
+        # existing min_keep_delta=0 gate keep ONLY significant gains and roll back
+        # anything within noise. reps=1 → std=0 → band=0 → keep iff delta>0.
+        noise_band = (self._baseline_std + cand_std) / baseline
+        significant = delta > noise_band
         via = "restart" if (self._prev and self._prev[0] == "restart") else "hot-swap"
         self.last_result = EngineABResult(
             knob=spec.knob, value=spec.value, baseline_tps=baseline,
-            candidate_tps=candidate, speedup=speedup, kept=delta >= 0.0, via=via,
+            candidate_tps=candidate, speedup=speedup, kept=significant, via=via,
+            baseline_std=self._baseline_std, candidate_std=cand_std,
+            reps=self._reps, significant=significant,
         )
-        return delta
+        return delta - noise_band
 
 
 def apply_intervention_from_file(

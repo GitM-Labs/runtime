@@ -28,6 +28,7 @@ makes the autonomous loop observe a real workload.
 from __future__ import annotations
 
 import os
+import socket
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -60,6 +61,16 @@ def get_factory(name: str | None) -> WorkloadFactory | None:
 
 def registered() -> list[str]:
     return sorted(_REGISTRY)
+
+
+def _free_port() -> int:
+    """An OS-assigned free TCP port. Used to give a restart-A/B candidate engine a
+    distinct distributed init port so its ``tcp://…:PORT`` bind doesn't collide
+    with the still-alive baseline engine (a two-engines-one-process hazard on V1).
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return int(s.getsockname()[1])
 
 
 # --- built-in workloads ------------------------------------------------------
@@ -558,9 +569,21 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     if os.environ.get("GITM_VLLM_SYNTHETIC") == "1":
         return _vllm_synthetic_runner(n_prompts, max_tokens)
 
+    import time
+
     from vllm import LLM, SamplingParams
 
-    llm = LLM(model=model)
+    # Optional GPU-memory cap (GITM_VLLM_GPU_MEM, e.g. 0.45). Set it for structural
+    # restart A/Bs (fp8 KV, quant): the applicator keeps the baseline engine alive
+    # while it builds the candidate, so BOTH must fit on the GPU at once. The
+    # baseline and every restart candidate inherit this cap. Unset = vLLM's default
+    # (~0.9) — fine for single-engine runs, but a restart candidate would OOM.
+    _gpu_mem = os.environ.get("GITM_VLLM_GPU_MEM")
+    _base_kwargs: dict[str, Any] = {}
+    if _gpu_mem is not None:
+        _base_kwargs["gpu_memory_utilization"] = float(_gpu_mem)
+
+    llm = LLM(model=model, **_base_kwargs)
     prompts = [f"Benchmark decode prompt {i}." for i in range(n_prompts)]
     params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
 
@@ -570,14 +593,51 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         sync_device()
         return {"prompts": len(prompts), "generated_tokens": produced, "model": model}
 
-    # Expose the live engine so the loop can (a) sample its scheduler stats and
-    # (b) run the Phase-4 decode-throughput A/B on it (LiveEngineApplicator).
-    # Without this the engine is built but never handed to the loop, so every
-    # run is predict-only (live=False). ``run.engine`` mirrors the ``.applicator``
-    # convention the hft/edge/openfold factories already use.
-    run.engine = llm
-    run.workload_id = "vllm-decode"
-    return run
+    def _throughput(eng: Any) -> float:
+        """Decode-throughput probe (tokens/sec) for the Phase-4 A/B.
+
+        Runs on WHATEVER engine it is handed — the original for hot-swap knobs, or
+        a restarted engine for structural knobs — so a rebuilt engine is measured
+        on itself, not on the original. (The loop's default probe re-runs the
+        original runner, which cannot measure a restarted engine.)
+        """
+        t0 = time.perf_counter()
+        outs = eng.generate(prompts, params)
+        toks = sum(len(o.outputs[0].token_ids) for o in outs)
+        sync_device()
+        return toks / max(time.perf_counter() - t0, 1e-9)
+
+    def _restart(_old_engine: Any, knob: str, value: Any) -> Any:
+        """Rebuild a fresh vLLM engine with one structural knob changed.
+
+        The restart-apply path for structural levers that can't be hot-swapped on a
+        running engine — most importantly ``kv_cache_dtype=fp8`` and
+        ``quantization``, the real throughput/memory levers for decode. Structural
+        knob names match the vLLM ``LLM`` kwargs (``kv_cache_dtype``,
+        ``gpu_memory_utilization``, ``swap_space``, ``block_size``,
+        ``quantization``, …), so the change is a single kwarg. Returns the new
+        engine; ``LiveEngineApplicator`` swaps it in for the A/B and tears it down
+        on restore. Raises on an unsupported knob/value (no fp8 support on this
+        SKU, missing quantized checkpoint) → the candidate is rolled back cleanly,
+        never a silent no-op.
+        """
+        kwargs = dict(_base_kwargs)  # inherit the mem cap so both engines coexist
+        kwargs[knob] = value  # the structural knob (wins if it IS gpu_memory_utilization)
+        # The baseline engine is still alive during the A/B, so the candidate is a
+        # SECOND in-process engine. Give it a fresh distributed port so its init
+        # doesn't collide with the baseline's (V1 uses tcp://…:PORT at world_size=1).
+        os.environ["VLLM_PORT"] = str(_free_port())
+        try:
+            return LLM(model=model, **kwargs)
+        except Exception as exc:
+            # Most likely a two-engines-one-process distributed clash (e.g. the
+            # torch default process group already initialised). Surface the cause
+            # so apply_intervention rolls back with it — GPU-validate whether a
+            # fresh port suffices or teardown-then-rebuild is needed (bigger fix).
+            raise RuntimeError(
+                f"restart candidate for {knob!r} failed to build — likely a "
+                f"two-engine V1 distributed clash: {exc}"
+            ) from exc
 
 def _vllm_synthetic_runner(n_prompts: int, max_tokens: int) -> WorkloadRunner:
     """A CPU-only stand-in for the decode loop (no vLLM, no GPU).

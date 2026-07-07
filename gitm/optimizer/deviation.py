@@ -23,10 +23,43 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from gitm.optimizer.invariants import INVARIANTS, Invariant
-from gitm.planner.graph import Graph
+from gitm.planner.graph import Graph, PredictedNode
 from gitm.tracer.capture import write_trace_jsonl
 from gitm.tracer.schema import KernelEvent, Trace
 
+# Ordered kernel-name → predicted-op rules (first match wins), case-insensitive
+# substring. Maps a raw CUDA/Triton kernel name to a predicted-graph op, or None
+# when it maps to no modeled op (norms, activations, copies, launch overhead) —
+# those are unmodeled work and kept as departures.
+#
+# The projection GEMMs (qkv/out/gate_up/down) are only distinguishable when the
+# kernel name carries the projection tag (vLLM/Triton fused kernels usually do); a
+# bare cuBLAS/cutlass GEMM with no tag falls through to None (unmodeled).
+# Distinguishing those needs shape-matching (a follow-up) — but this already beats
+# the old positional `i % len(pred)`, which aligned nothing under CUDA graphs.
+_OP_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("flash_attn", "flashattn", "paged_attention", "paged_attn", "fmha", "attention",
+      "attn_score"), "attn_score_value"),
+    (("qkv",), "qkv_proj"),
+    (("o_proj", "out_proj", "attn_out"), "attn_out_proj"),
+    (("gate_up", "gate_proj", "up_proj", "swiglu", "silu_and_mul"), "mlp_gate_up"),
+    (("down_proj", "mlp_down"), "mlp_down"),
+    (("lm_head", "logits", "vocab_proj", "embed"), "lm_head"),
+)
+
+
+def classify_op(kernel_name: str) -> str | None:
+    """Map a raw kernel name to a predicted-graph op, or ``None`` if unmodeled.
+
+    Case-insensitive substring match, first rule wins. ``None`` = the kernel maps
+    to no op in the predicted graph (a norm/activation/copy, or a bare GEMM whose
+    name doesn't carry its projection) → treated as unmodeled work.
+    """
+    n = kernel_name.lower()
+    for needles, op in _OP_RULES:
+        if any(k in n for k in needles):
+            return op
+    return None
 
 @dataclass
 class DeviationResult:
@@ -76,15 +109,14 @@ def deviating_kernel_indices(
 ) -> DeviationResult:
     """Indices of observed kernels that depart from the predicted graph.
 
-    Decode is a *repeated* step: the predicted graph models one decode step's
-    nodes (see :func:`gitm.planner.graph.predict_graph`), but a real trace spans
-    many steps. So we pair the observed kernels to the predicted step
-    **cyclically** — kernel ``i`` is compared against predicted node
-    ``i % len(pred)`` — instead of truncating at one step's worth (which would
-    label every kernel after the first step as "unmodeled" and keep ~everything,
-    defeating the point of deviation-only storage). A kernel is a *departure* when
-    its kernel-time or memory-traffic residual is out-of-band. With no predicted
-    graph at all, every kernel is unmodeled work and is kept.
+    Each observed kernel is matched to a predicted op **by identity** — its name is
+    classified (:func:`classify_op`) to an op and compared against that op's
+    predicted roofline node. This replaces the old positional ``i % len(pred)``
+    pairing, which was meaningless once CUDA graphs reorder/fuse the kernel stream
+    (it flagged ~everything, uniformly across ops). A kernel *departs* when its
+    kernel-time or memory-traffic residual is out-of-band; a kernel that classifies
+    to no modeled op (or to an op the graph didn't predict) is unmodeled work and is
+    kept. With no predicted graph at all, every kernel is kept.
     """
     obs = trace.kernels()
     pred = graph.nodes
@@ -96,9 +128,19 @@ def deviating_kernel_indices(
         return DeviationResult(kept_indices=list(range(len(obs))), n_observed=len(obs),
                                n_predicted=0)
 
+    # One representative predicted node per op — per-layer nodes share the same
+    # roofline prediction, so we match by op identity, not ordinal position.
+    by_op: dict[str, PredictedNode] = {}
+    for pn in pred:
+        by_op.setdefault(pn.op, pn)
+
     kept: list[int] = []
     for i, ok in enumerate(obs):
-        pn = pred[i % len(pred)]  # cycle the predicted step across repeated decode steps
+        op = classify_op(ok.name)
+        pn = by_op.get(op) if op is not None else None
+        if pn is None:
+            kept.append(i)  # unmodeled op → keep as a departure
+            continue
         if _departs(ok, pn.prediction.t_pred_s, pn.prediction.bytes, inv_kt, inv_mt):
             kept.append(i)
 
@@ -126,14 +168,15 @@ def deviation_summary(
 ) -> dict:
     """Compact summary of the deviation filter — for the run dir / report.
 
-    ``kept_ops`` counts departures per predicted op so the report can say *which*
-    ops are the ones that didn't behave as predicted.
+    ``kept_ops`` counts departures per *classified* op (the observed kernel's own
+    op, via :func:`classify_op`), so the report says which ops actually departed —
+    ``<unmodeled>`` for kernels that map to no predicted op.
     """
-    pred = graph.nodes
+    obs = trace.kernels()
     dev = deviating_kernel_indices(trace, graph, invariants)
     kept_ops: dict[str, int] = {}
     for i in dev.kept_indices:
-        op = pred[i % len(pred)].op if pred else "<unpredicted>"
+        op = classify_op(obs[i].name) or "<unmodeled>"
         kept_ops[op] = kept_ops.get(op, 0) + 1
     return {
         "n_observed": dev.n_observed,
@@ -142,7 +185,6 @@ def deviation_summary(
         "reduction": dev.reduction,
         "kept_ops": kept_ops,
     }
-
 
 def write_deviation_jsonl(reduced: Trace, path: str | Path) -> None:
     """Write a deviation-only trace as JSONL via the canonical trace writer.
