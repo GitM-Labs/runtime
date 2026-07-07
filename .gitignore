@@ -39,3 +39,4 @@ htmlcov/
 venv
 takehome
 .venv311/
+.python-version
