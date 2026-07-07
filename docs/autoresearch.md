@@ -122,8 +122,11 @@ Versatility comes from the `KnobSource`, **not** a `{workload: knobs}` table:
 
 - **`VLLMKnobSource`** (used by `EngineArgsProposer`, the vLLM binding of
   `GenerativeProposer`) introspects `dataclasses.fields(EngineArgs)` when vLLM is
-  importable — exposing `Literal` fields as searchable enums — and yields a frozen
-  catalog otherwise, so the path runs offline and deterministically.
+  importable and reads each field's **valid domain from its CLI argument** —
+  argparse `choices=` (the real enum domain) and `type=` — via
+  `EngineArgs.add_cli_args`, so the search only proposes values that can apply;
+  list-valued args (`nargs`) and non-performance fields are skipped. Yields a
+  frozen catalog otherwise, so the path runs offline and deterministically.
 - Another workload plugs in by yielding its own `Knob` list and a `workload`
   label: `GenerativeProposer(MyKnobSource(), workload="triton-serve")`. Candidates
   carry that label in their applicability; nothing enumerates workloads centrally.
@@ -213,12 +216,16 @@ it:
 
 - **Class→knob affinity is a keyword heuristic** (`prefill` / `cache` / `compil`
   …) matched against the knob name, not a learned or hand-authored mapping.
-- **Value grids are blind** — a generic `½×`/`2×`/`4×` ladder off the default (or
-  a hand-seeded grid where that would be nonsensical, e.g. token thresholds), not
-  tuned per knob. Per-class candidate counts are bounded by `max_candidates`.
-- **Live `EngineArgs` typing is best-effort** — introspected fields are typed
-  coarsely from their annotation; enums the introspector can't detect fall back
-  to "no grid" and are simply skipped.
+- **Enum domains come from vLLM; numeric ranges don't.** When vLLM is importable,
+  each knob's valid **choices** and **type** are read from its `EngineArgs` CLI
+  argument (argparse `choices=`/`type=`), and list-valued args are skipped — so
+  the search stops proposing enum values or shapes that can't apply. But argparse
+  carries no numeric min/max, so unconstrained ints/floats still use the generic
+  `½×`/`2×`/`4×` ladder (or a hand-seeded grid). Per-class candidate counts are
+  bounded by `max_candidates`.
+- **Live typing is otherwise best-effort** — fields with no CLI `choices`/`type`
+  are classified coarsely from their annotation; ones the introspector can't type
+  fall back to "no grid" and are simply skipped.
 - **The stochastic sampler isn't wired into the loop yet.** `StochasticProposer`
   exists behind the seam (seeded, reproducible), but Phase 4b still runs the
   generative proposer; flipping the loop onto it (or a `FallbackProposer` chain)

@@ -476,31 +476,113 @@ def _is_tunable(field_name: str) -> bool:
     return not any(h in lname for h in _NON_TUNABLE_HINTS)
 
 
+@dataclass(frozen=True)
+class _ArgDomain:
+    """Valid-value metadata for one EngineArgs field, read from its CLI argument.
+
+    ``choices`` is the argparse ``choices=`` set (the *real* enum domain); ``type``
+    is the argparse ``type=`` callable; ``is_list`` flags list-valued args
+    (``nargs`` +/*/N) which aren't scalar knobs. argparse carries no numeric
+    min/max, so ranges still fall to the value-grid ladder.
+    """
+
+    type: object | None = None
+    choices: tuple | None = None
+    default: object = None
+    is_list: bool = False
+
+
+def _argparse_domains(engine_args_cls: object) -> dict[str, _ArgDomain]:
+    """Read each EngineArgs field's valid domain from ``add_cli_args`` (best-effort).
+
+    vLLM builds its CLI from the same dataclass, so the argparse actions are the
+    authoritative source of choices/types — far better than string-matching the
+    annotation. Returns ``{}`` if the class has no ``add_cli_args`` or it raises.
+    """
+    try:
+        import argparse
+
+        parser = engine_args_cls.add_cli_args(argparse.ArgumentParser())  # type: ignore[attr-defined]
+    except Exception:
+        return {}
+    out: dict[str, _ArgDomain] = {}
+    for action in getattr(parser, "_actions", []):
+        dest = getattr(action, "dest", "")
+        if not dest or dest == "help":
+            continue
+        nargs = getattr(action, "nargs", None)
+        is_list = nargs in ("+", "*") or (isinstance(nargs, int) and nargs > 1)
+        choices = getattr(action, "choices", None)
+        out[dest] = _ArgDomain(
+            type=getattr(action, "type", None),
+            choices=tuple(choices) if choices else None,
+            default=getattr(action, "default", None),
+            is_list=is_list,
+        )
+    return out
+
+
+def _knob_domain(annotation: object, domain: _ArgDomain | None) -> tuple[str, tuple]:
+    """(kind, choices) for a field, preferring argparse metadata over the annotation.
+
+    argparse ``choices`` gives the exact enum domain (so the search only proposes
+    values that can apply); its ``type`` sharpens int/float when the annotation is
+    opaque. Everything else falls back to the annotation-based classification.
+    """
+    if domain is not None and domain.choices:
+        return "enum", domain.choices
+    kind, choices = _field_kind_and_choices(annotation)
+    if kind == "str" and domain is not None:
+        kind = {int: "int", float: "float", bool: "bool"}.get(domain.type, kind)  # type: ignore[arg-type]
+    return kind, choices
+
+
+def _knobs_from_engine_args(engine_args_cls: object) -> list[Knob]:
+    """Build the searchable knob list from an EngineArgs-like dataclass.
+
+    Split out from :func:`_engine_arg_knobs` (which handles the vLLM import +
+    fallback) so the extraction is testable without vLLM present. Skips
+    non-performance fields (:data:`_NON_TUNABLE_HINTS`) and list-valued args (not
+    scalar knobs), and sources each field's valid domain from its CLI argument.
+    """
+    import dataclasses
+
+    domains = _argparse_domains(engine_args_cls)
+    knobs: list[Knob] = []
+    for f in dataclasses.fields(engine_args_cls):  # type: ignore[arg-type]
+        if not _is_tunable(f.name):
+            continue
+        domain = domains.get(f.name)
+        if domain is not None and domain.is_list:
+            continue  # list-valued arg: not a scalar knob, can't grid-search
+        kind, choices = _knob_domain(f.type, domain)
+        if f.default is not dataclasses.MISSING:
+            default = f.default
+        else:
+            default = domain.default if domain is not None else None
+        knobs.append(Knob(name=f.name, kind=kind, default=default, choices=choices))
+    return knobs
+
+
 def _engine_arg_knobs() -> list[Knob]:
     """Enumerate real vLLM EngineArgs, or fall back to the frozen catalog.
 
-    Best-effort introspection: when vLLM is importable, each tunable dataclass
-    field is a candidate knob (typed as best we can from its annotation, with
-    ``Literal`` fields exposed as searchable enums). Non-performance fields (model
-    identity, paths, logging, RNG — see :data:`_NON_TUNABLE_HINTS`) are skipped.
-    When vLLM isn't importable (no GPU stack / air-gapped), the frozen catalog
-    keeps the generative path working offline.
+    Best-effort introspection: when vLLM is importable, each tunable, scalar field
+    is a candidate knob, with its valid domain (enum ``choices``, type) read from
+    the field's CLI argument (:func:`_argparse_domains`) so the search only
+    proposes values that can actually apply. Non-performance fields
+    (:data:`_NON_TUNABLE_HINTS`) and list-valued args are skipped. When vLLM isn't
+    importable (no GPU stack / air-gapped), the frozen catalog keeps the generative
+    path working offline.
     """
     try:
-        import dataclasses
-
         from vllm import EngineArgs  # type: ignore
     except Exception:
         return list(_FALLBACK_KNOBS)
-
-    knobs: list[Knob] = []
-    for f in dataclasses.fields(EngineArgs):
-        if not _is_tunable(f.name):
-            continue
-        default = None if f.default is dataclasses.MISSING else f.default
-        kind, choices = _field_kind_and_choices(f.type)
-        knobs.append(Knob(name=f.name, kind=kind, default=default, choices=choices))
-    return knobs
+    try:
+        return _knobs_from_engine_args(EngineArgs) or list(_FALLBACK_KNOBS)
+    except Exception:
+        return list(_FALLBACK_KNOBS)
 
 
 class KnobSource(Protocol):

@@ -269,9 +269,11 @@ from gitm.agents.autoresearch import (  # noqa: E402
     StochasticProposer,
     TableProposer,
     VLLMKnobSource,
+    _argparse_domains,
     _candidate_spec,
     _field_kind_and_choices,
     _is_tunable,
+    _knobs_from_engine_args,
     _value_grid,
 )
 
@@ -506,6 +508,76 @@ def test_field_kind_and_choices_extracts_literal_enum() -> None:
     # Plain scalars fall back to kind-only (no choices) and stay robust.
     assert _field_kind_and_choices(bool) == ("bool", ())
     assert _field_kind_and_choices(int) == ("int", ())
+
+
+# --- valid domains sourced from EngineArgs' CLI args -------------------------
+
+import argparse  # noqa: E402
+import dataclasses  # noqa: E402
+
+
+@dataclasses.dataclass
+class _FakeEngineArgs:
+    """An EngineArgs-like dataclass with a CLI builder — exercises the argparse
+    domain extraction without importing vLLM (absent in CI)."""
+
+    kv_cache_dtype: str = "auto"
+    max_num_seqs: int = 256
+    gpu_frac: float = 0.9
+    enforce_eager: bool = False
+    served_model_name: str = "m"  # non-perf (model/name) → excluded
+    middleware: tuple = ()  # list-valued (nargs=+) → skipped
+
+    @staticmethod
+    def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+        parser.add_argument(
+            "--kv-cache-dtype", dest="kv_cache_dtype",
+            choices=["auto", "fp8", "fp8_e5m2"], default="auto",
+        )
+        parser.add_argument("--max-num-seqs", dest="max_num_seqs", type=int, default=256)
+        parser.add_argument("--gpu-frac", dest="gpu_frac", type=float, default=0.9)
+        parser.add_argument("--enforce-eager", dest="enforce_eager", action="store_true")
+        parser.add_argument("--served-model-name", dest="served_model_name", type=str, default="m")
+        parser.add_argument("--middleware", dest="middleware", nargs="+", type=str, default=[])
+        return parser
+
+
+def test_knobs_from_engine_args_sources_valid_enum_domain() -> None:
+    """The enum domain comes from argparse ``choices`` — so the value grid only
+    contains values that can actually apply, never an invented ladder point."""
+    knobs = {k.name: k for k in _knobs_from_engine_args(_FakeEngineArgs)}
+    kv = knobs["kv_cache_dtype"]
+    assert kv.kind == "enum"
+    assert set(kv.choices) == {"auto", "fp8", "fp8_e5m2"}
+    assert set(_value_grid(kv)) == {"fp8", "fp8_e5m2"}  # valid non-default choices only
+
+
+def test_knobs_from_engine_args_types_from_argparse() -> None:
+    knobs = {k.name: k for k in _knobs_from_engine_args(_FakeEngineArgs)}
+    assert knobs["max_num_seqs"].kind == "int"
+    assert knobs["gpu_frac"].kind == "float"
+    assert knobs["enforce_eager"].kind == "bool"
+
+
+def test_knobs_from_engine_args_skips_nonperf_and_list_args() -> None:
+    names = {k.name for k in _knobs_from_engine_args(_FakeEngineArgs)}
+    assert "served_model_name" not in names  # non-performance field
+    assert "middleware" not in names  # list-valued arg (nargs=+): not a scalar knob
+
+
+def test_argparse_domains_reads_choices_type_and_nargs() -> None:
+    d = _argparse_domains(_FakeEngineArgs)
+    assert d["kv_cache_dtype"].choices == ("auto", "fp8", "fp8_e5m2")
+    assert d["max_num_seqs"].type is int
+    assert d["middleware"].is_list is True
+    assert d["kv_cache_dtype"].is_list is False
+
+
+def test_argparse_domains_empty_when_no_cli_builder() -> None:
+    class _Bare:
+        pass
+
+    assert _argparse_domains(_Bare) == {}
 
 
 def test_candidate_specs_share_the_forced_fields() -> None:

@@ -639,6 +639,11 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
                 f"two-engine V1 distributed clash: {exc}"
             ) from exc
 
+    run.engine = llm
+    llm.gitm_throughput_fn = _throughput
+    llm.gitm_restart_fn = _restart
+    return run
+
 def _vllm_synthetic_runner(n_prompts: int, max_tokens: int) -> WorkloadRunner:
     """A CPU-only stand-in for the decode loop (no vLLM, no GPU).
 
