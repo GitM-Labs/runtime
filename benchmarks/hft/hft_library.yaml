@@ -1,0 +1,98 @@
+# Candidate intervention library for the HFT LOB-replay benchmark.
+#
+# Same schema as gitm/kernels/library.yaml (the vLLM-decode library), but the
+# levers here target the data-loading path the nsys profile flagged: zstd
+# decompression (47.5%), Parquet page decode (26.2%), and the top-of-book merge
+# sort (8.3%). See benchmarks/hft/results.md for the stall profile.
+#
+# IMPORTANT: every expected_delta_* below is a PRE-REVIEW ESTIMATE from the
+# cited source, NOT measured on our workload. review: null on all entries until
+# Adit signs off. The real numbers come from the rollback-gated live apply
+# (Task B) via gitm/optimizer/apply.py + a checksum correctness gate.
+#
+# applies_to_kernels uses substring match against the real kernel names seen in
+# the seed-42 nsys profile:
+#   zstd::decompression_kernel
+#   cudf::io::parquet::detail::...decode_page_data_generic...
+#   cub::detail::merge_sort::DeviceMergeSort{Block,Merge}Kernel
+
+interventions:
+  # --- Candidate 1: overlap Parquet decode / H2D with compute -----------------
+  - name: hft_parquet_h2d_overlap
+    summary: >-
+      Pipeline Parquet decode + host-to-device copy of shard N+1 against GPU
+      compute of shard N, so decompression/decode stops serializing in front of
+      the replay kernels. Targets the 73% data-stall directly.
+    knob: reader_prefetch_depth
+    value: 2
+    applies_to_kernels: [decode_page_data, zstd::decompression]
+    expected_delta_mean: 0.25
+    expected_delta_lo: 0.10
+    expected_delta_hi: 0.40
+    source: https://docs.rapids.ai/api/cudf/stable/user_guide/io/io/
+    applicability:
+      workloads: [hft-lob-replay]
+      requires_hardware: [A100, H100]
+      other: >-
+        Estimate based on cuDF chunked-Parquet + prefetch guidance; H2D was
+        91.2% of memory time in our trace, so overlap headroom is large but
+        the realized fraction depends on PCIe vs compute balance.
+    safety:
+      tier: low_risk
+      requires_rollback_window_s: 60
+      notes: >-
+        Read-path only; derived-metric checksum (VWAP/microprice) must be
+        identical before keep.
+    review: null
+
+  # --- Candidate 2: multi-stream across symbol shards -------------------------
+  - name: hft_multistream_symbol_shards
+    summary: >-
+      Launch the per-symbol-shard decode + groupby on separate CUDA streams so
+      independent shards run concurrently instead of serializing. Targets the
+      serialized-launch fraction in the trace.
+    knob: num_cuda_streams
+    value: 4
+    applies_to_kernels: [decode_page_data, DeviceMergeSort, DeviceReduce]
+    expected_delta_mean: 0.15
+    expected_delta_lo: 0.05
+    expected_delta_hi: 0.30
+    source: https://developer.nvidia.com/blog/gpu-pro-tip-cuda-7-streams-simplify-concurrency/
+    applicability:
+      workloads: [hft-lob-replay]
+      requires_hardware: [A100, H100]
+      other: >-
+        Benefit scales with how independent the symbol shards are; if one symbol
+        dominates volume the concurrency win shrinks. Estimate, not measured.
+    safety:
+      tier: moderate
+      requires_rollback_window_s: 120
+      notes: >-
+        Multi-stream can change reduction order; checksum gate must allow a
+        documented float tolerance or use integer-stable accumulation.
+    review: null
+
+  # --- Candidate 3: fused groupby-scan to cut sync ----------------------------
+  - name: hft_groupby_scan_fuse
+    summary: >-
+      Fuse the top-of-book groupby with the VWAP cumulative scan to remove the
+      device sync between them, cutting the sync stall between merge_sort and
+      the reduction kernels.
+    knob: fuse_groupby_scan
+    value: true
+    applies_to_kernels: [DeviceMergeSort, DeviceScan, DeviceReduce]
+    expected_delta_mean: 0.08
+    expected_delta_lo: 0.02
+    expected_delta_hi: 0.15
+    source: https://docs.rapids.ai/api/cudf/stable/user_guide/guide-to-udfs/
+    applicability:
+      workloads: [hft-lob-replay]
+      requires_hardware: [A100, H100]
+      other: >-
+        Smallest of the three — sync was only ~7-8% of the trace — but also the
+        lowest risk. Estimate from cuDF fusion guidance, not measured.
+    safety:
+      tier: low_risk
+      requires_rollback_window_s: 60
+      notes: Pure reordering; checksum must be bit-identical.
+    review: null

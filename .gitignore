@@ -38,3 +38,5 @@ htmlcov/
 .claude
 venv
 takehome
+.venv311/
+.python-version
