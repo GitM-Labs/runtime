@@ -1,6 +1,6 @@
-import cupy as cp
-import numpy as np
 import time
+
+import numpy as np
 from numba import njit
 
 MU = 100.0

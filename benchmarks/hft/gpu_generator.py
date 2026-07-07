@@ -1,11 +1,12 @@
-import time
 import argparse
+import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
 import cupy as cp
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-from pathlib import Path
 from numba import njit
 
 MU = 100.0

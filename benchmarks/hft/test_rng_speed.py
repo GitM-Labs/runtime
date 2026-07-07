@@ -1,6 +1,7 @@
 import time
-import numpy as np
+
 import cupy as cp
+import numpy as np
 
 # Warmup CuPy first
 print("Warming up CuPy...")

@@ -87,9 +87,9 @@ def main(profile_dir: str) -> None:
 
     # Build residuals vs predicted graph, scaled to 5M-event shards.
     try:
-        from gitm.planner.hft_graph import HFTDatasetSpec, predict_hft_graph
         from gitm.optimizer.attribution import attribute
         from gitm.optimizer.monitor import KernelResidual, Residuals
+        from gitm.planner.hft_graph import HFTDatasetSpec, predict_hft_graph
     except Exception as e:  # noqa: BLE001
         print(f"\ncould not import gitm modules ({e}).")
         print("Run this from the repo root with the env that has pydantic/statsmodels.")

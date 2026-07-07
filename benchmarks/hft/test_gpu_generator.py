@@ -1,4 +1,5 @@
 import time
+
 import cupy as cp
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -15,7 +16,6 @@ etype = rng.integers(0, 3, size=n, dtype=cp.int8)
 gaps = rng.integers(1, 2000, size=n, dtype=cp.int64)
 ts_ns = cp.cumsum(gaps)
 
-import numpy as np
 table = pa.table({
     'ts_ns': pa.array(cp.asnumpy(ts_ns)),
     'symbol_id': pa.array(cp.asnumpy(symbol_id)),

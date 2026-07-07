@@ -15,6 +15,7 @@ is cheap(reads counter), so the loop can poll it at decode-step cadence.
 from __future__ import annotations
 
 from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field
 
 

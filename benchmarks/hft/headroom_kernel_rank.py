@@ -31,7 +31,6 @@ from gitm.kernels.spec import InterventionSpec
 from gitm.optimizer.replay import _applies, predict_delta
 from gitm.tracer.schema import KernelEvent, Trace
 
-
 # Real per-kernel times (ns) from the seed-42, 25M-event nsys profile.
 # Source: benchmarks/hft/results.md "Top GPU Kernels". These are the aggregate
 # kernel sums; the per-shard trace (Task 3 tooling) refines them.
