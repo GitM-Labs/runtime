@@ -191,6 +191,18 @@ def _model_spec_from_engine(engine: Any):
         return None
 
 
+def _agg_kt_residual(res: Any) -> float:
+    """Aggregate kernel-time residual for the report — the median of per-kernel
+    ``r_kt`` (observed-vs-predicted kernel time). Median (not mean) so a few
+    badly-aligned kernels don't dominate; ``0.0`` when there are no residuals.
+    """
+    kts = sorted(kr.r_kt for kr in res.per_kernel)
+    if not kts:
+        return 0.0
+    mid = len(kts) // 2
+    return kts[mid] if len(kts) % 2 else (kts[mid - 1] + kts[mid]) / 2.0
+
+
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     """Execute the 24-hour loop and return ``{summary, report_md, ...}``."""
     workload = cfg.workload or (getattr(cfg.engine, "workload_id", None) or "vllm-decode")
@@ -458,6 +470,10 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             cfg.engine,
             throughput_fn=_engine_throughput_fn(cfg.engine, runner),
             restart_fn=live_restart_fn,
+            reps=int(os.environ.get("GITM_AB_REPS", "1")),
+            # GITM_KNOBS_VIA_RESTART=1 applies scheduling knobs via engine rebuild
+            # too — for V1, which ignores a live scheduler-config mutation.
+            force_restart=os.environ.get("GITM_KNOBS_VIA_RESTART") == "1",
         )
     else:
         applicator = DryRunApplicator()
@@ -465,6 +481,9 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     claims: list[Claim] = []
     rolled_back: list[str] = []
     rejected: list[str] = []
+    # Aggregate kernel-time residual for the report (was hardcoded 0.0). Same for
+    # every claim in a run — it describes the run's gap vs the predicted graph.
+    kt_residual = _agg_kt_residual(res)
     for c in ranked:
         if c.rejected_reason is not None:
             rejected.append(f"{c.spec.name} ({c.rejected_reason})")
@@ -503,11 +522,14 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             Claim(
                 summary=c.spec.summary,
                 residual_invariant="kernel_time",
-                residual_value=0.0,
+                residual_value=kt_residual,
                 causal_evidence=causal_evidence,
                 intervention_name=c.spec.name,
                 predicted_delta=c.predicted_delta,
-                measured_delta=result.measured_delta,
+                # Display the TRUE measured delta (speedup-1); the gate uses the noise-adjusted
+                # return, so a within-noise gain reads as rolled back
+                # with its real (small) number, not a distorted one.
+                measured_delta=((ab.speedup - 1.0) if ab is not None else result.measured_delta),
                 rolled_back=result.rolled_back,
             )
         )
