@@ -129,6 +129,38 @@ def test_vllm_workload_still_uses_intervention_path(tmp_path: Path, monkeypatch)
     assert result["summary"]["mode"] == "intervention"
 
 
+def test_vllm_loop_runs_autoresearch(tmp_path: Path, monkeypatch):
+    """The vllm path runs agentic autoresearch: it classifies the bottleneck, then
+    *generates* non-catalog levers from the real EngineArgs surface and searches a
+    value grid per knob (EngineArgsProposer), surfacing them in the summary +
+    report. The serialized same-stream kernels above classify as idle_stall; the
+    frozen fallback catalog yields three idle knobs across six value-grid points."""
+    import gitm.scheduler.loop as loop
+
+    monkeypatch.setattr(loop, "capture", _fake_capture_with_kernels("paged_attention"))
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    from gitm import optimize
+
+    # budget="30s" (not 1s): the catalog pass must not exhaust the budget and skip
+    # the autoresearch phase on a slow box.
+    result = optimize(
+        workload="vllm-decode", budget="30s", scratch=str(tmp_path), workload_runner=lambda: {}
+    )
+    s = result["summary"]
+    assert s["bottleneck_class"] == "idle_stall"
+    # Generative, not the 2-row table: three idle knobs × their value grids = 6.
+    assert s["n_autoresearch"] == 6
+    assert "autoresearch:" in result["report_md"]  # candidates reach the report
+
+    ar_json = (Path(result["run_dir"]) / "autoresearch.json").read_text(encoding="utf-8")
+    # The value-grid naming (knob=value) proves generation ran, not the flat table.
+    assert "max_num_partial_prefills=" in ar_json
+    assert all(name in ar_json for name in ("=2048", "=4096"))  # explicit-grid search points
+    # Dry-run (no live engine) mutates nothing, so no safety trail is written.
+    assert not (Path(result["run_dir"]) / "audit.jsonl").exists()
+
+
 def test_cli_run_returns_nonzero_on_no_data(tmp_path: Path, capsys):
     """Automation must see a failure exit when a run measures nothing."""
     from gitm.cli import main

@@ -18,6 +18,14 @@ from pathlib import Path
 from typing import Any
 
 from gitm._paths import runs_dir, traces_dir
+from gitm.agents.autoresearch import (
+    AutoresearchRun,
+    EngineArgsProposer,
+    FallbackProposer,
+    TableProposer,
+    autoresearch,
+    classify_bottleneck,
+)
 from gitm.agents.policy import Policy, select_interventions
 from gitm.kernels.library import load_library
 from gitm.optimizer.apply import (
@@ -536,6 +544,85 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         if time.time_ns() - started_ns >= int(budget_s * 1e9):
             break
 
+
+    # Phase 4b - agentic autoresearch through the catalog gate/rollback path.
+    if time.time_ns() - started_ns < int(budget_s * 1e9):
+        proposer = FallbackProposer(EngineArgsProposer(), TableProposer())
+
+        def _unenactable(spec: Any) -> str | None:
+            if (
+                cfg.engine is not None
+                and live_restart_fn is None
+                and knob_kind(spec.knob) == "structural"
+            ):
+                return "structural knob: needs engine restart, no restart_fn"
+            return None
+
+        ar_run = autoresearch(
+            trace,
+            applicator=applicator,
+            policy=policy,
+            residuals=res,
+            proposer=proposer,
+            ctx=pctx.gate,
+            reject=_unenactable,
+        )
+    else:
+        ar_run = AutoresearchRun(bottleneck_class=classify_bottleneck(trace), results=[])
+
+    ar_causal_evidence = ", ".join(
+        f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
+    ) or "no strong causal signal"
+    for r in ar_run.results:
+        if not r.applicable:
+            rejected.append(f"{r.spec.name} ({r.rejected_reason})")
+            continue
+        if r.rolled_back:
+            rolled_back.append(r.spec.name)
+        claims.append(
+            Claim(
+                summary=r.spec.summary,
+                residual_invariant="kernel_time",
+                residual_value=0.0,
+                causal_evidence=ar_causal_evidence,
+                intervention_name=r.spec.name,
+                predicted_delta=r.predicted_delta,
+                measured_delta=r.measured_delta,
+                rolled_back=r.rolled_back,
+            )
+        )
+    (run_dir / "autoresearch.json").write_text(
+        json.dumps(
+            {
+                "bottleneck_class": ar_run.bottleneck_class,
+                "target": (
+                    {
+                        "op": ar_run.target.op,
+                        "residual": ar_run.target.residual,
+                        "n_kernels": ar_run.target.n_kernels,
+                    }
+                    if ar_run.target is not None
+                    else None
+                ),
+                "results": [
+                    {
+                        "name": r.spec.name,
+                        "knob": r.spec.knob,
+                        "value": r.spec.value,
+                        "applicable": r.applicable,
+                        "rejected_reason": r.rejected_reason,
+                        "predicted_delta": r.predicted_delta,
+                        "measured_delta": r.measured_delta,
+                        "rolled_back": r.rolled_back,
+                        "target_op": r.target_op,
+                    }
+                    for r in ar_run.results
+                ],
+            },
+            indent=2,
+        )
+    )
+
     # Phase 5 — stabilize + write report
     provenance = build_provenance(
         workload_id=workload,
@@ -572,6 +659,8 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         "n_claims": len(claims),
         "n_rolled_back": len(rolled_back),
         "n_rejected": len(rejected),
+        "bottleneck_class": ar_run.bottleneck_class,
+        "n_autoresearch": len(ar_run.results),
         "scheduler_stats": asdict(sched_summary) if sched_stats.samples else None,
         "report_path": str(run_dir / "report.md"),
     }
