@@ -38,3 +38,4 @@ htmlcov/
 .claude
 venv
 takehome
+.venv311/
