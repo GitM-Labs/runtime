@@ -8,13 +8,14 @@ UniRef30/BFD DBs (~2.2 TB NVMe), so they run on the staging box. `make smoke`
 synthesizes a tiny local dataset to drive the freeze/verify/reproduce loop.
 
 ## Sources
-- **CASP14 targets** — 110 sequences (`fetch.py fetch_casp`, pinned URL).
-- **CASP15 targets** — 94 sequences (`fetch.py fetch_casp`, pinned URL).
+- **CASP14 targets** — 110 sequences (`fetch.py fetch_casp`, Source: `https://predictioncenter.org/download_area/CASP14/sequences/casp14.seq.txt`).
+- **CASP15 targets** — 94 sequences (`fetch.py fetch_casp`, Source: `https://predictioncenter.org/download_area/CASP15/sequences/casp15.seq.txt`).
 - **UniProt subset** — filtered to lengths 50–512 aa, 50 000 sequences.
-- **Combined FASTA:** `proteins_50k.fasta`, reproducible from one `mmseqs2 filter`
-  command. <!-- TODO: paste the pinned mmseqs2 command into fetch.filter_uniprot. -->
+- **Combined FASTA:** `proteins_50k.fasta`, 50 000 sequences filtered to lengths
+  50–512 aa, sampled deterministically (seed=42) from SwissProt via
+  `fetch.py filter_uniprot`.
 - **MSAs:** precomputed against UniRef30 + BFD with the OpenFold MSA tooling,
-  frozen as `.a3m`. <!-- TODO: pin OpenFold MSA commit in fetch.build_msas. -->
+  frozen as `.a3m` per sequence under `$STAGE/msas/` <!-- TODO: pin OpenFold MSA commit in fetch.build_msas. -->
 
 ## Fields & units
 FASTA records + per-sequence `.a3m` MSA. <!-- TODO: paste a header sample + length histogram. -->

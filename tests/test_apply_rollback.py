@@ -1,4 +1,4 @@
-"""Tests for the rollback-gated intervention apply path (GITM-020/021).
+"""Tests for the rollback-gated intervention apply path.
 
 Covers the two forced-failure rollback cases the ticket requires (bad value,
 mid-apply crash) plus the regression rollback and the happy path, against both
@@ -90,6 +90,39 @@ def test_rollback_on_regression():
     assert cfg == {"block_size": 8}  # restored
 
 
+# --- safety audit trail on the apply seam -----------------------------------
+
+
+def test_apply_audits_kept_change(tmp_path):
+    from gitm.safety import AuditLog
+
+    log = AuditLog(tmp_path / "audit.jsonl")
+    cfg = {"block_size": 8}
+    apply_intervention(_spec(), DictApplicator(cfg, measure_fn=lambda s: +0.08), audit=log)
+
+    events = [e.event for e in log.entries()]
+    assert events == ["apply"]  # kept -> one apply, no revert
+    assert log.entries()[0].detail == {"knob": "block_size", "value": 16}
+
+
+def test_apply_audits_apply_then_revert_on_regression(tmp_path):
+    from gitm.safety import AuditLog
+
+    log = AuditLog(tmp_path / "audit.jsonl")
+    cfg = {"block_size": 8}
+    apply_intervention(_spec(), DictApplicator(cfg, measure_fn=lambda s: -0.05), audit=log)
+
+    # A regressing change is applied then reverted — both must be on the trail.
+    assert [e.event for e in log.entries()] == ["apply", "revert"]
+
+
+def test_apply_without_audit_writes_nothing(tmp_path):
+    """No audit arg -> no trail (dry-run/no-op applies stay off the record)."""
+    log_path = tmp_path / "audit.jsonl"
+    apply_intervention(_spec(), DictApplicator({"block_size": 8}, measure_fn=lambda s: +0.1))
+    assert not log_path.exists()
+
+
 # --- config-file applicator + CLI helper ------------------------------------
 
 
@@ -129,25 +162,25 @@ def test_apply_from_file_with_config(tmp_path):
     assert yaml.safe_load(target.read_text())["block_size"] == 16
 
 
-# --- library now carries the 18 curated levers ------------------------------
+# --- library now carries the 21 curated levers ------------------------------
 
 
 def test_library_has_18_validated_levers_with_values():
     from gitm.kernels import load_library
 
     specs = load_library()
-    assert len(specs) == 18
+    assert len(specs) == 21
     for s in specs:
         assert s.value is not None, f"{s.name} missing value"
         assert s.expected_delta_lo <= s.expected_delta_mean <= s.expected_delta_hi
-        assert s.source.startswith("http")
+        assert s.source.startswith(("http://", "https://", "benchmarks/"))
 
 
 # --- overhead measurement ---------------------------------------------------
 
 
 def test_measure_overhead_runs_and_reports():
-    from benchmarks.skeleton.measure_overhead import measure_overhead
+    from benchmarks.overhead.measure_overhead import measure_overhead
 
     result = measure_overhead(lambda: sum(range(10_000)), runs=3)
     assert result["runs"] == 3

@@ -4,7 +4,7 @@ Granger-causality test ranks candidate causes by Granger F p-value. The MLP
 that contended for cache shows up as a Granger-cause of attention's residual,
 not the symptom (attention's own residual).
 
-Doubly-robust estimator lands alongside Granger in W2 (GITM-008).
+A doubly-robust estimator runs alongside Granger (see gitm/optimizer/dr.py).
 """
 
 from __future__ import annotations

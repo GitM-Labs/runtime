@@ -1,4 +1,4 @@
-"""Tests for intern-1's dataset + reproducibility tooling.
+"""Tests for the dataset + reproducibility tooling.
 
 Covers the HFT synthetic generator, the biotech/edge fetch smoke fixtures, the
 shared smoke harness, and the reproducibility test. All GPU-free; the HFT tests

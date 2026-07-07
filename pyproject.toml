@@ -2,10 +2,15 @@
 requires = ["hatchling>=1.18"]
 build-backend = "hatchling.build"
 
+# Single source of truth for the version: gitm/__init__.py's __version__.
+# pyproject, the wheel metadata, and `gitm doctor` all read from there.
+[tool.hatch.version]
+path = "gitm/__init__.py"
+
 [project]
-name = "gitm"
-version = "0.0.1"
-description = "Behavioral compiler and intervention runtime for vLLM decode workloads."
+name = "gitm-labs"
+dynamic = ["version"]
+description = "Autonomous GPU kernel optimizer"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "GITM" }]
@@ -24,6 +29,22 @@ nvidia = ["pynvml>=11.5"]
 # fallback (pandas). On a GPU box the harness runs on cuDF/CuPy instead — those
 # install from the RAPIDS channel, not PyPI, so they are not listed here.
 bench = ["pyarrow>=15", "pandas>=2.0"]
+# Full GPU stack for the real HFT path in two commands: cuDF/CuPy (RAPIDS) +
+# the CUPTI/runtime wheels the tracer shim links + NVML telemetry + the Parquet
+# generator deps. cuDF/CuPy resolve from NVIDIA's index, so install with:
+#   pip install --extra-index-url https://pypi.nvidia.com "gitm-labs[gpu]"
+# Then `gitm run --workload hft-lob` auto-builds the shim and stages a smoke
+# dataset on first run. Linux-only wheels are markered so non-Linux installs
+# (e.g. a mac dev box) skip them rather than fail to resolve.
+gpu = [
+    "cudf-cu12>=24.0; platform_system=='Linux'",
+    "cupy-cuda12x>=13.0; platform_system=='Linux'",
+    "nvidia-cuda-cupti-cu12; platform_system=='Linux'",
+    "nvidia-cuda-runtime-cu12; platform_system=='Linux'",
+    "pynvml>=11.5",
+    "pyarrow>=15",
+    "pandas>=2.0",
+]
 prometheus = ["prometheus-client>=0.20"]
 otlp = ["opentelemetry-sdk>=1.25", "opentelemetry-exporter-otlp>=1.25"]
 s3 = ["boto3>=1.34"]
@@ -33,10 +54,12 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
     "build>=1.0",  # `python -m build` for the wheel-build verification check
+    "pre-commit>=3.5",  # local lint/test gate; see .pre-commit-config.yaml
 ]
 
 [project.scripts]
 gitm = "gitm.cli:main"
+gitm-run-workload = "gitm.runtime_driver:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["gitm"]

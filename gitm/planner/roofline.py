@@ -20,7 +20,7 @@ class HardwareSpec:
     """Peak achievable rates for a target GPU.
 
     Numbers below are illustrative defaults for A100-SXM4-80GB. Real values
-    land in a vendor catalogue at ``gitm/planner/catalogue.yaml`` (W2).
+    land in a vendor catalogue at ``gitm/planner/catalogue.yaml`` (roadmap).
     """
 
     name: str = "A100-SXM4-80GB"

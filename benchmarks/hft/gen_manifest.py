@@ -1,5 +1,8 @@
-import hashlib, os, yaml
+import hashlib
+import os
 from pathlib import Path
+
+import yaml
 
 data_root = Path(os.environ["GITM_DATA_ROOT"])
 seeds = [42, 43, 44]

@@ -1,0 +1,73 @@
+# GITM node-level operator (DaemonSet) — least-privilege, user-space, in-cluster.
+#
+# Invariants enforced here (see Deployment + Safety requirements):
+#   * no root            runAsNonRoot + runAsUser 10001, drop ALL capabilities
+#   * no privilege       allowPrivilegeEscalation: false, readOnlyRootFilesystem
+#   * no host escape     hostNetwork/hostPID false; GPU via the device plugin
+#                        resource (nvidia.com/gpu), never a privileged mount
+#   * no phone-home      no Role/RoleBinding and the SA token is not mounted, so
+#                        the pod has no Kubernetes API or out-of-cluster reach
+#
+# Pin the image by digest before applying:
+#   docker inspect --format='{{index .RepoDigests 0}}' <registry>/gitm:<tag>
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gitm-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitm-operator
+  namespace: gitm-system
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gitm-operator
+  namespace: gitm-system
+  labels:
+    app: gitm-operator
+spec:
+  selector:
+    matchLabels:
+      app: gitm-operator
+  template:
+    metadata:
+      labels:
+        app: gitm-operator
+    spec:
+      serviceAccountName: gitm-operator
+      automountServiceAccountToken: false
+      hostNetwork: false
+      hostPID: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gitm
+          image: REGISTRY/gitm@sha256:REPLACE_WITH_DIGEST
+          args: ["gitm", "doctor"]
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+          env:
+            - name: GITM_SCRATCH
+              value: /scratch
+          volumeMounts:
+            - name: scratch
+              mountPath: /scratch
+      volumes:
+        - name: scratch
+          emptyDir: {}

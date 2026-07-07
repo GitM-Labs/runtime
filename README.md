@@ -1,232 +1,148 @@
-# runtime
+# Git.M Runtime
 
-Behavioral compiler + intervention runtime for vLLM decode workloads.
+<img width="668" height="384" alt="gitm_logo" src="https://github.com/user-attachments/assets/9fff0bb8-f87a-4c8b-a9c8-576b9218160d" />
 
-```bash
-pip install -e .
-gitm run --workload vllm-decode --budget 24h --target 15%
-```
 
-Embedded:
 
-```python
-from gitm import optimize
-optimize(engine, budget="24h", target=0.15)
-```
+Git.M is a job-level runtime that makes already-placed GPU workloads run closer to their hardware ceiling. It reads runtime and hardware telemetry, models how the workload should execute, attributes the gap between expected and actual performance to a cause, and applies runtime configuration changes to close that gap. No source code, model weights, or training data are accessed.
 
-## Data layout
+It sits one layer below orchestration. Kubernetes, Slurm, or your own scheduler places the job on a node; Git.M optimizes execution on that node once the job is running.
 
-Two roots — set both before running anything:
+-----
 
-```bash
-export GITM_S3_ROOT="s3://gitm-data/prod"    # canonical store (datasets + archives)
-export GITM_SCRATCH="/mnt/nvme/gitm"         # local ephemeral run dir (defaults to ~/.cache/gitm)
-```
+## Contents
 
-Canonical layout under `$GITM_S3_ROOT` (S3):
+- [How it works](#how-it-works)
+- [Deployment and installation](#deployment-and-installation)
+- [Permissions and access](#permissions-and-access)
+- [What gets tuned](#what-gets-tuned)
+- [How optimizations are applied (configs, not rewrites)](#how-optimizations-are-applied)
+- [Verification and the optimization floor](#verification-and-the-optimization-floor)
+- [Supported environments](#supported-environments)
 
-```
-datasets/{hft,biotech,edge}/    # benchmark inputs (immutable, sha256-pinned)
-runs/                            # durable baseline + pilot outputs
-traces/                          # captured event-telemetry traces
-telemetry/                       # state-telemetry samples (1Hz GPU state)
-```
+-----
 
-Local layout under `$GITM_SCRATCH` (ephemeral, synced to S3 after a run):
+## How it works
 
-```
-staging/    # datasets staged in from S3 for the active run, then evicted
-runs/       # this run's outputs (small) before archival
-traces/     # this run's trace before archival
-telemetry/  # this run's samples before archival
-```
+1. **Telemetry ingest.** Git.M reads state and event telemetry from the GPU and runtime (CUPTI and NVML on NVIDIA, ROCm telemetry on AMD). It does not read source code, model weights, or data.
+1. **Predicted execution.** A GPU workload is treated as a repeating shape. From telemetry alone, Git.M models how the workload should execute and computes the achievable ceiling for that workload on that specific hardware.
+1. **Causal attribution.** When actual execution deviates from the predicted path, Git.M isolates the deviating regions and attributes the gap to a cause (sync stalls, scheduling gaps, memory movement, collective communication, and similar).
+1. **Constrained search.** The bottleneck class constrains the optimization search space. Within that space, Git.M selects from a library of known optimizations and runs agentic search for novel ones.
+1. **Apply and validate.** Candidate optimizations are sandboxed and validated, then applied as runtime configuration. Changes are reversible.
 
-## Architecture
+Primary metrics are model FLOP utilization (training) and goodput at SLO / model bandwidth utilization (inference), not top-line GPU busyness.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The runtime is structured as
-seven subpackages mirroring the data flow:
+-----
 
-```
-gitm/
-  telemetry/   # state telemetry: NVML / ROCm SMI, 1Hz GPU state samples
-  tracer/      # event telemetry: CUPTI / rocprof per-kernel records
-  planner/     # behavioral compiler: predicted execution graph (roofline)
-  optimizer/   # deviation monitor, attribution, replay, qualification, report
-  kernels/     # curated intervention library (the levers)
-  scheduler/   # 24-hour loop phase orchestration
-  agents/      # autonomous decision policy (intervention selection)
-```
+## Deployment and installation
 
-## Invariants
+Git.M ships as a **self-contained binary container** (a sealed artifact with a known footprint and no pip-time dependencies). A Python package is also available for development environments. The sealed container is the recommended path for environments with authorization or vulnerability-scanning boundaries.
 
-The deviation monitor checks observed-vs-predicted against three invariants:
+It installs as a **node-level / job-level operator**, in the same place a Kubernetes operator or a Slurm prolog would sit. Your users do not change how they submit or run their workloads.
 
-1. **Kernel-time invariant** — per-kernel duration must lie within roofline.
-2. **Memory-traffic invariant** — per-kernel bytes-moved must match predicted.
-3. **Stream-concurrency invariant** — predicted-concurrent kernels must overlap.
+### Kubernetes
 
-See [docs/invariants.md](docs/invariants.md).
-
-## The 24-hour loop
-
-| Phase | Hours | Module |
-|---|---|---|
-| 1. Capture trace, fingerprint workload, predict graph | 0–2 | `tracer`, `telemetry`, `planner` |
-| 2. Compute residuals + causal attribution | 2–6 | `optimizer.monitor`, `optimizer.attribution` |
-| 3. Query library, rank via counterfactual replay | 6–12 | `kernels`, `optimizer.replay` |
-| 4. Apply top-N interventions with rollback gates | 12–20 | `agents`, `optimizer` |
-| 5. Stabilize, write provenance report | 20–24 | `optimizer.report` |
-
-## Architecture
-
-GITM separates the **empirical** half (what happened) from the **predicted**
-half (what should have happened). Everything downstream operates on residuals
-— the difference between the two.
-
-### Two telemetry planes
-
-GITM never conflates these.
-
-#### State telemetry (`gitm.telemetry`)
-
-Point-in-time samples of GPU state at ~1 Hz:
-
-- Utilization, memory used, power, clocks, temperature
-- Throttle reasons (canonical bitmask across vendors)
-- NVLink throughput, ECC counters
-
-Source: **NVML** on NVIDIA, **ROCm SMI** on AMD.
-Cost: ~microseconds per sample.
-Shape: summary, not trace.
-
-#### Event telemetry (`gitm.tracer`)
-
-Per-kernel activity records with start/end timestamps, stream IDs, memory
-transfer events.
-
-Source: **CUPTI** on NVIDIA, **rocprof** on AMD.
-Cost: per-kernel callbacks.
-Shape: structurally a trace — required for the kernel-time invariant.
-
-### Components
-
-![arch](assets/arch.png)
-
-### Module responsibilities
-
-| Module | Responsibility |
-|---|---|
-| `gitm.telemetry` | Vendor-backend autodiscovery, NVML/ROCm SMI samples, pluggable sinks |
-| `gitm.tracer` | Event-telemetry capture (CUPTI/rocprof), trace schema, context manager |
-| `gitm.planner` | Behavioral Compiler — roofline-based predicted execution graph |
-| `gitm.optimizer.monitor` | Deviation monitor — residuals against 3 invariants |
-| `gitm.optimizer.attribution` | Granger + doubly-robust on residual subgraph |
-| `gitm.optimizer.replay` | Counterfactual replay for predicted intervention delta |
-| `gitm.optimizer.qualification` | Workload fingerprint gate (commit / diagnose) |
-| `gitm.optimizer.report` | Provenance chain renderer (claim → evidence → intervention → delta) |
-| `gitm.kernels` | Curated intervention library — 15–20 levers with applicability + safety |
-| `gitm.agents` | Autonomous policy — selects interventions, drives rollback |
-| `gitm.scheduler` | 24-hour loop phase orchestration |
-
-### Interfaces are contracts
-
-The five primary interfaces below are the load-bearing contracts. W2 swarm
-extends behind these without rewriting upstream code.
-
-```python
-# tracer
-with gitm.tracer.capture(out_path: Path) -> ContextManager[Trace]: ...
-
-# planner
-graph = gitm.planner.predict_graph(model: ModelSpec, hw: HardwareSpec, batch: BatchConfig) -> Graph
-
-# monitor
-residuals = gitm.optimizer.monitor.residuals(trace: Trace, graph: Graph) -> Residuals
-violations = gitm.optimizer.monitor.check_invariants(residuals, invariants) -> list[Violation]
-
-# attribution
-hypotheses = gitm.optimizer.attribution.attribute(residuals: Residuals, graph: Graph) -> RankedHypotheses
-
-# report
-report_md = gitm.optimizer.report.write(claims: list[Claim], provenance: Provenance) -> str
-```
-
-## Onboarding
-
-This document is load-bearing for Day 6 — the six benchmark interns rotate
-onto the skeleton using these steps. Every command here is expected to work
-on a clean checkout.
-
-### 1. Environment
+Git.M runs as a node-level operator. The workload is submitted to Kubernetes as usual; Git.M attaches at the job level on the node where the pod lands.
 
 ```bash
-git clone git@github.com:gitm-labs/runtime.git
-cd runtime
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
+# Deploy the operator (sealed container)
+kubectl apply -f gitm-operator.yaml
+
+# Confirm the operator is running on GPU nodes
+kubectl get pods -n gitm
 ```
 
-NVIDIA box additionally:
+### Slurm
+
+Git.M attaches at the job level under Slurm the same way it does under Kubernetes. No scheduler replacement is required.
 
 ```bash
-pip install -e ".[nvidia]"
+# Wrap the job step so the operator attaches to the allocation
+srun gitm run -- <your-existing-launch-command>
 ```
 
-Point at the canonical S3 store and a local scratch dir (see
-[Data layout](#data-layout) — datasets live in S3, never on local disk):
+### Standalone (no orchestrator)
+
+Kubernetes or Slurm are not required. Telemetry at the runtime layer is sufficient for Git.M to operate on the job directly.
 
 ```bash
-export GITM_S3_ROOT="s3://gitm-data/prod"    # canonical store
-export GITM_SCRATCH="/mnt/nvme/gitm"         # local scratch (defaults to ~/.cache/gitm)
+# Attach to a running or launching job on the local node
+gitm attach --job <job-id>
 ```
 
-`gitm doctor` reports both, plus discovered GPUs. Scratch subdirs are created
-on first run.
+The install itself is a few lines and adds no rewrite to the workload. Containers still pass through your normal image-scanning and authorization process before deployment.
 
-### 2. Smoke test
+-----
 
-```bash
-gitm --help
-gitm run --help
-pytest -q
-```
+## Permissions and access
 
-All three should pass on a clean checkout.
+Git.M is least-privilege by design so it can run inside cloud-provider, national-lab, and regulated environments without elevated rights.
 
-### 3. The 24-hour loop
+|Requirement                     |Needed?                                |
+|--------------------------------|---------------------------------------|
+|Root / elevated privileges      |No (default install runs in user space)|
+|Kernel module                   |No                                     |
+|Driver replacement              |No                                     |
+|Source code access              |No                                     |
+|Model weights access            |No                                     |
+|Training / inference data access|No                                     |
+|Outbound network / SaaS callback|No                                     |
 
-The CLI entry point composes five subpackages in order. Read the source in
-this order — it mirrors the data flow:
+Details:
 
-1. [`gitm/telemetry`](../gitm/telemetry/) — state telemetry (1 Hz GPU samples)
-2. [`gitm/tracer`](../gitm/tracer/) — event telemetry (per-kernel records)
-3. [`gitm/planner`](../gitm/planner/) — Behavioral Compiler (predicted graph)
-4. [`gitm/optimizer`](../gitm/optimizer/) — monitor, attribution, replay, report
-5. [`gitm/kernels`](../gitm/kernels/) — intervention library
-6. [`gitm/agents`](../gitm/agents/) — selection policy
-7. [`gitm/scheduler`](../gitm/scheduler/) — phase orchestration
+- **User space.** Everything runs in user space inside the user’s own job. Telemetry comes from CUPTI and NVML attached to your own processes, which is standard user-space profiling and the same access the user already has to their own job.
+- **Optimizations are config changes.** Optimizations are applied as environment and configuration changes plus runtime processes the user is already authorized to run. The tool ships and is shaped like any other user-space module or container image.
+- **Data stays in the boundary.** Telemetry is processed in-cluster. The operator runs locally and nothing about the workload (code, weights, data) leaves the authorization boundary. There are no SaaS dependencies and no phone-home.
 
-Building a runtime system
-gitm-labs/runtime, runtime/scheduler/, runtime/tracer/, runtime/optimizer/, runtime/kernels/, runtime/planner/, runtime/telemetry/, runtime/agents/
+-----
 
+## What gets tuned
 
-### 4. Where things live
+Git.M tunes runtime settings that can change without recompiling or touching source code. Kernels are roughly 10% of the surface area; most of the headroom is in everything around them. The parameter space is organized into layers, and the bottleneck class determines which layer is searched.
 
-| Concern | Path |
-|---|---|
-| Code | `gitm/` |
-| Tests | `tests/` |
-| Docs | `docs/` |
-| Datasets, traces, runs | `$GITM_S3_ROOT/` (S3, canonical) · `$GITM_SCRATCH/` (local, ephemeral) |
-| Intervention library | `gitm/kernels/library.yaml` |
-| Report template | `gitm/optimizer/templates/report.md.j2` |
-| Trace schema | `gitm/tracer/schema.py` (pydantic) |
-| Telemetry schema | `gitm/telemetry/schema.py` (pydantic) |
+- **Environment and launch.** Environment variables, library configuration, launch parameters.
+- **CUDA / ROCm runtime.** Stream configuration, memory allocator settings (for better work-queue overlap).
+- **Collective communication.** NCCL and MPI tuning knobs: algorithmic and protocol selection, thread counts.
+- **Memory and data movement.** Staging and movement, latency hiding by overlapping with other work, restructuring around stalls.
+- **Kernel variant selection.** Swapping in a better existing kernel or library implementation from available variants. This is selection, not rewriting.
 
-### 5. Contributing a new component
+Git.M does not rewrite or recompile the workload and does not edit a poorly written kernel in place. Where a kernel itself lowers the ceiling, Git.M substitutes a better available implementation or minimizes its impact (overlap, concurrency on separate streams, latency hiding) rather than pretending to configure the limit away.
 
-Every new module hangs off one of the seven subpackages and exposes its public
-surface through `__init__.py`. The five primary interfaces in
-[ARCHITECTURE.md](ARCHITECTURE.md) are contracts — extend behind them, do not
-change them, without Adit's sign-off.
+-----
+
+## How optimizations are applied
+
+Git.M is **not a compiler**. It does not recompile or rewrite the job (no Modular-style rewrite).
+
+The flow per workload:
+
+1. Profile the workload from telemetry and compute the predicted ceiling (headroom).
+1. Attribute each deviation from the ceiling to a cause.
+1. Use the bottleneck class to constrain the search space.
+1. Select candidate changes from a **library of known optimizations** (open-source mechanisms teams would otherwise hand-configure) and from **agentic auto-research** within the constrained space.
+1. Sandbox and validate each candidate.
+1. Apply validated changes as runtime configuration, dynamically while the job runs. Changes are reversible.
+
+Because the same workloads recur, optimizations amortize across runs. A 20-hour job that runs weekly is ephemeral but is the same shape each time, so the profile and the applied configuration carry over to every run.
+
+-----
+
+## Verification and the optimization floor
+
+Both deployment patterns start with a profiling step so you can see the gap before committing.
+
+1. **Profile.** Git.M profiles a sample workload, shows the achievable ceiling, and reports how far the workload is from it.
+1. **Floor.** Git.M commits to a guaranteed optimization floor (target 15%) on workloads that pass the headroom gate.
+1. **Pay on verified gains.** Pricing is a performance fee on verified recovered throughput plus a platform fee. You pay on proven gains; if a workload does not clear the floor, it is protected.
+
+Profiling reads telemetry only, so a blind evaluation is supported: hand Git.M a packaged workload (for example, one you believe is already well optimized and one you suspect has headroom) and it reports, per workload, how far each is from its ceiling and where the gap is.
+
+-----
+
+## Supported environments
+
+- **Hardware:** NVIDIA (CUDA) and AMD (ROCm). Hardware agnostic by design.
+- **Orchestration:** Kubernetes, Slurm, or standalone.
+- **Serving runtimes:** Works alongside vLLM (a tracer plugs into vLLM to read its behavior) and other runtimes. Git.M optimizes execution beneath the serving layer rather than replacing the runtime.
+- **Workloads:** Training and inference; text and non-text (multimodal, protein folding, high-frequency trading, robotics vision, and similar). Execution is treated as a shape, so the workload type is not a constraint.
+- **Topology:** On-prem, cloud, and neocloud. All processing stays within the authorization boundary.

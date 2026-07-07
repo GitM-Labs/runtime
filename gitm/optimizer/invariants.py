@@ -8,7 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-
 InvariantId = Literal["kernel_time", "memory_traffic", "stream_concurrency"]
 
 

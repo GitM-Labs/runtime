@@ -30,7 +30,7 @@ Matches `[expected_stall]` in [bench.toml](bench.toml):
 Data-stall is Parquet decode + host→device copy; sync is top-of-book
 reductions; CPU is low because Arrow handles ingest off the hot path.
 
-**Saturation rule:** if measured GPU active > 85 %, flag Adit same day — fall
+**Saturation rule:** if measured GPU active > 85 %, flag for review same day — fall
 back to a 500 M-event shard and document.
 
 ## 5. Profiling Methodology

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 from gitm.kernels.spec import InterventionSpec
+from gitm.optimizer.preconditions import GateContext, applicable
 from gitm.optimizer.replay import predict_delta
 from gitm.tracer.schema import Trace
 
@@ -30,14 +31,20 @@ def select_interventions(
     library: Iterable[InterventionSpec],
     policy: Policy,
     top_n: int = 5,
+    *,
+    ctx: GateContext | None = None,
 ) -> list[RankedCandidate]:
     candidates: list[RankedCandidate] = []
 
     for spec in library:
         reason: str | None = None
-        if policy.skip_high_risk and spec.safety.tier == "high_risk":
+        if ctx is not None:
+            ok, why = applicable(spec, ctx)
+            if not ok:
+                reason = f"not_applicable: {why}"
+        if reason is None and policy.skip_high_risk and spec.safety.tier == "high_risk":
             reason = "policy.skip_high_risk"
-        elif spec.safety.requires_qualification_commit and not policy.require_qualification_commit:
+        elif reason is None and (spec.safety.requires_qualification_commit and not policy.require_qualification_commit):
             reason = "safety.requires_qualification_commit"
         delta = predict_delta(trace, spec) if reason is None else 0.0
         candidates.append(RankedCandidate(spec=spec, predicted_delta=delta, rejected_reason=reason))

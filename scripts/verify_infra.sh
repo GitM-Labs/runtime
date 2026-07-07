@@ -28,7 +28,7 @@ check "pytest (full suite)"            "$PY -m pytest -q"
 check "ruff (lint, new surface)"       "ruff check gitm/bench gitm/tracer/_cupti gitm/tracer/_cupti_decode.py gitm/tracer/cupti.py gitm/optimizer/apply.py benchmarks tests/test_bench.py tests/test_bench_datasets.py tests/test_cupti.py tests/test_hft_harness.py tests/test_framework_harnesses.py tests/test_apply_rollback.py"
 check "import sanity (all new modules)" "$PY - <<'EOF'
 import importlib
-for m in ['gitm.bench.schema','gitm.bench.manifest','gitm.bench.baseline','gitm.bench.profile','gitm.bench.edge_manifest','gitm.bench.results','gitm.bench.runner','gitm.bench.reproduce','gitm.bench.cli','gitm.tracer.cupti','gitm.tracer._cupti_decode','gitm.optimizer.apply','benchmarks.hft.generate','benchmarks.hft.harness','benchmarks.biotech.fetch','benchmarks.biotech.harness','benchmarks.edge.fetch','benchmarks.edge.harness','benchmarks.skeleton.measure_overhead']:
+for m in ['gitm.bench.schema','gitm.bench.manifest','gitm.bench.baseline','gitm.bench.profile','gitm.bench.edge_manifest','gitm.bench.results','gitm.bench.runner','gitm.bench.reproduce','gitm.bench.cli','gitm.tracer.cupti','gitm.tracer._cupti_decode','gitm.optimizer.apply','gitm.benchmarks.hft.harness','gitm.runtime_driver','gitm.workloads','benchmarks.hft.generate','benchmarks.hft.harness','benchmarks.biotech.fetch','benchmarks.biotech.harness','benchmarks.edge.fetch','benchmarks.edge.harness','benchmarks.skeleton.measure_overhead']:
     importlib.import_module(m)
 EOF"
 check "intervention library validates" "$PY -c 'from gitm.kernels import load_library; assert len(load_library())==18'"

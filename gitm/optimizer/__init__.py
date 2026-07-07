@@ -8,6 +8,15 @@ and the provenance report writer.
 from __future__ import annotations
 
 from gitm.optimizer.attribution import RankedHypotheses, attribute
+from gitm.optimizer.headroom_kernel_rank import (
+    GpuHeadroom,
+    KernelROI,
+    gpu_headroom,
+    kernel_family,
+    kernel_roi,
+    live_gpu_headroom,
+    render_roi_table,
+)
 from gitm.optimizer.invariants import INVARIANTS, Invariant, Violation
 from gitm.optimizer.monitor import Residuals, check_invariants, residuals
 from gitm.optimizer.qualification import QualificationResult, qualify
@@ -29,4 +38,11 @@ __all__ = [
     "Claim",
     "Provenance",
     "write_report",
+    "kernel_roi",
+    "KernelROI",
+    "render_roi_table",
+    "gpu_headroom",
+    "GpuHeadroom",
+    "kernel_family",
+    "live_gpu_headroom",
 ]

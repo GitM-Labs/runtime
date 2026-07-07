@@ -18,6 +18,9 @@ class Applicability(BaseModel):
     requires_hardware: list[str] | None = None  # e.g. ["A100", "H100"]
     min_kv_cache_len: int | None = None
     max_kv_cache_len: int | None = None
+    min_gpus: int | None = None
+    requires_collective: bool = False
+    requires_interconnect: bool = False
     other: str | None = None  # free-form caveat
 
 
@@ -48,4 +51,4 @@ class InterventionSpec(BaseModel):
     source: str  # paper, blog, vLLM docs URL — required
     applicability: Applicability = Field(default_factory=Applicability)
     safety: SafetyGate = Field(default_factory=SafetyGate)
-    review: str | None = None  # Adit's review note when signed off
+    review: str | None = None  # reviewer sign-off note (None until reviewed)

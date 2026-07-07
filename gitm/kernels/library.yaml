@@ -1,14 +1,13 @@
 # Curated intervention library for vLLM decode workloads.
 #
 # Every entry has applicability, an expected delta range with a cited source,
-# and a safety gate. I2 curates entries in W2 (GITM-031 easy, GITM-032 medium,
-# GITM-033 harder); every entry carries review: null until Adit signs it off in
-# the GITM-010 library review. Expected deltas are pre-review estimates from the
-# cited source, not measured on our workloads — the replay engine and the
-# rollback-gated live apply produce the real numbers.
+# and a safety gate. Every entry carries review: null until it is signed off in
+# library review. Expected deltas are estimates from the cited source, not yet
+# measured on our own workloads. The replay engine and the rollback-gated live
+# apply produce the measured numbers.
 
 interventions:
-  # --- Tier 1: easy levers (GITM-031) ---------------------------------------
+  # --- Tier 1: low-effort levers --------------------------------------------
   - name: kv_cache_block_size_16
     summary: Set PagedAttention block size to 16 for short-context decode.
     knob: block_size
@@ -118,7 +117,7 @@ interventions:
       notes: Watch for OOM during long-running decode; rollback to 0.85 on first OOM.
     review: null
 
-  # --- Tier 2: medium levers (GITM-032) -------------------------------------
+  # --- Tier 2: medium-effort levers -----------------------------------------
   - name: enable_chunked_prefill
     summary: Chunk prefill so it overlaps with decode instead of stalling it.
     knob: enable_chunked_prefill
@@ -228,7 +227,7 @@ interventions:
       notes: Comm-path change; verify the stream-concurrency invariant holds.
     review: null
 
-  # --- Tier 3: harder levers (GITM-033) -------------------------------------
+  # --- Tier 3: higher-effort levers -----------------------------------------
   - name: tensor_parallel_size_2
     summary: Reshape to TP=2 to fit larger batches / longer context per replica.
     knob: tensor_parallel_size
@@ -342,4 +341,61 @@ interventions:
       requires_qualification_commit: true
       requires_rollback_window_s: 300
       notes: Execution-backend swap with restart; validate end-to-end before keep.
+    review: null
+
+  # unified non vLLM levels 
+  # catalog workloads levels, workload tagged load_library + the gate keep them scoped
+  # the measure delta still comes from each benchmarks A/B
+  - name: edge_fp16_autocast
+    summary: Run PointPillars/CenterPoint inference under fp16 autocast, gated on
+      detection-equivalence (count + sorted scores within tolerance).
+    knob: edge.inference_dtype
+    value: fp16
+    applies_to_kernels: [conv, pointpillars, centerpoint]
+    expected_delta_mean: 0.40
+    expected_delta_lo: 0.00
+    expected_delta_hi: 1.00
+    source: benchmarks/edge/optimize.py (detection-equivalence A/B)
+    applicability:
+      workloads: [edge, kitti, nuscenes]
+    safety:
+      tier: moderate
+      requires_rollback_window_s: 60
+      notes: fp16 can shift detections; keep only if detection-equivalent and faster.
+    review: null
+
+  - name: edge_frame_batching
+    summary: Run inference on batches of frames in one forward pass instead of one
+      frame at a time.
+    knob: edge.batch_size
+    value: 4
+    applies_to_kernels: [conv, pointpillars, centerpoint]
+    expected_delta_mean: 0.30
+    expected_delta_lo: 0.00
+    expected_delta_hi: 2.00
+    source: benchmarks/edge/optimize.py (detection-equivalence A/B)
+    applicability:
+      workloads: [edge, kitti, nuscenes]
+    safety:
+      tier: moderate
+      requires_rollback_window_s: 60
+      notes: Batching changes latency profile; gate on detection-equivalence.
+    review: null
+
+  - name: hft_top_of_book_fewer_scans
+    summary: Carry per-symbol top-of-book in 2 grouped scans instead of 4, gated on
+      byte-identical VWAP/microprice output.
+    knob: hft.top_of_book_grouped_scans
+    value: 2
+    applies_to_kernels: [cudf_groupby_scan, reduce, scan]
+    expected_delta_mean: 0.10
+    expected_delta_lo: 0.00
+    expected_delta_hi: 0.50
+    source: benchmarks/hft/optimize.py (byte-identical A/B)
+    applicability:
+      workloads: [hft, hft-lob]
+    safety:
+      tier: low_risk
+      requires_rollback_window_s: 30
+      notes: Pure reduction in scans; output must be byte-identical to keep.
     review: null

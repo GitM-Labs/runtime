@@ -1,4 +1,4 @@
-"""Measure trace-capture overhead — GITM-017 (W1 target <10%, W2 target <5%).
+"""Measure trace-capture overhead (current target <10%, tightening to <5%).
 
 Runs a workload ``runs`` times with instrumentation and ``runs`` times without,
 and reports the mean wall-clock overhead the capture path adds. The workload is
@@ -7,7 +7,7 @@ synthetic CPU compute loop so the methodology is runnable anywhere (on a
 CPU-only host capture is a no-op, so the measured overhead is ~0 — that is the
 floor of the method, not the GPU number).
 
-    python -m benchmarks.skeleton.measure_overhead --runs 3 --steps 100
+    python -m benchmarks.overhead.measure_overhead --runs 3 --steps 100
 """
 
 from __future__ import annotations
@@ -96,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"baseline    mean: {result['baseline_mean_s'] * 1e3:.2f} ms")
     print(f"instrumented mean: {result['instrumented_mean_s'] * 1e3:.2f} ms")
     print(f"overhead: {result['overhead_fraction'] * 100:.2f}%  "
-          f"(W1 target <10%, W2 target <5%)")
+          f"(target <10%, tightening to <5%)")
     return 0
 
 

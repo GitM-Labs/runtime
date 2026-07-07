@@ -1,8 +1,7 @@
 """Shared SMOKE/PLUMBING harness, not the real benchmark harness.
 
-Each benchmark's real work-unit (CUDA LOB kernels / OpenFold / OpenPCDet) is
-intern-2's deliverable and needs a GPU. This stand-in lets intern-1's
-dataset + reproducibility loop (`make smoke`, `make reproduce`) run end-to-end on
+Each benchmark's real work-unit (CUDA LOB kernels / OpenFold / OpenPCDet)
+needs a GPU. This stand-in lets the dataset + reproducibility loop (`make smoke`, `make reproduce`) run end-to-end on
 a laptop: it reads the staged dataset, derives a *deterministic* pseudo-metric
 and a stall breakdown sampled at the midpoint of the spec's expected bands, and
 prints the one-JSON-line harness contract. Replace via each benchmark's

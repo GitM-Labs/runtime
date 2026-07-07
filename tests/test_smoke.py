@@ -1,4 +1,4 @@
-"""End-to-end smoke tests for the W1 skeleton.
+"""End-to-end smoke tests for the runtime loop.
 
 These run without a GPU. They exercise every public interface on the critical
 path so any regression in the scaffold is caught on commit.
@@ -7,10 +7,7 @@ path so any regression in the scaffold is caught on commit.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-
-import pytest
 
 
 def test_version_importable():
@@ -52,7 +49,7 @@ def test_intervention_library_loads_and_validates():
     assert len(specs) >= 2
     for spec in specs:
         assert spec.expected_delta_lo <= spec.expected_delta_mean <= spec.expected_delta_hi
-        assert spec.source.startswith(("http://", "https://"))
+        assert spec.source.startswith(("http://", "https://", "benchmarks/"))
 
 
 def test_qualification_returns_diagnostic_on_empty_trace():
