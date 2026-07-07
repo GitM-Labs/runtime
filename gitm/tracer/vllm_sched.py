@@ -15,10 +15,7 @@ is cheap(reads counter), so the loop can poll it at decode-step cadence.
 from __future__ import annotations
 
 from typing import Any
-
-from numba.core.types import none
 from pydantic import BaseModel, ConfigDict, Field
-from pydantic.fields import PropertyT
 
 
 class SchedulerSample(BaseModel):
@@ -139,6 +136,6 @@ class SchedulerStatsTracker(BaseModel):
             "mean_queue_depth": sum(s.queue_depth for s in self.samples) / n,
             "max_queue_depth": max(s.queue_depth for s in self.samples),
             "mean_gpu_cache_usage": sum(s.gpu_cache_usage for s in self.samples) / n,
-            "total_preemptions": max(s.num_preemptions for s in self.samples),
+            "total_preemptions": max(s.num_preemptions for s in self.samples) - min(s.num_preemptions for s in self.samples),
             "starved_fraction": sum(1 for s in self.samples if s.batch_occupancy < 0.5) / n,
         }
