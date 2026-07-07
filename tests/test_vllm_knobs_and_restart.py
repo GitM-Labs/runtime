@@ -249,7 +249,9 @@ def test_run_loop_scheduler_stats_feed_attribution_and_claims(tmp_path, monkeypa
     monkeypatch.setattr(loop, "sync_device", lambda: None)
 
     engine = _FullEngine()
-    out = run_loop(LoopConfig(engine=engine, workload="vllm-decode", budget="5s",
+    # Non-expiring budget: max_num_seqs_256 ranks low and this asserts it's reached
+    # + kept; a short wall-clock would make that racy under load (loop is budget-bounded).
+    out = run_loop(LoopConfig(engine=engine, workload="vllm-decode", budget="24h",
                               scratch=str(tmp_path), top_n_interventions=50))
 
     run_dir = Path(out["run_dir"])
