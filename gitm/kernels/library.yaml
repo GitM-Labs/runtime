@@ -65,10 +65,14 @@ interventions:
       notes: fp8 KV can shift logits slightly; gate on an accuracy sentinel before keep.
     review: null
 
-  - name: max_num_batched_tokens_8192
-    summary: Raise the per-step token budget to 8192 to fill decode batches.
+  - name: max_num_batched_tokens_2x_current
+    summary: Double the per-step token budget (relative to whatever this engine
+      is already running) to fill decode batches.
     knob: max_num_batched_tokens
-    value: 8192
+    value: 8192  # offline/predict-only fallback when there's no live engine to scale
+    value_multiplier: 2.0  # vLLM's own auto_tune.sh sweeps this per-deployment,
+      # not one static number — the right absolute value depends on model
+      # size/GPU/workload shape, so scale the engine's current setting instead.
     applies_to_kernels: *all_ops  # batch-shape lever: touches every op's batch dim
     expected_delta_mean: 0.05
     expected_delta_lo: 0.01

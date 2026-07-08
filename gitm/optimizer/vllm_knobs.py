@@ -24,6 +24,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from gitm.kernels.spec import InterventionSpec
+
 KnobKind = Literal["scheduling", "structural"]
 
 # Prefixes a config object may hide behind, newest-first. ``""`` = the config is
@@ -223,3 +225,32 @@ def unmet_prerequisite(engine: Any | None, knob: str) -> str | None:
         return f"prerequisite {prereq!r} not enabled on this engine"
     except AttributeError:
         return f"prerequisite {prereq!r} unknown on this engine"
+
+
+def resolve_relative_value(spec: InterventionSpec, engine: Any | None) -> InterventionSpec:
+    """Scale a relative catalog lever's value off the engine's CURRENT setting.
+
+    A knob like ``max_num_batched_tokens`` doesn't have one right absolute
+    value across every deployment — it depends on model size, GPU, and
+    workload shape (this is exactly why vLLM's own auto_tune.sh sweeps it
+    rather than hardcoding a number). A catalog entry with ``value_multiplier``
+    set says "N times whatever this engine is already running at" instead of
+    one static guess. With a live engine, read its current value for the knob
+    and scale that. Falls back to the spec's static ``value`` when there's no
+    multiplier, no engine, or the current value can't be read/scaled
+    (offline/predict-only mode) — still a usable, honest estimate.
+    """
+    if spec.value_multiplier is None or engine is None:
+        return spec
+    try:
+        current = get_knob(engine, spec.knob)
+    except AttributeError:
+        return spec
+    if not isinstance(current, int | float) or isinstance(current, bool) or current <= 0:
+        return spec
+    scaled = current * spec.value_multiplier
+    new_value = int(round(scaled)) if isinstance(current, int) else scaled
+    return spec.model_copy(update={
+        "value": new_value,
+        "summary": f"{spec.summary} (scaled {spec.value_multiplier:g}x current {current} -> {new_value})",
+    })

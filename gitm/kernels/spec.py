@@ -45,6 +45,14 @@ class InterventionSpec(BaseModel):
     knob: str  # vLLM config key, e.g. "max_num_batched_tokens" — or a display
     # label ("k1=v1,k2=v2") for a joint candidate; see ``knobs`` below.
     value: int | float | str | bool | None = None  # value to set on apply (single-knob)
+    # For a knob whose "right" absolute value depends on model size/GPU/
+    # workload shape (e.g. max_num_batched_tokens): scale the engine's CURRENT
+    # value by this factor instead of hardcoding one number for every
+    # deployment. None (the default) means value is a static literal, applied
+    # as-is. See gitm.optimizer.vllm_knobs.resolve_relative_value — value
+    # stays the offline/predict-only fallback when there's no live engine to
+    # read a current setting from.
+    value_multiplier: float | None = None
     # A joint candidate: >1 knob=value pair applied/rolled back together as one
     # atomic unit. Empty (the default) means "single knob" — use ``knob``/
     # ``value`` instead. Additive: every existing single-knob spec is

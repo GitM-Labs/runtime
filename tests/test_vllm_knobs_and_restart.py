@@ -20,6 +20,7 @@ from gitm.optimizer.vllm_knobs import (
     get_knob,
     knob_kind,
     resolve_knob,
+    resolve_relative_value,
     set_knob,
     unmet_prerequisite,
 )
@@ -78,6 +79,36 @@ def test_unmet_prerequisite():
 
     # Engine exposes neither the taxonomy path nor a flat attr -> conservative reject.
     assert "unknown on this engine" in unmet_prerequisite(object(), "dbo_prefill_token_threshold")
+
+
+def test_resolve_relative_value():
+    relative = _spec("max_num_batched_tokens", 8192)
+    relative.value_multiplier = 2.0
+    absolute = _spec("max_num_seqs", 256)  # no multiplier -> untouched
+
+    class _Sched:
+        def __init__(self, tokens):
+            self.max_num_batched_tokens = tokens
+
+    class _Engine:
+        def __init__(self, tokens):
+            self.scheduler_config = _Sched(tokens)
+
+    # No engine, or no multiplier -> the static YAML/literal value is unchanged.
+    assert resolve_relative_value(relative, None).value == 8192
+    assert resolve_relative_value(absolute, _Engine(512)) is absolute
+
+    # A live engine's current value scales instead of the hardcoded literal —
+    # a tiny model's 512 doubles to 1024, not always jumping to 8192.
+    small = resolve_relative_value(relative, _Engine(512))
+    assert small.value == 1024
+    assert "512 -> 1024" in small.summary
+
+    big = resolve_relative_value(relative, _Engine(4096))
+    assert big.value == 8192
+
+    # Can't read the current value -> falls back to the static value, not a crash.
+    assert resolve_relative_value(relative, object()).value == 8192
 
 
 class _SchedCfg:
