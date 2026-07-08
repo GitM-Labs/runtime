@@ -37,6 +37,28 @@ def test_classify_op():
     assert classify_op("triton_rms_norm") is None  # not a modeled op
 
 
+def test_classify_op_matches_real_vllm_kernel_names():
+    """Confirmed against a real vLLM decode trace (L4, CUPTI) — these exact
+    mangled kernel names came back from a live run. FlashAttention's real
+    kernel is flash_fwd_*, NOT flash_attn_* (that needle alone misses it);
+    vLLM's own KV-cache write/bookkeeping kernels weren't covered at all."""
+    assert classify_op(
+        "_ZN5flash24flash_fwd_splitkv_kernelI23Flash_fwd_kernel_traitsILi64E"
+        "Li64ELi256ELi4ELb0ELb0EN7cutlass6half_tE19Flash_kernel_traitsILi64E"
+    ) == "attn_score_value"
+    assert classify_op(
+        "_ZN4vllm30reshape_and_cache_flash_kernelIttLNS_18Fp8KVCacheDataTypeE0EEE"
+    ) == "attn_score_value"
+    assert classify_op("_compute_slot_mapping_kernel") == "attn_score_value"
+    # The dominant real kernel type (~35% of launches on that trace) is a bare
+    # cuBLAS/cutlass GEMM shared across every projection — genuinely
+    # unattributable by name alone, not a bug to chase with more substrings.
+    assert classify_op("ampere_fp16_s16816gemm_fp16_128x128_ldg8_relu_f2f_stages_32x5_tn") is None
+    assert classify_op(
+        "_ZN7cutlass7Kernel2I66cutlass_80_tensorop_f16_s16816gemm_relu_f16_256x128_32x3_tn_align8EEE"
+    ) is None
+
+
 def test_in_band_op_not_kept_out_of_band_and_unmodeled_kept():
     g = predict_graph()
     t_attn = next(n.prediction.t_pred_s for n in g.nodes if n.op == "attn_score_value")
