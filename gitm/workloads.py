@@ -701,22 +701,24 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         sync_device()
         return toks / max(time.perf_counter() - t0, 1e-9)
 
-    def _restart(_old_engine: Any, knob: str, value: Any) -> Any:
-        """Rebuild a fresh vLLM engine with one structural knob changed.
+    def _restart(_old_engine: Any, knob_values: dict[str, Any]) -> Any:
+        """Rebuild a fresh vLLM engine with one or more structural knobs changed.
 
         The restart-apply path for structural levers that can't be hot-swapped on a
         running engine — most importantly ``kv_cache_dtype=fp8`` and
         ``quantization``, the real throughput/memory levers for decode. Structural
         knob names match the vLLM ``LLM`` kwargs (``kv_cache_dtype``,
         ``gpu_memory_utilization``, ``swap_space``, ``block_size``,
-        ``quantization``, …), so the change is a single kwarg. Returns the new
-        engine; ``LiveEngineApplicator`` swaps it in for the A/B and tears it down
-        on restore. Raises on an unsupported knob/value (no fp8 support on this
-        SKU, missing quantized checkpoint) → the candidate is rolled back cleanly,
+        ``quantization``, …), so the change is a kwargs update — one entry for a
+        single-knob candidate, more for a joint one (e.g. a prerequisite flag
+        turned on together with the knob it gates). Returns the new engine;
+        ``LiveEngineApplicator`` swaps it in for the A/B and tears it down on
+        restore. Raises on an unsupported knob/value (no fp8 support on this SKU,
+        missing quantized checkpoint) → the candidate is rolled back cleanly,
         never a silent no-op.
         """
         kwargs = dict(getattr(_old_engine, "gitm_llm_kwargs", _base_kwargs))
-        kwargs[knob] = value  # the structural knob (wins if it IS gpu_memory_utilization)
+        kwargs.update(knob_values)
         # Give each restarted engine a fresh distributed port so V1 init does not
         # collide with any prior in-process engine state.
         os.environ["VLLM_PORT"] = str(_free_port())
@@ -724,7 +726,7 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
             return _build_engine(kwargs)
         except Exception as exc:
             raise RuntimeError(
-                f"restart candidate for {knob!r} failed to build: {exc}"
+                f"restart candidate for {', '.join(knob_values)} failed to build: {exc}"
             ) from exc
 
     def _baseline_restart(old_engine: Any) -> Any:

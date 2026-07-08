@@ -15,10 +15,10 @@ _SCHED_KNOB = SimpleNamespace(knob="max_num_seqs", value=256)  # a scheduling kn
 
 
 def test_force_restart_rebuilds_for_a_scheduling_knob():
-    built: list[tuple[str, object]] = []
+    built: list[dict] = []
 
-    def restart(_engine, knob, value):
-        built.append((knob, value))
+    def restart(_engine, knob_values):
+        built.append(dict(knob_values))
         return SimpleNamespace(name="candidate")
 
     app = LiveEngineApplicator(
@@ -29,7 +29,7 @@ def test_force_restart_rebuilds_for_a_scheduling_knob():
     )
     app.snapshot()
     app.apply(_SCHED_KNOB)
-    assert built == [("max_num_seqs", 256)]  # rebuilt, not hot-swapped
+    assert built == [{"max_num_seqs": 256}]  # rebuilt, not hot-swapped
     assert app._prev[0] == "restart"
 
 
@@ -40,7 +40,7 @@ def test_default_hot_swaps_a_scheduling_knob():
         throughput_fn=lambda _e: 100.0,
         getter=lambda _e, _k: None,
         setter=lambda _e, k, v: sets.append((k, v)),
-        restart_fn=lambda _e, _k, _v: SimpleNamespace(),
+        restart_fn=lambda _e, _kv: SimpleNamespace(),
     )
     app.snapshot()
     app.apply(_SCHED_KNOB)

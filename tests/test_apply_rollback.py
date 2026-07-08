@@ -102,7 +102,7 @@ def test_apply_audits_kept_change(tmp_path):
 
     events = [e.event for e in log.entries()]
     assert events == ["apply"]  # kept -> one apply, no revert
-    assert log.entries()[0].detail == {"knob": "block_size", "value": 16}
+    assert log.entries()[0].detail == {"knobs": {"block_size": 16}}
 
 
 def test_apply_audits_apply_then_revert_on_regression(tmp_path):

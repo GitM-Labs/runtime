@@ -158,8 +158,8 @@ def test_hotswap_scheduling_knob_kept():
 def test_restart_apply_structural_knob_kept_and_swaps_engine():
     e0 = _TpsEngine(100.0)
 
-    def restart_fn(old, knob, value):
-        assert knob == "block_size" and value == 16
+    def restart_fn(old, knob_values):
+        assert knob_values == {"block_size": 16}
         return _TpsEngine(200.0)  # the "restarted" engine is faster
 
     app = LiveEngineApplicator(e0, throughput_fn=_tps_of, restart_fn=restart_fn)
@@ -194,10 +194,10 @@ def test_serial_restart_releases_baseline_before_building_candidate():
     restored = Engine(100.0)
     events: list[str] = []
 
-    def restart_fn(old, knob, value):
+    def restart_fn(old, knob_values):
         assert old is baseline
         assert old.shutdown_called
-        events.append(f"restart:{knob}={value}")
+        events.append("restart:" + ",".join(f"{k}={v}" for k, v in knob_values.items()))
         return Engine(50.0)
 
     def baseline_restart_fn(old):
@@ -224,7 +224,7 @@ def test_serial_restart_rebuilds_baseline_if_candidate_build_fails():
     baseline = _TpsEngine(100.0)
     restored = _TpsEngine(100.0)
 
-    def restart_fn(_old, _knob, _value):
+    def restart_fn(_old, _knob_values):
         raise RuntimeError("candidate OOM")
 
     app = LiveEngineApplicator(

@@ -154,7 +154,7 @@ def test_vllm_factory_returns_runner_with_live_engine_hooks(monkeypatch):
     assert FakeLLM.instances[0].calls == 1
     assert runner.engine.gitm_throughput_fn(runner.engine) > 0
     baseline = runner.engine
-    restarted = runner.engine.gitm_restart_fn(runner.engine, "swap_space", 2)
+    restarted = runner.engine.gitm_restart_fn(runner.engine, {"swap_space": 2})
     assert restarted.kwargs["gpu_memory_utilization"] == 0.45
     assert restarted.kwargs["swap_space"] == 2
 

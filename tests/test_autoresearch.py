@@ -311,10 +311,13 @@ from gitm.agents.autoresearch import (  # noqa: E402
     StochasticProposer,
     TableProposer,
     VLLMKnobSource,
+    _affinity_strength,
     _argparse_domains,
     _candidate_spec,
+    _delta_mean_for,
     _field_kind_and_choices,
     _is_tunable,
+    _joint_prerequisite_candidates,
     _knobs_from_engine_args,
     _requires_multi_gpu,
     _value_grid,
@@ -777,15 +780,18 @@ def test_engineargs_proposer_accepts_gpu_count_offline() -> None:
 
 
 def test_candidate_specs_share_the_forced_fields() -> None:
-    """DRY guard: table and generated candidates agree on delta band, safety tier,
-    and applicability — the fields _candidate_spec centralizes."""
+    """DRY guard: table and generated candidates agree on safety tier, delta
+    band bounds, and applicability — the fields _candidate_spec centralizes.
+    expected_delta_mean itself is excluded: generated candidates scale it by
+    affinity-keyword strength (see test_generated_delta_mean_scales_with_
+    affinity_strength), so it legitimately differs candidate to candidate."""
     table = propose("memory_bound")[0]
     generated = EngineArgsProposer(
         knobs=[Knob("cpu_offload_gb", "int", default=0)], catalog_knobs=set()
     ).propose("memory_bound")[0]
     for s in (table, generated):
         assert s.safety.tier == "moderate"
-        assert (s.expected_delta_mean, s.expected_delta_lo, s.expected_delta_hi) == (0.05, 0.0, 0.15)
+        assert (s.expected_delta_lo, s.expected_delta_hi) == (0.0, 0.15)
         assert s.applicability.workloads == ["vllm-decode"]
 
 
@@ -856,6 +862,116 @@ def test_candidate_spec_helper_forces_safety_and_delta() -> None:
     assert spec.safety.tier == "moderate"
     assert spec.expected_delta_hi == 0.15
     assert spec.applicability.workloads == ["some-workload"]
+
+
+# --- ranking: delta_mean scales with a real, computable signal ---------------
+
+
+def test_affinity_strength_counts_keyword_matches() -> None:
+    keywords = ("cache", "swap", "offload", "cpu")
+    assert _affinity_strength(Knob("cpu_offload_gb", "int", default=0), keywords) == 2
+    assert _affinity_strength(Knob("swap_space", "int", default=0), keywords) == 1
+    assert _affinity_strength(Knob("unrelated_thing", "int", default=0), keywords) == 0
+    # An explicit tag is one strong match regardless of name.
+    tagged = Knob("weird_lever", "int", default=0, classes=("idle_stall",))
+    assert _affinity_strength(tagged, keywords) == 1
+
+
+def test_delta_mean_for_scales_and_caps_at_expected_delta_hi() -> None:
+    assert _delta_mean_for(0) == _delta_mean_for(1)  # zero matches floors at 1
+    assert abs(_delta_mean_for(2) - 2 * _delta_mean_for(1)) < 1e-9
+    assert _delta_mean_for(100) == 0.15  # capped, never exceeds expected_delta_hi
+
+
+def test_generated_delta_mean_scales_with_affinity_strength() -> None:
+    """The bug this fixes: every generated candidate carried the identical
+    expected_delta_mean regardless of how strongly its name actually matched
+    the bottleneck class, so predict_delta's ranking was blind within a run.
+    A knob matching 2 keywords must rank ahead of one matching 1."""
+    p = EngineArgsProposer(
+        knobs=[
+            Knob("cpu_offload_gb", "int", default=0),  # matches "cpu" + "offload"
+            Knob("preemption_mode", "enum", default="recompute",
+                 choices=("recompute", "swap")),  # matches "preempt" only
+        ],
+        catalog_knobs=set(),
+    )
+    specs = {s.knob: s for s in p.propose("memory_bound")}
+    assert specs["cpu_offload_gb"].expected_delta_mean > specs["preemption_mode"].expected_delta_mean
+
+
+# --- joint candidates: prerequisite + dependent knob together ----------------
+
+
+def test_joint_prerequisite_candidate_pairs_flag_and_dependent_knob() -> None:
+    knobs = [
+        Knob("enable_dbo", "bool", default=False),
+        Knob("dbo_prefill_token_threshold", "int", default=512),
+    ]
+    specs = _joint_prerequisite_candidates(
+        knobs, bottleneck_class="idle_stall", workload="vllm-decode", target_op=None,
+        keywords=_CLASS_KEYWORDS["idle_stall"],
+    )
+    assert specs  # at least one value-grid point for the dependent knob
+    for s in specs:
+        assert set(s.knobs) == {"enable_dbo", "dbo_prefill_token_threshold"}
+        assert s.knobs["enable_dbo"] is True
+        assert s.value is None  # display-only label lives in .knob
+
+
+def test_joint_prerequisite_candidate_absent_without_the_flag_knob() -> None:
+    # No enable_dbo in the surface (e.g. offline fallback catalog) -> nothing.
+    knobs = [Knob("dbo_prefill_token_threshold", "int", default=512)]
+    assert _joint_prerequisite_candidates(
+        knobs, bottleneck_class="idle_stall", workload="vllm-decode", target_op=None,
+        keywords=_CLASS_KEYWORDS["idle_stall"],
+    ) == []
+
+
+def test_joint_prerequisite_candidate_respects_bottleneck_class_affinity() -> None:
+    knobs = [
+        Knob("enable_dbo", "bool", default=False),
+        Knob("dbo_prefill_token_threshold", "int", default=512),
+    ]
+    # compute_bound's keywords don't match "prefill" -> no joint candidate.
+    assert _joint_prerequisite_candidates(
+        knobs, bottleneck_class="compute_bound", workload="vllm-decode", target_op=None,
+        keywords=_CLASS_KEYWORDS["compute_bound"],
+    ) == []
+
+
+def test_engineargs_proposer_surfaces_joint_dbo_candidate() -> None:
+    """End-to-end through the proposer a real EngineArgs surface would yield."""
+    p = EngineArgsProposer(
+        knobs=[
+            Knob("enable_dbo", "bool", default=False),
+            Knob("dbo_prefill_token_threshold", "int", default=512),
+        ],
+        catalog_knobs=set(),
+    )
+    specs = p.propose("idle_stall")
+    joint = [s for s in specs if len(s.knobs) > 1]
+    assert joint and all(set(s.knobs) == {"enable_dbo", "dbo_prefill_token_threshold"}
+                          for s in joint)
+
+
+def test_intervention_spec_knob_values_property() -> None:
+    from gitm.kernels.spec import InterventionSpec
+
+    single = InterventionSpec(
+        name="n", summary="s", knob="max_num_seqs", value=256,
+        expected_delta_mean=0.05, expected_delta_lo=0.0, expected_delta_hi=0.1,
+        source="test",
+    )
+    assert single.knob_values == {"max_num_seqs": 256}
+
+    joint = InterventionSpec(
+        name="n", summary="s", knob="a=1,b=2", value=None,
+        knobs={"a": 1, "b": 2},
+        expected_delta_mean=0.05, expected_delta_lo=0.0, expected_delta_hi=0.1,
+        source="test",
+    )
+    assert joint.knob_values == {"a": 1, "b": 2}
 
 
 # --- stochastic (entropy-guided) proposer ------------------------------------

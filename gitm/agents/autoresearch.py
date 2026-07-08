@@ -48,6 +48,7 @@ from gitm.kernels.library import load_library
 from gitm.kernels.spec import Applicability, InterventionSpec, SafetyGate
 from gitm.optimizer.apply import Applicator, apply_intervention
 from gitm.optimizer.monitor import Residuals, _serialized_fraction
+from gitm.optimizer.vllm_knobs import KNOB_PREREQUISITES
 from gitm.tracer.schema import Trace
 
 if TYPE_CHECKING:
@@ -267,6 +268,8 @@ def _candidate_spec(
     bottleneck_class: str,
     workload: str,
     source: str,
+    knobs: dict[str, object] | None = None,
+    delta_mean: float = _DELTA_MEAN,
 ) -> InterventionSpec:
     """Build a candidate spec with the fields every proposer forces.
 
@@ -274,16 +277,24 @@ def _candidate_spec(
     applicability, and the moderate/rollback-gated safety posture — so the table
     and generative proposers can't drift apart on what a *candidate* is. Only the
     caller-varying parts (name, summary, knob/value, source) are parameters.
+
+    ``knobs`` makes this a *joint* candidate (>1 knob=value pair applied and
+    rolled back together) — ``knob``/``value`` stay a display label in that
+    case; see :class:`gitm.kernels.spec.InterventionSpec`. ``delta_mean``
+    overrides the flat default so a caller can scale confidence by a real,
+    computable signal (e.g. affinity-keyword strength) instead of every
+    candidate carrying the identical constant.
     """
     return InterventionSpec(
         name=name,
         summary=summary,
         knob=knob,
         value=value,  # int | float | str | bool
+        knobs=knobs or {},
         applies_to_kernels=applies_to_kernels,
         # Proposed, not measured: an honest, modest range. The measured A/B is
         # what turns this into a real number.
-        expected_delta_mean=_DELTA_MEAN,
+        expected_delta_mean=min(delta_mean, _DELTA_HI),
         expected_delta_lo=_DELTA_LO,
         expected_delta_hi=_DELTA_HI,
         source=source,
@@ -409,6 +420,31 @@ def _affine(knob: Knob, bottleneck_class: str, keywords: tuple[str, ...]) -> boo
         return bottleneck_class in knob.classes
     lname = knob.name.lower()
     return any(k in lname for k in keywords)
+
+
+def _affinity_strength(knob: Knob, keywords: tuple[str, ...]) -> int:
+    """How many affinity keywords match ``knob``'s name — a real, computable
+    signal for how strongly it's implicated in the bottleneck class, not a
+    fabricated score. An explicit ``Knob.classes`` tag is one strong match (no
+    keyword multiplicity to count)."""
+    if knob.classes:
+        return 1
+    lname = knob.name.lower()
+    return sum(1 for k in keywords if k in lname)
+
+
+#: expected_delta_mean per unit of affinity strength — every generated candidate
+#: previously carried the exact same constant (_DELTA_MEAN) regardless of how
+#: strongly its name actually matched the bottleneck class, so predict_delta's
+#: ranking was blind within a run (identical coverage, identical mean ⇒
+#: identical predicted_delta). Scaling by keyword-match count is still an
+#: unproven v0 estimate — just one that varies with a real per-candidate signal
+#: instead of a flat number.
+_DELTA_MEAN_PER_MATCH = _DELTA_MEAN
+
+
+def _delta_mean_for(strength: int) -> float:
+    return min(_DELTA_MEAN_PER_MATCH * max(strength, 1), _DELTA_HI)
 
 
 #: Multipliers applied to a numeric knob's default to derive its search points.
@@ -739,6 +775,7 @@ class _ProposerBase:
         target_op: str | None,
         verb: str,
         source: str,
+        keywords: tuple[str, ...] = (),
     ) -> InterventionSpec:
         aim = f" (targeting {target_op})" if target_op else ""
         return _candidate_spec(
@@ -750,7 +787,17 @@ class _ProposerBase:
             bottleneck_class=bottleneck_class,
             workload=self._workload,
             source=source,
+            delta_mean=_delta_mean_for(_affinity_strength(knob, keywords)),
         )
+
+    def _extra_candidates(
+        self, bottleneck_class: str, target_op: str | None, keywords: tuple[str, ...]
+    ) -> list[InterventionSpec]:
+        """Hook for a workload-specific source to add candidates beyond the
+        per-knob value grid (e.g. joint prerequisite+dependent pairs). No-op
+        here — :class:`GenerativeProposer` stays workload-agnostic; the vLLM
+        binding (:class:`EngineArgsProposer`) overrides this."""
+        return []
 
 
 class GenerativeProposer(_ProposerBase):
@@ -794,14 +841,74 @@ class GenerativeProposer(_ProposerBase):
                 target_op=target_op,
                 verb="search",
                 source="autoresearch-v0 (generated candidate; real workload knob, unproven delta)",
+                keywords=keywords,
             )
             for knob in self._searchable()
             if _affine(knob, bottleneck_class, keywords)
             for value in _value_grid(knob)
         ]
+        out += self._extra_candidates(bottleneck_class, target_op, keywords)
         # Bound the per-class candidate count so a large config surface can't
         # flood the gate; the rollback gate still ranks and proves what survives.
         return out if self._max is None else out[: self._max]
+
+
+def _joint_prerequisite_candidates(
+    knobs: list[Knob],
+    *,
+    bottleneck_class: str,
+    workload: str,
+    target_op: str | None,
+    keywords: tuple[str, ...] = (),
+) -> list[InterventionSpec]:
+    """Pair a prerequisite-gated knob with its prerequisite, as ONE candidate.
+
+    :func:`gitm.optimizer.vllm_knobs.unmet_prerequisite` can only veto a
+    standalone dependent-knob proposal when the prerequisite isn't already on
+    — it can never turn the prerequisite on itself (an ``InterventionSpec`` only
+    carries one knob). This is the other half: propose
+    ``{prerequisite: True, dependent: value}`` as a single joint spec, so the
+    dependent knob stays reachable (atomically tested, not just vetoed) even on
+    a deployment where the prerequisite isn't set yet.
+
+    Gated the same way every other generated candidate is — ``_affine`` against
+    this call's bottleneck class — so a joint dbo/chunked-prefill candidate
+    only surfaces when the run is actually searching idle_stall, not every
+    class. Also requires the prerequisite itself to be a real, present, boolean
+    knob — a source that doesn't expose it (e.g. the offline fallback catalog)
+    yields nothing here, same as any other candidate needing a surface it
+    doesn't have.
+    """
+    by_name = {k.name: k for k in knobs}
+    out: list[InterventionSpec] = []
+    for needle, prereq_name in KNOB_PREREQUISITES:
+        prereq = by_name.get(prereq_name)
+        if prereq is None or prereq.kind != "bool":
+            continue
+        for knob in knobs:
+            if knob.name == prereq_name or needle not in knob.name.lower():
+                continue
+            if not _affine(knob, bottleneck_class, keywords):
+                continue
+            aim = f" (targeting {target_op})" if target_op else ""
+            for value in _value_grid(knob):
+                pair = {prereq_name: True, knob.name: value}
+                label = ",".join(f"{k}={v}" for k, v in pair.items())
+                out.append(
+                    _candidate_spec(
+                        name=f"autoresearch:{bottleneck_class}:{label}",
+                        summary=f"enable {prereq_name} and set {knob.name}={value} "
+                                f"for {bottleneck_class}{aim}",
+                        knob=label,
+                        value=None,
+                        knobs=pair,
+                        applies_to_kernels=[target_op] if target_op else [],
+                        bottleneck_class=bottleneck_class,
+                        workload=workload,
+                        source="autoresearch-v0 (joint candidate: prerequisite + dependent knob)",
+                    )
+                )
+    return out
 
 
 class EngineArgsProposer(GenerativeProposer):
@@ -814,6 +921,10 @@ class EngineArgsProposer(GenerativeProposer):
     ``gpu_count`` forwards to :class:`VLLMKnobSource` (autodetected when unset;
     ignored when ``knobs`` is given) so a 1-GPU box isn't handed a multi-GPU
     topology candidate whose engine build can only fail.
+
+    Also proposes joint prerequisite+dependent candidates (see
+    :func:`_joint_prerequisite_candidates`) — the vLLM-specific extension of
+    :meth:`GenerativeProposer._extra_candidates`.
     """
 
     def __init__(
@@ -834,6 +945,14 @@ class EngineArgsProposer(GenerativeProposer):
             workload="vllm-decode",
             catalog_knobs=catalog_knobs,
             max_candidates=max_candidates,
+        )
+
+    def _extra_candidates(
+        self, bottleneck_class: str, target_op: str | None, keywords: tuple[str, ...]
+    ) -> list[InterventionSpec]:
+        return _joint_prerequisite_candidates(
+            self._searchable(), bottleneck_class=bottleneck_class,
+            workload=self._workload, target_op=target_op, keywords=keywords,
         )
 
 
@@ -926,6 +1045,7 @@ class StochasticProposer(_ProposerBase):
                     target_op=target_op,
                     verb="sample",
                     source="autoresearch-v0 (stochastic sample; real workload knob, unproven delta)",
+                    keywords=keywords,
                 )
             )
         return out

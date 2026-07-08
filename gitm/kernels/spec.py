@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -42,8 +42,14 @@ class InterventionSpec(BaseModel):
 
     name: str
     summary: str
-    knob: str  # vLLM config key, e.g. "max_num_batched_tokens"
-    value: int | float | str | bool | None = None  # value to set the knob to on apply
+    knob: str  # vLLM config key, e.g. "max_num_batched_tokens" — or a display
+    # label ("k1=v1,k2=v2") for a joint candidate; see ``knobs`` below.
+    value: int | float | str | bool | None = None  # value to set on apply (single-knob)
+    # A joint candidate: >1 knob=value pair applied/rolled back together as one
+    # atomic unit. Empty (the default) means "single knob" — use ``knob``/
+    # ``value`` instead. Additive: every existing single-knob spec is
+    # unaffected (``knobs`` stays ``{}``); see ``knob_values``.
+    knobs: dict[str, Any] = Field(default_factory=dict)
     applies_to_kernels: list[str] = Field(default_factory=list)  # substring match
     expected_delta_mean: float  # signed, e.g. +0.08 = 8% improvement
     expected_delta_lo: float
@@ -52,3 +58,9 @@ class InterventionSpec(BaseModel):
     applicability: Applicability = Field(default_factory=Applicability)
     safety: SafetyGate = Field(default_factory=SafetyGate)
     review: str | None = None  # reviewer sign-off note (None until reviewed)
+
+    @property
+    def knob_values(self) -> dict[str, Any]:
+        """The knob=value pairs this spec wants applied — the one shape every
+        applicator should read, whether the spec is single-knob or joint."""
+        return dict(self.knobs) if self.knobs else {self.knob: self.value}
