@@ -57,35 +57,27 @@ class _EngineWithFlags:
         self.scheduler_config = _SchedCfgFlags(**flags)
 
 
-def test_unmet_prerequisite_none_for_knobs_without_one():
+def test_unmet_prerequisite():
+    gated = ("max_num_partial_prefills", "long_prefill_token_threshold",
+             "dbo_prefill_token_threshold")
+
+    # No prerequisite for this knob -> None regardless of engine.
     assert unmet_prerequisite(_EngineWithFlags(), "max_num_seqs") is None
-    assert unmet_prerequisite(None, "max_num_seqs") is None  # no engine, no prerequisite either
+    assert unmet_prerequisite(None, "max_num_seqs") is None
 
+    # No live engine -> can't verify a prerequisite-gated knob -> reject.
+    for knob in gated:
+        assert "no live engine" in unmet_prerequisite(None, knob)
 
-def test_unmet_prerequisite_rejects_without_live_engine():
-    for knob in ("max_num_partial_prefills", "long_prefill_token_threshold",
-                 "dbo_prefill_token_threshold"):
-        reason = unmet_prerequisite(None, knob)
-        assert reason is not None and "no live engine" in reason
-
-
-def test_unmet_prerequisite_checks_the_live_flag():
+    # Live flag off -> reject; on -> allowed.
     off = _EngineWithFlags(chunked_prefill_enabled=False, enable_dbo=False)
-    assert unmet_prerequisite(off, "max_num_partial_prefills") is not None
-    assert unmet_prerequisite(off, "long_prefill_token_threshold") is not None
-    assert unmet_prerequisite(off, "dbo_prefill_token_threshold") is not None
-
     on = _EngineWithFlags(chunked_prefill_enabled=True, enable_dbo=True)
-    assert unmet_prerequisite(on, "max_num_partial_prefills") is None
-    assert unmet_prerequisite(on, "long_prefill_token_threshold") is None
-    assert unmet_prerequisite(on, "dbo_prefill_token_threshold") is None
+    for knob in gated:
+        assert unmet_prerequisite(off, knob) is not None
+        assert unmet_prerequisite(on, knob) is None
 
-
-def test_unmet_prerequisite_unknown_flag_is_conservative():
-    # An engine that doesn't expose the prerequisite at all (neither taxonomy
-    # path nor flat attr resolves) -> reject, don't assume it's satisfied.
-    reason = unmet_prerequisite(object(), "dbo_prefill_token_threshold")
-    assert reason is not None and "unknown on this engine" in reason
+    # Engine exposes neither the taxonomy path nor a flat attr -> conservative reject.
+    assert "unknown on this engine" in unmet_prerequisite(object(), "dbo_prefill_token_threshold")
 
 
 class _SchedCfg:

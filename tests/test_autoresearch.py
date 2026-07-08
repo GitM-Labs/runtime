@@ -113,31 +113,23 @@ def test_classify_empty_trace_defaults_to_compute() -> None:
 # --- classify_bottleneck: roofline-weighted memory signal ---------------------
 
 
-def test_roofline_memory_fraction_none_without_data() -> None:
+def test_roofline_memory_fraction() -> None:
     from gitm.agents.autoresearch import _roofline_memory_fraction
 
     assert _roofline_memory_fraction(None) is None
-    assert _roofline_memory_fraction(Residuals()) is None
-
-
-def test_roofline_memory_fraction_weights_by_observed_time() -> None:
-    from gitm.agents.autoresearch import _roofline_memory_fraction
-
+    assert _roofline_memory_fraction(Residuals()) is None  # no per_kernel data
     res = Residuals(per_kernel=[
         KernelResidual(op="a", layer=None, r_kt=0.0, r_mt=None, t_obs_s=3.0, bound="memory"),
         KernelResidual(op="b", layer=None, r_kt=0.0, r_mt=None, t_obs_s=1.0, bound="compute"),
     ])
-    assert _roofline_memory_fraction(res) == 0.75
+    assert _roofline_memory_fraction(res) == 0.75  # time-weighted, not a head count
 
 
 def test_classify_catches_intrinsic_memory_boundedness_with_no_memcpy() -> None:
-    """Decode's real memory-boundedness is intra-kernel (low bytes/FLOP inside
-    the attention/GEMM kernel itself), not standalone memcpy ops — the memcpy-
-    only heuristic structurally can't see it. Two overlapping kernels with no
-    memcpy classify as compute_bound on the trace alone (see
-    test_classify_compute_bound_when_overlapped_and_no_memcpy); passing
-    residuals whose roofline prediction says those kernels are memory-bound
-    must flip the verdict."""
+    """Real memory-boundedness is intra-kernel (low bytes/FLOP inside the
+    attention/GEMM kernel), not standalone memcpy ops — passing residuals
+    whose roofline prediction says so must flip a memcpy-blind compute_bound
+    verdict (see test_classify_compute_bound_when_overlapped_and_no_memcpy)."""
     events = [
         make_kernel("a", start_ns=0, end_ns=100, stream_id=0),
         make_kernel("b", start_ns=50, end_ns=150, stream_id=1),
@@ -488,11 +480,9 @@ def test_apply_failure_surfaces_the_error_not_just_a_bare_none() -> None:
 
 
 def test_unmet_prerequisite_vetoes_partial_prefill_without_chunked_prefill() -> None:
-    """End-to-end: max_num_partial_prefills is no longer denylisted (see
-    _is_tunable), but unmet_prerequisite wired as the reject hook still stops
-    it from being tried on an engine where enable_chunked_prefill is off —
-    the exact "Concurrent Partial Prefill is not supported" failure this was
-    built to prevent, without permanently forbidding the knob everywhere."""
+    """max_num_partial_prefills is no longer denylisted (see _is_tunable), but
+    unmet_prerequisite as the reject hook still stops it on an engine where
+    enable_chunked_prefill is off — without forbidding the knob everywhere."""
     from gitm.optimizer.vllm_knobs import unmet_prerequisite
 
     class _Sched:
@@ -867,27 +857,23 @@ def test_candidate_spec_helper_forces_safety_and_delta() -> None:
 # --- ranking: delta_mean scales with a real, computable signal ---------------
 
 
-def test_affinity_strength_counts_keyword_matches() -> None:
+def test_affinity_strength_and_delta_mean_for() -> None:
     keywords = ("cache", "swap", "offload", "cpu")
     assert _affinity_strength(Knob("cpu_offload_gb", "int", default=0), keywords) == 2
     assert _affinity_strength(Knob("swap_space", "int", default=0), keywords) == 1
     assert _affinity_strength(Knob("unrelated_thing", "int", default=0), keywords) == 0
     # An explicit tag is one strong match regardless of name.
-    tagged = Knob("weird_lever", "int", default=0, classes=("idle_stall",))
-    assert _affinity_strength(tagged, keywords) == 1
+    assert _affinity_strength(Knob("x", "int", default=0, classes=("idle_stall",)), keywords) == 1
 
-
-def test_delta_mean_for_scales_and_caps_at_expected_delta_hi() -> None:
     assert _delta_mean_for(0) == _delta_mean_for(1)  # zero matches floors at 1
     assert abs(_delta_mean_for(2) - 2 * _delta_mean_for(1)) < 1e-9
     assert _delta_mean_for(100) == 0.15  # capped, never exceeds expected_delta_hi
 
 
 def test_generated_delta_mean_scales_with_affinity_strength() -> None:
-    """The bug this fixes: every generated candidate carried the identical
-    expected_delta_mean regardless of how strongly its name actually matched
-    the bottleneck class, so predict_delta's ranking was blind within a run.
-    A knob matching 2 keywords must rank ahead of one matching 1."""
+    """Every generated candidate used to carry the identical expected_delta_mean
+    regardless of how strongly its name matched the class, so predict_delta's
+    ranking was blind within a run. A 2-keyword match must rank above a 1-match."""
     p = EngineArgsProposer(
         knobs=[
             Knob("cpu_offload_gb", "int", default=0),  # matches "cpu" + "offload"
@@ -903,13 +889,13 @@ def test_generated_delta_mean_scales_with_affinity_strength() -> None:
 # --- joint candidates: prerequisite + dependent knob together ----------------
 
 
-def test_joint_prerequisite_candidate_pairs_flag_and_dependent_knob() -> None:
-    knobs = [
+def test_joint_prerequisite_candidates() -> None:
+    dbo_knobs = [
         Knob("enable_dbo", "bool", default=False),
         Knob("dbo_prefill_token_threshold", "int", default=512),
     ]
     specs = _joint_prerequisite_candidates(
-        knobs, bottleneck_class="idle_stall", workload="vllm-decode", target_op=None,
+        dbo_knobs, bottleneck_class="idle_stall", workload="vllm-decode", target_op=None,
         keywords=_CLASS_KEYWORDS["idle_stall"],
     )
     assert specs  # at least one value-grid point for the dependent knob
@@ -918,60 +904,34 @@ def test_joint_prerequisite_candidate_pairs_flag_and_dependent_knob() -> None:
         assert s.knobs["enable_dbo"] is True
         assert s.value is None  # display-only label lives in .knob
 
-
-def test_joint_prerequisite_candidate_absent_without_the_flag_knob() -> None:
     # No enable_dbo in the surface (e.g. offline fallback catalog) -> nothing.
-    knobs = [Knob("dbo_prefill_token_threshold", "int", default=512)]
     assert _joint_prerequisite_candidates(
-        knobs, bottleneck_class="idle_stall", workload="vllm-decode", target_op=None,
+        [Knob("dbo_prefill_token_threshold", "int", default=512)],
+        bottleneck_class="idle_stall", workload="vllm-decode", target_op=None,
         keywords=_CLASS_KEYWORDS["idle_stall"],
     ) == []
 
-
-def test_joint_prerequisite_candidate_respects_bottleneck_class_affinity() -> None:
-    knobs = [
-        Knob("enable_dbo", "bool", default=False),
-        Knob("dbo_prefill_token_threshold", "int", default=512),
-    ]
     # compute_bound's keywords don't match "prefill" -> no joint candidate.
     assert _joint_prerequisite_candidates(
-        knobs, bottleneck_class="compute_bound", workload="vllm-decode", target_op=None,
+        dbo_knobs, bottleneck_class="compute_bound", workload="vllm-decode", target_op=None,
         keywords=_CLASS_KEYWORDS["compute_bound"],
     ) == []
 
-
-def test_engineargs_proposer_surfaces_joint_dbo_candidate() -> None:
-    """End-to-end through the proposer a real EngineArgs surface would yield."""
-    p = EngineArgsProposer(
-        knobs=[
-            Knob("enable_dbo", "bool", default=False),
-            Knob("dbo_prefill_token_threshold", "int", default=512),
-        ],
-        catalog_knobs=set(),
-    )
-    specs = p.propose("idle_stall")
-    joint = [s for s in specs if len(s.knobs) > 1]
-    assert joint and all(set(s.knobs) == {"enable_dbo", "dbo_prefill_token_threshold"}
-                          for s in joint)
+    # End-to-end through the proposer a real EngineArgs surface would yield.
+    joint = [s for s in EngineArgsProposer(knobs=dbo_knobs, catalog_knobs=set()).propose("idle_stall")
+             if len(s.knobs) > 1]
+    assert joint and all(set(s.knobs) == {"enable_dbo", "dbo_prefill_token_threshold"} for s in joint)
 
 
 def test_intervention_spec_knob_values_property() -> None:
     from gitm.kernels.spec import InterventionSpec
 
-    single = InterventionSpec(
-        name="n", summary="s", knob="max_num_seqs", value=256,
-        expected_delta_mean=0.05, expected_delta_lo=0.0, expected_delta_hi=0.1,
-        source="test",
-    )
-    assert single.knob_values == {"max_num_seqs": 256}
+    def _spec(**kw):
+        return InterventionSpec(name="n", summary="s", expected_delta_mean=0.05,
+                                 expected_delta_lo=0.0, expected_delta_hi=0.1, source="test", **kw)
 
-    joint = InterventionSpec(
-        name="n", summary="s", knob="a=1,b=2", value=None,
-        knobs={"a": 1, "b": 2},
-        expected_delta_mean=0.05, expected_delta_lo=0.0, expected_delta_hi=0.1,
-        source="test",
-    )
-    assert joint.knob_values == {"a": 1, "b": 2}
+    assert _spec(knob="max_num_seqs", value=256).knob_values == {"max_num_seqs": 256}
+    assert _spec(knob="a=1,b=2", knobs={"a": 1, "b": 2}).knob_values == {"a": 1, "b": 2}
 
 
 # --- stochastic (entropy-guided) proposer ------------------------------------
