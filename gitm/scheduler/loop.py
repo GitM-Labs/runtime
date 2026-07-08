@@ -42,7 +42,11 @@ from gitm.optimizer.monitor import check_invariants, residuals
 from gitm.optimizer.qualification import qualify
 from gitm.optimizer.report import Claim, build_provenance, write_report
 from gitm.optimizer.scheduler_attribution import scheduler_causes
-from gitm.optimizer.vllm_knobs import knob_kind, resolve_relative_value, unmet_prerequisite
+from gitm.optimizer.vllm_knobs import (
+    expand_relative_candidates,
+    knob_kind,
+    unmet_prerequisite,
+)
 from gitm.planner.context import build_planner_context
 from gitm.planner.graph import predict_graph
 from gitm.safety.audit import AuditLog, _write_report
@@ -466,9 +470,14 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
 
     # Phase 3 — library + counterfactual replay ranking
     pctx = build_planner_context(cfg.engine, workload = workload)
-    # Relative levers (value_multiplier set) resolve against the live engine's
-    # current setting here, once, before ranking — see resolve_relative_value.
-    library = [resolve_relative_value(s, cfg.engine) for s in load_library(workload=workload)]
+    # Relative levers (value_multiplier / value_multiplier_grid) resolve — and
+    # sweep, if a grid is set — against the live engine's current setting here,
+    # once, before ranking. See expand_relative_candidates.
+    library = [
+        resolved
+        for s in load_library(workload=workload)
+        for resolved in expand_relative_candidates(s, cfg.engine)
+    ]
     policy = Policy(require_qualification_commit=qual.commit, skip_high_risk=not qual.commit)
     ranked = select_interventions(trace, library, policy, top_n=cfg.top_n_interventions, ctx=pctx.gate)
     (run_dir / "ranked_candidates.json").write_text(

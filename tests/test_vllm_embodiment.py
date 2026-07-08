@@ -295,9 +295,10 @@ def test_run_loop_live_engine_keeps_winning_knob_and_rolls_back_unswappable(
     cfg = LoopConfig(
         engine=engine,
         workload="vllm-decode",
-        # Non-expiring budget: max_num_seqs_256 ranks low, and this test asserts it
-        # is reached + kept. A short wall-clock budget would make that racy under
-        # load (the loop is budget-bounded by design), so give it plenty of room.
+        # Non-expiring budget: max_num_seqs_dynamic ranks low, and this test
+        # asserts it is reached + kept. A short wall-clock budget would make
+        # that racy under load (the loop is budget-bounded by design), so
+        # give it plenty of room.
         budget="24h",
         scratch=str(tmp_path),
         top_n_interventions=50,  # evaluate the whole library, not just top 5
@@ -308,11 +309,15 @@ def test_run_loop_live_engine_keeps_winning_knob_and_rolls_back_unswappable(
     assert summary["status"] == "ok" and summary["mode"] == "intervention"
 
     # The hot-swappable winning knob is kept with a measured positive delta.
-    assert engine.max_num_seqs == 256
+    # max_num_seqs_dynamic now sweeps relative to the engine's starting value
+    # (32) rather than always jumping to one hardcoded 256 — assert it was
+    # raised and kept, not a specific literal that depends on where the sweep
+    # started.
+    assert engine.max_num_seqs > 32
     import json
 
     claims = json.loads((Path(out["run_dir"]) / "ranked_candidates.json").read_text())
-    assert any(c["name"] == "max_num_seqs_256" for c in claims)
+    assert any(c["name"].startswith("max_num_seqs_dynamic") for c in claims)
     # report carries the measured live A/B verdict (not a prediction).
     assert "live A/B" in out["report_md"]
     # Knobs the engine can't hot-swap were rolled back, not silently kept.

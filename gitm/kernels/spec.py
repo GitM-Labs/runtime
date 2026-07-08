@@ -53,6 +53,17 @@ class InterventionSpec(BaseModel):
     # stays the offline/predict-only fallback when there's no live engine to
     # read a current setting from.
     value_multiplier: float | None = None
+    # A sweep of multipliers instead of one — e.g. [0.5, 2.0, 4.0] — expands
+    # this single reviewed entry into one candidate per point (see
+    # gitm.optimizer.vllm_knobs.expand_relative_candidates), so the rollback
+    # gate picks whichever point actually wins instead of the catalog betting
+    # on a single guess. Empty (the default) means no sweep; value_multiplier
+    # (if set) resolves as one candidate as usual.
+    value_multiplier_grid: list[float] = Field(default_factory=list)
+    # Clamp the multiplier-scaled result (e.g. gpu_memory_utilization must stay
+    # a fraction below 1.0). None means no clamp.
+    value_max: float | None = None
+    value_min: float | None = None
     # A joint candidate: >1 knob=value pair applied/rolled back together as one
     # atomic unit. Empty (the default) means "single knob" — use ``knob``/
     # ``value`` instead. Additive: every existing single-knob spec is

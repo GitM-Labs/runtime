@@ -249,8 +249,47 @@ def resolve_relative_value(spec: InterventionSpec, engine: Any | None) -> Interv
     if not isinstance(current, int | float) or isinstance(current, bool) or current <= 0:
         return spec
     scaled = current * spec.value_multiplier
+    if spec.value_max is not None:
+        scaled = min(scaled, spec.value_max)
+    if spec.value_min is not None:
+        scaled = max(scaled, spec.value_min)
     new_value = int(round(scaled)) if isinstance(current, int) else scaled
     return spec.model_copy(update={
         "value": new_value,
         "summary": f"{spec.summary} (scaled {spec.value_multiplier:g}x current {current} -> {new_value})",
     })
+
+
+def expand_relative_candidates(spec: InterventionSpec, engine: Any | None) -> list[InterventionSpec]:
+    """Sweep ``value_multiplier_grid`` into one resolved candidate per point.
+
+    Mirrors vLLM's own auto_tune.sh (sweeps a list of candidate values per
+    knob rather than trying one guess) and autoresearch's generated-knob value
+    grid — the same idea applied to a reviewed catalog lever, so the rollback
+    gate picks whichever point actually wins instead of the catalog betting on
+    a single number. Each point is resolved off the SAME current engine value
+    via :func:`resolve_relative_value` and gets its own name/summary.
+
+    Falls back to a single :func:`resolve_relative_value` call when there's no
+    grid (a plain ``value_multiplier`` spec, or a static spec with neither) —
+    additive, not a new contract every entry must opt into. With no live
+    engine there's nothing to scale relative to, so the sweep collapses to one
+    candidate at the static fallback value (not N duplicates of it); the same
+    collapse happens when every grid point resolves to the same value (e.g.
+    the knob's current value is 0, so any multiplier of it stays 0).
+    """
+    if not spec.value_multiplier_grid:
+        return [resolve_relative_value(spec, engine)]
+    if engine is None:
+        return [spec.model_copy(update={"value_multiplier_grid": []})]
+    out: list[InterventionSpec] = []
+    seen_values: set[Any] = set()
+    for m in spec.value_multiplier_grid:
+        variant = spec.model_copy(update={"value_multiplier": m, "value_multiplier_grid": []})
+        resolved = resolve_relative_value(variant, engine)
+        if resolved.value in seen_values:
+            continue  # collapsed to an already-queued value (e.g. current == 0)
+        seen_values.add(resolved.value)
+        suffix = f"x{m:g}".replace(".", "_").replace("-", "neg")
+        out.append(resolved.model_copy(update={"name": f"{spec.name}_{suffix}"}))
+    return out

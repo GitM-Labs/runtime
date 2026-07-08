@@ -111,6 +111,54 @@ def test_resolve_relative_value():
     assert resolve_relative_value(relative, object()).value == 8192
 
 
+def test_resolve_relative_value_respects_clamp():
+    frac = _spec("gpu_memory_utilization", 0.92)
+    frac.value_multiplier = 1.10
+    frac.value_max = 0.97
+
+    class _Engine:
+        cache_config = type("C", (), {"gpu_memory_utilization": 0.95})()
+
+    # 0.95 * 1.10 = 1.045, which would be an invalid fraction -> clamped.
+    assert resolve_relative_value(frac, _Engine()).value == 0.97
+
+
+def test_expand_relative_candidates():
+    from gitm.optimizer.vllm_knobs import expand_relative_candidates
+
+    swept = _spec("max_num_seqs", 256)
+    swept.value_multiplier_grid = [0.5, 2.0, 4.0]
+    plain = _spec("block_size", 16)  # no multiplier/grid -> untouched
+
+    class _Sched:
+        def __init__(self, seqs):
+            self.max_num_seqs = seqs
+
+    class _Engine:
+        def __init__(self, seqs):
+            self.scheduler_config = _Sched(seqs)
+
+    # No grid at all -> single-item list, spec passed through as-is.
+    assert expand_relative_candidates(plain, _Engine(32)) == [plain]
+
+    # Each grid point becomes its own candidate, scaled off the SAME current
+    # value, with a distinct name.
+    out = expand_relative_candidates(swept, _Engine(64))
+    assert {s.value for s in out} == {32, 128, 256}
+    assert len({s.name for s in out}) == 3
+    assert all(s.name.startswith("max_num_seqs") for s in out)
+
+    # No live engine -> nothing to scale relative to; one candidate at the
+    # static fallback, not 3 duplicates of it.
+    offline = expand_relative_candidates(swept, None)
+    assert len(offline) == 1 and offline[0].value == 256
+
+    # Every grid point collapses to the same value (current == 0) -> dedup to
+    # one candidate, not 3 identical ones.
+    zeroed = expand_relative_candidates(swept, _Engine(0))
+    assert len(zeroed) == 1 and zeroed[0].value == 256  # static fallback
+
+
 class _SchedCfg:
     def __init__(self):
         self.max_num_seqs = 32
@@ -381,8 +429,9 @@ def test_run_loop_scheduler_stats_feed_attribution_and_claims(tmp_path, monkeypa
     monkeypatch.setattr(loop, "sync_device", lambda: None)
 
     engine = _FullEngine()
-    # Non-expiring budget: max_num_seqs_256 ranks low and this asserts it's reached
-    # + kept; a short wall-clock would make that racy under load (loop is budget-bounded).
+    # Non-expiring budget: max_num_seqs_dynamic ranks low and this asserts it's
+    # reached + kept; a short wall-clock would make that racy under load (loop
+    # is budget-bounded).
     out = run_loop(LoopConfig(engine=engine, workload="vllm-decode", budget="24h",
                               scratch=str(tmp_path), top_n_interventions=50))
 
@@ -393,8 +442,10 @@ def test_run_loop_scheduler_stats_feed_attribution_and_claims(tmp_path, monkeypa
     assert "under_filled_batch" in signals
     # And it reached the claim that it motivates (max_num_seqs), in the report.
     assert "scheduler[under_filled_batch]" in out["report_md"]
-    # The hot-swap won and was kept.
-    assert engine.scheduler_config.max_num_seqs == 256
+    # The hot-swap won and was kept. max_num_seqs_dynamic now sweeps relative
+    # to the engine's starting value (64) rather than one hardcoded 256, so
+    # assert it was raised and kept rather than pin an exact literal.
+    assert engine.scheduler_config.max_num_seqs > 64
     # Scheduler summary surfaced in the run summary (synchronous first sample).
     assert out["summary"]["scheduler_stats"] is not None
 
