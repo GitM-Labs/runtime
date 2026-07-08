@@ -90,11 +90,50 @@ def _len_or_none(x: Any) -> int | None:
 def _schedulers(engine: Any) -> list[Any]:
     """Resolve the engine's scheduler(s) as a list (vLLM may keep one per PP stage)."""
     sched = _first_attr(
-        engine, "scheduler", "engine.scheduler", "llm_engine.scheduler"
+        engine,
+        # vLLM V0.
+        "scheduler",
+        "engine.scheduler",
+        "llm_engine.scheduler",
+        # vLLM V1 (in-process, VLLM_ENABLE_V1_MULTIPROCESSING=0): the scheduler
+        # lives inside the EngineCore, not on the LLMEngine. Paths vary across
+        # v0.2x point releases — GPU-validate the exact one on the target build.
+        "llm_engine.engine_core.engine_core.scheduler",
+        "llm_engine.engine_core.scheduler",
+        "engine_core.engine_core.scheduler",
+        "engine_core.scheduler",
     )
     if sched is None:
         return []
     return list(sched) if isinstance(sched, list | tuple) else [sched]
+
+
+def _v1_scheduler_stats(scheduler: Any) -> dict[str, Any]:
+    """vLLM V1 stats via ``scheduler.make_stats()`` — V1 doesn't keep the V0
+    running/waiting deques in the same shape, but exposes a stats object with
+    ``num_running_reqs`` / ``num_waiting_reqs`` / ``kv_cache_usage``. Best-effort;
+    returns only the fields it actually found. GPU-validate the attr names on the
+    target vLLM build (they've shifted across v0.2x).
+    """
+    make = getattr(scheduler, "make_stats", None)
+    if not callable(make):
+        return {}
+    try:
+        stats = make()
+    except Exception:
+        return {}
+    if stats is None:
+        return {}
+    out: dict[str, Any] = {}
+    for field_name, attr in (("num_running", "num_running_reqs"),
+                             ("num_waiting", "num_waiting_reqs")):
+        v = getattr(stats, attr, None)
+        if isinstance(v, int):
+            out[field_name] = v
+    ku = getattr(stats, "kv_cache_usage", None)
+    if isinstance(ku, int | float):
+        out["gpu_cache_usage"] = float(ku)
+    return out
 
 
 def _max_num_seqs(engine: Any) -> int | None:
@@ -142,11 +181,19 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
             setattr(sample, field_name, val)
             saw_any = True
 
-        # KV-cache usage off the first scheduler's block manager (best-effort).
+        # KV-cache usage off the first scheduler's block manager (best-effort, V0).
         usage = _gpu_cache_usage(schedulers[0])
         if usage is not None:
             sample.gpu_cache_usage = usage
             saw_any = True
+
+        # vLLM V1: fill running / waiting / cache from the scheduler's stat object
+        # where the VO deques weren't exposed (they read empty on V1)
+        for sch in schedulers:
+            for field_name, val in _v1_scheduler_stats(sch).items():
+                if getattr(sample, field_name) is None:
+                    setattr(sample, field_name, val)
+                    saw_any = True
 
     # Total unfinished — a stable public method on LLMEngine across versions.
     getter = _first_attr(
