@@ -965,7 +965,7 @@ def _openfold_intervention_result(
         claims.append(
             Claim(
                 summary=spec.summary,
-                residual_invariant="kernel_time",
+                residual_invariant="stream_concurrency",
                 residual_value=float(mres.serialized_fraction),
                 causal_evidence=evidence,
                 intervention_name=spec.name,
@@ -1104,7 +1104,7 @@ def _edge_intervention_result(
         claims.append(
             Claim(
                 summary=spec.summary,
-                residual_invariant="kernel_time",
+                residual_invariant="stream_concurrency",
                 residual_value=float(mres.serialized_fraction),
                 causal_evidence=evidence,
                 intervention_name=spec.name,
