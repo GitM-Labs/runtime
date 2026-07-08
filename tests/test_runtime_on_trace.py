@@ -49,6 +49,54 @@ def test_residuals_compute_real_concurrency():
     assert res.serialized_concurrency_fraction == pytest.approx(1.0)  # all sequential, one stream
 
 
+# --- op-identity matching (was ordinal `for i in range(min(len(obs), len(pred)))`) --
+
+
+def test_residuals_match_by_op_identity_not_position():
+    """A real trace has far more kernels than the predicted graph has nodes
+    (thousands vs ~5*n_layers+1). The old ordinal pairing compared only the
+    first len(pred) observed kernels — in launch order — against predicted ops
+    in fixed sequence, regardless of what those kernels actually were. That
+    produced nonsense residuals (a real kernel's duration divided by an
+    unrelated op's predicted duration) and silently dropped every kernel past
+    index len(pred)-1.
+
+    Here the predicted graph has one layer (6 nodes); the trace has many more
+    "flash_attn" kernels than that, all named so they classify to
+    attn_score_value. Every one of them must be scored against the
+    attn_score_value node — not truncated, and not compared to qkv_proj/
+    mlp_down/etc because of where it happened to land positionally.
+    """
+    from gitm.optimizer.monitor import residuals
+    from gitm.planner.graph import predict_graph
+    from gitm.planner.roofline import ModelSpec
+
+    graph = predict_graph(model=ModelSpec(n_layers=1))
+    t_attn = next(n.prediction.t_pred_s for n in graph.nodes if n.op == "attn_score_value")
+    assert len(graph.nodes) == 6  # 5 per-layer nodes + lm_head
+
+    n_kernels = len(graph.nodes) * 10  # far more observed kernels than predicted nodes
+    trace = _trace([_kernel("flash_attn_kernel", i * 100, i * 100 + int(t_attn * 1e9))
+                     for i in range(n_kernels)])
+    res = residuals(trace, graph)
+
+    assert len(res.per_kernel) == n_kernels  # none silently dropped past len(pred)
+    assert all(kr.op == "attn_score_value" for kr in res.per_kernel)
+    assert all(kr.r_kt == pytest.approx(0.0, abs=1e-3) for kr in res.per_kernel)
+
+
+def test_residuals_skip_unmodeled_kernels():
+    """A kernel that doesn't classify to any predicted op (e.g. a bare norm/
+    activation) is unmodeled work, not a mismatched pairing — it must not
+    produce a residual record at all."""
+    from gitm.optimizer.monitor import residuals
+    from gitm.planner.graph import predict_graph
+
+    trace = _trace([_kernel("triton_rms_norm_kernel", 0, 100)])
+    res = residuals(trace, predict_graph())
+    assert res.per_kernel == []
+
+
 # --- multi-basis filter ------------------------------------------------------
 
 
