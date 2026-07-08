@@ -199,6 +199,19 @@ def _model_spec_from_engine(engine: Any):
         return None
 
 
+def _clamp_pct(value: float) -> float:
+    """Bound a residual/delta ratio to +/-100% for report display.
+
+    Shared by every residual the report shows: a bad/misaligned prediction (a
+    tiny predicted kernel matched to a real one, or a small-sample outlier) can
+    otherwise produce a ratio like 18x that reads as absurd next to a claim's
+    modest predicted/measured deltas. The raw, unclamped ratio remains in the
+    residual artifacts (autoresearch.json, violations.json) — only the report's
+    display value is bounded.
+    """
+    return max(-1.0, min(1.0, value))
+
+
 def _agg_kt_residual(res: Any) -> float:
     """Aggregate kernel-time residual for the report.
 
@@ -206,8 +219,6 @@ def _agg_kt_residual(res: Any) -> float:
     when residual records include timings. Per-kernel ratios can explode when a
     tiny predicted kernel is matched to a real kernel; the raw ratios remain in
     residual artifacts, but report claims should show a stable run-level gap.
-    The display value is clamped to +/-100% so a bad/misaligned model does not
-    make every intervention row look like an 18x kernel-time regression.
     """
     rows = list(getattr(res, "per_kernel", []))
     if not rows:
@@ -221,7 +232,19 @@ def _agg_kt_residual(res: Any) -> float:
         kts = sorted(float(kr.r_kt) for kr in rows)
         mid = len(kts) // 2
         value = kts[mid] if len(kts) % 2 else (kts[mid - 1] + kts[mid]) / 2.0
-    return max(-1.0, min(1.0, value))
+    return _clamp_pct(value)
+
+
+def _ar_target_residual(ar_run: AutoresearchRun) -> float:
+    """The residual autoresearch's claims should report (was hardcoded 0.0).
+
+    Same value for every claim in the autoresearch phase of a run — it's the
+    largest-residual op's mean ``r_kt`` that the search targeted (see
+    :func:`gitm.agents.autoresearch.largest_residual`), not a per-candidate
+    measurement. ``0.0`` when the run found no target (e.g. nothing exceeded
+    its predicted ceiling).
+    """
+    return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else 0.0
 
 
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
@@ -588,6 +611,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     ar_causal_evidence = ", ".join(
         f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
     ) or "no strong causal signal"
+    ar_residual = _ar_target_residual(ar_run)
     for r in ar_run.results:
         if not r.applicable:
             rejected.append(f"{r.spec.name} ({r.rejected_reason})")
@@ -605,7 +629,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             Claim(
                 summary=r.spec.summary,
                 residual_invariant="kernel_time",
-                residual_value=0.0,
+                residual_value=ar_residual,
                 causal_evidence=evidence,
                 intervention_name=r.spec.name,
                 predicted_delta=r.predicted_delta,

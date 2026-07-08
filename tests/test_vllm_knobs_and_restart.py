@@ -347,3 +347,25 @@ def test_report_kernel_time_residual_uses_weighted_total_and_clamps():
         ]
     )
     assert _agg_kt_residual(sane) == pytest.approx(0.2)
+
+
+def test_ar_target_residual_uses_the_search_target_not_a_hardcoded_zero():
+    from gitm.agents.autoresearch import AutoresearchRun, ResidualTarget
+    from gitm.scheduler.loop import _ar_target_residual
+
+    # No target found (nothing exceeded its predicted ceiling) -> honest 0.0.
+    empty = AutoresearchRun(bottleneck_class="idle_stall", results=[], target=None)
+    assert _ar_target_residual(empty) == 0.0
+
+    # A real target -> its residual surfaces, clamped like every other residual.
+    modest = AutoresearchRun(
+        bottleneck_class="idle_stall", results=[],
+        target=ResidualTarget(op="attn_score_value", residual=0.42, n_kernels=8),
+    )
+    assert _ar_target_residual(modest) == pytest.approx(0.42)
+
+    huge = AutoresearchRun(
+        bottleneck_class="idle_stall", results=[],
+        target=ResidualTarget(op="attn_score_value", residual=17.8, n_kernels=8),
+    )
+    assert _ar_target_residual(huge) == 1.0
