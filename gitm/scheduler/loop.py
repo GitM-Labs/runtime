@@ -200,26 +200,15 @@ def _model_spec_from_engine(engine: Any):
 
 
 def _clamp_pct(value: float) -> float:
-    """Bound a residual/delta ratio to +/-100% for report display.
-
-    Shared by every residual the report shows: a bad/misaligned prediction (a
-    tiny predicted kernel matched to a real one, or a small-sample outlier) can
-    otherwise produce a ratio like 18x that reads as absurd next to a claim's
-    modest predicted/measured deltas. The raw, unclamped ratio remains in the
-    residual artifacts (autoresearch.json, violations.json) — only the report's
-    display value is bounded.
-    """
+    """Bound a residual ratio to +/-100% so a bad/misaligned prediction (or a
+    small-sample outlier) can't blow up a report row into an absurd 18x."""
     return max(-1.0, min(1.0, value))
 
 
 def _agg_kt_residual(res: Any) -> float:
-    """Aggregate kernel-time residual for the report.
-
-    Prefer a duration-weighted run-level ratio, ``sum(obs - pred) / sum(pred)``,
-    when residual records include timings. Per-kernel ratios can explode when a
-    tiny predicted kernel is matched to a real kernel; the raw ratios remain in
-    residual artifacts, but report claims should show a stable run-level gap.
-    """
+    """Run-level kernel-time residual for the report: duration-weighted
+    ``sum(obs - pred) / sum(pred)`` when timings are available, else the
+    median per-kernel ratio. Same value for every catalog claim in a run."""
     rows = list(getattr(res, "per_kernel", []))
     if not rows:
         return 0.0
@@ -236,14 +225,9 @@ def _agg_kt_residual(res: Any) -> float:
 
 
 def _ar_target_residual(ar_run: AutoresearchRun) -> float:
-    """The residual autoresearch's claims should report (was hardcoded 0.0).
-
-    Same value for every claim in the autoresearch phase of a run — it's the
-    largest-residual op's mean ``r_kt`` that the search targeted (see
-    :func:`gitm.agents.autoresearch.largest_residual`), not a per-candidate
-    measurement. ``0.0`` when the run found no target (e.g. nothing exceeded
-    its predicted ceiling).
-    """
+    """The residual autoresearch's claims should report: the largest-residual
+    op's mean r_kt that the search targeted (:func:`gitm.agents.autoresearch.
+    largest_residual`), same for every claim in the phase. 0.0 with no target."""
     return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else 0.0
 
 

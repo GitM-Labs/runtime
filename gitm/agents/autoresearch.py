@@ -131,16 +131,9 @@ def classify_bottleneck(trace: Trace) -> str:
     return IDLE_STALL if sc_score >= mem_score else MEMORY_BOUND
 
 
-# --- residual targeting -----------------------------------------------------
-#
-# "Repoint at the largest residual": instead of aiming the search at the whole
-# trace, aim it at the single op whose kernels run furthest *over* the predicted
-# ceiling — the biggest gap the attribution layer found. This is the gap residual
-# ``r_kt = (t_obs - t_pred)/t_pred`` from gitm.optimizer.monitor.residuals(), NOT
-# the within-kernel-type jitter that measure_trace() computes, and NOT the Granger
-# p-value rank (significance, not magnitude).
-
-
+# "Repoint at the largest residual": aim the search at the single op whose
+# kernels run furthest over the predicted ceiling (r_kt from monitor.residuals),
+# not the whole trace.
 @dataclass
 class ResidualTarget:
     """The op with the largest kernel-time gap vs its predicted ceiling."""

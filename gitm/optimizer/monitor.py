@@ -41,19 +41,14 @@ class Residuals:
 def residuals(trace: Trace, graph: Graph) -> Residuals:
     """Pair observed kernels to predicted nodes by op identity, not position.
 
-    v0 alignment matched kernels to predicted nodes by ordinal index — sound
-    only when the two lists are the same length and order. A real capture has
-    orders of magnitude more kernels than the predicted graph's ~5*n_layers+1
-    nodes, so indexing paired a handful of early-launched kernels against
-    unrelated ops and left the rest of the trace scored against nothing; a
-    kernel's real duration divided by an unrelated predicted duration is what
-    produced runaway residuals. Each observed kernel is now classified by name
-    (:func:`gitm.optimizer.deviation.classify_op`, the same mapping the
-    deviation tracer uses) and compared against that op's predicted roofline
-    node; per-layer nodes share one roofline prediction (the model doesn't vary
-    it by layer), so one representative node per op is enough. A kernel that
-    classifies to no modeled op is unmodeled work and produces no residual —
-    the Granger pass still localizes bad pairings among what's left.
+    A real capture has orders of magnitude more kernels than the predicted
+    graph's ~5*n_layers+1 nodes; the old ordinal pairing matched a handful of
+    early kernels against unrelated ops, producing runaway r_kt ratios. Each
+    kernel is classified by name (:func:`gitm.optimizer.deviation.classify_op`)
+    and compared to that op's roofline node — one representative node per op,
+    since per-layer nodes share the same prediction. A kernel with no modeled
+    op is unmodeled work and gets no residual; ``layer`` is unrecoverable from
+    name-based classification, so it's always ``None``.
     """
     obs = trace.kernels()
     pred = graph.nodes
@@ -78,9 +73,6 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
         else:
             r_mt = None
 
-        # The observed kernel's layer isn't recoverable from name-based
-        # classification (many kernels share one op) — None rather than
-        # fabricating one from the old index-based pairing.
         res.per_kernel.append(
             KernelResidual(
                 op=pn.op, layer=None, r_kt=r_kt, r_mt=r_mt,

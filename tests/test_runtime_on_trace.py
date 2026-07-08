@@ -53,20 +53,9 @@ def test_residuals_compute_real_concurrency():
 
 
 def test_residuals_match_by_op_identity_not_position():
-    """A real trace has far more kernels than the predicted graph has nodes
-    (thousands vs ~5*n_layers+1). The old ordinal pairing compared only the
-    first len(pred) observed kernels — in launch order — against predicted ops
-    in fixed sequence, regardless of what those kernels actually were. That
-    produced nonsense residuals (a real kernel's duration divided by an
-    unrelated op's predicted duration) and silently dropped every kernel past
-    index len(pred)-1.
-
-    Here the predicted graph has one layer (6 nodes); the trace has many more
-    "flash_attn" kernels than that, all named so they classify to
-    attn_score_value. Every one of them must be scored against the
-    attn_score_value node — not truncated, and not compared to qkv_proj/
-    mlp_down/etc because of where it happened to land positionally.
-    """
+    """Far more observed kernels than predicted nodes (10x here, thousands in a
+    real trace): every one must still be scored against its own op — none
+    truncated at len(pred), none compared to an unrelated op by position."""
     from gitm.optimizer.monitor import residuals
     from gitm.planner.graph import predict_graph
     from gitm.planner.roofline import ModelSpec
