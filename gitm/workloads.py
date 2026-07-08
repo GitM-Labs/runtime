@@ -558,6 +558,12 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         GITM_VLLM_SYNTHETIC   "1" -> CPU-only decode stand-in instead of vLLM
                               (exercises the wire/registry path with no GPU or
                               vLLM; produces no GPU kernels)
+        GITM_VLLM_ENFORCE_EAGER "1" -> build with enforce_eager (no CUDA graphs).
+                              Set it when the CUPTI tracer records no kernels
+                              because decode runs via CUDA-graph replay that the
+                              platform's CUPTI doesn't attribute; also skips
+                              torch.compile + graph capture, so engine builds
+                              (and restart-A/B candidates) are much faster.
 
     On a box without vLLM/GPU the import raises; ``run_loop`` catches it and the
     empty-trace guard reports "no-data" rather than fabricating a result.
@@ -582,6 +588,11 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     _base_kwargs: dict[str, Any] = {}
     if _gpu_mem is not None:
         _base_kwargs["gpu_memory_utilization"] = float(_gpu_mem)
+    # Disable CUDA graphs so CUPTI captures decode kernels on platforms where
+    # graph-replayed kernels aren't attributed (and speed up every engine build).
+    # Inherited by restart candidates (kwargs = dict(_base_kwargs)) for a fair A/B.
+    if os.environ.get("GITM_VLLM_ENFORCE_EAGER") == "1":
+        _base_kwargs["enforce_eager"] = True
 
     llm = LLM(model=model, **_base_kwargs)
     prompts = [f"Benchmark decode prompt {i}." for i in range(n_prompts)]
