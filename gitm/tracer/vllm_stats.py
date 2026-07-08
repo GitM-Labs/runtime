@@ -186,7 +186,7 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
         if usage is not None:
             sample.gpu_cache_usage = usage
             saw_any = True
-            
+
         # vLLM V1: fill running / waiting / cache from the scheduler's stat object
         # where the VO deques weren't exposed (they read empty on V1)
         for sch in schedulers:
