@@ -127,6 +127,14 @@ Versatility comes from the `KnobSource`, **not** a `{workload: knobs}` table:
   `EngineArgs.add_cli_args`, so the search only proposes values that can apply;
   list-valued args (`nargs`) and non-performance fields are skipped. Yields a
   frozen catalog otherwise, so the path runs offline and deterministically.
+- **Hardware-applicability filter.** On a single-GPU box, knobs that only matter
+  with more than one GPU (`tensor_parallel_size`, `pipeline_parallel_size`,
+  `*_context_parallel_size`, …) are skipped — proposing one there can only fail
+  the engine build (no topology to satisfy it), wasting a restart-A/B on a
+  candidate that was never enactable. `VLLMKnobSource(gpu_count=...)` (and
+  `EngineArgsProposer(gpu_count=...)`) accepts an explicit count; left unset it's
+  autodetected (`torch.cuda.device_count()`, defaulting to 1 when it can't tell —
+  undercounting only skips a possibly-valid knob, which is the safe direction).
 - Another workload plugs in by yielding its own `Knob` list and a `workload`
   label: `GenerativeProposer(MyKnobSource(), workload="triton-serve")`. Candidates
   carry that label in their applicability; nothing enumerates workloads centrally.
@@ -226,6 +234,12 @@ it:
 - **Live typing is otherwise best-effort** — fields with no CLI `choices`/`type`
   are classified coarsely from their annotation; ones the introspector can't type
   fall back to "no grid" and are simply skipped.
+- **Hardware applicability only covers GPU count.** Multi-GPU topology knobs are
+  filtered (above); knobs that need something else to be true of the environment
+  — an AWQ-quantized checkpoint for `quantization=awq`, enough free VRAM for the
+  restart-A/B's second (candidate) engine alongside the still-live baseline — are
+  not, and can still fail an apply. Those still surface as an honest rolled-back /
+  unenacted result, never a fabricated claim, but they cost a wasted restart.
 - **The stochastic sampler isn't wired into the loop yet.** `StochasticProposer`
   exists behind the seam (seeded, reproducible), but Phase 4b still runs the
   generative proposer; flipping the loop onto it (or a `FallbackProposer` chain)

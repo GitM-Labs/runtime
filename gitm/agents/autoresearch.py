@@ -476,6 +476,41 @@ def _is_tunable(field_name: str) -> bool:
     return not any(h in lname for h in _NON_TUNABLE_HINTS)
 
 
+#: EngineArgs field-name fragments that only matter with more than one GPU
+#: (tensor/pipeline/data/context-parallel topology). Proposing one of these on a
+#: single-GPU box can only fail the engine build (no hardware to satisfy the
+#: topology) — a wasted restart-A/B, not a measured result.
+_MULTI_GPU_HINTS = (
+    "parallel_size",
+    "tensor_parallel",
+    "pipeline_parallel",
+    "data_parallel",
+    "context_parallel",
+    "expert_parallel",
+)
+
+
+def _requires_multi_gpu(field_name: str) -> bool:
+    """True for EngineArgs fields whose knob only makes sense on >1 GPU."""
+    lname = field_name.lower()
+    return any(h in lname for h in _MULTI_GPU_HINTS)
+
+
+def _visible_gpu_count() -> int:
+    """Best-effort count of GPUs on this box; defaults to 1 when it can't tell.
+
+    Conservative on purpose: undercounting only skips a possibly-valid
+    multi-GPU knob (safe), while overcounting would propose a topology knob
+    whose engine build is guaranteed to fail (a wasted restart trial).
+    """
+    try:
+        import torch
+
+        return torch.cuda.device_count() or 1
+    except Exception:
+        return 1
+
+
 @dataclass(frozen=True)
 class _ArgDomain:
     """Valid-value metadata for one EngineArgs field, read from its CLI argument.
@@ -537,20 +572,28 @@ def _knob_domain(annotation: object, domain: _ArgDomain | None) -> tuple[str, tu
     return kind, choices
 
 
-def _knobs_from_engine_args(engine_args_cls: object) -> list[Knob]:
+def _knobs_from_engine_args(
+    engine_args_cls: object, *, gpu_count: int | None = None
+) -> list[Knob]:
     """Build the searchable knob list from an EngineArgs-like dataclass.
 
     Split out from :func:`_engine_arg_knobs` (which handles the vLLM import +
     fallback) so the extraction is testable without vLLM present. Skips
-    non-performance fields (:data:`_NON_TUNABLE_HINTS`) and list-valued args (not
-    scalar knobs), and sources each field's valid domain from its CLI argument.
+    non-performance fields (:data:`_NON_TUNABLE_HINTS`), list-valued args (not
+    scalar knobs), and — when ``gpu_count`` (or an autodetected
+    :func:`_visible_gpu_count`) is 1 — knobs that only apply with more than one
+    GPU (:data:`_MULTI_GPU_HINTS`), then sources each field's valid domain from
+    its CLI argument.
     """
     import dataclasses
 
+    gpus = _visible_gpu_count() if gpu_count is None else gpu_count
     domains = _argparse_domains(engine_args_cls)
     knobs: list[Knob] = []
     for f in dataclasses.fields(engine_args_cls):  # type: ignore[arg-type]
         if not _is_tunable(f.name):
+            continue
+        if gpus < 2 and _requires_multi_gpu(f.name):
             continue
         domain = domains.get(f.name)
         if domain is not None and domain.is_list:
@@ -564,23 +607,24 @@ def _knobs_from_engine_args(engine_args_cls: object) -> list[Knob]:
     return knobs
 
 
-def _engine_arg_knobs() -> list[Knob]:
+def _engine_arg_knobs(*, gpu_count: int | None = None) -> list[Knob]:
     """Enumerate real vLLM EngineArgs, or fall back to the frozen catalog.
 
-    Best-effort introspection: when vLLM is importable, each tunable, scalar field
-    is a candidate knob, with its valid domain (enum ``choices``, type) read from
-    the field's CLI argument (:func:`_argparse_domains`) so the search only
-    proposes values that can actually apply. Non-performance fields
-    (:data:`_NON_TUNABLE_HINTS`) and list-valued args are skipped. When vLLM isn't
-    importable (no GPU stack / air-gapped), the frozen catalog keeps the generative
-    path working offline.
+    Best-effort introspection: when vLLM is importable, each tunable, scalar,
+    single-GPU-applicable field is a candidate knob, with its valid domain (enum
+    ``choices``, type) read from the field's CLI argument (:func:`_argparse_domains`)
+    so the search only proposes values that can actually apply. Non-performance
+    fields (:data:`_NON_TUNABLE_HINTS`), list-valued args, and (on a 1-GPU box)
+    multi-GPU topology knobs (:data:`_MULTI_GPU_HINTS`) are skipped. When vLLM
+    isn't importable (no GPU stack / air-gapped), the frozen catalog keeps the
+    generative path working offline.
     """
     try:
         from vllm import EngineArgs  # type: ignore
     except Exception:
         return list(_FALLBACK_KNOBS)
     try:
-        return _knobs_from_engine_args(EngineArgs) or list(_FALLBACK_KNOBS)
+        return _knobs_from_engine_args(EngineArgs, gpu_count=gpu_count) or list(_FALLBACK_KNOBS)
     except Exception:
         return list(_FALLBACK_KNOBS)
 
@@ -597,10 +641,21 @@ class KnobSource(Protocol):
 
 
 class VLLMKnobSource:
-    """The real vLLM ``EngineArgs`` surface (frozen fallback when vLLM is absent)."""
+    """The real vLLM ``EngineArgs`` surface (frozen fallback when vLLM is absent).
+
+    ``gpu_count`` overrides GPU-count autodetection (:func:`_visible_gpu_count`) —
+    pass it explicitly when the caller already knows the topology (e.g. the loop
+    reading it off the attached engine); left ``None`` it's read from the box.
+    On a 1-GPU count, knobs that only apply with more than one GPU are skipped
+    (see :data:`_MULTI_GPU_HINTS`) so the search doesn't propose a candidate
+    whose engine build can only fail.
+    """
+
+    def __init__(self, *, gpu_count: int | None = None) -> None:
+        self._gpu_count = gpu_count
 
     def knobs(self) -> list[Knob]:
-        return _engine_arg_knobs()
+        return _engine_arg_knobs(gpu_count=self._gpu_count)
 
 
 @dataclass(frozen=True)
@@ -731,6 +786,9 @@ class EngineArgsProposer(GenerativeProposer):
     tests); otherwise it introspects EngineArgs, falling back to the frozen catalog
     offline. Defaults to a candidate cap since the real ``EngineArgs`` surface is
     large — the offline fallback catalog is well under it, so counts are unchanged.
+    ``gpu_count`` forwards to :class:`VLLMKnobSource` (autodetected when unset;
+    ignored when ``knobs`` is given) so a 1-GPU box isn't handed a multi-GPU
+    topology candidate whose engine build can only fail.
     """
 
     def __init__(
@@ -739,9 +797,12 @@ class EngineArgsProposer(GenerativeProposer):
         knobs: list[Knob] | None = None,
         catalog_knobs: set[str] | None = None,
         max_candidates: int | None = 24,
+        gpu_count: int | None = None,
     ) -> None:
         source: KnobSource = (
-            _ListKnobSource(tuple(knobs)) if knobs is not None else VLLMKnobSource()
+            _ListKnobSource(tuple(knobs))
+            if knobs is not None
+            else VLLMKnobSource(gpu_count=gpu_count)
         )
         super().__init__(
             source,

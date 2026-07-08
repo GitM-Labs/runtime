@@ -274,7 +274,9 @@ from gitm.agents.autoresearch import (  # noqa: E402
     _field_kind_and_choices,
     _is_tunable,
     _knobs_from_engine_args,
+    _requires_multi_gpu,
     _value_grid,
+    _visible_gpu_count,
 )
 
 
@@ -527,6 +529,7 @@ class _FakeEngineArgs:
     enforce_eager: bool = False
     served_model_name: str = "m"  # non-perf (model/name) → excluded
     middleware: tuple = ()  # list-valued (nargs=+) → skipped
+    tensor_parallel_size: int = 1  # multi-GPU topology → skipped on a 1-GPU box
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -539,13 +542,14 @@ class _FakeEngineArgs:
         parser.add_argument("--enforce-eager", dest="enforce_eager", action="store_true")
         parser.add_argument("--served-model-name", dest="served_model_name", type=str, default="m")
         parser.add_argument("--middleware", dest="middleware", nargs="+", type=str, default=[])
+        parser.add_argument("--tensor-parallel-size", dest="tensor_parallel_size", type=int, default=1)
         return parser
 
 
 def test_knobs_from_engine_args_sources_valid_enum_domain() -> None:
     """The enum domain comes from argparse ``choices`` — so the value grid only
     contains values that can actually apply, never an invented ladder point."""
-    knobs = {k.name: k for k in _knobs_from_engine_args(_FakeEngineArgs)}
+    knobs = {k.name: k for k in _knobs_from_engine_args(_FakeEngineArgs, gpu_count=1)}
     kv = knobs["kv_cache_dtype"]
     assert kv.kind == "enum"
     assert set(kv.choices) == {"auto", "fp8", "fp8_e5m2"}
@@ -553,14 +557,14 @@ def test_knobs_from_engine_args_sources_valid_enum_domain() -> None:
 
 
 def test_knobs_from_engine_args_types_from_argparse() -> None:
-    knobs = {k.name: k for k in _knobs_from_engine_args(_FakeEngineArgs)}
+    knobs = {k.name: k for k in _knobs_from_engine_args(_FakeEngineArgs, gpu_count=1)}
     assert knobs["max_num_seqs"].kind == "int"
     assert knobs["gpu_frac"].kind == "float"
     assert knobs["enforce_eager"].kind == "bool"
 
 
 def test_knobs_from_engine_args_skips_nonperf_and_list_args() -> None:
-    names = {k.name for k in _knobs_from_engine_args(_FakeEngineArgs)}
+    names = {k.name for k in _knobs_from_engine_args(_FakeEngineArgs, gpu_count=1)}
     assert "served_model_name" not in names  # non-performance field
     assert "middleware" not in names  # list-valued arg (nargs=+): not a scalar knob
 
@@ -578,6 +582,52 @@ def test_argparse_domains_empty_when_no_cli_builder() -> None:
         pass
 
     assert _argparse_domains(_Bare) == {}
+
+
+# --- hardware-applicability: skip multi-GPU knobs on a single-GPU box --------
+
+
+def test_requires_multi_gpu_flags_known_topology_knobs() -> None:
+    for name in ("tensor_parallel_size", "pipeline_parallel_size",
+                 "data_parallel_size", "prefill_context_parallel_size",
+                 "decode_context_parallel_size", "expert_parallel_size"):
+        assert _requires_multi_gpu(name), f"{name} should be flagged as multi-GPU-only"
+    # Ordinary knobs (including ones with "size" in the name) aren't caught up in it.
+    for name in ("max_num_seqs", "cpu_offload_gb", "block_size", "max_num_batched_tokens"):
+        assert not _requires_multi_gpu(name), f"{name} should NOT be flagged"
+
+
+def test_knobs_from_engine_args_skips_multi_gpu_knob_on_single_gpu() -> None:
+    names = {k.name for k in _knobs_from_engine_args(_FakeEngineArgs, gpu_count=1)}
+    assert "tensor_parallel_size" not in names, (
+        "a 1-GPU box can't satisfy a multi-GPU topology knob — proposing it "
+        "would only waste a restart-A/B on a build that can't succeed"
+    )
+
+
+def test_knobs_from_engine_args_includes_multi_gpu_knob_with_multiple_gpus() -> None:
+    names = {k.name for k in _knobs_from_engine_args(_FakeEngineArgs, gpu_count=2)}
+    assert "tensor_parallel_size" in names
+
+
+def test_visible_gpu_count_is_a_positive_int() -> None:
+    # Environment-dependent (torch/CUDA may or may not be present) — the only
+    # invariant that must hold everywhere is "a usable, positive count".
+    n = _visible_gpu_count()
+    assert isinstance(n, int) and n >= 1
+
+
+def test_vllm_knob_source_gpu_count_override_is_accepted_offline() -> None:
+    # vLLM isn't importable in CI, so the offline fallback catalog is returned
+    # regardless of gpu_count — this just proves the parameter doesn't crash
+    # the offline path (the fallback catalog has no multi-GPU knobs to filter).
+    assert VLLMKnobSource(gpu_count=1).knobs() == VLLMKnobSource(gpu_count=4).knobs()
+
+
+def test_engineargs_proposer_accepts_gpu_count_offline() -> None:
+    # Same offline-safety guarantee at the EngineArgsProposer entry point.
+    p = EngineArgsProposer(gpu_count=1)
+    assert p.propose("idle_stall")
 
 
 def test_candidate_specs_share_the_forced_fields() -> None:
