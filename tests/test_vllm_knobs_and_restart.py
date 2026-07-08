@@ -132,6 +132,67 @@ def test_restart_apply_rolls_back_to_original_engine_on_regression():
     assert app.engine is e0  # original engine restored
 
 
+
+def test_serial_restart_releases_baseline_before_building_candidate():
+    class Engine(_TpsEngine):
+        def __init__(self, tps: float):
+            super().__init__(tps)
+            self.shutdown_called = False
+
+        def shutdown(self):
+            self.shutdown_called = True
+
+    baseline = Engine(100.0)
+    restored = Engine(100.0)
+    events: list[str] = []
+
+    def restart_fn(old, knob, value):
+        assert old is baseline
+        assert old.shutdown_called
+        events.append(f"restart:{knob}={value}")
+        return Engine(50.0)
+
+    def baseline_restart_fn(old):
+        assert old is baseline
+        events.append("restore-baseline")
+        return restored
+
+    app = LiveEngineApplicator(
+        baseline,
+        throughput_fn=_tps_of,
+        restart_fn=restart_fn,
+        baseline_restart_fn=baseline_restart_fn,
+        restart_mode="serial",
+    )
+
+    res = apply_intervention(_spec("block_size", 16), app, min_keep_delta=0.0)
+
+    assert res.applied and res.rolled_back
+    assert events == ["restart:block_size=16", "restore-baseline"]
+    assert app.engine is restored
+
+
+def test_serial_restart_rebuilds_baseline_if_candidate_build_fails():
+    baseline = _TpsEngine(100.0)
+    restored = _TpsEngine(100.0)
+
+    def restart_fn(_old, _knob, _value):
+        raise RuntimeError("candidate OOM")
+
+    app = LiveEngineApplicator(
+        baseline,
+        throughput_fn=_tps_of,
+        restart_fn=restart_fn,
+        baseline_restart_fn=lambda _old: restored,
+        restart_mode="serial",
+    )
+
+    res = apply_intervention(_spec("block_size", 16), app, min_keep_delta=0.0)
+
+    assert not res.applied and res.rolled_back
+    assert "candidate OOM" in res.error
+    assert app.engine is restored
+
 def test_structural_knob_without_restart_fn_rolls_back_cleanly():
     e0 = _TpsEngine(100.0)
     app = LiveEngineApplicator(e0, throughput_fn=_tps_of)  # no restart_fn
@@ -265,3 +326,24 @@ def test_run_loop_scheduler_stats_feed_attribution_and_claims(tmp_path, monkeypa
     assert engine.scheduler_config.max_num_seqs == 256
     # Scheduler summary surfaced in the run summary (synchronous first sample).
     assert out["summary"]["scheduler_stats"] is not None
+
+def test_report_kernel_time_residual_uses_weighted_total_and_clamps():
+    from gitm.optimizer.monitor import KernelResidual, Residuals
+    from gitm.scheduler.loop import _agg_kt_residual
+
+    res = Residuals(
+        per_kernel=[
+            KernelResidual(op="tiny", layer=None, r_kt=9999.0, r_mt=None, t_obs_s=200e-6, t_pred_s=1e-8),
+            KernelResidual(op="main", layer=None, r_kt=0.1, r_mt=None, t_obs_s=11e-6, t_pred_s=10e-6),
+        ]
+    )
+
+    assert _agg_kt_residual(res) == 1.0
+
+    sane = Residuals(
+        per_kernel=[
+            KernelResidual(op="a", layer=None, r_kt=9.0, r_mt=None, t_obs_s=12e-6, t_pred_s=10e-6),
+            KernelResidual(op="b", layer=None, r_kt=0.2, r_mt=None, t_obs_s=12e-6, t_pred_s=10e-6),
+        ]
+    )
+    assert _agg_kt_residual(sane) == pytest.approx(0.2)

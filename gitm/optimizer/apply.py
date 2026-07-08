@@ -20,6 +20,7 @@ The live vLLM/engine applicator implements the same three methods (roadmap).
 from __future__ import annotations
 
 import copy
+import gc
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -279,6 +280,8 @@ class LiveEngineApplicator:
         *,
         throughput_fn: Callable[[Any], float],
         restart_fn: Callable[[Any, str, Any], Any] | None = None,
+        baseline_restart_fn: Callable[[Any], Any] | None = None,
+        restart_mode: str = "parallel",
         getter: Callable[[Any, str], Any] | None = None,
         setter: Callable[[Any, str, Any], None] | None = None,
         reps: int = 1,
@@ -286,7 +289,11 @@ class LiveEngineApplicator:
     ) -> None:
         self.engine = engine
         self._tps = throughput_fn
+        if restart_mode not in {"parallel", "serial"}:
+            raise ValueError(f"restart_mode must be 'parallel' or 'serial', got {restart_mode!r}")
         self._restart_fn = restart_fn
+        self._baseline_restart_fn = baseline_restart_fn
+        self._restart_mode = restart_mode
         self._getter = getter or get_knob
         self._setter = setter or set_knob
         self._reps = max(1, reps)
@@ -296,7 +303,8 @@ class LiveEngineApplicator:
         self._force_restart = force_restart
         self._baseline_tps: float | None = None
         self._baseline_std: float = 0.0
-        # Restore record: ("hotswap", knob, old_value) | ("restart", old_engine) | None.
+        # Restore record: ("hotswap", knob, old_value) | ("restart", old_engine) |
+        # ("serial_restart", restore_baseline_fn) | None.
         self._prev: tuple[Any, ...] | None = None
         self.last_result: EngineABResult | None = None
 
@@ -349,13 +357,36 @@ class LiveEngineApplicator:
                 "no restart_fn supplied, so it cannot be applied live"
             )
         old_engine = self.engine
-        new_engine = self._restart_fn(old_engine, spec.knob, spec.value)
+        if self._restart_mode == "serial":
+            if self._baseline_restart_fn is None:
+                raise StructuralKnobRequiresRestart(
+                    "serial restart mode requires baseline_restart_fn to rebuild the baseline"
+                )
+            def restore_baseline() -> Any:
+                return self._baseline_restart_fn(old_engine)
+
+            self._shutdown(old_engine)
+            self._prev = ("serial_restart", restore_baseline)
+            try:
+                new_engine = self._restart_fn(old_engine, spec.knob, spec.value)
+            except Exception:
+                self.engine = restore_baseline()
+                self._prev = None
+                raise
+        else:
+            new_engine = self._restart_fn(old_engine, spec.knob, spec.value)
         if new_engine is None:
+            if self._restart_mode == "serial":
+                _, restore_baseline = self._prev
+                self.engine = restore_baseline()
+                self._prev = None
             raise StructuralKnobRequiresRestart(
                 f"restart_fn produced no engine for structural knob {spec.knob!r}"
             )
         self.engine = new_engine
-        self._prev = ("restart", old_engine)
+        self._activate(new_engine)
+        if self._restart_mode != "serial":
+            self._prev = ("restart", old_engine)
 
     def restore(self, snapshot: dict[str, Any]) -> None:
         if self._prev is None:
@@ -368,13 +399,35 @@ class LiveEngineApplicator:
             _, old_engine = self._prev
             self._shutdown(self.engine)  # drop the candidate engine we built
             self.engine = old_engine
+            self._activate(old_engine)
+        elif tag == "serial_restart":
+            _, restore_baseline = self._prev
+            self._shutdown(self.engine)  # drop the candidate engine we built
+            self.engine = restore_baseline()
+            self._activate(self.engine)
         # Consume the restore record so a second restore() can't re-undo (or
         # re-shutdown the already-discarded candidate engine) a second time.
         self._prev = None
 
     @staticmethod
+    def _activate(engine: Any) -> None:
+        fn = getattr(engine, "gitm_activate_fn", None)
+        if callable(fn):
+            try:
+                fn(engine)
+            except Exception:
+                pass
+
+    @staticmethod
     def _shutdown(engine: Any) -> None:
-        """Best-effort release of a candidate engine built for a restart A/B."""
+        """Best-effort release of an engine before/after a restart A/B."""
+        custom = getattr(engine, "gitm_shutdown_fn", None)
+        if callable(custom):
+            try:
+                custom(engine)
+            except Exception:
+                pass
+
         for path in ("shutdown", "llm_engine.shutdown", "engine.shutdown"):
             obj: Any = engine
             for attr in path.split("."):
@@ -386,7 +439,16 @@ class LiveEngineApplicator:
                     obj()
                 except Exception:
                     pass
-                return
+                break
+        try:
+            gc.collect()
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
 
     def measure(self, spec: InterventionSpec) -> float | None:
         baseline = self._baseline_tps if self._baseline_tps is not None else self._bench_stats()[0]

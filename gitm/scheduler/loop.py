@@ -200,15 +200,28 @@ def _model_spec_from_engine(engine: Any):
 
 
 def _agg_kt_residual(res: Any) -> float:
-    """Aggregate kernel-time residual for the report — the median of per-kernel
-    ``r_kt`` (observed-vs-predicted kernel time). Median (not mean) so a few
-    badly-aligned kernels don't dominate; ``0.0`` when there are no residuals.
+    """Aggregate kernel-time residual for the report.
+
+    Prefer a duration-weighted run-level ratio, ``sum(obs - pred) / sum(pred)``,
+    when residual records include timings. Per-kernel ratios can explode when a
+    tiny predicted kernel is matched to a real kernel; the raw ratios remain in
+    residual artifacts, but report claims should show a stable run-level gap.
+    The display value is clamped to +/-100% so a bad/misaligned model does not
+    make every intervention row look like an 18x kernel-time regression.
     """
-    kts = sorted(kr.r_kt for kr in res.per_kernel)
-    if not kts:
+    rows = list(getattr(res, "per_kernel", []))
+    if not rows:
         return 0.0
-    mid = len(kts) // 2
-    return kts[mid] if len(kts) % 2 else (kts[mid - 1] + kts[mid]) / 2.0
+
+    total_obs = sum(float(kr.t_obs_s) for kr in rows if getattr(kr, "t_obs_s", None) is not None)
+    total_pred = sum(float(kr.t_pred_s) for kr in rows if getattr(kr, "t_pred_s", None) is not None)
+    if total_pred > 0.0:
+        value = (total_obs - total_pred) / total_pred
+    else:
+        kts = sorted(float(kr.r_kt) for kr in rows)
+        mid = len(kts) // 2
+        value = kts[mid] if len(kts) % 2 else (kts[mid - 1] + kts[mid]) / 2.0
+    return max(-1.0, min(1.0, value))
 
 
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
@@ -478,6 +491,8 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             cfg.engine,
             throughput_fn=_engine_throughput_fn(cfg.engine, runner),
             restart_fn=live_restart_fn,
+            baseline_restart_fn=getattr(cfg.engine, "gitm_baseline_restart_fn", None),
+            restart_mode=os.environ.get("GITM_RESTART_MODE", "parallel"),
             reps=int(os.environ.get("GITM_AB_REPS", "1")),
             # GITM_KNOBS_VIA_RESTART=1 applies scheduling knobs via engine rebuild
             # too — for V1, which ignores a live scheduler-config mutation.
@@ -579,12 +594,19 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             continue
         if r.rolled_back:
             rolled_back.append(r.spec.name)
+        # A rolled-back candidate with no measured_delta means the live apply
+        # itself raised (engine build/restart failure), not "measured and lost" —
+        # surface why directly in the report so that distinction isn't buried in
+        # autoresearch.json.
+        evidence = ar_causal_evidence
+        if r.measured_delta is None and r.apply_error:
+            evidence += f"; apply failed: {r.apply_error}"
         claims.append(
             Claim(
                 summary=r.spec.summary,
                 residual_invariant="kernel_time",
                 residual_value=0.0,
-                causal_evidence=ar_causal_evidence,
+                causal_evidence=evidence,
                 intervention_name=r.spec.name,
                 predicted_delta=r.predicted_delta,
                 measured_delta=r.measured_delta,
@@ -615,6 +637,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                         "measured_delta": r.measured_delta,
                         "rolled_back": r.rolled_back,
                         "target_op": r.target_op,
+                        "apply_error": r.apply_error,
                     }
                     for r in ar_run.results
                 ],

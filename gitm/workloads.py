@@ -579,11 +579,9 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
 
     from vllm import LLM, SamplingParams
 
-    # Optional GPU-memory cap (GITM_VLLM_GPU_MEM, e.g. 0.45). Set it for structural
-    # restart A/Bs (fp8 KV, quant): the applicator keeps the baseline engine alive
-    # while it builds the candidate, so BOTH must fit on the GPU at once. The
-    # baseline and every restart candidate inherit this cap. Unset = vLLM's default
-    # (~0.9) — fine for single-engine runs, but a restart candidate would OOM.
+    # Optional GPU-memory cap (GITM_VLLM_GPU_MEM, e.g. 0.45). Structural restart
+    # A/Bs inherit this cap; in parallel mode baseline+candidate must both fit,
+    # while GITM_RESTART_MODE=serial releases the baseline before candidate build.
     _gpu_mem = os.environ.get("GITM_VLLM_GPU_MEM")
     _base_kwargs: dict[str, Any] = {}
     if _gpu_mem is not None:
@@ -594,12 +592,97 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     if os.environ.get("GITM_VLLM_ENFORCE_EAGER") == "1":
         _base_kwargs["enforce_eager"] = True
 
-    llm = LLM(model=model, **_base_kwargs)
+    engine_ref: dict[str, Any] = {}
+
+    def _shutdown_engine(engine: Any) -> None:
+        if engine_ref.get("engine") is engine:
+            engine_ref["engine"] = None
+        try:
+            if getattr(run, "engine", None) is engine:
+                run.engine = None
+        except NameError:
+            pass
+
+        for path in (
+            "shutdown",
+            "llm_engine.shutdown",
+            "llm_engine.engine_core.shutdown",
+            "llm_engine.engine_core.engine_core.shutdown",
+            "llm_engine.model_executor.shutdown",
+        ):
+            obj: Any = engine
+            for attr in path.split("."):
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            if callable(obj):
+                try:
+                    obj()
+                except Exception:
+                    pass
+                break
+
+        try:
+            from vllm.distributed.parallel_state import (
+                destroy_distributed_environment,
+                destroy_model_parallel,
+            )
+
+            destroy_model_parallel()
+            destroy_distributed_environment()
+        except Exception:
+            pass
+
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            pass
+
+        for attr in ("llm_engine", "engine"):
+            try:
+                delattr(engine, attr)
+            except Exception:
+                pass
+
+        try:
+            import gc
+
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+    def _activate_engine(engine: Any) -> None:
+        engine_ref["engine"] = engine
+        try:
+            run.engine = engine
+        except NameError:
+            pass
+
+    def _build_engine(kwargs: dict[str, Any]) -> Any:
+        engine = LLM(model=model, **kwargs)
+        engine.gitm_llm_kwargs = dict(kwargs)
+        engine.gitm_shutdown_fn = _shutdown_engine
+        engine.gitm_activate_fn = _activate_engine
+        return engine
+
+    llm = _build_engine(dict(_base_kwargs))
+    _activate_engine(llm)
     prompts = [f"Benchmark decode prompt {i}." for i in range(n_prompts)]
     params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
 
     def run() -> dict[str, Any]:
-        outputs = llm.generate(prompts, params)
+        active = engine_ref.get("engine")
+        if active is None:
+            raise RuntimeError("vLLM engine is not active")
+        outputs = active.generate(prompts, params)
         produced = sum(len(o.outputs[0].token_ids) for o in outputs)
         sync_device()
         return {"prompts": len(prompts), "generated_tokens": produced, "model": model}
@@ -632,27 +715,26 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         SKU, missing quantized checkpoint) → the candidate is rolled back cleanly,
         never a silent no-op.
         """
-        kwargs = dict(_base_kwargs)  # inherit the mem cap so both engines coexist
+        kwargs = dict(getattr(_old_engine, "gitm_llm_kwargs", _base_kwargs))
         kwargs[knob] = value  # the structural knob (wins if it IS gpu_memory_utilization)
-        # The baseline engine is still alive during the A/B, so the candidate is a
-        # SECOND in-process engine. Give it a fresh distributed port so its init
-        # doesn't collide with the baseline's (V1 uses tcp://…:PORT at world_size=1).
+        # Give each restarted engine a fresh distributed port so V1 init does not
+        # collide with any prior in-process engine state.
         os.environ["VLLM_PORT"] = str(_free_port())
         try:
-            return LLM(model=model, **kwargs)
+            return _build_engine(kwargs)
         except Exception as exc:
-            # Most likely a two-engines-one-process distributed clash (e.g. the
-            # torch default process group already initialised). Surface the cause
-            # so apply_intervention rolls back with it — GPU-validate whether a
-            # fresh port suffices or teardown-then-rebuild is needed (bigger fix).
             raise RuntimeError(
-                f"restart candidate for {knob!r} failed to build — likely a "
-                f"two-engine V1 distributed clash: {exc}"
+                f"restart candidate for {knob!r} failed to build: {exc}"
             ) from exc
+
+    def _baseline_restart(old_engine: Any) -> Any:
+        kwargs = dict(getattr(old_engine, "gitm_llm_kwargs", _base_kwargs))
+        return _build_engine(kwargs)
 
     run.engine = llm
     llm.gitm_throughput_fn = _throughput
     llm.gitm_restart_fn = _restart
+    llm.gitm_baseline_restart_fn = _baseline_restart
     return run
 
 def _vllm_synthetic_runner(n_prompts: int, max_tokens: int) -> WorkloadRunner:

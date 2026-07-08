@@ -149,14 +149,14 @@ def test_vllm_loop_runs_autoresearch(tmp_path: Path, monkeypatch):
     )
     s = result["summary"]
     assert s["bottleneck_class"] == "idle_stall"
-    # Generative, not the 2-row table: three idle knobs × their value grids = 6.
-    assert s["n_autoresearch"] == 6
-    assert "autoresearch:" in result["report_md"]  # candidates reach the report
+    # Generated idle partial-prefill/DBO/KV-sharing knobs are filtered as noisy;
+    # catalog idle levers still run in the main candidate pass.
+    assert s["n_autoresearch"] == 0
 
     ar_json = (Path(result["run_dir"]) / "autoresearch.json").read_text(encoding="utf-8")
-    # The value-grid naming (knob=value) proves generation ran, not the flat table.
-    assert "max_num_partial_prefills=" in ar_json
-    assert all(name in ar_json for name in ("=2048", "=4096"))  # explicit-grid search points
+    assert "max_num_partial_prefills=" not in ar_json
+    assert "long_prefill_token_threshold=" not in ar_json
+
     # Dry-run (no live engine) mutates nothing, so no safety trail is written.
     assert not (Path(result["run_dir"]) / "audit.jsonl").exists()
 

@@ -44,8 +44,8 @@ def test_public_api_names_all_resolve() -> None:
 
 
 def test_propose_known_class_returns_specs() -> None:
-    specs = propose("idle_stall")
-    assert specs, "known class should yield proposals"
+    specs = propose("memory_bound")
+    assert specs, "known class with safe standalone rules should yield proposals"
     assert all(isinstance(s, InterventionSpec) for s in specs)
     # Never high-risk: unproven proposals stay at moderate and lean on the gate.
     assert all(s.safety.tier != "high_risk" for s in specs)
@@ -121,9 +121,9 @@ def test_applies_and_keeps_on_measured_win() -> None:
     config: dict = {}
     applicator = DictApplicator(config, measure_fn=lambda spec: 0.10)  # +10% ⇒ keep
 
-    results = autoresearch_v0(_trace(), "idle_stall", applicator=applicator)
+    results = autoresearch_v0(_trace(), "memory_bound", applicator=applicator)
 
-    assert results, "idle_stall has proposals"
+    assert results, "memory_bound has safe standalone proposals"
     kept = [r for r in results if r.applicable and not r.rolled_back]
     assert kept, "a positive delta must be kept"
     for r in kept:
@@ -190,8 +190,8 @@ def test_autoresearch_end_to_end_classifies_and_runs() -> None:
 
     assert isinstance(run, AutoresearchRun)
     assert run.bottleneck_class == "idle_stall"
-    assert run.results
-    assert all(r.bottleneck_class == "idle_stall" for r in run.results)
+    assert run.results == []
+
 
 
 # --- repoint at the largest residual -----------------------------------------
@@ -229,10 +229,10 @@ def test_autoresearch_targets_largest_residual_op() -> None:
     run = autoresearch(make_trace(events=events), applicator=applicator, residuals=res)
 
     assert run.target is not None and run.target.op == "paged_attention"
-    assert run.results
-    assert all(r.target_op == "paged_attention" for r in run.results)
-    # The op is present in the trace, so proposals are scoped to it.
-    assert all(r.spec.applies_to_kernels == ["paged_attention"] for r in run.results)
+    assert run.results == []
+
+    # The idle generated partial-prefill knobs are filtered as unsupported/noisy.
+
 
 
 def test_autoresearch_without_residuals_has_no_target() -> None:
@@ -374,11 +374,12 @@ def test_engineargs_offline_fallback_runs_without_vllm() -> None:
     for every class, and every candidate stays outside the curated library."""
     catalog = {s.knob for s in load_library()}
     p = EngineArgsProposer()  # default knobs → _engine_arg_knobs() → frozen fallback
-    for cls in ("idle_stall", "memory_bound", "compute_bound"):
+    for cls in ("memory_bound", "compute_bound"):
         specs = p.propose(cls)
         assert specs, f"{cls} should yield fallback candidates offline"
         assert all(s.safety.tier == "moderate" for s in specs)
-        assert all(s.knob not in catalog for s in specs)  # disjoint from the library
+        assert all(s.knob not in catalog for s in specs)
+    assert p.propose("idle_stall") == []  # disjoint from the library
 
 
 def test_engineargs_candidates_route_through_gate_and_rollback() -> None:
@@ -408,6 +409,58 @@ def test_engineargs_candidates_route_through_gate_and_rollback() -> None:
     )
     assert reverted and all(r.rolled_back for r in reverted)
     assert revert_cfg == {}, "a regressing candidate must leave the config untouched"
+
+
+class _FailingApplicator:
+    """An applicator whose apply() always raises — simulates a live engine
+    build/restart failure (e.g. an unsatisfiable structural knob)."""
+
+    def snapshot(self) -> dict:
+        return {}
+
+    def apply(self, spec) -> None:
+        raise RuntimeError("engine build failed: two-engine distributed clash")
+
+    def restore(self, snapshot) -> None:
+        return None
+
+    def measure(self, spec) -> float | None:
+        return None
+
+
+def test_apply_failure_surfaces_the_error_not_just_a_bare_none() -> None:
+    """A candidate whose live apply raises is rolled back with measured_delta=None
+    — the same shape as 'measured and lost'. apply_error must distinguish the two
+    so a report can say *why* it failed instead of a bare unexplained '-'."""
+    proposer = EngineArgsProposer(
+        knobs=[Knob("cpu_offload_gb", "int", default=0)], catalog_knobs=set()
+    )
+    results = autoresearch_v0(
+        _trace(), "memory_bound", applicator=_FailingApplicator(), proposer=proposer
+    )
+    assert results and all(r.rolled_back and r.measured_delta is None for r in results)
+    assert all(r.apply_error and "distributed clash" in r.apply_error for r in results)
+
+
+def test_apply_error_is_none_when_not_applicable_or_measured() -> None:
+    # A candidate vetoed by the caller's reject hook never reaches apply — no
+    # apply_error to report (the same shape as a plain gate rejection).
+    rejected = autoresearch_v0(
+        _trace(), "idle_stall",
+        applicator=DictApplicator({}, measure_fn=lambda s: 0.10),
+        proposer=EngineArgsProposer(
+            knobs=[Knob("max_num_partial_prefills", "int", default=1)], catalog_knobs=set()
+        ),
+        reject=lambda spec: "vetoed",
+    )
+    assert rejected and all(not r.applicable and r.apply_error is None for r in rejected)
+    # A successfully measured-and-kept candidate also carries no apply_error.
+    kept = autoresearch_v0(
+        _trace(), "memory_bound",
+        applicator=DictApplicator({}, measure_fn=lambda s: 0.10),
+        proposer=EngineArgsProposer(knobs=[Knob("cpu_offload_gb", "int", default=0)], catalog_knobs=set()),
+    )
+    assert kept and all(r.apply_error is None for r in kept)
 
 
 def test_fallback_proposer_uses_table_only_when_primary_is_empty() -> None:
@@ -487,7 +540,9 @@ def test_vllm_knob_source_yields_offline_fallback_without_vllm() -> None:
     # vLLM isn't importable in CI → the source yields the frozen fallback catalog.
     knobs = VLLMKnobSource().knobs()
     assert knobs and all(isinstance(k, Knob) for k in knobs)
-    assert "max_num_partial_prefills" in {k.name for k in knobs}
+    names = {k.name for k in knobs}
+    assert "cpu_offload_gb" in names
+    assert "max_num_partial_prefills" not in names
 
 
 def test_is_tunable_excludes_non_perf_engine_args() -> None:
@@ -495,10 +550,15 @@ def test_is_tunable_excludes_non_perf_engine_args() -> None:
     for name in ("model", "served_model_name", "tokenizer", "seed",
                  "disable_log_stats", "download_dir", "revision"):
         assert not _is_tunable(name), f"{name} should be excluded"
-    # Real optimization knobs pass — including tricky substrings.
+    # Real standalone optimization knobs pass.
     for name in ("max_num_seqs", "gpu_memory_utilization", "compilation_config",
-                 "long_prefill_token_threshold", "cpu_offload_gb"):
+                 "cpu_offload_gb"):
         assert _is_tunable(name), f"{name} should be kept"
+    # Valid vLLM args, but not useful/supported as standalone generated candidates.
+    for name in ("max_num_partial_prefills", "max_long_partial_prefills",
+                 "long_prefill_token_threshold", "dbo_prefill_token_threshold",
+                 "kv_sharing_fast_prefill"):
+        assert not _is_tunable(name), f"{name} should be excluded"
 
 
 def test_field_kind_and_choices_extracts_literal_enum() -> None:
@@ -627,16 +687,16 @@ def test_vllm_knob_source_gpu_count_override_is_accepted_offline() -> None:
 def test_engineargs_proposer_accepts_gpu_count_offline() -> None:
     # Same offline-safety guarantee at the EngineArgsProposer entry point.
     p = EngineArgsProposer(gpu_count=1)
-    assert p.propose("idle_stall")
+    assert p.propose("memory_bound")
 
 
 def test_candidate_specs_share_the_forced_fields() -> None:
     """DRY guard: table and generated candidates agree on delta band, safety tier,
     and applicability — the fields _candidate_spec centralizes."""
-    table = propose("idle_stall")[0]
+    table = propose("memory_bound")[0]
     generated = EngineArgsProposer(
-        knobs=[Knob("max_num_partial_prefills", "int", default=1)], catalog_knobs=set()
-    ).propose("idle_stall")[0]
+        knobs=[Knob("cpu_offload_gb", "int", default=0)], catalog_knobs=set()
+    ).propose("memory_bound")[0]
     for s in (table, generated):
         assert s.safety.tier == "moderate"
         assert (s.expected_delta_mean, s.expected_delta_lo, s.expected_delta_hi) == (0.05, 0.0, 0.15)

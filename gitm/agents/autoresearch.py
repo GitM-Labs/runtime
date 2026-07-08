@@ -188,12 +188,7 @@ def _op_present(trace: Trace, op: str) -> bool:
 # curated library.yaml — autoresearch proposes *outside* the catalog. The
 # rationales are plausibility arguments, not measured claims.
 _RULES: dict[str, list[tuple[str, object, str]]] = {
-    "idle_stall": [
-        ("max_num_partial_prefills", 4,
-         "raise partial-prefill concurrency so prefill overlaps decode instead of stalling it"),
-        ("long_prefill_token_threshold", 2048,
-         "lower the long-prefill threshold so big prompts chunk and interleave, closing decode gaps"),
-    ],
+    "idle_stall": [],
     "memory_bound": [
         ("cpu_offload_gb", 4,
          "offload cold weights to host RAM to free HBM for a larger KV cache"),
@@ -217,6 +212,11 @@ class AutoresearchResult:
     measured_delta: float | None
     rolled_back: bool
     target_op: str | None = None  # the largest-residual op this proposal aimed at
+    # The live apply/measure exception message when a candidate was attempted but
+    # never actually measured (measured_delta is None *and* rolled_back is True):
+    # distinguishes "the engine build/apply itself failed" from "measured and
+    # lost" — both otherwise look identical (measured_delta=None) in the report.
+    apply_error: str | None = None
 
 
 @dataclass
@@ -359,9 +359,6 @@ class Knob:
 #: NOT in library.yaml. Used when vLLM can't be imported (air-gapped operator, no
 #: GPU stack) so the generative path still runs offline and deterministically.
 _FALLBACK_KNOBS: tuple[Knob, ...] = (
-    Knob("max_num_partial_prefills", "int", default=1),
-    Knob("long_prefill_token_threshold", "int", default=0, grid=(2048, 4096)),
-    Knob("max_long_partial_prefills", "int", default=1),
     Knob("cpu_offload_gb", "int", default=0),
     Knob("preemption_mode", "enum", default="recompute", choices=("recompute", "swap")),
     Knob("compilation_config", "int", default=0, grid=(2, 3)),
@@ -467,6 +464,14 @@ _NON_TUNABLE_HINTS = (
     "trust_remote_code",
     "config_format",
     "download",
+    # Valid EngineArgs but poor standalone generated candidates: they require
+    # extra feature gates, are currently no-op/WIP, or are rejected by common vLLM
+    # runtime paths. Keep curated, reviewed catalog entries for these instead.
+    "partial_prefill",
+    "partial_prefills",
+    "long_prefill_token_threshold",
+    "dbo",
+    "kv_sharing",
 )
 
 
@@ -978,6 +983,7 @@ def autoresearch_v0(
                 measured_delta=applied.measured_delta if applied else None,
                 rolled_back=applied.rolled_back if applied else False,
                 target_op=aimed_at,
+                apply_error=applied.error if applied else None,
             )
         )
     return results

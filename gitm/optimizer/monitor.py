@@ -25,6 +25,8 @@ class KernelResidual:
     layer: int | None
     r_kt: float  # kernel-time residual
     r_mt: float | None  # memory-traffic residual (None if bytes unavailable)
+    t_obs_s: float | None = None
+    t_pred_s: float | None = None
 
 
 @dataclass
@@ -60,7 +62,12 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
         else:
             r_mt = None
 
-        res.per_kernel.append(KernelResidual(op=pn.op, layer=pn.layer, r_kt=r_kt, r_mt=r_mt))
+        res.per_kernel.append(
+            KernelResidual(
+                op=pn.op, layer=pn.layer, r_kt=r_kt, r_mt=r_mt,
+                t_obs_s=t_obs, t_pred_s=t_pred,
+            )
+        )
 
     res.serialized_concurrency_fraction = _serialized_fraction(obs)
     return res
