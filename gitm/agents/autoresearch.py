@@ -488,13 +488,9 @@ _NON_TUNABLE_HINTS = (
     "trust_remote_code",
     "config_format",
     "download",
-    # Valid EngineArgs but poor standalone generated candidates: they require
-    # extra feature gates, are currently no-op/WIP, or are rejected by common vLLM
-    # runtime paths. Keep curated, reviewed catalog entries for these instead.
-    "partial_prefill",
-    "partial_prefills",
-    "long_prefill_token_threshold",
-    "dbo",
+    # WIP/no-op per vLLM docs ("no prefill optimization takes place with this
+    # flag enabled currently") — not a prerequisite gap, it just doesn't do
+    # anything yet. Nothing to check live; always exclude.
     "kv_sharing",
 )
 

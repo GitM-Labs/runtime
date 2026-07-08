@@ -16,7 +16,13 @@ from gitm.optimizer.apply import (
     apply_intervention,
 )
 from gitm.optimizer.scheduler_attribution import scheduler_causes
-from gitm.optimizer.vllm_knobs import get_knob, knob_kind, resolve_knob, set_knob
+from gitm.optimizer.vllm_knobs import (
+    get_knob,
+    knob_kind,
+    resolve_knob,
+    set_knob,
+    unmet_prerequisite,
+)
 from gitm.tracer.vllm_stats import SchedulerStatsSummary
 
 
@@ -38,6 +44,48 @@ def test_knob_kind_classification():
     assert knob_kind("tensor_parallel_size") == "structural"
     assert knob_kind("block_size") == "structural"
     assert knob_kind("totally_unknown_knob") == "structural"  # safe default
+
+
+class _SchedCfgFlags:
+    def __init__(self, *, chunked_prefill_enabled=False, enable_dbo=False):
+        self.chunked_prefill_enabled = chunked_prefill_enabled
+        self.enable_dbo = enable_dbo
+
+
+class _EngineWithFlags:
+    def __init__(self, **flags):
+        self.scheduler_config = _SchedCfgFlags(**flags)
+
+
+def test_unmet_prerequisite_none_for_knobs_without_one():
+    assert unmet_prerequisite(_EngineWithFlags(), "max_num_seqs") is None
+    assert unmet_prerequisite(None, "max_num_seqs") is None  # no engine, no prerequisite either
+
+
+def test_unmet_prerequisite_rejects_without_live_engine():
+    for knob in ("max_num_partial_prefills", "long_prefill_token_threshold",
+                 "dbo_prefill_token_threshold"):
+        reason = unmet_prerequisite(None, knob)
+        assert reason is not None and "no live engine" in reason
+
+
+def test_unmet_prerequisite_checks_the_live_flag():
+    off = _EngineWithFlags(chunked_prefill_enabled=False, enable_dbo=False)
+    assert unmet_prerequisite(off, "max_num_partial_prefills") is not None
+    assert unmet_prerequisite(off, "long_prefill_token_threshold") is not None
+    assert unmet_prerequisite(off, "dbo_prefill_token_threshold") is not None
+
+    on = _EngineWithFlags(chunked_prefill_enabled=True, enable_dbo=True)
+    assert unmet_prerequisite(on, "max_num_partial_prefills") is None
+    assert unmet_prerequisite(on, "long_prefill_token_threshold") is None
+    assert unmet_prerequisite(on, "dbo_prefill_token_threshold") is None
+
+
+def test_unmet_prerequisite_unknown_flag_is_conservative():
+    # An engine that doesn't expose the prerequisite at all (neither taxonomy
+    # path nor flat attr resolves) -> reject, don't assume it's satisfied.
+    reason = unmet_prerequisite(object(), "dbo_prefill_token_threshold")
+    assert reason is not None and "unknown on this engine" in reason
 
 
 class _SchedCfg:

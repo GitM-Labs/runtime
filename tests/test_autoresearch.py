@@ -484,6 +484,46 @@ def test_apply_failure_surfaces_the_error_not_just_a_bare_none() -> None:
     assert all(r.apply_error and "distributed clash" in r.apply_error for r in results)
 
 
+def test_unmet_prerequisite_vetoes_partial_prefill_without_chunked_prefill() -> None:
+    """End-to-end: max_num_partial_prefills is no longer denylisted (see
+    _is_tunable), but unmet_prerequisite wired as the reject hook still stops
+    it from being tried on an engine where enable_chunked_prefill is off —
+    the exact "Concurrent Partial Prefill is not supported" failure this was
+    built to prevent, without permanently forbidding the knob everywhere."""
+    from gitm.optimizer.vllm_knobs import unmet_prerequisite
+
+    class _Sched:
+        def __init__(self, enabled: bool):
+            self.chunked_prefill_enabled = enabled
+
+    class _Engine:
+        def __init__(self, enabled: bool):
+            self.scheduler_config = _Sched(enabled)
+
+    proposer = EngineArgsProposer(
+        knobs=[Knob("max_num_partial_prefills", "int", default=1)], catalog_knobs=set()
+    )
+
+    off = _Engine(enabled=False)
+    rejected = autoresearch_v0(
+        _trace(), "idle_stall",
+        applicator=DictApplicator({}, measure_fn=lambda s: 0.10),
+        proposer=proposer,
+        reject=lambda spec: unmet_prerequisite(off, spec.knob),
+    )
+    assert rejected and all(not r.applicable for r in rejected)
+    assert all("enable_chunked_prefill" in (r.rejected_reason or "") for r in rejected)
+
+    on = _Engine(enabled=True)
+    kept = autoresearch_v0(
+        _trace(), "idle_stall",
+        applicator=DictApplicator({}, measure_fn=lambda s: 0.10),
+        proposer=proposer,
+        reject=lambda spec: unmet_prerequisite(on, spec.knob),
+    )
+    assert kept and all(r.applicable for r in kept)
+
+
 def test_apply_error_is_none_when_not_applicable_or_measured() -> None:
     # A candidate vetoed by the caller's reject hook never reaches apply — no
     # apply_error to report (the same shape as a plain gate rejection).
@@ -596,11 +636,15 @@ def test_is_tunable_excludes_non_perf_engine_args() -> None:
     for name in ("max_num_seqs", "gpu_memory_utilization", "compilation_config",
                  "cpu_offload_gb"):
         assert _is_tunable(name), f"{name} should be kept"
-    # Valid vLLM args, but not useful/supported as standalone generated candidates.
+    # kv_sharing_fast_prefill is WIP/no-op per vLLM docs regardless of engine
+    # config — nothing to check live, so it stays denylisted outright.
+    assert not _is_tunable("kv_sharing_fast_prefill")
+    # These are real, sometimes-useful knobs gated by a live prerequisite
+    # (enable_chunked_prefill / enable_dbo) — not denylisted anymore; they're
+    # tunable here and vetoed live via unmet_prerequisite (see test_vllm_knobs).
     for name in ("max_num_partial_prefills", "max_long_partial_prefills",
-                 "long_prefill_token_threshold", "dbo_prefill_token_threshold",
-                 "kv_sharing_fast_prefill"):
-        assert not _is_tunable(name), f"{name} should be excluded"
+                 "long_prefill_token_threshold", "dbo_prefill_token_threshold"):
+        assert _is_tunable(name), f"{name} should be kept (prerequisite-gated, not denylisted)"
 
 
 def test_field_kind_and_choices_extracts_literal_enum() -> None:

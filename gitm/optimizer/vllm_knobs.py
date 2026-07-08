@@ -97,6 +97,8 @@ _KNOBS: dict[str, KnobSpec] = {
     "VLLM_ATTENTION_BACKEND": KnobSpec(
         "VLLM_ATTENTION_BACKEND", "env:VLLM_ATTENTION_BACKEND", "structural"
     ),
+    # Prerequisite flags for the table below — not applied standalone, only read.
+    "enable_dbo": KnobSpec("enable_dbo", "scheduler_config.enable_dbo", "structural"),
 }
 
 
@@ -185,3 +187,39 @@ def knob_kind(knob: str) -> KnobKind:
     """
     spec = resolve_knob(knob)
     return spec.kind if spec is not None else "structural"
+
+
+#: (name substring, prerequisite knob) — a generated candidate matching the
+#: substring only does anything (or even applies) when the prerequisite is
+#: already on. E.g. ``dbo_prefill_token_threshold`` requires ``--enable-dbo``;
+#: ``max_num_partial_prefills``/``long_prefill_token_threshold`` require
+#: ``--enable-chunked-prefill`` (vLLM docs). A blanket denylist would forfeit
+#: these forever, including on deployments where the prerequisite genuinely
+#: holds — check the live engine instead via :func:`unmet_prerequisite`.
+KNOB_PREREQUISITES: tuple[tuple[str, str], ...] = (
+    ("partial_prefill", "enable_chunked_prefill"),
+    ("long_prefill_token_threshold", "enable_chunked_prefill"),
+    ("dbo", "enable_dbo"),
+)
+
+
+def unmet_prerequisite(engine: Any | None, knob: str) -> str | None:
+    """None if ``knob`` has no prerequisite, or its prerequisite holds on ``engine``.
+
+    Otherwise the rejection reason. With no live engine, a prerequisite-gated
+    knob can't be verified at all — conservative default is to reject rather
+    than assume it holds (mirrors this module's other unknown-defaults-unsafe
+    calls, e.g. :func:`knob_kind`).
+    """
+    lname = knob.lower()
+    prereq = next((p for needle, p in KNOB_PREREQUISITES if needle in lname), None)
+    if prereq is None:
+        return None
+    if engine is None:
+        return f"prerequisite {prereq!r} unverifiable: no live engine"
+    try:
+        if get_knob(engine, prereq):
+            return None
+        return f"prerequisite {prereq!r} not enabled on this engine"
+    except AttributeError:
+        return f"prerequisite {prereq!r} unknown on this engine"

@@ -42,7 +42,7 @@ from gitm.optimizer.monitor import check_invariants, residuals
 from gitm.optimizer.qualification import qualify
 from gitm.optimizer.report import Claim, build_provenance, write_report
 from gitm.optimizer.scheduler_attribution import scheduler_causes
-from gitm.optimizer.vllm_knobs import knob_kind
+from gitm.optimizer.vllm_knobs import knob_kind, unmet_prerequisite
 from gitm.planner.context import build_planner_context
 from gitm.planner.graph import predict_graph
 from gitm.safety.audit import AuditLog, _write_report
@@ -578,7 +578,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 and knob_kind(spec.knob) == "structural"
             ):
                 return "structural knob: needs engine restart, no restart_fn"
-            return None
+            return unmet_prerequisite(cfg.engine, spec.knob)
 
         ar_run = autoresearch(
             trace,
