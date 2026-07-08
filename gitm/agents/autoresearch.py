@@ -23,8 +23,10 @@ The proposed knobs are real, current vLLM arguments (verified against
 docs.vllm.ai); their expected deltas, however, are unproven estimates. The
 ``source`` field says so, and only the measured A/B keeps or discards them.
 
-v0 classifies the bottleneck from coarse trace telemetry (:func:`classify_bottleneck`)
-and repoints the search at the largest-residual op. Candidates come from one of
+v0 classifies the bottleneck from trace telemetry (:func:`classify_bottleneck`) —
+weighted by the roofline model's per-op compute/memory prediction when residuals
+are available, not just wall-clock heuristics — and repoints the search at the
+largest-residual op. Candidates come from one of
 two sources behind the :class:`Proposer` seam: the static per-class table
 (:func:`propose`) or :class:`GenerativeProposer`, which searches a workload's knob
 surface (supplied by a :class:`KnobSource` — vLLM's ``EngineArgs`` by default) at
@@ -103,15 +105,41 @@ _SC_THRESHOLD = 0.5
 _MEMCPY_THRESHOLD = 0.25
 
 
-def classify_bottleneck(trace: Trace) -> str:
+def _roofline_memory_fraction(residuals: Residuals | None) -> float | None:
+    """Fraction of matched kernel time the roofline model predicts is memory-bound.
+
+    ``None`` when there's nothing to compute from (no residuals passed, or no
+    observed kernel matched a predicted op) — ``classify_bottleneck`` then falls
+    back to the memcpy-only signal. Unlike memcpy share, this catches the actual
+    decode bottleneck: low arithmetic intensity *inside* an attention/GEMM kernel
+    (roofline's ``t_memory > t_compute``), not just standalone copy ops — decode
+    is rarely dominated by explicit memcpys, so the memcpy signal alone misses it.
+    """
+    if residuals is None or not residuals.per_kernel:
+        return None
+    total = mem = 0.0
+    for kr in residuals.per_kernel:
+        t = kr.t_obs_s or 0.0
+        total += t
+        if kr.bound == "memory":
+            mem += t
+    return mem / total if total > 0 else None
+
+
+def classify_bottleneck(trace: Trace, residuals: Residuals | None = None) -> str:
     """Map a captured trace to one of ``idle_stall`` / ``memory_bound`` / ``compute_bound``.
 
-    v0 heuristic on two signals read straight from the trace: the
-    serialized-concurrency fraction (poor kernel overlap ⇒ idle/scheduling gaps)
-    and the memcpy fraction (data movement dominating ⇒ memory bound). Each is
-    scored against its threshold; the stronger signal wins, and if neither
-    crosses its threshold the workload is treated as compute bound. An empty
-    trace has no stall/movement signal, so it defaults to ``compute_bound``.
+    Two signals, scored against a threshold each; the stronger wins, and neither
+    crossing its threshold defaults to compute bound (an empty trace too, having
+    no stall/movement signal at all):
+
+    - serialized-concurrency fraction: poor kernel overlap ⇒ idle/scheduling gaps.
+    - memory pressure: the memcpy share of GPU-op time (data movement dominating),
+      widened by the roofline-predicted memory-bound fraction of matched kernel
+      time when ``residuals`` (from :func:`gitm.optimizer.monitor.residuals`) is
+      passed — real arithmetic intensity per op, not just standalone copies.
+      Whichever of the two reads higher memory pressure wins; without
+      ``residuals`` this is exactly the old memcpy-only heuristic.
     """
     kernels = trace.kernels()
     if not kernels:
@@ -126,6 +154,9 @@ def classify_bottleneck(trace: Trace) -> str:
 
     sc_score = sc / _SC_THRESHOLD
     mem_score = memcpy_frac / _MEMCPY_THRESHOLD
+    roofline_frac = _roofline_memory_fraction(residuals)
+    if roofline_frac is not None:
+        mem_score = max(mem_score, roofline_frac / _MEMCPY_THRESHOLD)
     if max(sc_score, mem_score) < 1.0:
         return COMPUTE_BOUND
     return IDLE_STALL if sc_score >= mem_score else MEMORY_BOUND
@@ -1007,11 +1038,14 @@ def autoresearch(
     guard). See :func:`autoresearch_v0`.
 
     When ``residuals`` (from :func:`gitm.optimizer.monitor.residuals`) are passed,
-    the search is repointed at the largest-residual op — the biggest gap vs the
-    predicted ceiling — rather than the whole trace. The loop already computes
-    these in its attribution phase, so it passes them straight through.
+    two things sharpen: the bottleneck class itself weighs the roofline-predicted
+    memory-bound fraction of matched kernel time (not just the memcpy-only
+    signal), and the search is repointed at the largest-residual op — the
+    biggest gap vs the predicted ceiling — rather than the whole trace. The loop
+    already computes these in its attribution phase, so it passes them straight
+    through.
     """
-    bottleneck_class = classify_bottleneck(trace)
+    bottleneck_class = classify_bottleneck(trace, residuals)
     target = largest_residual(residuals) if residuals is not None else None
     return AutoresearchRun(
         bottleneck_class=bottleneck_class,

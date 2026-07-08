@@ -110,6 +110,48 @@ def test_classify_empty_trace_defaults_to_compute() -> None:
     assert classify_bottleneck(make_trace(events=[])) == "compute_bound"
 
 
+# --- classify_bottleneck: roofline-weighted memory signal ---------------------
+
+
+def test_roofline_memory_fraction_none_without_data() -> None:
+    from gitm.agents.autoresearch import _roofline_memory_fraction
+
+    assert _roofline_memory_fraction(None) is None
+    assert _roofline_memory_fraction(Residuals()) is None
+
+
+def test_roofline_memory_fraction_weights_by_observed_time() -> None:
+    from gitm.agents.autoresearch import _roofline_memory_fraction
+
+    res = Residuals(per_kernel=[
+        KernelResidual(op="a", layer=None, r_kt=0.0, r_mt=None, t_obs_s=3.0, bound="memory"),
+        KernelResidual(op="b", layer=None, r_kt=0.0, r_mt=None, t_obs_s=1.0, bound="compute"),
+    ])
+    assert _roofline_memory_fraction(res) == 0.75
+
+
+def test_classify_catches_intrinsic_memory_boundedness_with_no_memcpy() -> None:
+    """Decode's real memory-boundedness is intra-kernel (low bytes/FLOP inside
+    the attention/GEMM kernel itself), not standalone memcpy ops — the memcpy-
+    only heuristic structurally can't see it. Two overlapping kernels with no
+    memcpy classify as compute_bound on the trace alone (see
+    test_classify_compute_bound_when_overlapped_and_no_memcpy); passing
+    residuals whose roofline prediction says those kernels are memory-bound
+    must flip the verdict."""
+    events = [
+        make_kernel("a", start_ns=0, end_ns=100, stream_id=0),
+        make_kernel("b", start_ns=50, end_ns=150, stream_id=1),
+    ]
+    trace = make_trace(events=events)
+    assert classify_bottleneck(trace) == "compute_bound"  # unchanged, no residuals
+
+    res = _residuals([("a", 0.0), ("b", 0.0)])
+    for kr in res.per_kernel:
+        kr.bound = "memory"
+        kr.t_obs_s = 1.0
+    assert classify_bottleneck(trace, res) == "memory_bound"
+
+
 # --- autoresearch_v0: apply / rollback ---------------------------------------
 
 

@@ -28,6 +28,7 @@ class KernelResidual:
     r_mt: float | None  # memory-traffic residual (None if bytes unavailable)
     t_obs_s: float | None = None
     t_pred_s: float | None = None
+    bound: str | None = None  # the matched op's roofline bound: "compute" | "memory"
 
 
 @dataclass
@@ -48,7 +49,10 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
     and compared to that op's roofline node — one representative node per op,
     since per-layer nodes share the same prediction. A kernel with no modeled
     op is unmodeled work and gets no residual; ``layer`` is unrecoverable from
-    name-based classification, so it's always ``None``.
+    name-based classification, so it's always ``None``. Each record also carries
+    the matched op's roofline ``bound`` ("compute" | "memory") so callers can
+    weight bottleneck classification by real arithmetic intensity instead of
+    guessing from wall-clock signals alone.
     """
     obs = trace.kernels()
     pred = graph.nodes
@@ -76,7 +80,7 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
         res.per_kernel.append(
             KernelResidual(
                 op=pn.op, layer=None, r_kt=r_kt, r_mt=r_mt,
-                t_obs_s=t_obs, t_pred_s=t_pred,
+                t_obs_s=t_obs, t_pred_s=t_pred, bound=pn.prediction.bound,
             )
         )
 

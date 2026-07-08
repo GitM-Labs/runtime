@@ -590,7 +590,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             reject=_unenactable,
         )
     else:
-        ar_run = AutoresearchRun(bottleneck_class=classify_bottleneck(trace), results=[])
+        ar_run = AutoresearchRun(bottleneck_class=classify_bottleneck(trace, res), results=[])
 
     ar_causal_evidence = ", ".join(
         f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)

@@ -133,8 +133,11 @@ def test_vllm_loop_runs_autoresearch(tmp_path: Path, monkeypatch):
     """The vllm path runs agentic autoresearch: it classifies the bottleneck, then
     *generates* non-catalog levers from the real EngineArgs surface and searches a
     value grid per knob (EngineArgsProposer), surfacing them in the summary +
-    report. The serialized same-stream kernels above classify as idle_stall; the
-    frozen fallback catalog yields three idle knobs across six value-grid points."""
+    report. The serialized same-stream "paged_attention" kernels above are also
+    roofline-predicted memory-bound (attn_score_value at batch=1 is bandwidth-
+    bound) — a stronger signal than the serialization alone, so classification is
+    memory_bound; the frozen fallback catalog's two memory knobs (cpu_offload_gb,
+    preemption_mode) surface as candidates."""
     import gitm.scheduler.loop as loop
 
     monkeypatch.setattr(loop, "capture", _fake_capture_with_kernels("paged_attention"))
@@ -148,12 +151,14 @@ def test_vllm_loop_runs_autoresearch(tmp_path: Path, monkeypatch):
         workload="vllm-decode", budget="30s", scratch=str(tmp_path), workload_runner=lambda: {}
     )
     s = result["summary"]
-    assert s["bottleneck_class"] == "idle_stall"
-    # Generated idle partial-prefill/DBO/KV-sharing knobs are filtered as noisy;
-    # catalog idle levers still run in the main candidate pass.
-    assert s["n_autoresearch"] == 0
+    assert s["bottleneck_class"] == "memory_bound"
+    assert s["n_autoresearch"] == 3  # cpu_offload_gb x2 value-grid points + preemption_mode
 
     ar_json = (Path(result["run_dir"]) / "autoresearch.json").read_text(encoding="utf-8")
+    assert "cpu_offload_gb=" in ar_json
+    assert "preemption_mode=" in ar_json
+    # Denylisted knobs with unchecked prerequisites must never surface, regardless
+    # of which bottleneck class the run classifies as.
     assert "max_num_partial_prefills=" not in ar_json
     assert "long_prefill_token_threshold=" not in ar_json
 
