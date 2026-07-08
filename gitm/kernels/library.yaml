@@ -5,6 +5,25 @@
 # library review. Expected deltas are estimates from the cited source, not yet
 # measured on our own workloads. The replay engine and the rollback-gated live
 # apply produce the measured numbers.
+#
+# applies_to_kernels scopes each vLLM entry to the canonical per-decode-step op
+# vocabulary predict_graph()/classify_op() share (qkv_proj, attn_score_value,
+# attn_out_proj, mlp_gate_up, mlp_down, lm_head) — NOT raw kernel-name
+# substrings, which drift across attention backends/GPU vendors/torch.compile.
+# A knob whose effect genuinely spans the whole decode step (scheduling/
+# admission/topology/graph-capture levers) is tagged with every op via the
+# &all_ops anchor below; an empty list means "no modeled coverage" (0, not
+# 100%) — e.g. a lever whose benefit is prefill-side or orchestration-level,
+# which the decode-only predicted graph doesn't represent. Non-vLLM entries
+# (edge/HFT) keep their own kernel-name vocabulary; classify_op doesn't cover
+# them, so predict_delta falls back to substring matching for those.
+_decode_step_ops: &all_ops
+  - qkv_proj
+  - attn_score_value
+  - attn_out_proj
+  - mlp_gate_up
+  - mlp_down
+  - lm_head
 
 interventions:
   # --- Tier 1: low-effort levers --------------------------------------------
@@ -12,7 +31,7 @@ interventions:
     summary: Set PagedAttention block size to 16 for short-context decode.
     knob: block_size
     value: 16
-    applies_to_kernels: [paged_attention, attn_score_value]
+    applies_to_kernels: [attn_score_value]  # KV-cache layout; reads live here
     expected_delta_mean: 0.05
     expected_delta_lo: 0.02
     expected_delta_hi: 0.10
@@ -31,7 +50,7 @@ interventions:
     summary: Store the KV cache in fp8 to roughly double cache capacity.
     knob: kv_cache_dtype
     value: fp8
-    applies_to_kernels: [paged_attention, kv_cache_write, kv_cache_read]
+    applies_to_kernels: [attn_score_value]  # KV-cache read/write traffic
     expected_delta_mean: 0.06
     expected_delta_lo: 0.00
     expected_delta_hi: 0.12
@@ -50,7 +69,7 @@ interventions:
     summary: Raise the per-step token budget to 8192 to fill decode batches.
     knob: max_num_batched_tokens
     value: 8192
-    applies_to_kernels: []
+    applies_to_kernels: *all_ops  # batch-shape lever: touches every op's batch dim
     expected_delta_mean: 0.05
     expected_delta_lo: 0.01
     expected_delta_hi: 0.10
@@ -68,7 +87,7 @@ interventions:
     summary: Allow up to 256 concurrent sequences to raise decode concurrency.
     knob: max_num_seqs
     value: 256
-    applies_to_kernels: []
+    applies_to_kernels: *all_ops  # concurrency lever: touches every op's batch dim
     expected_delta_mean: 0.04
     expected_delta_lo: 0.00
     expected_delta_hi: 0.09
@@ -86,7 +105,7 @@ interventions:
     summary: Give the block manager 4 GiB CPU swap to avoid preemption stalls.
     knob: swap_space
     value: 4
-    applies_to_kernels: []
+    applies_to_kernels: [attn_score_value]  # preemption/swap is the KV-cache path
     expected_delta_mean: 0.03
     expected_delta_lo: -0.01
     expected_delta_hi: 0.07
@@ -103,7 +122,7 @@ interventions:
     summary: Raise gpu_memory_utilization to 0.92 to permit larger batch slots.
     knob: gpu_memory_utilization
     value: 0.92
-    applies_to_kernels: []
+    applies_to_kernels: *all_ops  # raises the batch-slot ceiling for every op
     expected_delta_mean: 0.04
     expected_delta_lo: 0.01
     expected_delta_hi: 0.08
@@ -122,7 +141,7 @@ interventions:
     summary: Chunk prefill so it overlaps with decode instead of stalling it.
     knob: enable_chunked_prefill
     value: true
-    applies_to_kernels: [prefill, paged_attention]
+    applies_to_kernels: *all_ops  # changes the prefill/decode mix every step runs
     expected_delta_mean: 0.08
     expected_delta_lo: 0.02
     expected_delta_hi: 0.15
@@ -139,7 +158,10 @@ interventions:
     summary: Cache shared prompt prefixes to skip repeated prefill work.
     knob: enable_prefix_caching
     value: true
-    applies_to_kernels: [prefill, kv_cache_write]
+    # No modeled coverage: the win is prefill-side (skipped prefill work), and
+    # predict_graph() only models one decode step — honestly 0 here, not a
+    # false 100%. The measured A/B is what actually judges this one.
+    applies_to_kernels: []
     expected_delta_mean: 0.10
     expected_delta_lo: 0.00
     expected_delta_hi: 0.30
@@ -157,7 +179,7 @@ interventions:
     summary: Enable 5-token n-gram speculative decoding to cut decode steps.
     knob: num_speculative_tokens
     value: 5
-    applies_to_kernels: [decode, paged_attention]
+    applies_to_kernels: *all_ops  # changes the whole per-step decode cadence
     expected_delta_mean: 0.12
     expected_delta_lo: -0.05
     expected_delta_hi: 0.30
@@ -176,7 +198,7 @@ interventions:
     summary: Switch the scheduler to priority policy for mixed-SLO traffic.
     knob: scheduling_policy
     value: priority
-    applies_to_kernels: []
+    applies_to_kernels: *all_ops  # admission order changes every step's batch
     expected_delta_mean: 0.03
     expected_delta_lo: -0.02
     expected_delta_hi: 0.08
@@ -194,7 +216,7 @@ interventions:
     summary: Swap the attention backend to FlashInfer for fused decode attention.
     knob: VLLM_ATTENTION_BACKEND
     value: FLASHINFER
-    applies_to_kernels: [paged_attention, attn_score_value]
+    applies_to_kernels: [attn_score_value]  # attention kernel swap only
     expected_delta_mean: 0.07
     expected_delta_lo: -0.03
     expected_delta_hi: 0.15
@@ -213,7 +235,8 @@ interventions:
     summary: Fall back to NCCL all-reduce when custom all-reduce stalls comm overlap.
     knob: disable_custom_all_reduce
     value: true
-    applies_to_kernels: [all_reduce, nccl]
+    # Comm-path change, not one of the modeled per-op decode kernels — honest 0.
+    applies_to_kernels: []
     expected_delta_mean: 0.02
     expected_delta_lo: -0.04
     expected_delta_hi: 0.08
@@ -232,7 +255,7 @@ interventions:
     summary: Reshape to TP=2 to fit larger batches / longer context per replica.
     knob: tensor_parallel_size
     value: 2
-    applies_to_kernels: [all_reduce, linear, paged_attention]
+    applies_to_kernels: *all_ops  # every layer's op gets sharded
     expected_delta_mean: 0.00
     expected_delta_lo: -0.15
     expected_delta_hi: 0.20
@@ -252,7 +275,9 @@ interventions:
     summary: Load AWQ 4-bit weights to shrink the model and free KV-cache memory.
     knob: quantization
     value: awq
-    applies_to_kernels: [linear, gemm]
+    # Weight dtype/size shrinks — the weight-heavy projection ops, not
+    # attn_score_value (its cost is KV-cache bytes, not weight bytes).
+    applies_to_kernels: [qkv_proj, attn_out_proj, mlp_gate_up, mlp_down, lm_head]
     expected_delta_mean: 0.10
     expected_delta_lo: -0.05
     expected_delta_hi: 0.25
@@ -271,7 +296,7 @@ interventions:
     summary: Disable enforce_eager so CUDA graphs capture and replay the decode step.
     knob: enforce_eager
     value: false
-    applies_to_kernels: [decode, paged_attention, linear]
+    applies_to_kernels: *all_ops  # graph capture wraps the whole decode step
     expected_delta_mean: 0.09
     expected_delta_lo: 0.02
     expected_delta_hi: 0.18
@@ -289,7 +314,7 @@ interventions:
     summary: Extend CUDA-graph capture to 8192 tokens so long contexts stay graphed.
     knob: max_seq_len_to_capture
     value: 8192
-    applies_to_kernels: [decode, paged_attention]
+    applies_to_kernels: *all_ops  # extends graph-capture scope for the whole step
     expected_delta_mean: 0.04
     expected_delta_lo: -0.02
     expected_delta_hi: 0.10
@@ -308,7 +333,7 @@ interventions:
     summary: Split layers across 2 pipeline stages to fit a model that won't shard on TP alone.
     knob: pipeline_parallel_size
     value: 2
-    applies_to_kernels: [send_recv, linear]
+    applies_to_kernels: *all_ops  # every layer's op is split across stages
     expected_delta_mean: -0.02
     expected_delta_lo: -0.20
     expected_delta_hi: 0.15
@@ -328,6 +353,8 @@ interventions:
     summary: Use the Ray executor backend for multi-node distributed decode.
     knob: distributed_executor_backend
     value: ray
+    # Multi-node orchestration overhead, not represented in the decode roofline
+    # model at all — honest 0.
     applies_to_kernels: []
     expected_delta_mean: 0.00
     expected_delta_lo: -0.10

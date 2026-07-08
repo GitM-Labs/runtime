@@ -47,6 +47,7 @@ from gitm.agents.policy import Policy, select_interventions
 from gitm.kernels.library import load_library
 from gitm.kernels.spec import Applicability, InterventionSpec, SafetyGate
 from gitm.optimizer.apply import Applicator, apply_intervention
+from gitm.optimizer.deviation import classify_op
 from gitm.optimizer.monitor import Residuals, _serialized_fraction
 from gitm.optimizer.vllm_knobs import KNOB_PREREQUISITES
 from gitm.tracer.schema import Trace
@@ -196,14 +197,18 @@ def largest_residual(res: Residuals) -> ResidualTarget | None:
 
 
 def _op_present(trace: Trace, op: str) -> bool:
-    """True if ``op`` names (a substring of) a real kernel in the trace.
+    """True if some kernel in the trace classifies to ``op``.
 
     Guards the ``applies_to_kernels`` tagging: the residual op label comes from
-    the predicted graph, so only tag a proposal with it when it actually matches
-    a captured kernel name — otherwise ``predict_delta`` coverage would be 0 and
-    the proposal would rank as worthless rather than untargeted.
+    the predicted graph (a synthetic name like ``attn_score_value``, never a
+    literal substring of a real kernel name — checking containment directly
+    against ``k.name`` would essentially never match), so classify by identity
+    the same way ``residuals()`` does, and only tag a proposal with the op when
+    it actually matches a captured kernel — otherwise ``predict_delta``
+    coverage would be 0 and the proposal would rank as worthless rather than
+    untargeted.
     """
-    return any(op in k.name for k in trace.kernels())
+    return any(classify_op(k.name) == op for k in trace.kernels())
 
 
 # --- candidate table --------------------------------------------------------

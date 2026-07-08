@@ -15,6 +15,7 @@ from pathlib import Path
 import yaml
 
 from gitm.kernels.spec import InterventionSpec
+from gitm.optimizer.deviation import classify_op
 from gitm.tracer.schema import Trace
 
 
@@ -35,7 +36,26 @@ def predict_delta(trace: Trace, spec: InterventionSpec) -> float:
 
 
 def _applies(spec: InterventionSpec, kernel_name: str) -> bool:
+    """Does ``kernel_name`` fall within ``spec``'s declared scope?
+
+    Prefers op-identity classification (:func:`gitm.optimizer.deviation.
+    classify_op`) — the same canonical vLLM decode-step vocabulary
+    ``residuals()`` uses — over raw substring matching, so a tag like
+    ``attn_score_value`` means the same thing here as it does in residual
+    attribution, and both stay in sync when the name→op mapping is updated.
+    Falls back to substring matching for tags classify_op doesn't cover
+    (other workloads' own kernel-name vocabularies, e.g. HFT's
+    ``cudf_groupby_scan`` or edge's ``pointpillars``).
+
+    An empty ``applies_to_kernels`` means "targets nothing measurable" (0
+    coverage) — NOT "targets everything". A blank scope used to win every
+    ranking by default (100% coverage) regardless of whether the lever was
+    real; every candidate must now state its scope to be counted.
+    """
     if not spec.applies_to_kernels:
+        return False
+    op = classify_op(kernel_name)
+    if op is not None and op in spec.applies_to_kernels:
         return True
     return any(pat in kernel_name for pat in spec.applies_to_kernels)
 

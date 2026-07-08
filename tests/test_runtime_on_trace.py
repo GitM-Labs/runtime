@@ -182,6 +182,44 @@ def test_attribute_dr_ranks_pairs():
     assert "doubly-robust ATE" in top.notes
 
 
+# --- predict_delta coverage: unified onto classify_op ------------------------
+
+
+def test_predict_delta_coverage_uses_classify_op():
+    from gitm.kernels.spec import InterventionSpec
+    from gitm.optimizer.replay import predict_delta
+
+    def _spec(tags):
+        return InterventionSpec(name="n", summary="s", knob="k", value=1,
+                                 applies_to_kernels=tags, expected_delta_mean=0.10,
+                                 expected_delta_lo=0.0, expected_delta_hi=0.2, source="test")
+
+    trace = _trace([
+        _kernel("flash_attn_kernel", 0, 100),      # classifies to attn_score_value
+        _kernel("triton_rms_norm_kernel", 100, 200),  # unmodeled
+    ])
+    # Canonical-op tag matches via classify_op, not literal substring.
+    assert predict_delta(trace, _spec(["attn_score_value"])) == pytest.approx(0.05)
+    # Unmatched op tag -> 0 coverage.
+    assert predict_delta(trace, _spec(["mlp_down"])) == 0.0
+    # No tag at all -> 0 coverage (was 1.0; a blank scope no longer wins by default).
+    assert predict_delta(trace, _spec([])) == 0.0
+    # A tag classify_op doesn't recognize still matches via substring fallback
+    # (other workloads' own kernel-name vocabularies, e.g. HFT/edge).
+    assert predict_delta(trace, _spec(["rms_norm"])) == pytest.approx(0.05)
+
+
+def test_op_present_uses_classify_op_not_literal_substring():
+    from gitm.agents.autoresearch import _op_present
+
+    trace = _trace([_kernel("flash_attn_kernel", 0, 100)])
+    # The op label is synthetic (from the predicted graph) and never literally
+    # appears in a real kernel name -- checking containment against the raw
+    # name would (and did) always be False.
+    assert _op_present(trace, "attn_score_value") is True
+    assert _op_present(trace, "mlp_down") is False
+
+
 # --- replay validation harness ----------------------------------------------
 
 
