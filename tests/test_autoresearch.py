@@ -44,7 +44,7 @@ def test_public_api_names_all_resolve() -> None:
 
 
 def test_propose_known_class_returns_specs() -> None:
-    specs = propose("memory_bound")
+    specs = propose("compute_bound")
     assert specs, "known class with safe standalone rules should yield proposals"
     assert all(isinstance(s, InterventionSpec) for s in specs)
     # Never high-risk: unproven proposals stay at moderate and lean on the gate.
@@ -126,9 +126,7 @@ def test_roofline_memory_fraction() -> None:
 
 
 def test_classify_catches_intrinsic_memory_boundedness_with_no_memcpy() -> None:
-    """Real memory-boundedness is intra-kernel (low bytes/FLOP inside the
-    attention/GEMM kernel), not standalone memcpy ops — passing residuals
-    whose roofline prediction says so must flip a memcpy-blind compute_bound
+    """Roofline-flagged memory-boundedness flips a memcpy-blind compute_bound
     verdict (see test_classify_compute_bound_when_overlapped_and_no_memcpy)."""
     events = [
         make_kernel("a", start_ns=0, end_ns=100, stream_id=0),
@@ -155,9 +153,12 @@ def test_applies_and_keeps_on_measured_win() -> None:
     config: dict = {}
     applicator = DictApplicator(config, measure_fn=lambda spec: 0.10)  # +10% ⇒ keep
 
-    results = autoresearch_v0(_trace(), "memory_bound", applicator=applicator)
+    # compute_bound: memory_bound's static candidates (cpu_offload_gb,
+    # preemption_mode) graduated to the curated catalog, so the static table
+    # is empty for it now (see _RULES) — same as idle_stall already was.
+    results = autoresearch_v0(_trace(), "compute_bound", applicator=applicator)
 
-    assert results, "memory_bound has safe standalone proposals"
+    assert results, "compute_bound has safe standalone proposals"
     kept = [r for r in results if r.applicable and not r.rolled_back]
     assert kept, "a positive delta must be kept"
     for r in kept:
@@ -169,7 +170,7 @@ def test_rolls_back_on_regression() -> None:
     config: dict = {}
     applicator = DictApplicator(config, measure_fn=lambda spec: -0.10)  # slower ⇒ revert
 
-    results = autoresearch_v0(_trace(), "memory_bound", applicator=applicator)
+    results = autoresearch_v0(_trace(), "compute_bound", applicator=applicator)
 
     assert results
     assert all(r.applicable and r.rolled_back for r in results)
@@ -407,15 +408,18 @@ def test_engineargs_proposer_scopes_specs_to_target_op() -> None:
 
 
 def test_engineargs_offline_fallback_runs_without_vllm() -> None:
-    """vLLM isn't importable in CI; the frozen catalog must still yield candidates
-    for every class, and every candidate stays outside the curated library."""
+    """vLLM isn't importable in CI; the frozen fallback catalog still yields
+    candidates for compute_bound, and every candidate stays outside the
+    curated library. memory_bound's fallback knobs (cpu_offload_gb,
+    preemption_mode) graduated to the curated catalog, so the offline path
+    has nothing left for that class — same gap idle_stall already had."""
     catalog = {s.knob for s in load_library()}
     p = EngineArgsProposer()  # default knobs → _engine_arg_knobs() → frozen fallback
-    for cls in ("memory_bound", "compute_bound"):
-        specs = p.propose(cls)
-        assert specs, f"{cls} should yield fallback candidates offline"
-        assert all(s.safety.tier == "moderate" for s in specs)
-        assert all(s.knob not in catalog for s in specs)
+    assert p.propose("memory_bound") == []
+    specs = p.propose("compute_bound")
+    assert specs, "compute_bound should yield fallback candidates offline"
+    assert all(s.safety.tier == "moderate" for s in specs)
+    assert all(s.knob not in catalog for s in specs)
     assert p.propose("idle_stall") == []  # disjoint from the library
 
 
@@ -629,12 +633,10 @@ def test_is_tunable_excludes_non_perf_engine_args() -> None:
     for name in ("max_num_seqs", "gpu_memory_utilization", "compilation_config",
                  "cpu_offload_gb"):
         assert _is_tunable(name), f"{name} should be kept"
-    # kv_sharing_fast_prefill is WIP/no-op per vLLM docs regardless of engine
-    # config — nothing to check live, so it stays denylisted outright.
+    # kv_sharing_fast_prefill is WIP/no-op per vLLM docs -> denylisted outright.
     assert not _is_tunable("kv_sharing_fast_prefill")
-    # These are real, sometimes-useful knobs gated by a live prerequisite
-    # (enable_chunked_prefill / enable_dbo) — not denylisted anymore; they're
-    # tunable here and vetoed live via unmet_prerequisite (see test_vllm_knobs).
+    # Prerequisite-gated (enable_chunked_prefill/enable_dbo), not denylisted —
+    # vetoed live via unmet_prerequisite instead (see test_vllm_knobs).
     for name in ("max_num_partial_prefills", "max_long_partial_prefills",
                  "long_prefill_token_threshold", "dbo_prefill_token_threshold"):
         assert _is_tunable(name), f"{name} should be kept (prerequisite-gated, not denylisted)"
@@ -766,16 +768,14 @@ def test_vllm_knob_source_gpu_count_override_is_accepted_offline() -> None:
 def test_engineargs_proposer_accepts_gpu_count_offline() -> None:
     # Same offline-safety guarantee at the EngineArgsProposer entry point.
     p = EngineArgsProposer(gpu_count=1)
-    assert p.propose("memory_bound")
+    assert p.propose("compute_bound")
 
 
 def test_candidate_specs_share_the_forced_fields() -> None:
-    """DRY guard: table and generated candidates agree on safety tier, delta
-    band bounds, and applicability — the fields _candidate_spec centralizes.
-    expected_delta_mean itself is excluded: generated candidates scale it by
-    affinity-keyword strength (see test_generated_delta_mean_scales_with_
-    affinity_strength), so it legitimately differs candidate to candidate."""
-    table = propose("memory_bound")[0]
+    """DRY guard: safety tier, delta bounds, applicability match. Excludes
+    expected_delta_mean, which now legitimately varies by affinity strength
+    (see test_generated_delta_mean_scales_with_affinity_strength)."""
+    table = propose("compute_bound")[0]
     generated = EngineArgsProposer(
         knobs=[Knob("cpu_offload_gb", "int", default=0)], catalog_knobs=set()
     ).propose("memory_bound")[0]
@@ -871,9 +871,7 @@ def test_affinity_strength_and_delta_mean_for() -> None:
 
 
 def test_generated_delta_mean_scales_with_affinity_strength() -> None:
-    """Every generated candidate used to carry the identical expected_delta_mean
-    regardless of how strongly its name matched the class, so predict_delta's
-    ranking was blind within a run. A 2-keyword match must rank above a 1-match."""
+    """A 2-keyword match must rank above a 1-match (previously identical)."""
     p = EngineArgsProposer(
         knobs=[
             Knob("cpu_offload_gb", "int", default=0),  # matches "cpu" + "offload"

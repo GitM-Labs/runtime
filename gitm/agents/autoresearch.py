@@ -23,10 +23,9 @@ The proposed knobs are real, current vLLM arguments (verified against
 docs.vllm.ai); their expected deltas, however, are unproven estimates. The
 ``source`` field says so, and only the measured A/B keeps or discards them.
 
-v0 classifies the bottleneck from trace telemetry (:func:`classify_bottleneck`) —
-weighted by the roofline model's per-op compute/memory prediction when residuals
-are available, not just wall-clock heuristics — and repoints the search at the
-largest-residual op. Candidates come from one of
+v0 classifies the bottleneck from trace telemetry (:func:`classify_bottleneck`,
+weighted by the roofline model's per-op bound when residuals are available) and
+repoints the search at the largest-residual op. Candidates come from one of
 two sources behind the :class:`Proposer` seam: the static per-class table
 (:func:`propose`) or :class:`GenerativeProposer`, which searches a workload's knob
 surface (supplied by a :class:`KnobSource` — vLLM's ``EngineArgs`` by default) at
@@ -110,12 +109,9 @@ _MEMCPY_THRESHOLD = 0.25
 def _roofline_memory_fraction(residuals: Residuals | None) -> float | None:
     """Fraction of matched kernel time the roofline model predicts is memory-bound.
 
-    ``None`` when there's nothing to compute from (no residuals passed, or no
-    observed kernel matched a predicted op) — ``classify_bottleneck`` then falls
-    back to the memcpy-only signal. Unlike memcpy share, this catches the actual
-    decode bottleneck: low arithmetic intensity *inside* an attention/GEMM kernel
-    (roofline's ``t_memory > t_compute``), not just standalone copy ops — decode
-    is rarely dominated by explicit memcpys, so the memcpy signal alone misses it.
+    ``None`` with nothing to compute from — ``classify_bottleneck`` falls back
+    to the memcpy-only signal. Catches real arithmetic-intensity-bound decode
+    (roofline's ``t_memory > t_compute``), which explicit memcpy share misses.
     """
     if residuals is None or not residuals.per_kernel:
         return None
@@ -131,17 +127,12 @@ def _roofline_memory_fraction(residuals: Residuals | None) -> float | None:
 def classify_bottleneck(trace: Trace, residuals: Residuals | None = None) -> str:
     """Map a captured trace to one of ``idle_stall`` / ``memory_bound`` / ``compute_bound``.
 
-    Two signals, scored against a threshold each; the stronger wins, and neither
-    crossing its threshold defaults to compute bound (an empty trace too, having
-    no stall/movement signal at all):
-
-    - serialized-concurrency fraction: poor kernel overlap ⇒ idle/scheduling gaps.
-    - memory pressure: the memcpy share of GPU-op time (data movement dominating),
-      widened by the roofline-predicted memory-bound fraction of matched kernel
-      time when ``residuals`` (from :func:`gitm.optimizer.monitor.residuals`) is
-      passed — real arithmetic intensity per op, not just standalone copies.
-      Whichever of the two reads higher memory pressure wins; without
-      ``residuals`` this is exactly the old memcpy-only heuristic.
+    Two signals, scored against a threshold each; the stronger wins, neither
+    crossing defaults to compute bound: serialized-concurrency fraction (poor
+    kernel overlap ⇒ idle/scheduling gaps), and memory pressure (memcpy share
+    of GPU-op time, widened by the roofline-predicted memory-bound fraction of
+    matched kernel time when ``residuals`` is passed). Without ``residuals``
+    this is the memcpy-only heuristic.
     """
     kernels = trace.kernels()
     if not kernels:
@@ -199,14 +190,10 @@ def largest_residual(res: Residuals) -> ResidualTarget | None:
 def _op_present(trace: Trace, op: str) -> bool:
     """True if some kernel in the trace classifies to ``op``.
 
-    Guards the ``applies_to_kernels`` tagging: the residual op label comes from
-    the predicted graph (a synthetic name like ``attn_score_value``, never a
-    literal substring of a real kernel name — checking containment directly
-    against ``k.name`` would essentially never match), so classify by identity
-    the same way ``residuals()`` does, and only tag a proposal with the op when
-    it actually matches a captured kernel — otherwise ``predict_delta``
-    coverage would be 0 and the proposal would rank as worthless rather than
-    untargeted.
+    The op label is synthetic (from the predicted graph), never a literal
+    substring of a real kernel name, so classify by identity like
+    ``residuals()`` does — otherwise an untargeted proposal would get tagged
+    anyway and rank as worthless (zero ``predict_delta`` coverage).
     """
     return any(classify_op(k.name) == op for k in trace.kernels())
 
@@ -219,12 +206,9 @@ def _op_present(trace: Trace, op: str) -> bool:
 # rationales are plausibility arguments, not measured claims.
 _RULES: dict[str, list[tuple[str, object, str]]] = {
     "idle_stall": [],
-    "memory_bound": [
-        ("cpu_offload_gb", 4,
-         "offload cold weights to host RAM to free HBM for a larger KV cache"),
-        ("preemption_mode", "swap",
-         "swap preempted KV blocks to host instead of recomputing them under memory pressure"),
-    ],
+    # cpu_offload_gb/preemption_mode moved to library.yaml (curated catalog);
+    # autoresearch only proposes outside the catalog.
+    "memory_bound": [],
     "compute_bound": [
         ("compilation_config", 3,
          "raise torch.compile to level 3 for kernel fusion + piecewise CUDA graphs"),
@@ -283,12 +267,10 @@ def _candidate_spec(
     and generative proposers can't drift apart on what a *candidate* is. Only the
     caller-varying parts (name, summary, knob/value, source) are parameters.
 
-    ``knobs`` makes this a *joint* candidate (>1 knob=value pair applied and
-    rolled back together) — ``knob``/``value`` stay a display label in that
-    case; see :class:`gitm.kernels.spec.InterventionSpec`. ``delta_mean``
-    overrides the flat default so a caller can scale confidence by a real,
-    computable signal (e.g. affinity-keyword strength) instead of every
-    candidate carrying the identical constant.
+    ``knobs`` set makes this a *joint* candidate (see
+    :class:`gitm.kernels.spec.InterventionSpec`); ``knob``/``value`` become a
+    display label. ``delta_mean`` overrides the flat default so a caller can
+    scale confidence by a real per-candidate signal instead of one constant.
     """
     return InterventionSpec(
         name=name,
@@ -429,22 +411,17 @@ def _affine(knob: Knob, bottleneck_class: str, keywords: tuple[str, ...]) -> boo
 
 def _affinity_strength(knob: Knob, keywords: tuple[str, ...]) -> int:
     """How many affinity keywords match ``knob``'s name — a real, computable
-    signal for how strongly it's implicated in the bottleneck class, not a
-    fabricated score. An explicit ``Knob.classes`` tag is one strong match (no
-    keyword multiplicity to count)."""
+    confidence signal, not a fabricated score. An explicit ``Knob.classes`` tag
+    counts as one strong match."""
     if knob.classes:
         return 1
     lname = knob.name.lower()
     return sum(1 for k in keywords if k in lname)
 
 
-#: expected_delta_mean per unit of affinity strength — every generated candidate
-#: previously carried the exact same constant (_DELTA_MEAN) regardless of how
-#: strongly its name actually matched the bottleneck class, so predict_delta's
-#: ranking was blind within a run (identical coverage, identical mean ⇒
-#: identical predicted_delta). Scaling by keyword-match count is still an
-#: unproven v0 estimate — just one that varies with a real per-candidate signal
-#: instead of a flat number.
+#: expected_delta_mean per unit of affinity strength (see _affinity_strength) —
+#: lets ranking vary per candidate instead of every generated candidate sharing
+#: the identical _DELTA_MEAN constant.
 _DELTA_MEAN_PER_MATCH = _DELTA_MEAN
 
 
@@ -799,9 +776,8 @@ class _ProposerBase:
         self, bottleneck_class: str, target_op: str | None, keywords: tuple[str, ...]
     ) -> list[InterventionSpec]:
         """Hook for a workload-specific source to add candidates beyond the
-        per-knob value grid (e.g. joint prerequisite+dependent pairs). No-op
-        here — :class:`GenerativeProposer` stays workload-agnostic; the vLLM
-        binding (:class:`EngineArgsProposer`) overrides this."""
+        per-knob value grid. No-op here (stays workload-agnostic); overridden
+        by :class:`EngineArgsProposer`."""
         return []
 
 
@@ -869,20 +845,14 @@ def _joint_prerequisite_candidates(
     """Pair a prerequisite-gated knob with its prerequisite, as ONE candidate.
 
     :func:`gitm.optimizer.vllm_knobs.unmet_prerequisite` can only veto a
-    standalone dependent-knob proposal when the prerequisite isn't already on
-    — it can never turn the prerequisite on itself (an ``InterventionSpec`` only
-    carries one knob). This is the other half: propose
-    ``{prerequisite: True, dependent: value}`` as a single joint spec, so the
-    dependent knob stays reachable (atomically tested, not just vetoed) even on
-    a deployment where the prerequisite isn't set yet.
+    standalone dependent-knob proposal when its prerequisite isn't already on
+    — it can't turn the prerequisite on itself. This proposes
+    ``{prerequisite: True, dependent: value}`` as a single joint spec instead,
+    so the dependent knob stays reachable rather than permanently vetoed.
 
-    Gated the same way every other generated candidate is — ``_affine`` against
-    this call's bottleneck class — so a joint dbo/chunked-prefill candidate
-    only surfaces when the run is actually searching idle_stall, not every
-    class. Also requires the prerequisite itself to be a real, present, boolean
-    knob — a source that doesn't expose it (e.g. the offline fallback catalog)
-    yields nothing here, same as any other candidate needing a surface it
-    doesn't have.
+    Gated by ``_affine`` like any other generated candidate, and requires the
+    prerequisite to be a real, present boolean knob — a source that doesn't
+    expose it (e.g. the offline fallback catalog) yields nothing here.
     """
     by_name = {k.name: k for k in knobs}
     out: list[InterventionSpec] = []
@@ -927,9 +897,9 @@ class EngineArgsProposer(GenerativeProposer):
     ignored when ``knobs`` is given) so a 1-GPU box isn't handed a multi-GPU
     topology candidate whose engine build can only fail.
 
-    Also proposes joint prerequisite+dependent candidates (see
-    :func:`_joint_prerequisite_candidates`) — the vLLM-specific extension of
-    :meth:`GenerativeProposer._extra_candidates`.
+    Also proposes joint prerequisite+dependent candidates via
+    :func:`_joint_prerequisite_candidates` (the vLLM extension of
+    :meth:`GenerativeProposer._extra_candidates`).
     """
 
     def __init__(
@@ -1159,12 +1129,9 @@ def autoresearch(
     guard). See :func:`autoresearch_v0`.
 
     When ``residuals`` (from :func:`gitm.optimizer.monitor.residuals`) are passed,
-    two things sharpen: the bottleneck class itself weighs the roofline-predicted
-    memory-bound fraction of matched kernel time (not just the memcpy-only
-    signal), and the search is repointed at the largest-residual op — the
-    biggest gap vs the predicted ceiling — rather than the whole trace. The loop
-    already computes these in its attribution phase, so it passes them straight
-    through.
+    the bottleneck class weighs the roofline-predicted memory-bound fraction too,
+    and the search repoints at the largest-residual op rather than the whole
+    trace. The loop already computes these, so it passes them straight through.
     """
     bottleneck_class = classify_bottleneck(trace, residuals)
     target = largest_residual(residuals) if residuals is not None else None
