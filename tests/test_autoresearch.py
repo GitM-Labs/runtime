@@ -921,6 +921,21 @@ def test_joint_prerequisite_candidates() -> None:
     assert joint and all(set(s.knobs) == {"enable_dbo", "dbo_prefill_token_threshold"} for s in joint)
 
 
+def test_joint_candidates_survive_max_candidates_even_when_grid_alone_fills_it() -> None:
+    """Joint candidates go first, so a large single-knob value grid can't
+    silently truncate them off the end of the list."""
+    dbo_knobs = [
+        Knob("enable_dbo", "bool", default=False),
+        Knob("dbo_prefill_token_threshold", "int", default=512),
+    ]
+    # A single-knob grid big enough to fill the whole cap on its own.
+    filler = [Knob(f"prefill_filler_{i}", "bool", default=False) for i in range(50)]
+    p = EngineArgsProposer(knobs=dbo_knobs + filler, catalog_knobs=set(), max_candidates=10)
+    specs = p.propose("idle_stall")
+    assert len(specs) == 10
+    assert any(len(s.knobs) > 1 for s in specs), "joint candidates were crowded out by the cap"
+
+
 def test_intervention_spec_knob_values_property() -> None:
     from gitm.kernels.spec import InterventionSpec
 

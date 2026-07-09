@@ -828,7 +828,12 @@ class GenerativeProposer(_ProposerBase):
             if _affine(knob, bottleneck_class, keywords)
             for value in _value_grid(knob)
         ]
-        out += self._extra_candidates(bottleneck_class, target_op, keywords)
+        # Joint candidates (e.g. prerequisite+dependent pairs) go first: a large
+        # value-grid surface can easily fill the whole cap on its own, which
+        # would silently starve out the joint candidates the cap truncates
+        # from the end otherwise.
+        extra = self._extra_candidates(bottleneck_class, target_op, keywords)
+        out = extra + out
         # Bound the per-class candidate count so a large config surface can't
         # flood the gate; the rollback gate still ranks and proves what survives.
         return out if self._max is None else out[: self._max]
