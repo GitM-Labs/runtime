@@ -32,6 +32,35 @@ def test_no_data_guard_does_not_fabricate_claims(tmp_path: Path):
     assert "NO DATA" in result["report_md"]
 
 
+class _Runner:
+    """A minimal workload_runner double — explicit about whether/what
+    ``workload_id`` it carries, instead of monkey-patching a plain function
+    (which silently loses the attribute if ever wrapped, e.g. functools.partial)."""
+
+    def __init__(self, workload_id: object = "unset") -> None:
+        # "unset" (the sentinel) means: don't set the attribute at all, so
+        # getattr(..., "workload_id", None) exercises its own default path
+        # rather than reading an attribute that happens to be None.
+        if workload_id != "unset":
+            self.workload_id = workload_id
+
+    def __call__(self) -> dict:
+        return {"events": 1}
+
+
+def _capturing_fake_capture(captured: dict):
+    """A fake ``capture()`` that records the ``workload_id`` it was called
+    with, shared by the workload_id-relabeling tests below."""
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        captured["workload_id"] = workload_id
+        kernels = [make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90) for i in range(10)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    return fake_capture
+
+
 def test_runner_workload_id_relabels_trace_when_workload_unset(tmp_path: Path, monkeypatch):
     """A factory-built runner's own ``workload_id`` (e.g. set by
     ``_vllm_decode_factory``, see #60) must relabel the trace/capture call
@@ -47,24 +76,12 @@ def test_runner_workload_id_relabels_trace_when_workload_unset(tmp_path: Path, m
     import gitm.scheduler.loop as loop
 
     captured: dict = {}
-
-    @contextmanager
-    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
-        captured["workload_id"] = workload_id
-        kernels = [make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90) for i in range(10)]
-        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
-
-    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "capture", _capturing_fake_capture(captured))
     monkeypatch.setattr(loop, "sync_device", lambda: None)
-
-    def runner():
-        return {"events": 1}
-
-    runner.workload_id = "custom-workload"
 
     from gitm import optimize
 
-    optimize(budget="1s", scratch=str(tmp_path), workload_runner=runner)
+    optimize(budget="1s", scratch=str(tmp_path), workload_runner=_Runner("custom-workload"))
 
     assert captured["workload_id"] == "custom-workload"
 
@@ -74,26 +91,54 @@ def test_runner_workload_id_does_not_override_explicit_workload(tmp_path: Path, 
     import gitm.scheduler.loop as loop
 
     captured: dict = {}
-
-    @contextmanager
-    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
-        captured["workload_id"] = workload_id
-        kernels = [make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90) for i in range(10)]
-        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
-
-    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "capture", _capturing_fake_capture(captured))
     monkeypatch.setattr(loop, "sync_device", lambda: None)
-
-    def runner():
-        return {"events": 1}
-
-    runner.workload_id = "custom-workload"
 
     from gitm import optimize
 
-    optimize(workload="hft", budget="1s", scratch=str(tmp_path), workload_runner=runner)
+    optimize(
+        workload="hft", budget="1s", scratch=str(tmp_path),
+        workload_runner=_Runner("custom-workload"),
+    )
 
     assert captured["workload_id"] == "hft"
+
+
+def test_runner_workload_id_none_falls_back_to_default(tmp_path: Path, monkeypatch):
+    """A factory that didn't populate ``workload_id`` (explicit ``None``, a
+    plausible real-world state) falls back to the guessed/default label
+    rather than relabeling to "None"."""
+    import gitm.scheduler.loop as loop
+
+    captured: dict = {}
+    monkeypatch.setattr(loop, "capture", _capturing_fake_capture(captured))
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    from gitm import optimize
+
+    optimize(budget="1s", scratch=str(tmp_path), workload_runner=_Runner(None))
+
+    assert captured["workload_id"] == "vllm-decode"
+
+
+def test_runner_without_workload_id_attribute_falls_back_to_default(
+    tmp_path: Path, monkeypatch
+):
+    """A plain runner with no ``workload_id`` attribute at all (the common case
+    for a directly-passed callable, not a registry factory) exercises the
+    ``getattr(..., "workload_id", None)`` default path, not just the explicit
+    ``None`` case above."""
+    import gitm.scheduler.loop as loop
+
+    captured: dict = {}
+    monkeypatch.setattr(loop, "capture", _capturing_fake_capture(captured))
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    from gitm import optimize
+
+    optimize(budget="1s", scratch=str(tmp_path), workload_runner=_Runner())
+
+    assert captured["workload_id"] == "vllm-decode"
 
 
 def test_runner_runs_inside_capture_and_produces_real_trace(tmp_path: Path, monkeypatch):
