@@ -32,16 +32,19 @@ def test_no_data_guard_does_not_fabricate_claims(tmp_path: Path):
     assert "NO DATA" in result["report_md"]
 
 
+_UNSET = object()  # identity sentinel — a real workload_id could legitimately be any string
+
+
 class _Runner:
     """A minimal workload_runner double — explicit about whether/what
     ``workload_id`` it carries, instead of monkey-patching a plain function
     (which silently loses the attribute if ever wrapped, e.g. functools.partial)."""
 
-    def __init__(self, workload_id: object = "unset") -> None:
-        # "unset" (the sentinel) means: don't set the attribute at all, so
+    def __init__(self, workload_id: object = _UNSET) -> None:
+        # _UNSET means: don't set the attribute at all, so
         # getattr(..., "workload_id", None) exercises its own default path
         # rather than reading an attribute that happens to be None.
-        if workload_id != "unset":
+        if workload_id is not _UNSET:
             self.workload_id = workload_id
 
     def __call__(self) -> dict:
@@ -137,6 +140,44 @@ def test_runner_without_workload_id_attribute_falls_back_to_default(
     from gitm import optimize
 
     optimize(budget="1s", scratch=str(tmp_path), workload_runner=_Runner())
+
+    assert captured["workload_id"] == "vllm-decode"
+
+
+def test_runner_workload_id_empty_string_falls_back_to_default(tmp_path: Path, monkeypatch):
+    """An empty-string ``workload_id`` is treated the same as unset/None, not
+    as a real (if unusual) label — ``getattr(...) or workload`` falls back on
+    any falsy value, by design, not just ``None``. Documented explicitly here
+    since it's a plausible footgun otherwise."""
+    import gitm.scheduler.loop as loop
+
+    captured: dict = {}
+    monkeypatch.setattr(loop, "capture", _capturing_fake_capture(captured))
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    from gitm import optimize
+
+    optimize(budget="1s", scratch=str(tmp_path), workload_runner=_Runner(""))
+
+    assert captured["workload_id"] == "vllm-decode"
+
+
+def test_no_runner_and_no_explicit_workload_uses_default(tmp_path: Path, monkeypatch):
+    """With nothing to read from at all (no runner, no cfg.workload, no
+    cfg.engine), the simplest path still resolves to the hardcoded default —
+    the relabeling guard must not require a runner to be present."""
+    import gitm.scheduler.loop as loop
+
+    captured: dict = {}
+    monkeypatch.setattr(loop, "capture", _capturing_fake_capture(captured))
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    # No registered factory for "vllm-decode" resolves a runner in this test
+    # environment (no vLLM installed), so runner stays None throughout.
+    monkeypatch.setattr(loop, "get_factory", lambda _workload: None)
+
+    from gitm import optimize
+
+    optimize(budget="1s", scratch=str(tmp_path))
 
     assert captured["workload_id"] == "vllm-decode"
 

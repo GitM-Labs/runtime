@@ -245,7 +245,11 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # "vllm-decode" default regardless of what the runner actually is). Only
     # the runner's own object carries this — earlier ``cfg.engine`` is never
     # populated yet — so it must be re-checked here, after resolution, not
-    # folded into the guess above.
+    # folded into the guess above. NOTE: ``cfg.workload`` (the field) is never
+    # reassigned anywhere in this function — it stays the caller's original
+    # input for the whole call, unlike the local ``workload`` var below it,
+    # which this line progressively resolves. So this is an unambiguous
+    # "did the caller pin one explicitly" check, not a proxy for it.
     if cfg.workload is None and runner is not None:
         workload = getattr(runner, "workload_id", None) or workload
 
