@@ -32,6 +32,70 @@ def test_no_data_guard_does_not_fabricate_claims(tmp_path: Path):
     assert "NO DATA" in result["report_md"]
 
 
+def test_runner_workload_id_relabels_trace_when_workload_unset(tmp_path: Path, monkeypatch):
+    """A factory-built runner's own ``workload_id`` (e.g. set by
+    ``_vllm_decode_factory``, see #60) must relabel the trace/capture call
+    instead of being silently discarded.
+
+    Regression guard: ``run_loop`` computed its ``workload`` label from
+    ``cfg.engine.workload_id`` before the runner (and ``cfg.engine``) were even
+    resolved — the runner's own attribute was set on the wrong object at the
+    wrong time and was never actually read, so a runner passed via
+    ``workload_runner`` with no explicit ``cfg.workload`` always fell back to
+    the hardcoded "vllm-decode" default regardless of what it actually was.
+    """
+    import gitm.scheduler.loop as loop
+
+    captured: dict = {}
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        captured["workload_id"] = workload_id
+        kernels = [make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90) for i in range(10)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    def runner():
+        return {"events": 1}
+
+    runner.workload_id = "custom-workload"
+
+    from gitm import optimize
+
+    optimize(budget="1s", scratch=str(tmp_path), workload_runner=runner)
+
+    assert captured["workload_id"] == "custom-workload"
+
+
+def test_runner_workload_id_does_not_override_explicit_workload(tmp_path: Path, monkeypatch):
+    """An explicit ``cfg.workload`` always wins over the runner's self-reported id."""
+    import gitm.scheduler.loop as loop
+
+    captured: dict = {}
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        captured["workload_id"] = workload_id
+        kernels = [make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90) for i in range(10)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    def runner():
+        return {"events": 1}
+
+    runner.workload_id = "custom-workload"
+
+    from gitm import optimize
+
+    optimize(workload="hft", budget="1s", scratch=str(tmp_path), workload_runner=runner)
+
+    assert captured["workload_id"] == "hft"
+
+
 def test_runner_runs_inside_capture_and_produces_real_trace(tmp_path: Path, monkeypatch):
     """An injected runner is invoked inside the capture window; with kernels in
     the trace the loop proceeds to real claims with a non-empty fingerprint."""

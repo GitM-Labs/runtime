@@ -239,6 +239,16 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     if cfg.engine is None and runner is not None:
         cfg.engine = getattr(runner, "engine", None)
 
+    # A factory-built runner may know its own workload id better than the
+    # guessed/default one above (e.g. a caller passed ``workload_runner``
+    # directly with no ``cfg.workload``, so ``workload`` fell through to the
+    # "vllm-decode" default regardless of what the runner actually is). Only
+    # the runner's own object carries this — earlier ``cfg.engine`` is never
+    # populated yet — so it must be re-checked here, after resolution, not
+    # folded into the guess above.
+    if cfg.workload is None and runner is not None:
+        workload = getattr(runner, "workload_id", None) or workload
+
     # Sample the engine scheduler (queue depth, batch occupancy, preemptions)
     # over the same window as the CUPTI capture — engine-level telemetry the GPU
     # trace can't see. A no-op when no engine is attached (empty series).
