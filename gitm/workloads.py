@@ -733,7 +733,16 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         kwargs = dict(getattr(old_engine, "gitm_llm_kwargs", _base_kwargs))
         return _build_engine(kwargs)
 
+    # Expose the live engine + its A/B hooks so the loop can (a) sample scheduler
+    # stats and (b) run the Phase-4 decode-throughput A/B on it. ``run.engine`` is
+    # picked up as ``cfg.engine``; the loop reads ``gitm_throughput_fn`` /
+    # ``gitm_restart_fn`` off the engine (gitm.scheduler.loop Phase 4). The restart
+    # hook is what lets structural knobs (fp8 KV cache, quantization) be *measured*
+    # via an engine rebuild instead of rejected; ``gitm_baseline_restart_fn``
+    # rebuilds the baseline for ``restart_mode="serial"``. Mirrors the
+    # ``.applicator`` convention the hft/edge/openfold factories use.
     run.engine = llm
+    run.workload_id = "vllm-decode"
     llm.gitm_throughput_fn = _throughput
     llm.gitm_restart_fn = _restart
     llm.gitm_baseline_restart_fn = _baseline_restart
