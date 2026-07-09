@@ -152,7 +152,7 @@ def classify_bottleneck(trace: Trace, residuals: Residuals | None = None) -> str
         mem_score = max(mem_score, roofline_frac / _MEMCPY_THRESHOLD)
     if max(sc_score, mem_score) < 1.0:
         return COMPUTE_BOUND
-    return IDLE_STALL if sc_score >= mem_score else MEMORY_BOUND
+    return IDLE_STALL if sc_score >= mem_score else MEMORY_BOUND  # ties favor idle_stall
 
 
 # "Repoint at the largest residual": aim the search at the single op whose
@@ -451,8 +451,9 @@ def _value_grid(knob: Knob) -> list[object]:
         return [c for c in knob.choices if c != knob.default]
     if knob.kind in ("int", "float"):
         d = knob.default
-        base = d if isinstance(d, int | float) and d not in (0, False) else 1
-        raw = [base * m for m in _GRID_MULTIPLIERS]
+        if not isinstance(d, int | float) or d in (0, False):
+            return []  # zero/non-numeric default: no meaningful multiplicative grid
+        raw = [d * m for m in _GRID_MULTIPLIERS]
         if knob.kind == "int":
             vals = sorted({int(round(x)) for x in raw if round(x) >= 1})
         else:
@@ -744,12 +745,22 @@ class _ProposerBase:
             if catalog_knobs is not None
             else {s.knob for s in load_library()}
         )
+        self._searchable_cache: list[Knob] | None = None
 
     def _searchable(self) -> list[Knob]:
-        """Knobs worth searching: outside the catalog and with a non-empty grid."""
-        return [
-            k for k in self._source.knobs() if k.name not in self._catalog and _value_grid(k)
-        ]
+        """Knobs worth searching: outside the catalog and with a non-empty grid.
+
+        Cached: ``propose()`` calls this twice per invocation (main loop +
+        ``_extra_candidates``), and ``self._source.knobs()`` re-parses the
+        knob surface (e.g. VLLMKnobSource re-runs argparse introspection)
+        every time — the source and catalog are fixed for this instance's
+        lifetime, so the result can't change between calls.
+        """
+        if self._searchable_cache is None:
+            self._searchable_cache = [
+                k for k in self._source.knobs() if k.name not in self._catalog and _value_grid(k)
+            ]
+        return self._searchable_cache
 
     def _spec(
         self,

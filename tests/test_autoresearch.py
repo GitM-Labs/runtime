@@ -356,7 +356,7 @@ def test_value_grid_explicit_grid_wins() -> None:
 def _stub_knobs() -> list[Knob]:
     return [
         Knob("max_num_partial_prefills", "int", default=1),  # idle_stall-affine
-        Knob("cpu_offload_gb", "int", default=0),  # memory_bound-affine
+        Knob("cpu_offload_gb", "int", default=4),  # memory_bound-affine
         Knob("block_size", "int", default=16),  # memory-affine but IN the catalog
     ]
 
@@ -400,7 +400,7 @@ def test_engineargs_proposer_unknown_class_is_empty() -> None:
 
 def test_engineargs_proposer_scopes_specs_to_target_op() -> None:
     p = EngineArgsProposer(
-        knobs=[Knob("cpu_offload_gb", "int", default=0)], catalog_knobs=set()
+        knobs=[Knob("cpu_offload_gb", "int", default=4)], catalog_knobs=set()
     )
     specs = p.propose("memory_bound", target_op="paged_attention")
     assert specs
@@ -427,9 +427,9 @@ def test_engineargs_candidates_route_through_gate_and_rollback() -> None:
     """A generated candidate is kept on a measured win and reverted on a regression —
     the same gate the catalog goes through, nothing special for generated specs."""
     proposer = EngineArgsProposer(
-        knobs=[Knob("cpu_offload_gb", "int", default=0)], catalog_knobs=set()
+        knobs=[Knob("cpu_offload_gb", "int", default=4)], catalog_knobs=set()
     )
-    grid = _value_grid(Knob("cpu_offload_gb", "int", default=0))
+    grid = _value_grid(Knob("cpu_offload_gb", "int", default=4))
 
     kept_cfg: dict = {}
     kept = autoresearch_v0(
@@ -474,7 +474,7 @@ def test_apply_failure_surfaces_the_error_not_just_a_bare_none() -> None:
     — the same shape as 'measured and lost'. apply_error must distinguish the two
     so a report can say *why* it failed instead of a bare unexplained '-'."""
     proposer = EngineArgsProposer(
-        knobs=[Knob("cpu_offload_gb", "int", default=0)], catalog_knobs=set()
+        knobs=[Knob("cpu_offload_gb", "int", default=4)], catalog_knobs=set()
     )
     results = autoresearch_v0(
         _trace(), "memory_bound", applicator=_FailingApplicator(), proposer=proposer
@@ -537,7 +537,7 @@ def test_apply_error_is_none_when_not_applicable_or_measured() -> None:
     kept = autoresearch_v0(
         _trace(), "memory_bound",
         applicator=DictApplicator({}, measure_fn=lambda s: 0.10),
-        proposer=EngineArgsProposer(knobs=[Knob("cpu_offload_gb", "int", default=0)], catalog_knobs=set()),
+        proposer=EngineArgsProposer(knobs=[Knob("cpu_offload_gb", "int", default=4)], catalog_knobs=set()),
     )
     assert kept and all(r.apply_error is None for r in kept)
 
@@ -546,7 +546,7 @@ def test_fallback_proposer_uses_table_only_when_primary_is_empty() -> None:
     table = TableProposer()
     # Primary has no compute_bound knob here → falls back to the table's compute lever.
     fb = FallbackProposer(
-        EngineArgsProposer(knobs=[Knob("cpu_offload_gb", "int", default=0)], catalog_knobs=set()),
+        EngineArgsProposer(knobs=[Knob("cpu_offload_gb", "int", default=4)], catalog_knobs=set()),
         table,
     )
     # memory_bound: primary yields cpu_offload_gb candidates → table NOT consulted.
@@ -609,7 +609,7 @@ def test_knob_explicit_classes_override_keyword_affinity() -> None:
 
 def test_engineargs_proposer_is_a_vllm_bound_generative_proposer() -> None:
     """EngineArgsProposer is just GenerativeProposer bound to the vLLM surface."""
-    p = EngineArgsProposer(knobs=[Knob("cpu_offload_gb", "int", default=0)], catalog_knobs=set())
+    p = EngineArgsProposer(knobs=[Knob("cpu_offload_gb", "int", default=4)], catalog_knobs=set())
     assert isinstance(p, GenerativeProposer)
     specs = p.propose("memory_bound")
     assert specs and all(s.applicability.workloads == ["vllm-decode"] for s in specs)
@@ -777,7 +777,7 @@ def test_candidate_specs_share_the_forced_fields() -> None:
     (see test_generated_delta_mean_scales_with_affinity_strength)."""
     table = propose("compute_bound")[0]
     generated = EngineArgsProposer(
-        knobs=[Knob("cpu_offload_gb", "int", default=0)], catalog_knobs=set()
+        knobs=[Knob("cpu_offload_gb", "int", default=4)], catalog_knobs=set()
     ).propose("memory_bound")[0]
     for s in (table, generated):
         assert s.safety.tier == "moderate"
@@ -859,7 +859,7 @@ def test_candidate_spec_helper_forces_safety_and_delta() -> None:
 
 def test_affinity_strength_and_delta_mean_for() -> None:
     keywords = ("cache", "swap", "offload", "cpu")
-    assert _affinity_strength(Knob("cpu_offload_gb", "int", default=0), keywords) == 2
+    assert _affinity_strength(Knob("cpu_offload_gb", "int", default=4), keywords) == 2
     assert _affinity_strength(Knob("swap_space", "int", default=0), keywords) == 1
     assert _affinity_strength(Knob("unrelated_thing", "int", default=0), keywords) == 0
     # An explicit tag is authored ground truth: it scores as matching every
@@ -877,7 +877,7 @@ def test_generated_delta_mean_scales_with_affinity_strength() -> None:
     """A 2-keyword match must rank above a 1-match (previously identical)."""
     p = EngineArgsProposer(
         knobs=[
-            Knob("cpu_offload_gb", "int", default=0),  # matches "cpu" + "offload"
+            Knob("cpu_offload_gb", "int", default=4),  # matches "cpu" + "offload"
             Knob("preemption_mode", "enum", default="recompute",
                  choices=("recompute", "swap")),  # matches "preempt" only
         ],
