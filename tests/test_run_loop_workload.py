@@ -153,3 +153,67 @@ def test_hft_is_registered():
     # still resolves to None.
     assert get_factory("vllm-decode") is not None
     assert get_factory("not-a-workload") is None
+
+
+def test_vllm_decode_factory_returns_wired_runner(monkeypatch):
+    """The vllm-decode factory MUST return a runner wired with the live engine and
+    its Phase-4 A/B hooks.
+
+    Regression guard: a refactor (#55, "real restart-apply") once dropped the
+    trailing ``run.engine = ...`` wiring and ``return run``, so the factory
+    returned ``None`` on the non-synthetic path. The loop then saw no runner,
+    never ran the workload, and reported ``no_data`` unconditionally — and the
+    structural-knob hooks (fp8 KV, quantization) were never attached. The whole
+    suite stayed green because nothing exercised the factory's real return path
+    (it needs ``vllm`` imported, which CPU-only CI skips). This injects a fake
+    ``vllm`` module so that path is covered.
+    """
+    import sys
+    import types
+
+    from gitm.scheduler.loop import LoopConfig
+    from gitm.workloads import get_factory
+
+    class _Out:
+        def __init__(self, n: int):
+            self.outputs = [types.SimpleNamespace(token_ids=list(range(n)))]
+
+    class _LLM:
+        def __init__(self, model, **kwargs):
+            self.model = model
+            self.kwargs = kwargs
+
+        def generate(self, prompts, params):
+            return [_Out(params.max_tokens) for _ in prompts]
+
+    class _SamplingParams:
+        def __init__(self, max_tokens: int = 0, temperature: float = 0.0):
+            self.max_tokens = max_tokens
+            self.temperature = temperature
+
+    fake = types.ModuleType("vllm")
+    fake.LLM = _LLM
+    fake.SamplingParams = _SamplingParams
+    monkeypatch.setitem(sys.modules, "vllm", fake)
+    monkeypatch.setenv("GITM_VLLM_PROMPTS", "3")
+    monkeypatch.setenv("GITM_VLLM_MAX_TOKENS", "5")
+    monkeypatch.delenv("GITM_VLLM_SYNTHETIC", raising=False)
+
+    runner = get_factory("vllm-decode")(LoopConfig(workload="vllm-decode"))
+
+    assert runner is not None, "factory returned None — engine wiring/return dropped"
+    assert callable(runner)
+    engine = getattr(runner, "engine", None)
+    assert engine is not None, "run.engine not attached — loop stays predict-only"
+    assert getattr(runner, "workload_id", None) == "vllm-decode"
+    # Structural-knob hooks the loop reads off the engine (gitm.scheduler.loop
+    # Phase 4). Without gitm_restart_fn, fp8/quant get rejected instead of measured.
+    assert callable(getattr(engine, "gitm_throughput_fn", None))
+    assert callable(getattr(engine, "gitm_restart_fn", None))
+    # The observe runner produces a real token count, and the throughput probe
+    # measures whatever engine it is handed (3 prompts x 5 tokens).
+    assert runner()["generated_tokens"] == 3 * 5
+    assert engine.gitm_throughput_fn(engine) > 0
+    # The restart hook rebuilds a fresh engine with the structural knob applied.
+    rebuilt = engine.gitm_restart_fn(engine, "kv_cache_dtype", "fp8")
+    assert rebuilt is not engine and rebuilt.kwargs["kv_cache_dtype"] == "fp8"
