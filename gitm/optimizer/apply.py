@@ -120,12 +120,8 @@ def _audit(
 
 
 def _knob_values(spec: Any) -> dict[str, Any]:
-    """The knob=value pairs ``spec`` wants applied — single or joint.
-
-    Duck-type-friendly: works for a real :class:`InterventionSpec` (via its
-    ``knobs``/``knob``/``value`` fields) or a bare test double exposing just
-    ``.knob``/``.value``, which several tests use for brevity.
-    """
+    """The knob=value pairs ``spec`` wants applied — single or joint. Duck-type
+    friendly: also works for a bare test double exposing just .knob/.value."""
     knobs = getattr(spec, "knobs", None)
     return dict(knobs) if knobs else {spec.knob: spec.value}
 
@@ -353,9 +349,8 @@ class LiveEngineApplicator:
             raise ValueError(f"intervention {spec.name!r} has no value(s) to set")
 
         if not self._force_restart and all(knob_kind(k) == "scheduling" for k in values):
-            # Hot-swap every knob in place, atomically as a set. Record each
-            # restore point only AFTER its successful set: if a later knob's
-            # setter raises, restore() only undoes what was actually changed.
+            # Record each restore point only after its successful set, so a
+            # later setter raising only leaves what was actually changed to undo.
             applied: dict[str, Any] = {}
             self._prev = ("hotswap", applied)
             for knob, value in values.items():

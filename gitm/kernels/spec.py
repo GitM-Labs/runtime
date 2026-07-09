@@ -45,29 +45,19 @@ class InterventionSpec(BaseModel):
     knob: str  # vLLM config key, e.g. "max_num_batched_tokens" — or a display
     # label ("k1=v1,k2=v2") for a joint candidate; see ``knobs`` below.
     value: int | float | str | bool | None = None  # value to set on apply (single-knob)
-    # For a knob whose "right" absolute value depends on model size/GPU/
-    # workload shape (e.g. max_num_batched_tokens): scale the engine's CURRENT
-    # value by this factor instead of hardcoding one number for every
-    # deployment. None (the default) means value is a static literal, applied
-    # as-is. See gitm.optimizer.vllm_knobs.resolve_relative_value — value
-    # stays the offline/predict-only fallback when there's no live engine to
-    # read a current setting from.
+    # Scale the engine's CURRENT value by this factor instead of hardcoding one
+    # number (see gitm.optimizer.vllm_knobs.resolve_relative_value). None (the
+    # default): value is a static literal. value is the offline/predict-only
+    # fallback when there's no live engine to read a current setting from.
     value_multiplier: float | None = None
-    # A sweep of multipliers instead of one — e.g. [0.5, 2.0, 4.0] — expands
-    # this single reviewed entry into one candidate per point (see
-    # gitm.optimizer.vllm_knobs.expand_relative_candidates), so the rollback
-    # gate picks whichever point actually wins instead of the catalog betting
-    # on a single guess. Empty (the default) means no sweep; value_multiplier
-    # (if set) resolves as one candidate as usual.
+    # A sweep of multipliers (e.g. [0.5, 2.0, 4.0]) instead of one — expands
+    # this entry into one candidate per point (expand_relative_candidates).
+    # Empty (default): no sweep.
     value_multiplier_grid: list[float] = Field(default_factory=list)
-    # Clamp the multiplier-scaled result (e.g. gpu_memory_utilization must stay
-    # a fraction below 1.0). None means no clamp.
-    value_max: float | None = None
+    value_max: float | None = None  # clamp the scaled result (e.g. a fraction < 1.0)
     value_min: float | None = None
-    # A joint candidate: >1 knob=value pair applied/rolled back together as one
-    # atomic unit. Empty (the default) means "single knob" — use ``knob``/
-    # ``value`` instead. Additive: every existing single-knob spec is
-    # unaffected (``knobs`` stays ``{}``); see ``knob_values``.
+    # >1 knob=value pair applied/rolled back together as one atomic unit. Empty
+    # (default) means single-knob — use knob/value instead. See knob_values.
     knobs: dict[str, Any] = Field(default_factory=dict)
     applies_to_kernels: list[str] = Field(default_factory=list)  # substring match
     expected_delta_mean: float  # signed, e.g. +0.08 = 8% improvement

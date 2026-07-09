@@ -191,13 +191,10 @@ def knob_kind(knob: str) -> KnobKind:
     return spec.kind if spec is not None else "structural"
 
 
-#: (name substring, prerequisite knob) — a generated candidate matching the
-#: substring only does anything (or even applies) when the prerequisite is
-#: already on. E.g. ``dbo_prefill_token_threshold`` requires ``--enable-dbo``;
-#: ``max_num_partial_prefills``/``long_prefill_token_threshold`` require
-#: ``--enable-chunked-prefill`` (vLLM docs). A blanket denylist would forfeit
-#: these forever, including on deployments where the prerequisite genuinely
-#: holds — check the live engine instead via :func:`unmet_prerequisite`.
+#: (name substring, prerequisite knob) — a candidate matching the substring
+#: only applies when the prerequisite is on (e.g. dbo_prefill_token_threshold
+#: needs --enable-dbo). Check the live engine via unmet_prerequisite rather
+#: than denylisting forever, including on deployments where it genuinely holds.
 KNOB_PREREQUISITES: tuple[tuple[str, str], ...] = (
     ("partial_prefill", "enable_chunked_prefill"),
     ("long_prefill_token_threshold", "enable_chunked_prefill"),
@@ -206,13 +203,9 @@ KNOB_PREREQUISITES: tuple[tuple[str, str], ...] = (
 
 
 def unmet_prerequisite(engine: Any | None, knob: str) -> str | None:
-    """None if ``knob`` has no prerequisite, or its prerequisite holds on ``engine``.
-
-    Otherwise the rejection reason. With no live engine, a prerequisite-gated
-    knob can't be verified at all — conservative default is to reject rather
-    than assume it holds (mirrors this module's other unknown-defaults-unsafe
-    calls, e.g. :func:`knob_kind`).
-    """
+    """None if ``knob`` has no prerequisite, or it holds on ``engine`` — else
+    the rejection reason. No engine -> can't verify -> reject (conservative,
+    like :func:`knob_kind`'s unknown-defaults-unsafe default)."""
     lname = knob.lower()
     prereq = next((p for needle, p in KNOB_PREREQUISITES if needle in lname), None)
     if prereq is None:
@@ -230,15 +223,11 @@ def unmet_prerequisite(engine: Any | None, knob: str) -> str | None:
 def resolve_relative_value(spec: InterventionSpec, engine: Any | None) -> InterventionSpec:
     """Scale a relative catalog lever's value off the engine's CURRENT setting.
 
-    A knob like ``max_num_batched_tokens`` doesn't have one right absolute
-    value across every deployment — it depends on model size, GPU, and
-    workload shape (this is exactly why vLLM's own auto_tune.sh sweeps it
-    rather than hardcoding a number). A catalog entry with ``value_multiplier``
-    set says "N times whatever this engine is already running at" instead of
-    one static guess. With a live engine, read its current value for the knob
-    and scale that. Falls back to the spec's static ``value`` when there's no
-    multiplier, no engine, or the current value can't be read/scaled
-    (offline/predict-only mode) — still a usable, honest estimate.
+    A knob like ``max_num_batched_tokens`` has no single right absolute value
+    across deployments (model size/GPU/workload shape vary) — vLLM's own
+    auto_tune.sh sweeps it rather than hardcoding a number. With a live engine,
+    read its current value and scale by ``value_multiplier``. Falls back to
+    the static ``value`` with no multiplier/engine/readable current value.
     """
     if spec.value_multiplier is None or engine is None:
         return spec
@@ -261,22 +250,14 @@ def resolve_relative_value(spec: InterventionSpec, engine: Any | None) -> Interv
 
 
 def expand_relative_candidates(spec: InterventionSpec, engine: Any | None) -> list[InterventionSpec]:
-    """Sweep ``value_multiplier_grid`` into one resolved candidate per point.
+    """Sweep ``value_multiplier_grid`` into one resolved candidate per point —
+    same idea as vLLM's auto_tune.sh and autoresearch's value grid, applied to
+    a reviewed catalog lever. Each point resolves off the SAME current engine
+    value via :func:`resolve_relative_value`, with its own name.
 
-    Mirrors vLLM's own auto_tune.sh (sweeps a list of candidate values per
-    knob rather than trying one guess) and autoresearch's generated-knob value
-    grid — the same idea applied to a reviewed catalog lever, so the rollback
-    gate picks whichever point actually wins instead of the catalog betting on
-    a single number. Each point is resolved off the SAME current engine value
-    via :func:`resolve_relative_value` and gets its own name/summary.
-
-    Falls back to a single :func:`resolve_relative_value` call when there's no
-    grid (a plain ``value_multiplier`` spec, or a static spec with neither) —
-    additive, not a new contract every entry must opt into. With no live
-    engine there's nothing to scale relative to, so the sweep collapses to one
-    candidate at the static fallback value (not N duplicates of it); the same
-    collapse happens when every grid point resolves to the same value (e.g.
-    the knob's current value is 0, so any multiplier of it stays 0).
+    No grid -> a single :func:`resolve_relative_value` call. No live engine,
+    or every point collapsing to the same value (current == 0), -> one
+    candidate, not N duplicates.
     """
     if not spec.value_multiplier_grid:
         return [resolve_relative_value(spec, engine)]

@@ -42,17 +42,14 @@ class Residuals:
 def residuals(trace: Trace, graph: Graph) -> Residuals:
     """Pair observed kernels to predicted nodes by op identity, not position.
 
-    A real capture has orders of magnitude more kernels than the predicted
-    graph's ~5*n_layers+1 nodes; the old ordinal pairing matched a handful of
-    early kernels against unrelated ops, producing runaway r_kt ratios. Each
-    kernel is classified by name (:func:`gitm.optimizer.deviation.classify_op`)
-    and compared to that op's roofline node — one representative node per op,
-    since per-layer nodes share the same prediction. A kernel with no modeled
-    op is unmodeled work and gets no residual; ``layer`` is unrecoverable from
-    name-based classification, so it's always ``None``. Each record also carries
-    the matched op's roofline ``bound`` ("compute" | "memory") so callers can
-    weight bottleneck classification by real arithmetic intensity instead of
-    guessing from wall-clock signals alone.
+    The old ordinal pairing matched a handful of early kernels against
+    unrelated ops (orders of magnitude fewer predicted nodes than real
+    kernels), producing runaway r_kt ratios. Each kernel is now classified by
+    name (:func:`gitm.optimizer.deviation.classify_op`) against one
+    representative node per op (per-layer nodes share a prediction);
+    unmodeled kernels get no residual, and ``layer`` is always ``None``
+    (unrecoverable from name-based classification). Carries the matched op's
+    roofline ``bound`` for bottleneck classification.
     """
     obs = trace.kernels()
     pred = graph.nodes

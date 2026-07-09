@@ -470,9 +470,8 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
 
     # Phase 3 — library + counterfactual replay ranking
     pctx = build_planner_context(cfg.engine, workload = workload)
-    # Relative levers (value_multiplier / value_multiplier_grid) resolve — and
-    # sweep, if a grid is set — against the live engine's current setting here,
-    # once, before ranking. See expand_relative_candidates.
+    # Relative/swept levers resolve against the live engine here, once, before
+    # ranking. See expand_relative_candidates.
     library = [
         resolved
         for s in load_library(workload=workload)
