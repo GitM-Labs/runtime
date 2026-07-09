@@ -150,7 +150,7 @@ docs.vllm.ai) that is **not** in `library.yaml`:
 
 | Class | Knob | Value | Rationale |
 |-------|------|-------|-----------|
-| `idle_stall` | *(none by default)* | — | dependent prefill/DBO knobs are filtered unless represented by reviewed catalog entries |
+| `idle_stall` | *(none by default)* | â€” | dependent prefill/DBO knobs are filtered unless represented by reviewed catalog entries |
 | `memory_bound` | `cpu_offload_gb` | 4 | offload cold weights to host RAM, freeing HBM for KV cache |
 | `memory_bound` | `preemption_mode` | `swap` | swap preempted KV blocks instead of recomputing under pressure |
 | `compute_bound` | `compilation_config` | 3 | torch.compile level 3: kernel fusion + piecewise CUDA graphs |
