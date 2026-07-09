@@ -81,7 +81,8 @@ def apply_intervention(
         applicator.apply(spec)
     except Exception as exc:
         applicator.restore(snapshot)
-        _audit(audit, "revert", spec, cause=f"apply failed, restored: {exc}")
+        _audit(audit, "revert", spec, cause=f"apply failed, restored: {exc}",
+               knobs=_knob_values(spec))
         return ApplyResult(False, rolled_back=True, measured_delta=None,
                            error=f"apply failed, restored: {exc}")
     _audit(audit, "apply", spec, cause="applied live", knobs=_knob_values(spec))
@@ -91,14 +92,15 @@ def apply_intervention(
         delta = applicator.measure(spec)
     except Exception as exc:
         applicator.restore(snapshot)
-        _audit(audit, "revert", spec, cause=f"measure failed, restored: {exc}")
+        _audit(audit, "revert", spec, cause=f"measure failed, restored: {exc}",
+               knobs=_knob_values(spec))
         return ApplyResult(False, rolled_back=True, measured_delta=None,
                            error=f"measure failed, restored: {exc}")
 
     # Step 4: keep-or-rollback on the regression threshold.
     if delta is not None and delta < min_keep_delta:
         applicator.restore(snapshot)
-        _audit(audit, "revert", spec,
+        _audit(audit, "revert", spec, knobs=_knob_values(spec),
                cause=f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}")
         return ApplyResult(True, rolled_back=True, measured_delta=delta,
                            error=f"regression {delta:+.3f} < keep threshold "

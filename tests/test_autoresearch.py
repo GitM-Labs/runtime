@@ -862,8 +862,11 @@ def test_affinity_strength_and_delta_mean_for() -> None:
     assert _affinity_strength(Knob("cpu_offload_gb", "int", default=0), keywords) == 2
     assert _affinity_strength(Knob("swap_space", "int", default=0), keywords) == 1
     assert _affinity_strength(Knob("unrelated_thing", "int", default=0), keywords) == 0
-    # An explicit tag is one strong match regardless of name.
-    assert _affinity_strength(Knob("x", "int", default=0, classes=("idle_stall",)), keywords) == 1
+    # An explicit tag is authored ground truth: it scores as matching every
+    # keyword (the max), so it can never be outranked by a coincidental
+    # multi-keyword name match.
+    assert _affinity_strength(Knob("x", "int", default=0, classes=("idle_stall",)), keywords) == len(keywords)
+    assert _affinity_strength(Knob("x", "int", default=0, classes=("idle_stall",)), ()) == 1  # no keywords -> floor at 1
 
     assert _delta_mean_for(0) == _delta_mean_for(1)  # zero matches floors at 1
     assert abs(_delta_mean_for(2) - 2 * _delta_mean_for(1)) < 1e-9

@@ -114,6 +114,41 @@ def test_apply_audits_apply_then_revert_on_regression(tmp_path):
 
     # A regressing change is applied then reverted — both must be on the trail.
     assert [e.event for e in log.entries()] == ["apply", "revert"]
+    # The revert entry names which knob(s) were involved, not just the cause —
+    # essential once a rollback can be a joint (multi-knob) candidate.
+    assert log.entries()[1].detail["knobs"] == {"block_size": 16}
+
+
+def test_apply_audits_knobs_on_apply_and_measure_failures(tmp_path):
+    """The revert entry carries which knob(s) were attempted even when the
+    failure happens before or during measurement, not just on a regression."""
+    from gitm.safety import AuditLog
+
+    class _RaisesOnApply:
+        def snapshot(self):
+            return {}
+
+        def apply(self, spec):
+            raise RuntimeError("bad value")
+
+        def restore(self, snapshot):
+            pass
+
+        def measure(self, spec):
+            return None
+
+    class _RaisesOnMeasure(_RaisesOnApply):
+        def apply(self, spec):
+            pass
+
+        def measure(self, spec):
+            raise RuntimeError("measurement crashed")
+
+    for applicator in (_RaisesOnApply(), _RaisesOnMeasure()):
+        log = AuditLog(tmp_path / f"audit-{type(applicator).__name__}.jsonl")
+        apply_intervention(_spec(), applicator, audit=log)
+        assert log.entries()[-1].event == "revert"
+        assert log.entries()[-1].detail["knobs"] == {"block_size": 16}
 
 
 def test_apply_without_audit_writes_nothing(tmp_path):

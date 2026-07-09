@@ -412,9 +412,12 @@ def _affine(knob: Knob, bottleneck_class: str, keywords: tuple[str, ...]) -> boo
 def _affinity_strength(knob: Knob, keywords: tuple[str, ...]) -> int:
     """How many affinity keywords match ``knob``'s name — a real, computable
     confidence signal, not a fabricated score. An explicit ``Knob.classes`` tag
-    counts as one strong match."""
+    is authored ground truth, so it counts as matching every keyword (the max
+    possible score for this class) — a knob whose name happens to contain
+    several keywords by coincidence must never outrank one a source explicitly
+    tagged."""
     if knob.classes:
-        return 1
+        return max(len(keywords), 1)
     lname = knob.name.lower()
     return sum(1 for k in keywords if k in lname)
 
