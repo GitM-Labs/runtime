@@ -639,6 +639,19 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
                 f"two-engine V1 distributed clash: {exc}"
             ) from exc
 
+    # Expose the live engine + its A/B hooks so the loop can (a) sample scheduler
+    # stats and (b) run the Phase-4 decode-throughput A/B on it. ``run.engine`` is
+    # picked up as ``cfg.engine``; the loop reads ``gitm_throughput_fn`` /
+    # ``gitm_restart_fn`` off the engine (gitm.scheduler.loop Phase 4). The restart
+    # hook is what lets structural knobs (fp8 KV cache, quantization) be *measured*
+    # via an engine rebuild instead of rejected. Mirrors the ``.applicator``
+    # convention the hft/edge/openfold factories use.
+    run.engine = llm
+    run.workload_id = "vllm-decode"
+    llm.gitm_throughput_fn = _throughput
+    llm.gitm_restart_fn = _restart
+    return run
+
 def _vllm_synthetic_runner(n_prompts: int, max_tokens: int) -> WorkloadRunner:
     """A CPU-only stand-in for the decode loop (no vLLM, no GPU).
 
