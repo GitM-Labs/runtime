@@ -228,11 +228,14 @@ def _agg_kt_residual(res: Any) -> float:
     return _clamp_pct(value)
 
 
-def _ar_target_residual(ar_run: AutoresearchRun) -> float:
-    """The residual autoresearch's claims should report: the largest-residual
-    op's mean r_kt that the search targeted (:func:`gitm.agents.autoresearch.
-    largest_residual`), same for every claim in the phase. 0.0 with no target."""
-    return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else 0.0
+def _ar_target_residual(ar_run: AutoresearchRun, fallback: float = 0.0) -> float:
+    """Residual for autoresearch claims.
+
+    Prefer the largest-residual op that autoresearch targeted; when there is no
+    target, fall back to the run-level kernel-time residual so generated claims
+    do not all display a misleading +0.0% gap.
+    """
+    return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else fallback
 
 
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
@@ -495,13 +498,13 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
 
     # Phase 4 — apply with rollback gates.
     # With a live engine attached, each candidate runs the rollback-gated decode-
-    # throughput A/B (LiveEngineApplicator): snapshot baseline tps → hot-swap the
-    # knob → measure candidate tps → keep only on a non-negative delta, else
-    # restore. Scheduling knobs are hot-swapped; structural knobs are routed
-    # through ``engine.gitm_restart_fn`` (if the deployment provides one) or
-    # rolled back rather than silently no-op'd. With no engine it's predict-only
-    # (DryRunApplicator): candidates land in the report as unverified
-    # (measured_delta=None), never claimed as won.
+    # throughput A/B (LiveEngineApplicator): snapshot baseline tps, apply the
+    # candidate, measure candidate tps, keep only on a non-negative delta, else
+    # restore. vLLM EngineArgs are routed through ``engine.gitm_restart_fn``
+    # (if the deployment provides one) because the real engine reads them at
+    # construction time. With no engine it is predict-only (DryRunApplicator):
+    # candidates land in the report as unverified (measured_delta=None), never
+    # claimed as won.
     live_restart_fn = getattr(cfg.engine, "gitm_restart_fn", None) if cfg.engine else None
     if cfg.engine is not None:
         applicator: Applicator = LiveEngineApplicator(
@@ -511,8 +514,8 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             baseline_restart_fn=getattr(cfg.engine, "gitm_baseline_restart_fn", None),
             restart_mode=os.environ.get("GITM_RESTART_MODE", "parallel"),
             reps=int(os.environ.get("GITM_AB_REPS", "1")),
-            # GITM_KNOBS_VIA_RESTART=1 applies scheduling knobs via engine rebuild
-            # too — for V1, which ignores a live scheduler-config mutation.
+            # Compatibility escape hatch for custom scheduling-classified knobs
+            # that should still be measured through engine rebuild.
             force_restart=os.environ.get("GITM_KNOBS_VIA_RESTART") == "1",
         )
     else:
@@ -605,7 +608,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     ar_causal_evidence = ", ".join(
         f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
     ) or "no strong causal signal"
-    ar_residual = _ar_target_residual(ar_run)
+    ar_residual = _ar_target_residual(ar_run, kt_residual)
     for r in ar_run.results:
         if not r.applicable:
             rejected.append(f"{r.spec.name} ({r.rejected_reason})")

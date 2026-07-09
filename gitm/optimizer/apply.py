@@ -261,10 +261,10 @@ class LiveEngineApplicator:
 
     Routes by knob taxonomy (:mod:`gitm.optimizer.vllm_knobs`):
 
-    * **scheduling** knobs (``max_num_seqs``, ``max_num_batched_tokens``,
-      ``scheduling_policy``) are *hot-swapped* in place — set on the live
-      scheduler config, effective next step, restored by setting the old value.
-      A joint candidate whose knobs are ALL scheduling is hot-swapped as one set.
+    * **scheduling** knobs are rare deployment-specific live controls. A joint
+      candidate whose knobs are ALL scheduling is hot-swapped as one set.
+      The curated vLLM EngineArg map intentionally treats scheduler-looking
+      EngineArgs as structural because vLLM reads them at construction time.
     * **structural** knobs (parallelism, dtype, quantization, block size, …) can
       only take effect on a fresh engine, so they (or a joint set containing
       any structural knob) are routed through
@@ -308,9 +308,8 @@ class LiveEngineApplicator:
         self._getter = getter or get_knob
         self._setter = setter or set_knob
         self._reps = max(1, reps)
-        # force_restart: apply scheduling knobs via the restart path too, for
-        # engines that don't honor a live scheduler-config mutation (vLLM V1 reads
-        # scheduler_config at construction). Requires a restart_fn.
+        # force_restart is kept for custom deployments that still classify a
+        # knob as scheduling but want to measure it through the restart path.
         self._force_restart = force_restart
         self._baseline_tps: float | None = None
         self._baseline_std: float = 0.0
@@ -462,9 +461,9 @@ class LiveEngineApplicator:
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
         except Exception:
             pass
-
 
     def measure(self, spec: InterventionSpec) -> float | None:
         baseline = self._baseline_tps if self._baseline_tps is not None else self._bench_stats()[0]
@@ -486,7 +485,7 @@ class LiveEngineApplicator:
         # anything within noise. reps=1 → std=0 → band=0 → keep iff delta>0.
         noise_band = (self._baseline_std + cand_std) / baseline
         significant = delta > noise_band
-        via = "restart" if (self._prev and self._prev[0] == "restart") else "hot-swap"
+        via = "restart" if (self._prev and self._prev[0] in {"restart", "serial_restart"}) else "hot-swap"
         self.last_result = EngineABResult(
             knob=spec.knob, value=(getattr(spec, "knobs", None) or spec.value),
             baseline_tps=baseline,

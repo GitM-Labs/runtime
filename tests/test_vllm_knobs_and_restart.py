@@ -39,9 +39,12 @@ def _spec(knob: str, value) -> InterventionSpec:
 # knob taxonomy                                                               #
 # --------------------------------------------------------------------------- #
 def test_knob_kind_classification():
-    assert knob_kind("max_num_seqs") == "scheduling"
-    assert knob_kind("max_num_batched_tokens") == "scheduling"
-    assert knob_kind("scheduling_policy") == "scheduling"
+    assert knob_kind("max_num_seqs") == "structural"
+    assert knob_kind("max_num_batched_tokens") == "structural"
+    assert knob_kind("scheduling_policy") == "structural"
+    assert knob_kind("async_scheduling") == "structural"
+    assert knob_kind("dbo_prefill_token_threshold") == "structural"
+    assert knob_kind("kv_sharing_fast_prefill") == "structural"
     assert knob_kind("tensor_parallel_size") == "structural"
     assert knob_kind("block_size") == "structural"
     assert knob_kind("totally_unknown_knob") == "structural"  # safe default
@@ -201,7 +204,7 @@ def test_unresolvable_knob_raises():
 
 
 # --------------------------------------------------------------------------- #
-# LiveEngineApplicator: hot-swap vs restart-apply                             #
+# LiveEngineApplicator: restart-apply                                         #
 # --------------------------------------------------------------------------- #
 class _TpsEngine:
     """Engine whose throughput is a settable number; restart yields a new one."""
@@ -215,15 +218,22 @@ def _tps_of(e):
     return e._tps
 
 
-def test_hotswap_scheduling_knob_kept():
+def test_engine_arg_knob_uses_restart_not_hotswap():
     e = _TpsEngine(100.0)
-    # throughput rises with max_num_seqs so the hot-swap is a measurable win.
-    app = LiveEngineApplicator(e, throughput_fn=lambda x: float(x.scheduler_config.max_num_seqs))
+    built: list[dict[str, object]] = []
+
+    def restart_fn(old, knob_values):
+        assert old is e
+        built.append(dict(knob_values))
+        return _TpsEngine(200.0)
+
+    app = LiveEngineApplicator(e, throughput_fn=_tps_of, restart_fn=restart_fn)
     res = apply_intervention(_spec("max_num_seqs", 256), app, min_keep_delta=0.0)
     assert res.applied and not res.rolled_back
-    assert e.scheduler_config.max_num_seqs == 256
-    assert app.last_result.via == "hot-swap"
-    assert app.last_result.speedup == pytest.approx(256 / 32)
+    assert built == [{"max_num_seqs": 256}]
+    assert app.engine is not e and app.engine._tps == 200.0
+    assert app.last_result.via == "restart"
+    assert app.last_result.speedup == pytest.approx(2.0)
 
 
 def test_restart_apply_structural_knob_kept_and_swaps_engine():
@@ -289,6 +299,7 @@ def test_serial_restart_releases_baseline_before_building_candidate():
     assert res.applied and res.rolled_back
     assert events == ["restart:block_size=16", "restore-baseline"]
     assert app.engine is restored
+    assert app.last_result.via == "restart"
 
 
 def test_serial_restart_rebuilds_baseline_if_candidate_build_fails():
@@ -397,16 +408,21 @@ class _SchedCfg64:
 
 
 class _FullEngine:
-    """Fake engine exposing scheduler stats AND a hot-swappable max_num_seqs."""
+    """Fake engine exposing scheduler stats and a restartable max_num_seqs."""
 
-    def __init__(self):
+    def __init__(self, max_num_seqs: int = 64):
         self.model_config = _ModelCfgBf16()
         self.scheduler = [_LowOccScheduler()]
         self.scheduler_config = _SchedCfg64()
+        self.scheduler_config.max_num_seqs = max_num_seqs
         self.gitm_throughput_fn = lambda e: float(e.scheduler_config.max_num_seqs)
+        self.gitm_restart_fn = self._restart
 
     def get_num_unfinished_requests(self):
         return 2
+
+    def _restart(self, _old_engine, knob_values):
+        return _FullEngine(max_num_seqs=int(knob_values.get("max_num_seqs", 64)))
 
 
 def test_run_loop_scheduler_stats_feed_attribution_and_claims(tmp_path, monkeypatch):
@@ -442,10 +458,9 @@ def test_run_loop_scheduler_stats_feed_attribution_and_claims(tmp_path, monkeypa
     assert "under_filled_batch" in signals
     # And it reached the claim that it motivates (max_num_seqs), in the report.
     assert "scheduler[under_filled_batch]" in out["report_md"]
-    # The hot-swap won and was kept. max_num_seqs_dynamic now sweeps relative
-    # to the engine's starting value (64) rather than one hardcoded 256, so
-    # assert it was raised and kept rather than pin an exact literal.
-    assert engine.scheduler_config.max_num_seqs > 64
+    # The restart path won and was kept for the generated max_num_seqs lever.
+    assert "via restart" in out["report_md"]
+    assert "max_num_seqs" in out["report_md"]
     # Scheduler summary surfaced in the run summary (synchronous first sample).
     assert out["summary"]["scheduler_stats"] is not None
 

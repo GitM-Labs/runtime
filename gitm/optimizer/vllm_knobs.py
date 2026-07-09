@@ -53,16 +53,17 @@ class KnobSpec:
         return self.path.startswith("env:")
 
 
-# The curated map. Only the three scheduler knobs vLLM honors mid-run are
-# "scheduling"; everything else is fixed at construction → "structural".
+# The curated map. vLLM EngineArgs are treated as construction-time knobs in the
+# real in-process engine path, even when a Python config object exposes the same
+# field. Route them through restart so the A/B measures a rebuilt engine, not a
+# config mutation the scheduler/cache/model may ignore.
 _KNOBS: dict[str, KnobSpec] = {
-    # --- scheduling: live-settable on the scheduler, effective next step -------
-    "max_num_seqs": KnobSpec("max_num_seqs", "scheduler_config.max_num_seqs", "scheduling"),
-    "max_num_batched_tokens": KnobSpec(
-        "max_num_batched_tokens", "scheduler_config.max_num_batched_tokens", "scheduling"
-    ),
-    "scheduling_policy": KnobSpec("scheduling_policy", "scheduler_config.policy", "scheduling"),
     # --- structural: fixed at engine construction, need a restart to change ----
+    "max_num_seqs": KnobSpec("max_num_seqs", "scheduler_config.max_num_seqs", "structural"),
+    "max_num_batched_tokens": KnobSpec(
+        "max_num_batched_tokens", "scheduler_config.max_num_batched_tokens", "structural"
+    ),
+    "scheduling_policy": KnobSpec("scheduling_policy", "scheduler_config.policy", "structural"),
     "block_size": KnobSpec("block_size", "cache_config.block_size", "structural"),
     "kv_cache_dtype": KnobSpec("kv_cache_dtype", "cache_config.cache_dtype", "structural"),
     "gpu_memory_utilization": KnobSpec(
@@ -75,6 +76,27 @@ _KNOBS: dict[str, KnobSpec] = {
     "enable_chunked_prefill": KnobSpec(
         "enable_chunked_prefill", "scheduler_config.chunked_prefill_enabled", "structural"
     ),
+    "async_scheduling": KnobSpec(
+        "async_scheduling", "scheduler_config.async_scheduling", "structural"
+    ),
+    "scheduler_delay_factor": KnobSpec(
+        "scheduler_delay_factor", "scheduler_config.scheduler_delay_factor", "structural"
+    ),
+    "max_num_partial_prefills": KnobSpec(
+        "max_num_partial_prefills", "scheduler_config.max_num_partial_prefills", "structural"
+    ),
+    "max_long_partial_prefills": KnobSpec(
+        "max_long_partial_prefills", "scheduler_config.max_long_partial_prefills", "structural"
+    ),
+    "long_prefill_token_threshold": KnobSpec(
+        "long_prefill_token_threshold", "scheduler_config.long_prefill_token_threshold", "structural"
+    ),
+    "dbo_decode_token_threshold": KnobSpec(
+        "dbo_decode_token_threshold", "scheduler_config.dbo_decode_token_threshold", "structural"
+    ),
+    "dbo_prefill_token_threshold": KnobSpec(
+        "dbo_prefill_token_threshold", "scheduler_config.dbo_prefill_token_threshold", "structural"
+    ),
     "num_speculative_tokens": KnobSpec(
         "num_speculative_tokens", "speculative_config.num_speculative_tokens", "structural"
     ),
@@ -82,7 +104,17 @@ _KNOBS: dict[str, KnobSpec] = {
     "max_seq_len_to_capture": KnobSpec(
         "max_seq_len_to_capture", "model_config.max_seq_len_to_capture", "structural"
     ),
+    "max_model_len": KnobSpec("max_model_len", "model_config.max_model_len", "structural"),
+    "disable_sliding_window": KnobSpec(
+        "disable_sliding_window", "model_config.disable_sliding_window", "structural"
+    ),
     "quantization": KnobSpec("quantization", "model_config.quantization", "structural"),
+    "calculate_kv_scales": KnobSpec(
+        "calculate_kv_scales", "cache_config.calculate_kv_scales", "structural"
+    ),
+    "kv_sharing_fast_prefill": KnobSpec(
+        "kv_sharing_fast_prefill", "cache_config.kv_sharing_fast_prefill", "structural"
+    ),
     "tensor_parallel_size": KnobSpec(
         "tensor_parallel_size", "parallel_config.tensor_parallel_size", "structural"
     ),
@@ -153,7 +185,7 @@ def get_knob(engine: Any, knob: str) -> Any:
 
 
 def set_knob(engine: Any, knob: str, value: Any) -> None:
-    """Set ``knob`` on the live engine via its taxonomy path (scheduling knobs).
+    """Set ``knob`` on the live engine via its taxonomy path (live knobs).
 
     Raises ``AttributeError`` when the knob can't be located — the caller
     (:class:`~gitm.optimizer.apply.LiveEngineApplicator`) turns that into a

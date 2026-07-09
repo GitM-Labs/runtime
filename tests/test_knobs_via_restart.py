@@ -1,8 +1,8 @@
-"""GITM_KNOBS_VIA_RESTART routes scheduling knobs through the rebuild.
+"""EngineArg knobs route through restart by default.
 
-If an engine ignores a live scheduler-config mutation (vLLM V1 reads it at
-construction), force_restart makes the applicator apply scheduling knobs via the
-restart path — a fresh engine with the knob baked in — instead of hot-swapping.
+vLLM V1 reads many scheduler-looking EngineArgs at construction time. The
+applicator should rebuild a fresh engine with those values baked in instead of
+mutating scheduler_config fields that the live engine may ignore.
 """
 
 from __future__ import annotations
@@ -11,10 +11,10 @@ from types import SimpleNamespace
 
 from gitm.optimizer.apply import LiveEngineApplicator
 
-_SCHED_KNOB = SimpleNamespace(knob="max_num_seqs", value=256)  # a scheduling knob
+_ENGINE_ARG_KNOB = SimpleNamespace(knob="max_num_seqs", value=256)
 
 
-def test_force_restart_rebuilds_for_a_scheduling_knob():
+def test_engine_arg_rebuilds_by_default():
     built: list[dict] = []
 
     def restart(_engine, knob_values):
@@ -25,24 +25,30 @@ def test_force_restart_rebuilds_for_a_scheduling_knob():
         SimpleNamespace(name="baseline"),
         throughput_fn=lambda _e: 100.0,
         restart_fn=restart,
-        force_restart=True,
     )
     app.snapshot()
-    app.apply(_SCHED_KNOB)
-    assert built == [{"max_num_seqs": 256}]  # rebuilt, not hot-swapped
+    app.apply(_ENGINE_ARG_KNOB)
+    assert built == [{"max_num_seqs": 256}]
     assert app._prev[0] == "restart"
 
 
-def test_default_hot_swaps_a_scheduling_knob():
+def test_unknown_knob_defaults_to_restart_not_hotswap():
+    built: list[dict] = []
     sets: list[tuple[str, object]] = []
+
+    def restart(_engine, knob_values):
+        built.append(dict(knob_values))
+        return SimpleNamespace(name="candidate")
+
     app = LiveEngineApplicator(
-        SimpleNamespace(),
+        SimpleNamespace(name="baseline"),
         throughput_fn=lambda _e: 100.0,
         getter=lambda _e, _k: None,
         setter=lambda _e, k, v: sets.append((k, v)),
-        restart_fn=lambda _e, _kv: SimpleNamespace(),
+        restart_fn=restart,
     )
     app.snapshot()
-    app.apply(_SCHED_KNOB)
-    assert sets == [("max_num_seqs", 256)]  # hot-swapped in place
-    assert app._prev[0] == "hotswap"
+    app.apply(SimpleNamespace(knob="future_engine_arg", value=1))
+    assert sets == []
+    assert built == [{"future_engine_arg": 1}]
+    assert app._prev[0] == "restart"
