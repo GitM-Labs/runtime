@@ -2,13 +2,13 @@
 
 *The trace picks the lever. A gated A/B proves it.*
 
-**+32.4% on HFT, byte-identical on 400M events. +37% on nuScenes. Up to +427% on KITTI. Zero human tuning, every failed change rolled back.**
+**+32.4% on HFT, byte-identical output on 400 million events. On the edge tracks, up to +427% on KITTI and +37% on nuScenes, where the gate is throughput plus detection equivalence. Zero human tuning, every failed change rolled back.**
 
 *July 2026*
 
 [Reproduce our benchmarks](#try-it-yourself)
 
----
+-----
 
 We think most GPU fleets run far below the hardware they are paying for, and that the waste is a systems problem, not a kernel problem. The GPU is rarely slow because the math is slow. It is slow because it waits: launching thousands of tiny kernels one at a time, stalling at synchronization points, moving memory it did not need to move, or running work in series that could have overlapped.
 
@@ -24,7 +24,7 @@ Every number in this post is a kept decision, not a guess.
 
 A good engineer can tune one workload once. A fleet is thousands of workloads changing weekly: new models, new request mixes, new kernels, new traffic shapes, new failure modes. That is why this has to be a runtime loop, not a consulting pass. The loop earns its place because it runs continuously, per job, where hand-tuning gives up. Any one result below is useful; the point is that the same loop found all of them automatically, verified each one, and rolled back the ones that failed.
 
-Two honest notes before the numbers. These are benchmark workloads, not a customer's production fleet, and what they prove is the loop, that the runtime can read what actually limits a workload and apply a safe, verified fix without touching model code. Separately, our commercial wedge is inference serving, and the same loop is now pointed there in a vLLM decode benchmark we describe at the end. We are not pretending these four workloads stand in for that one. They show the loop; the next one runs it on what we sell into.
+Two honest notes before the numbers. These are benchmark workloads, not a customer’s production fleet, and what they prove is the loop, that the runtime can read what actually limits a workload and apply a safe, verified fix without touching model code. Separately, our commercial wedge is inference serving, and the same loop is now pointed there in a vLLM decode benchmark we describe at the end. We are not pretending these four workloads stand in for that one. They show the loop; the next one runs it on what we sell into.
 
 ## Where the Waste Actually Lives
 
@@ -48,7 +48,7 @@ optimize hft: 400,000,000 events on NVIDIA A100 80GB PCIe
   VERDICT: kept candidate — verified +32.4% faster, identical output
 ```
 
-Here is why it is the trust anchor. The order book is the live list of every outstanding buy and sell for an instrument; HFT churns it constantly into a stream of nanosecond-timestamped events. Real HFT flow is proprietary, so we generate a **deterministic synthetic stream per seed** with the structural properties that exercise scan-bound execution, and we say so plainly: generated data, reproducible from a seed, not a customer's tape. We are testing an execution path, not claiming market realism. On it we compute three per-symbol microstructure features (top of book, microprice, one-second VWAP).
+Here is why it is the trust anchor. The order book is the live list of every outstanding buy and sell for an instrument; HFT churns it constantly into a stream of nanosecond-timestamped events. Real HFT flow is proprietary, so we generate a **deterministic synthetic stream per seed** with the structural properties that exercise scan-bound execution, and we say so plainly: generated data, reproducible from a seed, not a customer’s tape. We are testing an execution path, not claiming market realism. On it we compute three per-symbol microstructure features (top of book, microprice, one-second VWAP).
 
 The trace reads as launch-and-scan-bound, so the lever is not precision and not batch size. It is **doing fewer scans**, collapsing redundant passes over the book while preserving the exact output. Because the computation is deterministic, we hold it to byte-identical output, not a tolerance: two reductions form an output signature, and the candidate is kept only when that signature matches to the byte. +32.4% faster, and every byte the same. No accuracy hand-waving is possible, because the correctness bar is exact.
 
@@ -58,20 +58,22 @@ The edge tracks are where the diagnosis argument lands. They run the *identical*
 
 **KITTI** is the standard autonomous-driving 3D detection benchmark: one LiDAR frame in, scored 3D boxes out. Model is PointPillars (OpenPCDet, pinned `pointpillar.yaml`, `pointpillar_7728.pth`). Its trace is unambiguous: serialized concurrency 1.000, 14,590 kernels in single file, the GPU spending its time launching rather than computing.
 
-**nuScenes** is the heavier cousin: ten accumulated LiDAR sweeps per frame (about 10x the points), ten classes. Model is CenterPoint on a PointPillars backbone. Its baseline runs at about 2.6 frames per second versus KITTI's 9 to 11, because each frame already spends real time doing math.
+**nuScenes** is the heavier cousin: ten accumulated LiDAR sweeps per frame (about 10x the points), ten classes. Model is CenterPoint on a PointPillars backbone. Its baseline runs at about 2.6 frames per second versus KITTI’s 9 to 11, because each frame already spends real time doing math.
 
 Same lever on both: **frame batching**, collating several frames into one forward pass so per-frame launch cost is divided by the batch size. In eval mode the normalization is fixed and convolutions act per sample, so batching does not mix frames; it only shares the launches.
 
-| Batch | KITTI | nuScenes |
-| --- | --- | --- |
-| 2 | +37.3% | kept baseline (not faster) |
-| 4 | +63.2% | +7.1% |
-| 8 | +174.9% | +23.2% |
-| 16 | +275.4% | +34.0% |
-| 32 | +366.0% | +37.3% |
-| 64 | **+427.0%** | +25.8% |
-| 128 | **rolled back** | +34.0% |
-| 256+ | OOM | OOM |
+|Batch|KITTI          |nuScenes                  |
+|-----|---------------|--------------------------|
+|2    |+37.3%         |kept baseline (not faster)|
+|4    |+63.2%         |+7.1%                     |
+|8    |+174.9%        |+23.2%                    |
+|16   |+275.4%        |+34.0%                    |
+|32   |+366.0%        |+37.3%                    |
+|64   |**+427.0%**    |+25.8%                    |
+|128  |**rolled back**|+34.0%                    |
+|256+ |OOM            |OOM                       |
+
+A note before reading this table as serving numbers: in deployment the same gate that verifies correctness also enforces the workload’s latency budget, so the sweep shows throughput headroom under this workload’s offline tolerance, not a real-time serving prescription.
 
 KITTI tops out at +427%. nuScenes tops out around +37%. Nobody tuned the lever differently. The runtime read a heavier, more compute-bound workload off the trace and the physics did the rest.
 
@@ -89,7 +91,7 @@ That B=128 rollback sits in the table as `rolled back`, not quietly dropped. A r
 
 **We name the model, the hardware, and the config.** Pinned checkpoints, pinned configs, named GPUs, seeded data. The commands below regenerate every number.
 
-## What This Does Not Yet Prove, and What's Next
+## What This Does Not Yet Prove, and What’s Next
 
 Two honest gaps.
 
@@ -120,6 +122,6 @@ done
 
 **Want this run against your own workload?** Point us at one GPU job and we will hand back a headroom assessment: its bottleneck classification (launch-bound, compute-bound, or serialized), the serialized-concurrency reading, the levers we tried, which ones passed the gate and which rolled back, and the verified before/after. You give us the workload and read access to run it; we give you a number that is a proven A/B or does not exist. Turnaround is days, not weeks, and it costs you nothing.
 
----
+-----
 
 *Thanks to the OpenPCDet and OpenFold projects, and to the KITTI and nuScenes teams, whose open models and datasets made these benchmarks reproducible.*
