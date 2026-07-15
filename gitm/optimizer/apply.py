@@ -20,6 +20,7 @@ The live vLLM/engine applicator implements the same three methods (roadmap).
 from __future__ import annotations
 
 import copy
+import gc
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -80,24 +81,26 @@ def apply_intervention(
         applicator.apply(spec)
     except Exception as exc:
         applicator.restore(snapshot)
-        _audit(audit, "revert", spec, cause=f"apply failed, restored: {exc}")
+        _audit(audit, "revert", spec, cause=f"apply failed, restored: {exc}",
+               knobs=_knob_values(spec))
         return ApplyResult(False, rolled_back=True, measured_delta=None,
                            error=f"apply failed, restored: {exc}")
-    _audit(audit, "apply", spec, cause="applied live", knob=spec.knob, value=spec.value)
+    _audit(audit, "apply", spec, cause="applied live", knobs=_knob_values(spec))
 
     # Step 3: measure. A crash mid-measurement also rolls back.
     try:
         delta = applicator.measure(spec)
     except Exception as exc:
         applicator.restore(snapshot)
-        _audit(audit, "revert", spec, cause=f"measure failed, restored: {exc}")
+        _audit(audit, "revert", spec, cause=f"measure failed, restored: {exc}",
+               knobs=_knob_values(spec))
         return ApplyResult(False, rolled_back=True, measured_delta=None,
                            error=f"measure failed, restored: {exc}")
 
     # Step 4: keep-or-rollback on the regression threshold.
     if delta is not None and delta < min_keep_delta:
         applicator.restore(snapshot)
-        _audit(audit, "revert", spec,
+        _audit(audit, "revert", spec, knobs=_knob_values(spec),
                cause=f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}")
         return ApplyResult(True, rolled_back=True, measured_delta=delta,
                            error=f"regression {delta:+.3f} < keep threshold "
@@ -118,15 +121,21 @@ def _audit(
         pass
 
 
+def _knob_values(spec: Any) -> dict[str, Any]:
+    """The knob=value pairs ``spec`` wants applied — single or joint. Duck-type
+    friendly: also works for a bare test double exposing just .knob/.value."""
+    knobs = getattr(spec, "knobs", None)
+    return dict(knobs) if knobs else {spec.knob: spec.value}
+
+
 # --- reference applicators ---------------------------------------------------
 
 
 def _set_knob(config: dict, spec: InterventionSpec) -> None:
-    if spec.value is None:
-        raise ValueError(
-            f"intervention {spec.name!r} has no value to set on knob {spec.knob!r}"
-        )
-    config[spec.knob] = spec.value
+    values = _knob_values(spec)
+    if not values or any(v is None for v in values.values()):
+        raise ValueError(f"intervention {spec.name!r} has no value(s) to set")
+    config.update(values)
 
 
 class DryRunApplicator:
@@ -247,18 +256,21 @@ class StructuralKnobRequiresRestart(RuntimeError):
 
 
 class LiveEngineApplicator:
-    """Apply a knob to a live (vLLM) engine, gated by a real decode-throughput A/B.
+    """Apply a knob (or a joint set — see ``InterventionSpec.knobs``) to a live
+    (vLLM) engine, gated by a real decode-throughput A/B.
 
     Routes by knob taxonomy (:mod:`gitm.optimizer.vllm_knobs`):
 
-    * **scheduling** knobs (``max_num_seqs``, ``max_num_batched_tokens``,
-      ``scheduling_policy``) are *hot-swapped* in place — set on the live
-      scheduler config, effective next step, restored by setting the old value.
+    * **scheduling** knobs are rare deployment-specific live controls. A joint
+      candidate whose knobs are ALL scheduling is hot-swapped as one set.
+      The curated vLLM EngineArg map intentionally treats scheduler-looking
+      EngineArgs as structural because vLLM reads them at construction time.
     * **structural** knobs (parallelism, dtype, quantization, block size, …) can
-      only take effect on a fresh engine, so they are routed through
-      ``restart_fn(engine, knob, value) -> new_engine``: the candidate engine
-      replaces the live one for the A/B, and restore swaps the original back
-      (shutting the candidate down best-effort). With no ``restart_fn`` a
+      only take effect on a fresh engine, so they (or a joint set containing
+      any structural knob) are routed through
+      ``restart_fn(engine, {knob: value, ...}) -> new_engine``: the candidate
+      engine replaces the live one for the A/B, and restore swaps the original
+      back (shutting the candidate down best-effort). With no ``restart_fn`` a
       structural knob raises :class:`StructuralKnobRequiresRestart`, which
       ``apply_intervention`` turns into a clean rollback — never a silent no-op.
 
@@ -278,7 +290,9 @@ class LiveEngineApplicator:
         engine: Any,
         *,
         throughput_fn: Callable[[Any], float],
-        restart_fn: Callable[[Any, str, Any], Any] | None = None,
+        restart_fn: Callable[[Any, dict[str, Any]], Any] | None = None,
+        baseline_restart_fn: Callable[[Any], Any] | None = None,
+        restart_mode: str = "parallel",
         getter: Callable[[Any, str], Any] | None = None,
         setter: Callable[[Any, str, Any], None] | None = None,
         reps: int = 1,
@@ -286,17 +300,21 @@ class LiveEngineApplicator:
     ) -> None:
         self.engine = engine
         self._tps = throughput_fn
+        if restart_mode not in {"parallel", "serial"}:
+            raise ValueError(f"restart_mode must be 'parallel' or 'serial', got {restart_mode!r}")
         self._restart_fn = restart_fn
+        self._baseline_restart_fn = baseline_restart_fn
+        self._restart_mode = restart_mode
         self._getter = getter or get_knob
         self._setter = setter or set_knob
         self._reps = max(1, reps)
-        # force_restart: apply scheduling knobs via the restart path too, for
-        # engines that don't honor a live scheduler-config mutation (vLLM V1 reads
-        # scheduler_config at construction). Requires a restart_fn.
+        # force_restart is kept for custom deployments that still classify a
+        # knob as scheduling but want to measure it through the restart path.
         self._force_restart = force_restart
         self._baseline_tps: float | None = None
         self._baseline_std: float = 0.0
-        # Restore record: ("hotswap", knob, old_value) | ("restart", old_engine) | None.
+        # Restore record: ("hotswap", knob, old_value) | ("restart", old_engine) |
+        # ("serial_restart", restore_baseline_fn) | None.
         self._prev: tuple[Any, ...] | None = None
         self.last_result: EngineABResult | None = None
 
@@ -327,54 +345,104 @@ class LiveEngineApplicator:
         return {"baseline_tps": self._baseline_tps}
 
     def apply(self, spec: InterventionSpec) -> None:
-        if spec.value is None:
-            raise ValueError(f"intervention {spec.name!r} has no value for knob {spec.knob!r}")
+        values = _knob_values(spec)  # single knob, or a joint candidate's set
+        if not values or any(v is None for v in values.values()):
+            raise ValueError(f"intervention {spec.name!r} has no value(s) to set")
 
-        if not self._force_restart and knob_kind(spec.knob) == "scheduling":
-            # Hot-swap in place. Record the restore point only AFTER a successful
-            # set: if the knob can't be located the setter raises, _prev stays
-            # None, and restore() is a no-op (nothing changed → nothing to undo).
-            try:
-                prev = self._getter(self.engine, spec.knob)
-            except AttributeError:
-                prev = None
-            self._setter(self.engine, spec.knob, spec.value)
-            self._prev = ("hotswap", spec.knob, prev)
+        if not self._force_restart and all(knob_kind(k) == "scheduling" for k in values):
+            # Record each restore point only after its successful set, so a
+            # later setter raising only leaves what was actually changed to undo.
+            applied: dict[str, Any] = {}
+            self._prev = ("hotswap", applied)
+            for knob, value in values.items():
+                try:
+                    prev = self._getter(self.engine, knob)
+                except AttributeError:
+                    prev = None
+                self._setter(self.engine, knob, value)
+                applied[knob] = prev
             return
 
-        # Structural knob — needs a restart to take effect.
+        # >=1 structural knob — the set can only take effect together via a
+        # rebuild, so the whole dict goes through restart_fn in one call.
         if self._restart_fn is None:
             raise StructuralKnobRequiresRestart(
-                f"knob {spec.knob!r} is structural (needs an engine restart); "
-                "no restart_fn supplied, so it cannot be applied live"
+                f"knob(s) {', '.join(values)} are structural (need an engine "
+                "restart); no restart_fn supplied, so they cannot be applied live"
             )
         old_engine = self.engine
-        new_engine = self._restart_fn(old_engine, spec.knob, spec.value)
+        if self._restart_mode == "serial":
+            if self._baseline_restart_fn is None:
+                raise StructuralKnobRequiresRestart(
+                    "serial restart mode requires baseline_restart_fn to rebuild the baseline"
+                )
+            def restore_baseline() -> Any:
+                return self._baseline_restart_fn(old_engine)
+
+            self._shutdown(old_engine)
+            self._prev = ("serial_restart", restore_baseline)
+            try:
+                new_engine = self._restart_fn(old_engine, values)
+            except Exception:
+                self.engine = restore_baseline()
+                self._prev = None
+                raise
+        else:
+            new_engine = self._restart_fn(old_engine, values)
         if new_engine is None:
+            if self._restart_mode == "serial":
+                _, restore_baseline = self._prev
+                self.engine = restore_baseline()
+                self._prev = None
             raise StructuralKnobRequiresRestart(
-                f"restart_fn produced no engine for structural knob {spec.knob!r}"
+                f"restart_fn produced no engine for knob(s) {', '.join(values)}"
             )
         self.engine = new_engine
-        self._prev = ("restart", old_engine)
+        self._activate(new_engine)
+        if self._restart_mode != "serial":
+            self._prev = ("restart", old_engine)
 
     def restore(self, snapshot: dict[str, Any]) -> None:
         if self._prev is None:
             return
         tag = self._prev[0]
         if tag == "hotswap":
-            _, knob, old = self._prev
-            self._setter(self.engine, knob, old)
+            _, applied = self._prev
+            for knob, old in applied.items():
+                self._setter(self.engine, knob, old)
         elif tag == "restart":
             _, old_engine = self._prev
             self._shutdown(self.engine)  # drop the candidate engine we built
             self.engine = old_engine
+            self._activate(old_engine)
+        elif tag == "serial_restart":
+            _, restore_baseline = self._prev
+            self._shutdown(self.engine)  # drop the candidate engine we built
+            self.engine = restore_baseline()
+            self._activate(self.engine)
         # Consume the restore record so a second restore() can't re-undo (or
         # re-shutdown the already-discarded candidate engine) a second time.
         self._prev = None
 
     @staticmethod
+    def _activate(engine: Any) -> None:
+        fn = getattr(engine, "gitm_activate_fn", None)
+        if callable(fn):
+            try:
+                fn(engine)
+            except Exception:
+                pass
+
+    @staticmethod
     def _shutdown(engine: Any) -> None:
-        """Best-effort release of a candidate engine built for a restart A/B."""
+        """Best-effort release of an engine before/after a restart A/B."""
+        custom = getattr(engine, "gitm_shutdown_fn", None)
+        if callable(custom):
+            try:
+                custom(engine)
+            except Exception:
+                pass
+
         for path in ("shutdown", "llm_engine.shutdown", "engine.shutdown"):
             obj: Any = engine
             for attr in path.split("."):
@@ -386,7 +454,16 @@ class LiveEngineApplicator:
                     obj()
                 except Exception:
                     pass
-                return
+                break
+        try:
+            gc.collect()
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
 
     def measure(self, spec: InterventionSpec) -> float | None:
         baseline = self._baseline_tps if self._baseline_tps is not None else self._bench_stats()[0]
@@ -408,9 +485,10 @@ class LiveEngineApplicator:
         # anything within noise. reps=1 → std=0 → band=0 → keep iff delta>0.
         noise_band = (self._baseline_std + cand_std) / baseline
         significant = delta > noise_band
-        via = "restart" if (self._prev and self._prev[0] == "restart") else "hot-swap"
+        via = "restart" if (self._prev and self._prev[0] in {"restart", "serial_restart"}) else "hot-swap"
         self.last_result = EngineABResult(
-            knob=spec.knob, value=spec.value, baseline_tps=baseline,
+            knob=spec.knob, value=(getattr(spec, "knobs", None) or spec.value),
+            baseline_tps=baseline,
             candidate_tps=candidate, speedup=speedup, kept=significant, via=via,
             baseline_std=self._baseline_std, candidate_std=cand_std,
             reps=self._reps, significant=significant,

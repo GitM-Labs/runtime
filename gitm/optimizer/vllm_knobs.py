@@ -24,6 +24,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from gitm.kernels.spec import InterventionSpec
+
 KnobKind = Literal["scheduling", "structural"]
 
 # Prefixes a config object may hide behind, newest-first. ``""`` = the config is
@@ -51,16 +53,17 @@ class KnobSpec:
         return self.path.startswith("env:")
 
 
-# The curated map. Only the three scheduler knobs vLLM honors mid-run are
-# "scheduling"; everything else is fixed at construction → "structural".
+# The curated map. vLLM EngineArgs are treated as construction-time knobs in the
+# real in-process engine path, even when a Python config object exposes the same
+# field. Route them through restart so the A/B measures a rebuilt engine, not a
+# config mutation the scheduler/cache/model may ignore.
 _KNOBS: dict[str, KnobSpec] = {
-    # --- scheduling: live-settable on the scheduler, effective next step -------
-    "max_num_seqs": KnobSpec("max_num_seqs", "scheduler_config.max_num_seqs", "scheduling"),
-    "max_num_batched_tokens": KnobSpec(
-        "max_num_batched_tokens", "scheduler_config.max_num_batched_tokens", "scheduling"
-    ),
-    "scheduling_policy": KnobSpec("scheduling_policy", "scheduler_config.policy", "scheduling"),
     # --- structural: fixed at engine construction, need a restart to change ----
+    "max_num_seqs": KnobSpec("max_num_seqs", "scheduler_config.max_num_seqs", "structural"),
+    "max_num_batched_tokens": KnobSpec(
+        "max_num_batched_tokens", "scheduler_config.max_num_batched_tokens", "structural"
+    ),
+    "scheduling_policy": KnobSpec("scheduling_policy", "scheduler_config.policy", "structural"),
     "block_size": KnobSpec("block_size", "cache_config.block_size", "structural"),
     "kv_cache_dtype": KnobSpec("kv_cache_dtype", "cache_config.cache_dtype", "structural"),
     "gpu_memory_utilization": KnobSpec(
@@ -73,6 +76,27 @@ _KNOBS: dict[str, KnobSpec] = {
     "enable_chunked_prefill": KnobSpec(
         "enable_chunked_prefill", "scheduler_config.chunked_prefill_enabled", "structural"
     ),
+    "async_scheduling": KnobSpec(
+        "async_scheduling", "scheduler_config.async_scheduling", "structural"
+    ),
+    "scheduler_delay_factor": KnobSpec(
+        "scheduler_delay_factor", "scheduler_config.scheduler_delay_factor", "structural"
+    ),
+    "max_num_partial_prefills": KnobSpec(
+        "max_num_partial_prefills", "scheduler_config.max_num_partial_prefills", "structural"
+    ),
+    "max_long_partial_prefills": KnobSpec(
+        "max_long_partial_prefills", "scheduler_config.max_long_partial_prefills", "structural"
+    ),
+    "long_prefill_token_threshold": KnobSpec(
+        "long_prefill_token_threshold", "scheduler_config.long_prefill_token_threshold", "structural"
+    ),
+    "dbo_decode_token_threshold": KnobSpec(
+        "dbo_decode_token_threshold", "scheduler_config.dbo_decode_token_threshold", "structural"
+    ),
+    "dbo_prefill_token_threshold": KnobSpec(
+        "dbo_prefill_token_threshold", "scheduler_config.dbo_prefill_token_threshold", "structural"
+    ),
     "num_speculative_tokens": KnobSpec(
         "num_speculative_tokens", "speculative_config.num_speculative_tokens", "structural"
     ),
@@ -80,7 +104,17 @@ _KNOBS: dict[str, KnobSpec] = {
     "max_seq_len_to_capture": KnobSpec(
         "max_seq_len_to_capture", "model_config.max_seq_len_to_capture", "structural"
     ),
+    "max_model_len": KnobSpec("max_model_len", "model_config.max_model_len", "structural"),
+    "disable_sliding_window": KnobSpec(
+        "disable_sliding_window", "model_config.disable_sliding_window", "structural"
+    ),
     "quantization": KnobSpec("quantization", "model_config.quantization", "structural"),
+    "calculate_kv_scales": KnobSpec(
+        "calculate_kv_scales", "cache_config.calculate_kv_scales", "structural"
+    ),
+    "kv_sharing_fast_prefill": KnobSpec(
+        "kv_sharing_fast_prefill", "cache_config.kv_sharing_fast_prefill", "structural"
+    ),
     "tensor_parallel_size": KnobSpec(
         "tensor_parallel_size", "parallel_config.tensor_parallel_size", "structural"
     ),
@@ -97,6 +131,8 @@ _KNOBS: dict[str, KnobSpec] = {
     "VLLM_ATTENTION_BACKEND": KnobSpec(
         "VLLM_ATTENTION_BACKEND", "env:VLLM_ATTENTION_BACKEND", "structural"
     ),
+    # Prerequisite flags for the table below — not applied standalone, only read.
+    "enable_dbo": KnobSpec("enable_dbo", "scheduler_config.enable_dbo", "structural"),
 }
 
 
@@ -149,7 +185,7 @@ def get_knob(engine: Any, knob: str) -> Any:
 
 
 def set_knob(engine: Any, knob: str, value: Any) -> None:
-    """Set ``knob`` on the live engine via its taxonomy path (scheduling knobs).
+    """Set ``knob`` on the live engine via its taxonomy path (live knobs).
 
     Raises ``AttributeError`` when the knob can't be located — the caller
     (:class:`~gitm.optimizer.apply.LiveEngineApplicator`) turns that into a
@@ -185,3 +221,88 @@ def knob_kind(knob: str) -> KnobKind:
     """
     spec = resolve_knob(knob)
     return spec.kind if spec is not None else "structural"
+
+
+#: (name substring, prerequisite knob) — a candidate matching the substring
+#: only applies when the prerequisite is on (e.g. dbo_prefill_token_threshold
+#: needs --enable-dbo). Check the live engine via unmet_prerequisite rather
+#: than denylisting forever, including on deployments where it genuinely holds.
+KNOB_PREREQUISITES: tuple[tuple[str, str], ...] = (
+    ("partial_prefill", "enable_chunked_prefill"),
+    ("long_prefill_token_threshold", "enable_chunked_prefill"),
+    ("dbo", "enable_dbo"),
+)
+
+
+def unmet_prerequisite(engine: Any | None, knob: str) -> str | None:
+    """None if ``knob`` has no prerequisite, or it holds on ``engine`` — else
+    the rejection reason. No engine -> can't verify -> reject (conservative,
+    like :func:`knob_kind`'s unknown-defaults-unsafe default)."""
+    lname = knob.lower()
+    prereq = next((p for needle, p in KNOB_PREREQUISITES if needle in lname), None)
+    if prereq is None:
+        return None
+    if engine is None:
+        return f"prerequisite {prereq!r} unverifiable: no live engine"
+    try:
+        if get_knob(engine, prereq):
+            return None
+        return f"prerequisite {prereq!r} not enabled on this engine"
+    except AttributeError:
+        return f"prerequisite {prereq!r} unknown on this engine"
+
+
+def resolve_relative_value(spec: InterventionSpec, engine: Any | None) -> InterventionSpec:
+    """Scale a relative catalog lever's value off the engine's CURRENT setting.
+
+    A knob like ``max_num_batched_tokens`` has no single right absolute value
+    across deployments (model size/GPU/workload shape vary) — vLLM's own
+    auto_tune.sh sweeps it rather than hardcoding a number. With a live engine,
+    read its current value and scale by ``value_multiplier``. Falls back to
+    the static ``value`` with no multiplier/engine/readable current value.
+    """
+    if spec.value_multiplier is None or engine is None:
+        return spec
+    try:
+        current = get_knob(engine, spec.knob)
+    except AttributeError:
+        return spec
+    if not isinstance(current, int | float) or isinstance(current, bool) or current <= 0:
+        return spec
+    scaled = current * spec.value_multiplier
+    if spec.value_max is not None:
+        scaled = min(scaled, spec.value_max)
+    if spec.value_min is not None:
+        scaled = max(scaled, spec.value_min)
+    new_value = int(round(scaled)) if isinstance(current, int) else scaled
+    return spec.model_copy(update={
+        "value": new_value,
+        "summary": f"{spec.summary} (scaled {spec.value_multiplier:g}x current {current} -> {new_value})",
+    })
+
+
+def expand_relative_candidates(spec: InterventionSpec, engine: Any | None) -> list[InterventionSpec]:
+    """Sweep ``value_multiplier_grid`` into one resolved candidate per point —
+    same idea as vLLM's auto_tune.sh and autoresearch's value grid, applied to
+    a reviewed catalog lever. Each point resolves off the SAME current engine
+    value via :func:`resolve_relative_value`, with its own name.
+
+    No grid -> a single :func:`resolve_relative_value` call. No live engine,
+    or every point collapsing to the same value (current == 0), -> one
+    candidate, not N duplicates.
+    """
+    if not spec.value_multiplier_grid:
+        return [resolve_relative_value(spec, engine)]
+    if engine is None:
+        return [spec.model_copy(update={"value_multiplier_grid": []})]
+    out: list[InterventionSpec] = []
+    seen_values: set[Any] = set()
+    for m in spec.value_multiplier_grid:
+        variant = spec.model_copy(update={"value_multiplier": m, "value_multiplier_grid": []})
+        resolved = resolve_relative_value(variant, engine)
+        if resolved.value in seen_values:
+            continue  # collapsed to an already-queued value (e.g. current == 0)
+        seen_values.add(resolved.value)
+        suffix = f"x{m:g}".replace(".", "_").replace("-", "neg")
+        out.append(resolved.model_copy(update={"name": f"{spec.name}_{suffix}"}))
+    return out

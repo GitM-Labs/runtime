@@ -15,6 +15,7 @@ from pathlib import Path
 import yaml
 
 from gitm.kernels.spec import InterventionSpec
+from gitm.optimizer.deviation import classify_op
 from gitm.tracer.schema import Trace
 
 
@@ -35,7 +36,18 @@ def predict_delta(trace: Trace, spec: InterventionSpec) -> float:
 
 
 def _applies(spec: InterventionSpec, kernel_name: str) -> bool:
+    """Does ``kernel_name`` fall within ``spec``'s declared scope?
+
+    Prefers op-identity via :func:`gitm.optimizer.deviation.classify_op` (same
+    vocabulary ``residuals()`` uses), falling back to substring matching for
+    tags it doesn't cover (other workloads' own vocabularies, e.g. HFT's
+    ``cudf_groupby_scan``). An empty ``applies_to_kernels`` means 0 coverage,
+    not 100% — a blank scope no longer wins ranking by default.
+    """
     if not spec.applies_to_kernels:
+        return False
+    op = classify_op(kernel_name)
+    if op is not None and op in spec.applies_to_kernels:
         return True
     return any(pat in kernel_name for pat in spec.applies_to_kernels)
 

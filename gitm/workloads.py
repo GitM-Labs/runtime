@@ -558,6 +558,12 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         GITM_VLLM_SYNTHETIC   "1" -> CPU-only decode stand-in instead of vLLM
                               (exercises the wire/registry path with no GPU or
                               vLLM; produces no GPU kernels)
+        GITM_VLLM_ENFORCE_EAGER "1" -> build with enforce_eager (no CUDA graphs).
+                              Set it when the CUPTI tracer records no kernels
+                              because decode runs via CUDA-graph replay that the
+                              platform's CUPTI doesn't attribute; also skips
+                              torch.compile + graph capture, so engine builds
+                              (and restart-A/B candidates) are much faster.
 
     On a box without vLLM/GPU the import raises; ``run_loop`` catches it and the
     empty-trace guard reports "no-data" rather than fabricating a result.
@@ -573,22 +579,110 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
 
     from vllm import LLM, SamplingParams
 
-    # Optional GPU-memory cap (GITM_VLLM_GPU_MEM, e.g. 0.45). Set it for structural
-    # restart A/Bs (fp8 KV, quant): the applicator keeps the baseline engine alive
-    # while it builds the candidate, so BOTH must fit on the GPU at once. The
-    # baseline and every restart candidate inherit this cap. Unset = vLLM's default
-    # (~0.9) — fine for single-engine runs, but a restart candidate would OOM.
+    # Optional GPU-memory cap (GITM_VLLM_GPU_MEM, e.g. 0.45). Structural restart
+    # A/Bs inherit this cap; in parallel mode baseline+candidate must both fit,
+    # while GITM_RESTART_MODE=serial releases the baseline before candidate build.
     _gpu_mem = os.environ.get("GITM_VLLM_GPU_MEM")
     _base_kwargs: dict[str, Any] = {}
     if _gpu_mem is not None:
         _base_kwargs["gpu_memory_utilization"] = float(_gpu_mem)
+    # Disable CUDA graphs so CUPTI captures decode kernels on platforms where
+    # graph-replayed kernels aren't attributed (and speed up every engine build).
+    # Inherited by restart candidates (kwargs = dict(_base_kwargs)) for a fair A/B.
+    if os.environ.get("GITM_VLLM_ENFORCE_EAGER") == "1":
+        _base_kwargs["enforce_eager"] = True
 
-    llm = LLM(model=model, **_base_kwargs)
+    engine_ref: dict[str, Any] = {}
+
+    def _shutdown_engine(engine: Any) -> None:
+        if engine_ref.get("engine") is engine:
+            engine_ref["engine"] = None
+        try:
+            if getattr(run, "engine", None) is engine:
+                run.engine = None
+        except NameError:
+            pass
+
+        for path in (
+            "shutdown",
+            "llm_engine.shutdown",
+            "llm_engine.engine_core.shutdown",
+            "llm_engine.engine_core.engine_core.shutdown",
+            "llm_engine.model_executor.shutdown",
+        ):
+            obj: Any = engine
+            for attr in path.split("."):
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            if callable(obj):
+                try:
+                    obj()
+                except Exception:
+                    pass
+                break
+
+        try:
+            from vllm.distributed.parallel_state import (
+                destroy_distributed_environment,
+                destroy_model_parallel,
+            )
+
+            destroy_model_parallel()
+            destroy_distributed_environment()
+        except Exception:
+            pass
+
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            pass
+
+        for attr in ("llm_engine", "engine"):
+            try:
+                delattr(engine, attr)
+            except Exception:
+                pass
+
+        try:
+            import gc
+
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+    def _activate_engine(engine: Any) -> None:
+        engine_ref["engine"] = engine
+        try:
+            run.engine = engine
+        except NameError:
+            pass
+
+    def _build_engine(kwargs: dict[str, Any]) -> Any:
+        engine = LLM(model=model, **kwargs)
+        engine.gitm_llm_kwargs = dict(kwargs)
+        engine.gitm_shutdown_fn = _shutdown_engine
+        engine.gitm_activate_fn = _activate_engine
+        return engine
+
+    llm = _build_engine(dict(_base_kwargs))
+    _activate_engine(llm)
     prompts = [f"Benchmark decode prompt {i}." for i in range(n_prompts)]
     params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
 
     def run() -> dict[str, Any]:
-        outputs = llm.generate(prompts, params)
+        active = engine_ref.get("engine")
+        if active is None:
+            raise RuntimeError("vLLM engine is not active")
+        outputs = active.generate(prompts, params)
         produced = sum(len(o.outputs[0].token_ids) for o in outputs)
         sync_device()
         return {"prompts": len(prompts), "generated_tokens": produced, "model": model}
@@ -607,49 +701,51 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         sync_device()
         return toks / max(time.perf_counter() - t0, 1e-9)
 
-    def _restart(_old_engine: Any, knob: str, value: Any) -> Any:
-        """Rebuild a fresh vLLM engine with one structural knob changed.
+    def _restart(_old_engine: Any, knob_values: dict[str, Any]) -> Any:
+        """Rebuild a fresh vLLM engine with one or more structural knobs changed.
 
         The restart-apply path for structural levers that can't be hot-swapped on a
         running engine — most importantly ``kv_cache_dtype=fp8`` and
         ``quantization``, the real throughput/memory levers for decode. Structural
         knob names match the vLLM ``LLM`` kwargs (``kv_cache_dtype``,
         ``gpu_memory_utilization``, ``swap_space``, ``block_size``,
-        ``quantization``, …), so the change is a single kwarg. Returns the new
-        engine; ``LiveEngineApplicator`` swaps it in for the A/B and tears it down
-        on restore. Raises on an unsupported knob/value (no fp8 support on this
-        SKU, missing quantized checkpoint) → the candidate is rolled back cleanly,
+        ``quantization``, …), so the change is a kwargs update — one entry for a
+        single-knob candidate, more for a joint one (e.g. a prerequisite flag
+        turned on together with the knob it gates). Returns the new engine;
+        ``LiveEngineApplicator`` swaps it in for the A/B and tears it down on
+        restore. Raises on an unsupported knob/value (no fp8 support on this SKU,
+        missing quantized checkpoint) → the candidate is rolled back cleanly,
         never a silent no-op.
         """
-        kwargs = dict(_base_kwargs)  # inherit the mem cap so both engines coexist
-        kwargs[knob] = value  # the structural knob (wins if it IS gpu_memory_utilization)
-        # The baseline engine is still alive during the A/B, so the candidate is a
-        # SECOND in-process engine. Give it a fresh distributed port so its init
-        # doesn't collide with the baseline's (V1 uses tcp://…:PORT at world_size=1).
+        kwargs = dict(getattr(_old_engine, "gitm_llm_kwargs", _base_kwargs))
+        kwargs.update(knob_values)
+        # Give each restarted engine a fresh distributed port so V1 init does not
+        # collide with any prior in-process engine state.
         os.environ["VLLM_PORT"] = str(_free_port())
         try:
-            return LLM(model=model, **kwargs)
+            return _build_engine(kwargs)
         except Exception as exc:
-            # Most likely a two-engines-one-process distributed clash (e.g. the
-            # torch default process group already initialised). Surface the cause
-            # so apply_intervention rolls back with it — GPU-validate whether a
-            # fresh port suffices or teardown-then-rebuild is needed (bigger fix).
             raise RuntimeError(
-                f"restart candidate for {knob!r} failed to build — likely a "
-                f"two-engine V1 distributed clash: {exc}"
+                f"restart candidate for {', '.join(knob_values)} failed to build: {exc}"
             ) from exc
+
+    def _baseline_restart(old_engine: Any) -> Any:
+        kwargs = dict(getattr(old_engine, "gitm_llm_kwargs", _base_kwargs))
+        return _build_engine(kwargs)
 
     # Expose the live engine + its A/B hooks so the loop can (a) sample scheduler
     # stats and (b) run the Phase-4 decode-throughput A/B on it. ``run.engine`` is
     # picked up as ``cfg.engine``; the loop reads ``gitm_throughput_fn`` /
     # ``gitm_restart_fn`` off the engine (gitm.scheduler.loop Phase 4). The restart
     # hook is what lets structural knobs (fp8 KV cache, quantization) be *measured*
-    # via an engine rebuild instead of rejected. Mirrors the ``.applicator``
-    # convention the hft/edge/openfold factories use.
+    # via an engine rebuild instead of rejected; ``gitm_baseline_restart_fn``
+    # rebuilds the baseline for ``restart_mode="serial"``. Mirrors the
+    # ``.applicator`` convention the hft/edge/openfold factories use.
     run.engine = llm
     run.workload_id = "vllm-decode"
     llm.gitm_throughput_fn = _throughput
     llm.gitm_restart_fn = _restart
+    llm.gitm_baseline_restart_fn = _baseline_restart
     return run
 
 def _vllm_synthetic_runner(n_prompts: int, max_tokens: int) -> WorkloadRunner:

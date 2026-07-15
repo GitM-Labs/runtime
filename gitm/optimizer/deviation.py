@@ -28,18 +28,22 @@ from gitm.tracer.capture import write_trace_jsonl
 from gitm.tracer.schema import KernelEvent, Trace
 
 # Ordered kernel-name → predicted-op rules (first match wins), case-insensitive
-# substring. Maps a raw CUDA/Triton kernel name to a predicted-graph op, or None
-# when it maps to no modeled op (norms, activations, copies, launch overhead) —
-# those are unmodeled work and kept as departures.
+# substring. None = no modeled op (norms, activations, copies, launch overhead)
+# — unmodeled work, kept as departures.
 #
-# The projection GEMMs (qkv/out/gate_up/down) are only distinguishable when the
-# kernel name carries the projection tag (vLLM/Triton fused kernels usually do); a
-# bare cuBLAS/cutlass GEMM with no tag falls through to None (unmodeled).
-# Distinguishing those needs shape-matching (a follow-up) — but this already beats
-# the old positional `i % len(pred)`, which aligned nothing under CUDA graphs.
+# The projection GEMMs (qkv/out/gate_up/down/lm_head) only classify when the
+# kernel name carries a projection tag; a bare cuBLAS/cutlass GEMM (e.g.
+# `ampere_fp16_s16816gemm_*`) carries none and stays unmodeled — confirmed
+# against a real vLLM/L4/CUPTI trace, where these are ~35% of launches and
+# reused across every projection. Needs shape-matching or launch-order
+# instrumentation to fix, not a vocabulary tweak. The attention/KV-cache
+# needles below ARE confirmed against that trace: FlashAttention's real
+# kernel is `flash_fwd_splitkv_kernel` (`flash_attn` alone misses it), and
+# vLLM's `reshape_and_cache_flash_kernel`/`_compute_slot_mapping_kernel`
+# weren't covered before.
 _OP_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("flash_attn", "flashattn", "paged_attention", "paged_attn", "fmha", "attention",
-      "attn_score"), "attn_score_value"),
+    (("flash_attn", "flashattn", "flash_fwd", "paged_attention", "paged_attn", "fmha",
+      "attention", "attn_score", "reshape_and_cache", "slot_mapping"), "attn_score_value"),
     (("qkv",), "qkv_proj"),
     (("o_proj", "out_proj", "attn_out"), "attn_out_proj"),
     (("gate_up", "gate_proj", "up_proj", "swiglu", "silu_and_mul"), "mlp_gate_up"),

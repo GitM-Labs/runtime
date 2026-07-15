@@ -129,6 +129,42 @@ def test_vllm_workload_still_uses_intervention_path(tmp_path: Path, monkeypatch)
     assert result["summary"]["mode"] == "intervention"
 
 
+def test_vllm_loop_runs_autoresearch(tmp_path: Path, monkeypatch):
+    """The vllm path runs agentic autoresearch: it classifies the bottleneck via
+    trace telemetry (the serialized same-stream "paged_attention" kernels are
+    also roofline-predicted memory-bound at batch=1, so classification is
+    memory_bound). With no vLLM installed, the frozen fallback catalog is used
+    — but its two former memory_bound candidates (cpu_offload_gb,
+    preemption_mode) have since graduated to the curated catalog (see
+    library.yaml), so there's honestly nothing left for autoresearch to
+    generate here: the catalog absorbing a proven lever is the intended
+    lifecycle, not a regression."""
+    import gitm.scheduler.loop as loop
+
+    monkeypatch.setattr(loop, "capture", _fake_capture_with_kernels("paged_attention"))
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    from gitm import optimize
+
+    # budget="30s" (not 1s): the catalog pass must not exhaust the budget and skip
+    # the autoresearch phase on a slow box.
+    result = optimize(
+        workload="vllm-decode", budget="30s", scratch=str(tmp_path), workload_runner=lambda: {}
+    )
+    s = result["summary"]
+    assert s["bottleneck_class"] == "memory_bound"
+    assert s["n_autoresearch"] == 0
+
+    ar_json = (Path(result["run_dir"]) / "autoresearch.json").read_text(encoding="utf-8")
+    # Denylisted knobs with unchecked prerequisites must never surface, regardless
+    # of which bottleneck class the run classifies as.
+    assert "max_num_partial_prefills=" not in ar_json
+    assert "long_prefill_token_threshold=" not in ar_json
+
+    # Dry-run (no live engine) mutates nothing, so no safety trail is written.
+    assert not (Path(result["run_dir"]) / "audit.jsonl").exists()
+
+
 def test_cli_run_returns_nonzero_on_no_data(tmp_path: Path, capsys):
     """Automation must see a failure exit when a run measures nothing."""
     from gitm.cli import main
@@ -215,5 +251,5 @@ def test_vllm_decode_factory_returns_wired_runner(monkeypatch):
     assert runner()["generated_tokens"] == 3 * 5
     assert engine.gitm_throughput_fn(engine) > 0
     # The restart hook rebuilds a fresh engine with the structural knob applied.
-    rebuilt = engine.gitm_restart_fn(engine, "kv_cache_dtype", "fp8")
+    rebuilt = engine.gitm_restart_fn(engine, {"kv_cache_dtype": "fp8"})
     assert rebuilt is not engine and rebuilt.kwargs["kv_cache_dtype"] == "fp8"

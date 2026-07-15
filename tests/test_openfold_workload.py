@@ -142,6 +142,10 @@ def test_openfold_loop_runs_intervention_with_applicator(tmp_path: Path, monkeyp
     assert "af2_bf16_inference" in md
     for knob in ("max_num_batched_tokens", "gpu_memory_utilization", "max_num_seqs"):
         assert knob not in md
+    # The claim's residual is a serialized-concurrency fraction, not a kernel-time
+    # ratio — it must be labeled as such, not mislabeled "kernel_time".
+    assert "`stream_concurrency`" in md
+    assert "`kernel_time`" not in md
     assert (Path(result["run_dir"]) / "apply_result.json").exists()
     # The live bf16 apply is recorded on the durable safety trail.
     from gitm.safety import AuditLog

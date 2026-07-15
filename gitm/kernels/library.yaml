@@ -5,6 +5,24 @@
 # library review. Expected deltas are estimates from the cited source, not yet
 # measured on our own workloads. The replay engine and the rollback-gated live
 # apply produce the measured numbers.
+#
+# applies_to_kernels scopes each vLLM entry to the canonical per-decode-step op
+# vocabulary predict_graph()/classify_op() share — NOT raw kernel-name
+# substrings, which drift across backends/vendors/torch.compile. Whole-step
+# levers use &all_ops; empty means 0 coverage (not 100%) for levers the
+# decode-only predicted graph can't represent (prefill-side, orchestration).
+# Non-vLLM entries (edge/HFT) keep their own vocabulary via substring fallback.
+_decode_step_ops: &all_ops
+  - qkv_proj
+  - attn_score_value
+  - attn_out_proj
+  - mlp_gate_up
+  - mlp_down
+  - lm_head
+
+# Shared multiplier ladder for sweeping relative levers — same as
+# autoresearch's _GRID_MULTIPLIERS, one canonical convention.
+_relative_sweep: &sweep_grid [0.5, 2.0, 4.0]
 
 interventions:
   # --- Tier 1: low-effort levers --------------------------------------------
@@ -12,7 +30,7 @@ interventions:
     summary: Set PagedAttention block size to 16 for short-context decode.
     knob: block_size
     value: 16
-    applies_to_kernels: [paged_attention, attn_score_value]
+    applies_to_kernels: [attn_score_value]  # KV-cache layout; reads live here
     expected_delta_mean: 0.05
     expected_delta_lo: 0.02
     expected_delta_hi: 0.10
@@ -31,7 +49,7 @@ interventions:
     summary: Store the KV cache in fp8 to roughly double cache capacity.
     knob: kv_cache_dtype
     value: fp8
-    applies_to_kernels: [paged_attention, kv_cache_write, kv_cache_read]
+    applies_to_kernels: [attn_score_value]  # KV-cache read/write traffic
     expected_delta_mean: 0.06
     expected_delta_lo: 0.00
     expected_delta_hi: 0.12
@@ -46,11 +64,13 @@ interventions:
       notes: fp8 KV can shift logits slightly; gate on an accuracy sentinel before keep.
     review: null
 
-  - name: max_num_batched_tokens_8192
-    summary: Raise the per-step token budget to 8192 to fill decode batches.
+  - name: max_num_batched_tokens_dynamic
+    summary: Sweep the per-step token budget relative to whatever this engine
+      is already running (not one hardcoded number) to fill decode batches.
     knob: max_num_batched_tokens
-    value: 8192
-    applies_to_kernels: []
+    value: 8192  # offline/predict-only fallback when there's no live engine to scale
+    value_multiplier_grid: *sweep_grid  # right value depends on model/GPU/workload
+    applies_to_kernels: *all_ops  # batch-shape lever: touches every op's batch dim
     expected_delta_mean: 0.05
     expected_delta_lo: 0.01
     expected_delta_hi: 0.10
@@ -64,11 +84,13 @@ interventions:
       notes: Larger batches raise peak activation memory; watch for OOM.
     review: null
 
-  - name: max_num_seqs_256
-    summary: Allow up to 256 concurrent sequences to raise decode concurrency.
+  - name: max_num_seqs_dynamic
+    summary: Sweep concurrent-sequence concurrency relative to whatever this
+      engine already allows (not one hardcoded 256) to raise decode concurrency.
     knob: max_num_seqs
-    value: 256
-    applies_to_kernels: []
+    value: 256  # offline/predict-only fallback when there's no live engine to scale
+    value_multiplier_grid: *sweep_grid
+    applies_to_kernels: *all_ops  # concurrency lever: touches every op's batch dim
     expected_delta_mean: 0.04
     expected_delta_lo: 0.00
     expected_delta_hi: 0.09
@@ -82,11 +104,14 @@ interventions:
       notes: Interacts with gpu_memory_utilization; tune one lever at a time.
     review: null
 
-  - name: swap_space_4gib
-    summary: Give the block manager 4 GiB CPU swap to avoid preemption stalls.
+  - name: swap_space_dynamic
+    summary: Sweep CPU swap relative to whatever this engine already has
+      configured (not one hardcoded 4 GiB) to avoid preemption stalls.
     knob: swap_space
-    value: 4
-    applies_to_kernels: []
+    value: 4  # fallback; also the outcome when current swap_space is 0 (common
+      # default) — 0 * any multiplier stays 0, so the sweep collapses to this.
+    value_multiplier_grid: *sweep_grid
+    applies_to_kernels: [attn_score_value]  # preemption/swap is the KV-cache path
     expected_delta_mean: 0.03
     expected_delta_lo: -0.01
     expected_delta_hi: 0.07
@@ -99,11 +124,16 @@ interventions:
       notes: Swap I/O can regress latency-bound workloads; keep only on a positive delta.
     review: null
 
-  - name: gpu_memory_utilization_092
-    summary: Raise gpu_memory_utilization to 0.92 to permit larger batch slots.
+  - name: gpu_memory_utilization_dynamic
+    summary: Sweep gpu_memory_utilization relative to whatever this engine
+      already runs at (not one hardcoded 0.92) to permit larger batch slots.
     knob: gpu_memory_utilization
-    value: 0.92
-    applies_to_kernels: []
+    value: 0.92  # offline/predict-only fallback when there's no live engine to scale
+    # A fraction near 1.0, not a count — the shared *0.5/*4 ladder would be
+    # invalid here, so a gentler one, clamped below 1.0.
+    value_multiplier_grid: [0.95, 1.03, 1.10]
+    value_max: 0.97
+    applies_to_kernels: *all_ops  # raises the batch-slot ceiling for every op
     expected_delta_mean: 0.04
     expected_delta_lo: 0.01
     expected_delta_hi: 0.08
@@ -117,12 +147,67 @@ interventions:
       notes: Watch for OOM during long-running decode; rollback to 0.85 on first OOM.
     review: null
 
+  - name: cpu_offload_gb_4
+    summary: Offload cold weights to host RAM to free HBM for a larger KV cache.
+    knob: cpu_offload_gb
+    value: 4
+    applies_to_kernels: [attn_score_value]  # frees HBM for KV-cache headroom
+    expected_delta_mean: 0.04
+    expected_delta_lo: -0.02
+    expected_delta_hi: 0.10
+    source: https://docs.vllm.ai/en/latest/serving/engine_args.html
+    applicability:
+      workloads: [vllm-decode]
+      other: Helps when weights, not KV cache, are the memory bottleneck; adds host<->device transfer overhead.
+    safety:
+      tier: moderate
+      requires_rollback_window_s: 120
+      notes: Structural (needs restart); watch for transfer-latency regressions on small models.
+    review: null
+
+  - name: preemption_mode_swap
+    summary: Swap preempted KV blocks to host instead of recomputing them under memory pressure.
+    knob: preemption_mode
+    value: swap
+    applies_to_kernels: [attn_score_value]  # preemption is the KV-cache path
+    expected_delta_mean: 0.03
+    expected_delta_lo: -0.01
+    expected_delta_hi: 0.07
+    source: https://docs.vllm.ai/en/latest/serving/engine_args.html
+    applicability:
+      workloads: [vllm-decode]
+      other: Only matters under real preemption pressure; neutral otherwise.
+    safety:
+      tier: low_risk
+      requires_rollback_window_s: 60
+      notes: Swap I/O can regress latency-bound workloads; keep only on a positive delta.
+    review: null
+
   # --- Tier 2: medium-effort levers -----------------------------------------
+  - name: async_scheduling
+    summary: Overlap CPU-side request scheduling with GPU execution to close
+      idle/launch-bound gaps between decode steps.
+    knob: async_scheduling
+    value: true
+    applies_to_kernels: *all_ops  # closes idle gaps around every op's launch
+    expected_delta_mean: 0.02
+    expected_delta_lo: -0.02
+    expected_delta_hi: 0.05
+    source: https://docs.vllm.ai/en/latest/serving/engine_args.html
+    applicability:
+      workloads: [vllm-decode]
+      other: Targets idle_stall (scheduling/launch-bound gaps); measured ~+1.7% on a real L4/opt-125m trace.
+    safety:
+      tier: low_risk
+      requires_rollback_window_s: 60
+      notes: Pure scheduling overlap; no numerics change.
+    review: null
+
   - name: enable_chunked_prefill
     summary: Chunk prefill so it overlaps with decode instead of stalling it.
     knob: enable_chunked_prefill
     value: true
-    applies_to_kernels: [prefill, paged_attention]
+    applies_to_kernels: *all_ops  # changes the prefill/decode mix every step runs
     expected_delta_mean: 0.08
     expected_delta_lo: 0.02
     expected_delta_hi: 0.15
@@ -139,7 +224,7 @@ interventions:
     summary: Cache shared prompt prefixes to skip repeated prefill work.
     knob: enable_prefix_caching
     value: true
-    applies_to_kernels: [prefill, kv_cache_write]
+    applies_to_kernels: []  # win is prefill-side; the decode-only graph doesn't model it
     expected_delta_mean: 0.10
     expected_delta_lo: 0.00
     expected_delta_hi: 0.30
@@ -157,7 +242,7 @@ interventions:
     summary: Enable 5-token n-gram speculative decoding to cut decode steps.
     knob: num_speculative_tokens
     value: 5
-    applies_to_kernels: [decode, paged_attention]
+    applies_to_kernels: *all_ops  # changes the whole per-step decode cadence
     expected_delta_mean: 0.12
     expected_delta_lo: -0.05
     expected_delta_hi: 0.30
@@ -176,7 +261,7 @@ interventions:
     summary: Switch the scheduler to priority policy for mixed-SLO traffic.
     knob: scheduling_policy
     value: priority
-    applies_to_kernels: []
+    applies_to_kernels: *all_ops  # admission order changes every step's batch
     expected_delta_mean: 0.03
     expected_delta_lo: -0.02
     expected_delta_hi: 0.08
@@ -194,7 +279,7 @@ interventions:
     summary: Swap the attention backend to FlashInfer for fused decode attention.
     knob: VLLM_ATTENTION_BACKEND
     value: FLASHINFER
-    applies_to_kernels: [paged_attention, attn_score_value]
+    applies_to_kernels: [attn_score_value]  # attention kernel swap only
     expected_delta_mean: 0.07
     expected_delta_lo: -0.03
     expected_delta_hi: 0.15
@@ -213,7 +298,8 @@ interventions:
     summary: Fall back to NCCL all-reduce when custom all-reduce stalls comm overlap.
     knob: disable_custom_all_reduce
     value: true
-    applies_to_kernels: [all_reduce, nccl]
+    # Comm-path change, not one of the modeled per-op decode kernels — honest 0.
+    applies_to_kernels: []
     expected_delta_mean: 0.02
     expected_delta_lo: -0.04
     expected_delta_hi: 0.08
@@ -232,7 +318,7 @@ interventions:
     summary: Reshape to TP=2 to fit larger batches / longer context per replica.
     knob: tensor_parallel_size
     value: 2
-    applies_to_kernels: [all_reduce, linear, paged_attention]
+    applies_to_kernels: *all_ops  # every layer's op gets sharded
     expected_delta_mean: 0.00
     expected_delta_lo: -0.15
     expected_delta_hi: 0.20
@@ -252,7 +338,8 @@ interventions:
     summary: Load AWQ 4-bit weights to shrink the model and free KV-cache memory.
     knob: quantization
     value: awq
-    applies_to_kernels: [linear, gemm]
+    # Weight-heavy projection ops, not attn_score_value (KV-cache bytes, not weight bytes).
+    applies_to_kernels: [qkv_proj, attn_out_proj, mlp_gate_up, mlp_down, lm_head]
     expected_delta_mean: 0.10
     expected_delta_lo: -0.05
     expected_delta_hi: 0.25
@@ -271,7 +358,7 @@ interventions:
     summary: Disable enforce_eager so CUDA graphs capture and replay the decode step.
     knob: enforce_eager
     value: false
-    applies_to_kernels: [decode, paged_attention, linear]
+    applies_to_kernels: *all_ops  # graph capture wraps the whole decode step
     expected_delta_mean: 0.09
     expected_delta_lo: 0.02
     expected_delta_hi: 0.18
@@ -285,11 +372,13 @@ interventions:
       notes: Graph capture raises warmup memory; watch for OOM on first capture.
     review: null
 
-  - name: max_seq_len_to_capture_8192
-    summary: Extend CUDA-graph capture to 8192 tokens so long contexts stay graphed.
+  - name: max_seq_len_to_capture_dynamic
+    summary: Sweep CUDA-graph capture length relative to whatever this engine
+      already captures (not one hardcoded 8192) so long contexts stay graphed.
     knob: max_seq_len_to_capture
-    value: 8192
-    applies_to_kernels: [decode, paged_attention]
+    value: 8192  # offline/predict-only fallback when there's no live engine to scale
+    value_multiplier_grid: *sweep_grid
+    applies_to_kernels: *all_ops  # extends graph-capture scope for the whole step
     expected_delta_mean: 0.04
     expected_delta_lo: -0.02
     expected_delta_hi: 0.10
@@ -308,7 +397,7 @@ interventions:
     summary: Split layers across 2 pipeline stages to fit a model that won't shard on TP alone.
     knob: pipeline_parallel_size
     value: 2
-    applies_to_kernels: [send_recv, linear]
+    applies_to_kernels: *all_ops  # every layer's op is split across stages
     expected_delta_mean: -0.02
     expected_delta_lo: -0.20
     expected_delta_hi: 0.15
@@ -328,7 +417,7 @@ interventions:
     summary: Use the Ray executor backend for multi-node distributed decode.
     knob: distributed_executor_backend
     value: ray
-    applies_to_kernels: []
+    applies_to_kernels: []  # multi-node orchestration overhead, not modeled at all
     expected_delta_mean: 0.00
     expected_delta_lo: -0.10
     expected_delta_hi: 0.05

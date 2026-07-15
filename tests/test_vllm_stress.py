@@ -36,38 +36,49 @@ class _SchedCfg:
 
 
 class _Engine:
-    def __init__(self):
+    def __init__(self, max_num_seqs: int = 32):
         self.scheduler_config = _SchedCfg()
+        self.scheduler_config.max_num_seqs = max_num_seqs
+
+    def restart(self, _old_engine, knob_values):
+        if set(knob_values) != {"max_num_seqs"}:
+            raise AttributeError("unsupported fake-engine restart knob")
+        return _Engine(max_num_seqs=int(knob_values["max_num_seqs"]))
 
 
 def test_failed_apply_clears_previous_ab_result():
-    """A structural-knob candidate with no restart hook must not surface the
-    *previous* hot-swap's A/B result (snapshot() resets last_result)."""
+    """A failed restart candidate must not surface the previous A/B result."""
     e = _Engine()
-    app = LiveEngineApplicator(e, throughput_fn=lambda x: float(x.scheduler_config.max_num_seqs))
+    app = LiveEngineApplicator(
+        e,
+        throughput_fn=lambda x: float(x.scheduler_config.max_num_seqs),
+        restart_fn=e.restart,
+    )
 
     r1 = apply_intervention(_spec("max_num_seqs", 256), app, min_keep_delta=0.0)
-    assert r1.applied and app.last_result is not None  # hot-swap measured
+    assert r1.applied and app.last_result is not None
 
-    # Next: a structural knob with no restart_fn → apply raises → rolled back,
-    # measure never runs → last_result must be reset to None, not stale.
+    # Next: an unsupported structural knob raises during restart. measure never
+    # runs, so last_result must be reset to None, not stale from r1.
     r2 = apply_intervention(_spec("quantization", "awq"), app, min_keep_delta=0.0)
     assert r2.rolled_back and app.last_result is None
 
 
 def test_many_candidates_restore_is_clean():
-    """Hot-swap → rollback → hot-swap across many candidates leaves the engine at
-    the last *kept* value, never a half-applied state."""
+    """Restart, rollback, restart leaves the applicator at the last kept engine."""
     e = _Engine()
-    # Throughput rises with the knob, so higher is kept, lower is rolled back.
-    app = LiveEngineApplicator(e, throughput_fn=lambda x: float(x.scheduler_config.max_num_seqs))
+    app = LiveEngineApplicator(
+        e,
+        throughput_fn=lambda x: float(x.scheduler_config.max_num_seqs),
+        restart_fn=e.restart,
+    )
 
     apply_intervention(_spec("max_num_seqs", 256), app, min_keep_delta=0.0)  # 32->256 kept
-    assert e.scheduler_config.max_num_seqs == 256
-    apply_intervention(_spec("max_num_seqs", 64), app, min_keep_delta=0.0)   # 256->64 slower, rolled back
-    assert e.scheduler_config.max_num_seqs == 256  # restored
+    assert app.engine.scheduler_config.max_num_seqs == 256
+    apply_intervention(_spec("max_num_seqs", 64), app, min_keep_delta=0.0)  # 256->64 slower
+    assert app.engine.scheduler_config.max_num_seqs == 256  # restored
     apply_intervention(_spec("max_num_seqs", 512), app, min_keep_delta=0.0)  # 256->512 kept
-    assert e.scheduler_config.max_num_seqs == 512
+    assert app.engine.scheduler_config.max_num_seqs == 512
 
 
 # --------------------------------------------------------------------------- #
@@ -213,8 +224,8 @@ def test_measure_rolls_back_on_nonpositive_baseline():
     class _Idle:
         scheduler_config = _SchedCfg()
 
-    # Baseline probe returns 0 (idle engine) → measure() raises → rollback.
-    app = LiveEngineApplicator(_Idle(), throughput_fn=lambda e: 0.0)
+    # Baseline probe returns 0 (idle engine), so measure() raises after apply.
+    app = LiveEngineApplicator(_Idle(), throughput_fn=lambda e: 0.0, restart_fn=lambda _e, _kv: _Idle())
     res = apply_intervention(_spec("max_num_seqs", 256), app, min_keep_delta=0.0)
     assert not res.applied and res.rolled_back
 

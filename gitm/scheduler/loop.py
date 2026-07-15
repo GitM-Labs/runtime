@@ -18,6 +18,14 @@ from pathlib import Path
 from typing import Any
 
 from gitm._paths import runs_dir, traces_dir
+from gitm.agents.autoresearch import (
+    AutoresearchRun,
+    EngineArgsProposer,
+    FallbackProposer,
+    TableProposer,
+    autoresearch,
+    classify_bottleneck,
+)
 from gitm.agents.policy import Policy, select_interventions
 from gitm.kernels.library import load_library
 from gitm.optimizer.apply import (
@@ -34,7 +42,11 @@ from gitm.optimizer.monitor import check_invariants, residuals
 from gitm.optimizer.qualification import qualify
 from gitm.optimizer.report import Claim, build_provenance, write_report
 from gitm.optimizer.scheduler_attribution import scheduler_causes
-from gitm.optimizer.vllm_knobs import knob_kind
+from gitm.optimizer.vllm_knobs import (
+    expand_relative_candidates,
+    knob_kind,
+    unmet_prerequisite,
+)
 from gitm.planner.context import build_planner_context
 from gitm.planner.graph import predict_graph
 from gitm.safety.audit import AuditLog, _write_report
@@ -191,16 +203,39 @@ def _model_spec_from_engine(engine: Any):
         return None
 
 
+def _clamp_pct(value: float) -> float:
+    """Bound a residual ratio to +/-100% so a bad/misaligned prediction (or a
+    small-sample outlier) can't blow up a report row into an absurd 18x."""
+    return max(-1.0, min(1.0, value))
+
+
 def _agg_kt_residual(res: Any) -> float:
-    """Aggregate kernel-time residual for the report — the median of per-kernel
-    ``r_kt`` (observed-vs-predicted kernel time). Median (not mean) so a few
-    badly-aligned kernels don't dominate; ``0.0`` when there are no residuals.
-    """
-    kts = sorted(kr.r_kt for kr in res.per_kernel)
-    if not kts:
+    """Run-level kernel-time residual for the report: duration-weighted
+    ``sum(obs - pred) / sum(pred)`` when timings are available, else the
+    median per-kernel ratio. Same value for every catalog claim in a run."""
+    rows = list(getattr(res, "per_kernel", []))
+    if not rows:
         return 0.0
-    mid = len(kts) // 2
-    return kts[mid] if len(kts) % 2 else (kts[mid - 1] + kts[mid]) / 2.0
+
+    total_obs = sum(float(kr.t_obs_s) for kr in rows if getattr(kr, "t_obs_s", None) is not None)
+    total_pred = sum(float(kr.t_pred_s) for kr in rows if getattr(kr, "t_pred_s", None) is not None)
+    if total_pred > 0.0:
+        value = (total_obs - total_pred) / total_pred
+    else:
+        kts = sorted(float(kr.r_kt) for kr in rows)
+        mid = len(kts) // 2
+        value = kts[mid] if len(kts) % 2 else (kts[mid - 1] + kts[mid]) / 2.0
+    return _clamp_pct(value)
+
+
+def _ar_target_residual(ar_run: AutoresearchRun, fallback: float = 0.0) -> float:
+    """Residual for autoresearch claims.
+
+    Prefer the largest-residual op that autoresearch targeted; when there is no
+    target, fall back to the run-level kernel-time residual so generated claims
+    do not all display a misleading +0.0% gap.
+    """
+    return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else fallback
 
 
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
@@ -438,7 +473,13 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
 
     # Phase 3 — library + counterfactual replay ranking
     pctx = build_planner_context(cfg.engine, workload = workload)
-    library = load_library(workload = workload)
+    # Relative/swept levers resolve against the live engine here, once, before
+    # ranking. See expand_relative_candidates.
+    library = [
+        resolved
+        for s in load_library(workload=workload)
+        for resolved in expand_relative_candidates(s, cfg.engine)
+    ]
     policy = Policy(require_qualification_commit=qual.commit, skip_high_risk=not qual.commit)
     ranked = select_interventions(trace, library, policy, top_n=cfg.top_n_interventions, ctx=pctx.gate)
     (run_dir / "ranked_candidates.json").write_text(
@@ -457,22 +498,24 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
 
     # Phase 4 — apply with rollback gates.
     # With a live engine attached, each candidate runs the rollback-gated decode-
-    # throughput A/B (LiveEngineApplicator): snapshot baseline tps → hot-swap the
-    # knob → measure candidate tps → keep only on a non-negative delta, else
-    # restore. Scheduling knobs are hot-swapped; structural knobs are routed
-    # through ``engine.gitm_restart_fn`` (if the deployment provides one) or
-    # rolled back rather than silently no-op'd. With no engine it's predict-only
-    # (DryRunApplicator): candidates land in the report as unverified
-    # (measured_delta=None), never claimed as won.
+    # throughput A/B (LiveEngineApplicator): snapshot baseline tps, apply the
+    # candidate, measure candidate tps, keep only on a non-negative delta, else
+    # restore. vLLM EngineArgs are routed through ``engine.gitm_restart_fn``
+    # (if the deployment provides one) because the real engine reads them at
+    # construction time. With no engine it is predict-only (DryRunApplicator):
+    # candidates land in the report as unverified (measured_delta=None), never
+    # claimed as won.
     live_restart_fn = getattr(cfg.engine, "gitm_restart_fn", None) if cfg.engine else None
     if cfg.engine is not None:
         applicator: Applicator = LiveEngineApplicator(
             cfg.engine,
             throughput_fn=_engine_throughput_fn(cfg.engine, runner),
             restart_fn=live_restart_fn,
+            baseline_restart_fn=getattr(cfg.engine, "gitm_baseline_restart_fn", None),
+            restart_mode=os.environ.get("GITM_RESTART_MODE", "parallel"),
             reps=int(os.environ.get("GITM_AB_REPS", "1")),
-            # GITM_KNOBS_VIA_RESTART=1 applies scheduling knobs via engine rebuild
-            # too — for V1, which ignores a live scheduler-config mutation.
+            # Compatibility escape hatch for custom scheduling-classified knobs
+            # that should still be measured through engine rebuild.
             force_restart=os.environ.get("GITM_KNOBS_VIA_RESTART") == "1",
         )
     else:
@@ -536,6 +579,94 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         if time.time_ns() - started_ns >= int(budget_s * 1e9):
             break
 
+
+    # Phase 4b - agentic autoresearch through the catalog gate/rollback path.
+    if time.time_ns() - started_ns < int(budget_s * 1e9):
+        proposer = FallbackProposer(EngineArgsProposer(), TableProposer())
+
+        def _unenactable(spec: Any) -> str | None:
+            if (
+                cfg.engine is not None
+                and live_restart_fn is None
+                and knob_kind(spec.knob) == "structural"
+            ):
+                return "structural knob: needs engine restart, no restart_fn"
+            return unmet_prerequisite(cfg.engine, spec.knob)
+
+        ar_run = autoresearch(
+            trace,
+            applicator=applicator,
+            policy=policy,
+            residuals=res,
+            proposer=proposer,
+            ctx=pctx.gate,
+            reject=_unenactable,
+        )
+    else:
+        ar_run = AutoresearchRun(bottleneck_class=classify_bottleneck(trace, res), results=[])
+
+    ar_causal_evidence = ", ".join(
+        f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
+    ) or "no strong causal signal"
+    ar_residual = _ar_target_residual(ar_run, kt_residual)
+    for r in ar_run.results:
+        if not r.applicable:
+            rejected.append(f"{r.spec.name} ({r.rejected_reason})")
+            continue
+        if r.rolled_back:
+            rolled_back.append(r.spec.name)
+        # A rolled-back candidate with no measured_delta means the live apply
+        # itself raised (engine build/restart failure), not "measured and lost" —
+        # surface why directly in the report so that distinction isn't buried in
+        # autoresearch.json.
+        evidence = ar_causal_evidence
+        if r.measured_delta is None and r.apply_error:
+            evidence += f"; apply failed: {r.apply_error}"
+        claims.append(
+            Claim(
+                summary=r.spec.summary,
+                residual_invariant="kernel_time",
+                residual_value=ar_residual,
+                causal_evidence=evidence,
+                intervention_name=r.spec.name,
+                predicted_delta=r.predicted_delta,
+                measured_delta=r.measured_delta,
+                rolled_back=r.rolled_back,
+            )
+        )
+    (run_dir / "autoresearch.json").write_text(
+        json.dumps(
+            {
+                "bottleneck_class": ar_run.bottleneck_class,
+                "target": (
+                    {
+                        "op": ar_run.target.op,
+                        "residual": ar_run.target.residual,
+                        "n_kernels": ar_run.target.n_kernels,
+                    }
+                    if ar_run.target is not None
+                    else None
+                ),
+                "results": [
+                    {
+                        "name": r.spec.name,
+                        "knob": r.spec.knob,
+                        "value": r.spec.value,
+                        "applicable": r.applicable,
+                        "rejected_reason": r.rejected_reason,
+                        "predicted_delta": r.predicted_delta,
+                        "measured_delta": r.measured_delta,
+                        "rolled_back": r.rolled_back,
+                        "target_op": r.target_op,
+                        "apply_error": r.apply_error,
+                    }
+                    for r in ar_run.results
+                ],
+            },
+            indent=2,
+        )
+    )
+
     # Phase 5 — stabilize + write report
     provenance = build_provenance(
         workload_id=workload,
@@ -572,6 +703,8 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         "n_claims": len(claims),
         "n_rolled_back": len(rolled_back),
         "n_rejected": len(rejected),
+        "bottleneck_class": ar_run.bottleneck_class,
+        "n_autoresearch": len(ar_run.results),
         "scheduler_stats": asdict(sched_summary) if sched_stats.samples else None,
         "report_path": str(run_dir / "report.md"),
     }
@@ -853,7 +986,7 @@ def _openfold_intervention_result(
         claims.append(
             Claim(
                 summary=spec.summary,
-                residual_invariant="kernel_time",
+                residual_invariant="stream_concurrency",
                 residual_value=float(mres.serialized_fraction),
                 causal_evidence=evidence,
                 intervention_name=spec.name,
@@ -992,7 +1125,7 @@ def _edge_intervention_result(
         claims.append(
             Claim(
                 summary=spec.summary,
-                residual_invariant="kernel_time",
+                residual_invariant="stream_concurrency",
                 residual_value=float(mres.serialized_fraction),
                 causal_evidence=evidence,
                 intervention_name=spec.name,

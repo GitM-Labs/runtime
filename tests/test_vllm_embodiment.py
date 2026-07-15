@@ -259,16 +259,21 @@ class _ModelConfig:
 
 
 class _LiveEngine:
-    """Duck-typed vLLM engine with one hot-swappable knob and a deterministic
-    throughput probe, so the rollback-gated A/B has a real (noise-free) signal."""
+    """Duck-typed vLLM engine with a restartable max_num_seqs lever."""
 
-    def __init__(self):
+    def __init__(self, max_num_seqs: int = 32):
         self.model_config = _ModelConfig()
-        self.max_num_seqs = 32  # the one knob this fake engine can hot-swap
-        # Decode throughput scales with batch width — so raising max_num_seqs is a
-        # measurable win and is kept; knobs with no matching attribute raise on
-        # apply and are rolled back (the "structural knob can't hot-swap" path).
+        self.max_num_seqs = max_num_seqs
+        # Decode throughput scales with batch width, so raising max_num_seqs is a
+        # measurable win and is kept. Other structural knobs raise from restart
+        # and are rolled back.
         self.gitm_throughput_fn = lambda e: float(e.max_num_seqs)
+        self.gitm_restart_fn = self._restart
+
+    def _restart(self, _old_engine, knob_values):
+        if set(knob_values) != {"max_num_seqs"}:
+            raise AttributeError("unsupported fake-engine restart knob")
+        return _LiveEngine(max_num_seqs=int(knob_values["max_num_seqs"]))
 
 
 def test_run_loop_live_engine_keeps_winning_knob_and_rolls_back_unswappable(
@@ -295,9 +300,10 @@ def test_run_loop_live_engine_keeps_winning_knob_and_rolls_back_unswappable(
     cfg = LoopConfig(
         engine=engine,
         workload="vllm-decode",
-        # Non-expiring budget: max_num_seqs_256 ranks low, and this test asserts it
-        # is reached + kept. A short wall-clock budget would make that racy under
-        # load (the loop is budget-bounded by design), so give it plenty of room.
+        # Non-expiring budget: max_num_seqs_dynamic ranks low, and this test
+        # asserts it is reached + kept. A short wall-clock budget would make
+        # that racy under load (the loop is budget-bounded by design), so
+        # give it plenty of room.
         budget="24h",
         scratch=str(tmp_path),
         top_n_interventions=50,  # evaluate the whole library, not just top 5
@@ -307,12 +313,15 @@ def test_run_loop_live_engine_keeps_winning_knob_and_rolls_back_unswappable(
     summary = out["summary"]
     assert summary["status"] == "ok" and summary["mode"] == "intervention"
 
-    # The hot-swappable winning knob is kept with a measured positive delta.
-    assert engine.max_num_seqs == 256
+    # The restartable winning knob is kept with a measured positive delta.
+    # The original fake engine is not mutated; the live applicator swaps in a
+    # rebuilt candidate engine, just like the vLLM runner does.
+    assert "via restart" in out["report_md"]
+    assert "max_num_seqs" in out["report_md"]
     import json
 
     claims = json.loads((Path(out["run_dir"]) / "ranked_candidates.json").read_text())
-    assert any(c["name"] == "max_num_seqs_256" for c in claims)
+    assert any(c["name"].startswith("max_num_seqs_dynamic") for c in claims)
     # report carries the measured live A/B verdict (not a prediction).
     assert "live A/B" in out["report_md"]
     # Knobs the engine can't hot-swap were rolled back, not silently kept.

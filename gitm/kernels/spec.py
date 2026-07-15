@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -42,8 +42,23 @@ class InterventionSpec(BaseModel):
 
     name: str
     summary: str
-    knob: str  # vLLM config key, e.g. "max_num_batched_tokens"
-    value: int | float | str | bool | None = None  # value to set the knob to on apply
+    knob: str  # vLLM config key, e.g. "max_num_batched_tokens" — or a display
+    # label ("k1=v1,k2=v2") for a joint candidate; see ``knobs`` below.
+    value: int | float | str | bool | None = None  # value to set on apply (single-knob)
+    # Scale the engine's CURRENT value by this factor instead of hardcoding one
+    # number (see gitm.optimizer.vllm_knobs.resolve_relative_value). None (the
+    # default): value is a static literal. value is the offline/predict-only
+    # fallback when there's no live engine to read a current setting from.
+    value_multiplier: float | None = None
+    # A sweep of multipliers (e.g. [0.5, 2.0, 4.0]) instead of one — expands
+    # this entry into one candidate per point (expand_relative_candidates).
+    # Empty (default): no sweep.
+    value_multiplier_grid: list[float] = Field(default_factory=list)
+    value_max: float | None = None  # clamp the scaled result (e.g. a fraction < 1.0)
+    value_min: float | None = None
+    # >1 knob=value pair applied/rolled back together as one atomic unit. Empty
+    # (default) means single-knob — use knob/value instead. See knob_values.
+    knobs: dict[str, Any] = Field(default_factory=dict)
     applies_to_kernels: list[str] = Field(default_factory=list)  # substring match
     expected_delta_mean: float  # signed, e.g. +0.08 = 8% improvement
     expected_delta_lo: float
@@ -52,3 +67,9 @@ class InterventionSpec(BaseModel):
     applicability: Applicability = Field(default_factory=Applicability)
     safety: SafetyGate = Field(default_factory=SafetyGate)
     review: str | None = None  # reviewer sign-off note (None until reviewed)
+
+    @property
+    def knob_values(self) -> dict[str, Any]:
+        """The knob=value pairs this spec wants applied — the one shape every
+        applicator should read, whether the spec is single-knob or joint."""
+        return dict(self.knobs) if self.knobs else {self.knob: self.value}

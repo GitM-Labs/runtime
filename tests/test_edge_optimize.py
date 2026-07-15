@@ -159,3 +159,33 @@ def test_applicator_runs_through_the_apply_gate():
 
     drift = EdgeBatchingApplicator(_fake_run_mode(equivalent=False), reps=1)
     assert apply_intervention(drift.spec, drift, min_keep_delta=0.0).rolled_back
+
+
+def test_edge_report_claim_labels_serialized_concurrency_not_kernel_time(tmp_path):
+    """The edge claim's residual is a serialized-concurrency fraction (from
+    measure_trace), not a kernel-time ratio — the report must label it
+    `stream_concurrency`, matching the HFT/AF2 claims, not `kernel_time`."""
+    from gitm.optimizer.qualification import QualificationResult
+    from gitm.scheduler.loop import _edge_intervention_result
+    from gitm.tracer.schema import Trace
+
+    trace = Trace(
+        workload_id="kitti", fingerprint="f", run_id="r", device_count=1,
+        vendor="nvidia", captured_at_ns=0, duration_ns=1, events=[],
+    )
+    qual = QualificationResult(commit=False, floor=0.0, fingerprint="f")
+    applicator = EdgeBatchingApplicator(_fake_run_mode(equivalent=True), reps=1)
+
+    result = _edge_intervention_result(
+        run_dir=tmp_path,
+        run_id="r",
+        workload="kitti",
+        trace=trace,
+        qual=qual,
+        applicator=applicator,
+        started_ns=0,
+        trace_path=tmp_path / "trace.jsonl",
+    )
+    md = result["report_md"]
+    assert "`stream_concurrency`" in md
+    assert "`kernel_time`" not in md

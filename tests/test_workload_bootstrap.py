@@ -96,3 +96,75 @@ def test_generate_importable_from_package():
     from gitm.benchmarks.hft import generate
 
     assert generate.generate and generate.GenConfig
+
+
+def test_vllm_factory_returns_runner_with_live_engine_hooks(monkeypatch):
+    """The vLLM factory must return the decode runner, not just build the engine."""
+    import sys
+    import types
+
+    import gitm.workloads as workloads
+
+    class FakeSamplingParams:
+        def __init__(self, *, max_tokens: int, temperature: float):
+            self.max_tokens = max_tokens
+            self.temperature = temperature
+
+    class FakeLLM:
+        instances = []
+
+        def __init__(self, *, model: str, **kwargs):
+            self.model = model
+            self.kwargs = kwargs
+            self.calls = 0
+            FakeLLM.instances.append(self)
+
+        def generate(self, prompts, params):
+            self.calls += 1
+            return [
+                types.SimpleNamespace(
+                    outputs=[types.SimpleNamespace(token_ids=list(range(params.max_tokens)))]
+                )
+                for _ in prompts
+            ]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm",
+        types.SimpleNamespace(LLM=FakeLLM, SamplingParams=FakeSamplingParams),
+    )
+    monkeypatch.setattr(workloads, "sync_device", lambda: None)
+    monkeypatch.setenv("GITM_VLLM_MODEL", "fake/model")
+    monkeypatch.setenv("GITM_VLLM_PROMPTS", "2")
+    monkeypatch.setenv("GITM_VLLM_MAX_TOKENS", "4")
+    monkeypatch.setenv("GITM_VLLM_GPU_MEM", "0.45")
+
+    runner = workloads.get_factory("vllm-decode")(None)
+
+    assert callable(runner)
+    assert runner.engine is FakeLLM.instances[0]
+    assert callable(runner.engine.gitm_throughput_fn)
+    assert callable(runner.engine.gitm_restart_fn)
+    assert callable(runner.engine.gitm_baseline_restart_fn)
+    assert callable(runner.engine.gitm_shutdown_fn)
+    assert callable(runner.engine.gitm_activate_fn)
+
+    summary = runner()
+    assert summary["generated_tokens"] == 8
+    assert FakeLLM.instances[0].calls == 1
+    assert runner.engine.gitm_throughput_fn(runner.engine) > 0
+    baseline = runner.engine
+    restarted = runner.engine.gitm_restart_fn(runner.engine, {"swap_space": 2})
+    assert restarted.kwargs["gpu_memory_utilization"] == 0.45
+    assert restarted.kwargs["swap_space"] == 2
+
+    restarted.gitm_activate_fn(restarted)
+    assert runner.engine is restarted
+    summary = runner()
+    assert summary["generated_tokens"] == 8
+    assert restarted.calls == 1
+
+    baseline.gitm_shutdown_fn(baseline)
+    assert runner.engine is restarted
+    restarted.gitm_shutdown_fn(restarted)
+    assert runner.engine is None

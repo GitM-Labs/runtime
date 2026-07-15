@@ -13,9 +13,10 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from gitm.optimizer.deviation import classify_op
 from gitm.optimizer.invariants import INVARIANTS, Invariant, Violation
 from gitm.optimizer.multibasis import confirmed_positions
-from gitm.planner.graph import Graph
+from gitm.planner.graph import Graph, PredictedNode
 from gitm.tracer.schema import KernelEvent, Trace
 
 
@@ -25,6 +26,9 @@ class KernelResidual:
     layer: int | None
     r_kt: float  # kernel-time residual
     r_mt: float | None  # memory-traffic residual (None if bytes unavailable)
+    t_obs_s: float | None = None
+    t_pred_s: float | None = None
+    bound: str | None = None  # the matched op's roofline bound: "compute" | "memory"
 
 
 @dataclass
@@ -36,20 +40,30 @@ class Residuals:
 
 
 def residuals(trace: Trace, graph: Graph) -> Residuals:
-    """Pair observed kernels to predicted nodes by ordinal position.
+    """Pair observed kernels to predicted nodes by op identity, not position.
 
-    v0 alignment: predicted nodes and observed kernels are matched by index
-    after filtering. The attribution layer doesn't require perfect alignment
-    — bad pairings show as outsized residuals that the Granger pass localizes.
+    The old ordinal pairing matched a handful of early kernels against
+    unrelated ops (orders of magnitude fewer predicted nodes than real
+    kernels), producing runaway r_kt ratios. Each kernel is now classified by
+    name (:func:`gitm.optimizer.deviation.classify_op`) against one
+    representative node per op (per-layer nodes share a prediction);
+    unmodeled kernels get no residual, and ``layer`` is always ``None``
+    (unrecoverable from name-based classification). Carries the matched op's
+    roofline ``bound`` for bottleneck classification.
     """
     obs = trace.kernels()
     pred = graph.nodes
 
     res = Residuals()
-    n = min(len(obs), len(pred))
-    for i in range(n):
-        ok: KernelEvent = obs[i]
-        pn = pred[i]
+    by_op: dict[str, PredictedNode] = {}
+    for pn in pred:
+        by_op.setdefault(pn.op, pn)
+
+    for ok in obs:
+        op = classify_op(ok.name)
+        pn = by_op.get(op) if op is not None else None
+        if pn is None:
+            continue
         t_obs = max((ok.end_ns - ok.start_ns) / 1e9, 1e-12)
         t_pred = max(pn.prediction.t_pred_s, 1e-12)
         r_kt = (t_obs - t_pred) / t_pred
@@ -60,7 +74,12 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
         else:
             r_mt = None
 
-        res.per_kernel.append(KernelResidual(op=pn.op, layer=pn.layer, r_kt=r_kt, r_mt=r_mt))
+        res.per_kernel.append(
+            KernelResidual(
+                op=pn.op, layer=None, r_kt=r_kt, r_mt=r_mt,
+                t_obs_s=t_obs, t_pred_s=t_pred, bound=pn.prediction.bound,
+            )
+        )
 
     res.serialized_concurrency_fraction = _serialized_fraction(obs)
     return res
