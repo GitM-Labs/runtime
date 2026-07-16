@@ -725,8 +725,27 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         try:
             return _build_engine(kwargs)
         except Exception as exc:
+            # Diagnose the spawn/entrypoint failure specifically — it presents as a
+            # child dying with FileNotFoundError on '<stdin>' or '-c'. Once CUDA is
+            # initialized in the parent, vLLM must build this second engine with
+            # 'spawn', and spawn re-imports __main__ in the child — which only works
+            # if __main__ is an importable file guarded by `if __name__ ==
+            # "__main__"`. gitm keeps the parent CUDA-free (see run()/_throughput) so
+            # fork is used instead, but a caller that initializes CUDA in the parent
+            # reintroduces the spawn path.
+            knobs = ", ".join(knob_values)
+            text = str(exc)
+            if "<stdin>" in text or "spawn" in text.lower() or "run_path" in text:
+                raise RuntimeError(
+                    f"restart candidate for {knobs} could not build its second "
+                    f"engine under the 'spawn' start method: the entrypoint is not "
+                    f"spawn-safe. Run gitm from an importable script guarded by "
+                    f"`if __name__ == \"__main__\":` (not `python -c` or a stdin "
+                    f"heredoc), or avoid initializing CUDA in the parent process. "
+                    f"Root cause: {exc}"
+                ) from exc
             raise RuntimeError(
-                f"restart candidate for {', '.join(knob_values)} failed to build: {exc}"
+                f"restart candidate for {knobs} failed to build: {exc}"
             ) from exc
 
     def _baseline_restart(old_engine: Any) -> Any:
@@ -770,6 +789,35 @@ def _vllm_synthetic_runner(n_prompts: int, max_tokens: int) -> WorkloadRunner:
         return {"prompts": n_prompts, "decode_steps": steps, "synthetic": True}
 
     return run
+
+def set_decode_run_defaults() -> dict[str, str]:
+    """Populate the env a traced, KV-pressured vllm-decode run needs.
+    So ``python scripts/fp8_ab.py`` Just Works with zero manual exports. Every value
+    uses ``setdefault``, so anything you already exported wins — override any single
+    knob without re-listing the rest.
+    MUST be called before the engine is built (before CUDA init): the driver reads
+    ``CUDA_INJECTION64_PATH`` at CUDA init, which is when the child EngineCore comes
+    up, and the child inherits this process's environment. Returns the resolved
+    values for logging.
+    The defaults encode the two things this experiment gets wrong by accident:
+    ``GPU_MEM=0.45`` so the baseline and the restart candidate both fit at once, and
+    512x2048 so the ~151k-token KV cache is ~8x oversubscribed — without that,
+    fp8 measures pure noise.
+    """
+    from gitm.tracer.injection import lib_path
+
+    defaults = {
+        "CUDA_INJECTION64_PATH": str(lib_path()),
+        "GITM_TRACE_OUT": "/root/.cache/gitm/traces/vllm.jsonl",
+        "GITM_VLLM_MODEL": "NousResearch/Meta-Llama-3-8B",
+        "GITM_VLLM_GPU_MEM": "0.45",
+        "GITM_VLLM_PROMPTS": "512",
+        "GITM_VLLM_MAX_TOKENS": "2048",
+    }
+    for k, v in defaults.items():
+        os.environ.setdefault(k, v)
+    Path(os.environ["GITM_TRACE_OUT"]).parent.mkdir(parents=True, exist_ok=True)
+    return {k: os.environ[k] for k in defaults}
 
 def sync_device() -> None:
     """Block until queued GPU work completes, so all kernels land in the trace
