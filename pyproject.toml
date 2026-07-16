@@ -29,6 +29,10 @@ nvidia = ["pynvml>=11.5"]
 # fallback (pandas). On a GPU box the harness runs on cuDF/CuPy instead — those
 # install from the RAPIDS channel, not PyPI, so they are not listed here.
 bench = ["pyarrow>=15", "pandas>=2.0"]
+# The vllm-decode workload. Deliberately NOT folded into [gpu]: vLLM is a heavy
+# install that pins its own torch, and both must be built for a CUDA major the
+# HOST driver supports — see gitm/cuda_env.py, which checks exactly that.
+vllm = ["vllm>=0.6"]
 # Full GPU stack for the real HFT path in two commands: cuDF/CuPy (RAPIDS) +
 # the CUPTI/runtime wheels the tracer shim links + NVML telemetry + the Parquet
 # generator deps. cuDF/CuPy resolve from NVIDIA's index, so install with:
@@ -67,7 +71,10 @@ packages = ["gitm"]
 [tool.hatch.build.targets.wheel.force-include]
 "gitm/optimizer/templates/report.md.j2" = "gitm/optimizer/templates/report.md.j2"
 "gitm/bench/templates/results.md.j2" = "gitm/bench/templates/results.md.j2"
+"gitm/tracer/_cupti/cupti_core.h" = "gitm/tracer/_cupti/cupti_core.h"
+"gitm/tracer/_cupti/cupti_core.c" = "gitm/tracer/_cupti/cupti_core.c"
 "gitm/tracer/_cupti/cupti_shim.c" = "gitm/tracer/_cupti/cupti_shim.c"
+"gitm/tracer/_cupti/cupti_inject.c" = "gitm/tracer/_cupti/cupti_inject.c"
 "gitm/kernels/library.yaml" = "gitm/kernels/library.yaml"
 
 [tool.pytest.ini_options]
