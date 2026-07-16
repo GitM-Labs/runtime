@@ -195,6 +195,14 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
                     setattr(sample, field_name, val)
                     saw_any = True
 
+        # vLLM V1: fill running / waiting / cache from the scheduler's stat object
+        # where the VO deques weren't exposed (they read empty on V1)
+        for sch in schedulers:
+            for field_name, val in _v1_scheduler_stats(sch).items():
+                if getattr(sample, field_name) is None:
+                    setattr(sample, field_name, val)
+                    saw_any = True
+
     # Total unfinished — a stable public method on LLMEngine across versions.
     getter = _first_attr(
         engine,
