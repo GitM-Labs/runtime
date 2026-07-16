@@ -28,6 +28,7 @@ Only a host C compiler is needed — not ``nvcc``. On a host with no CUDA this
 exits non-zero and the tracer degrades to a no-op.
 """
 from __future__ import annotations
+
 import os
 import re
 import shlex
