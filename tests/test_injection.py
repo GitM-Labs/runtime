@@ -15,7 +15,7 @@ import pytest
 from gitm.tracer import injection
 from gitm.tracer.capture import capture
 
-# gitm.tracer re-exports the capture() function as gitm.tracer.capture, so the
+# gitm.tracer re-exports the capture() *function* as gitm.tracer.capture, so the
 # module has to be fetched explicitly to patch its internals.
 capture_mod = importlib.import_module("gitm.tracer.capture")
 
@@ -125,6 +125,7 @@ def test_capture_merges_injected_shards_and_never_starts_the_local_backend(
     run_env, tmp_path, monkeypatch
 ):
     """Under injection, capture() must NOT call backend.start().
+
     CUPTI allows one activity-callback registration per process. The injected library
     already holds it; registering again from the in-process shim would clobber it and
     we would collect nothing.
@@ -182,6 +183,7 @@ def test_capture_falls_back_to_the_local_backend_when_not_injected(tmp_path, mon
 
 def test_stale_shard_cleanup_never_deletes_a_live_process_shard(run_env):
     """The bug that made a working injection look like a dead one.
+
     The injected library opens its shard at CUDA init — for vLLM that is during the
     engine build, BEFORE capture() is entered. Unlinking it then leaves the live
     EngineCore writing into a deleted inode: no records on disk, no error, and a merge

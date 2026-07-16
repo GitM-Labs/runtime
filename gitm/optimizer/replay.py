@@ -22,17 +22,53 @@ from gitm.tracer.schema import Trace
 def predict_delta(trace: Trace, spec: InterventionSpec) -> float:
     """Predicted fractional delta in wall-clock time on this trace.
 
-    v0 model: apply the spec's ``expected_delta_mean`` weighted by the
-    fraction of trace time spent in ops the spec is applicable to. The
-    trace-driven replay engine that replaces this v0 is on the roadmap.
+    v0 model: the spec's ``expected_delta_mean``, weighted by the headroom it can
+    actually act on. The trace-driven replay engine that replaces this v0 is on the
+    roadmap.
+
+    Which headroom depends on the spec's mechanism, and getting this wrong once cost
+    us a whole report:
+
+    * **Kernel-attributable** specs (fp8 KV, quantization, attention backend) make
+      specific kernels cheaper. Their headroom is the share of trace time spent in
+      the kernels they name.
+    * **Non-kernel-attributable** specs — an empty ``applies_to_kernels``, i.e. the
+      scheduler knobs (batch size, concurrency, policy) — do not make any kernel
+      faster. They fill the GAPS: better batching claws back time the GPU spent idle.
+      Their headroom is the *non-kernel* time.
+
+    Previously an empty list meant "matches every kernel", so a scheduler knob scored
+    against the whole trace while a targeted lever scored only its own kernels — a
+    spec was rewarded for declining to say what it touches, and broad levers swept
+    the top-N by construction. The five claims in the first vllm-decode report were
+    exactly the five specs with an empty list; no structural lever could ever have
+    been selected.
+
+    Note the two numbers are still not commensurable — they are computed against
+    different denominators. ``select_interventions`` therefore balances the slate
+    across the two classes rather than trusting a single ranking.
     """
     total_ns = max(trace.duration_ns, 1)
-    applicable_ns = 0
-    for k in trace.kernels():
-        if _applies(spec, k.name):
-            applicable_ns += k.end_ns - k.start_ns
-    coverage = applicable_ns / total_ns
-    return coverage * spec.expected_delta_mean
+    kernel_ns = sum(k.end_ns - k.start_ns for k in trace.kernels())
+
+    if not spec.applies_to_kernels:
+        headroom = max(total_ns - kernel_ns, 0) / total_ns   # idle/stall time
+    else:
+        matched_ns = sum(
+            k.end_ns - k.start_ns for k in trace.kernels() if _applies(spec, k.name)
+        )
+        headroom = matched_ns / total_ns
+
+    return headroom * spec.expected_delta_mean
+
+
+def is_kernel_attributable(spec: InterventionSpec) -> bool:
+    """Does this spec claim to act on specific kernels?
+
+    The split that decides which headroom ``predict_delta`` scores it against, and
+    which half of the slate it competes for.
+    """
+    return bool(spec.applies_to_kernels)
 
 
 def _applies(spec: InterventionSpec, kernel_name: str) -> bool:

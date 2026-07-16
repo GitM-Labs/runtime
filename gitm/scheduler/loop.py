@@ -148,7 +148,11 @@ class LoopConfig:
     budget: str = "24h"
     target: float = 0.15
     scratch: str | None = None
-    top_n_interventions: int = 5
+    # Was 5, which truncated the slate to the scheduler knobs alone. Raised so a
+    # structural lever (fp8 KV, quantization) can't be crowded off the end before it
+    # is ever measured — see select_interventions, which now also balances the slate
+    # across kernel-attributable and scheduler-side specs.
+    top_n_interventions: int = 12
     # Optional explicit driver for the embedded/engine path. When unset, the
     # loop looks up ``workload`` in the workload registry (gitm.workloads).
     workload_runner: WorkloadRunner | None = None

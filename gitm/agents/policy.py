@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from gitm.kernels.spec import InterventionSpec
 from gitm.optimizer.preconditions import GateContext, applicable
-from gitm.optimizer.replay import predict_delta
+from gitm.optimizer.replay import is_kernel_attributable, predict_delta
 from gitm.tracer.schema import Trace
 
 
@@ -49,7 +49,31 @@ def select_interventions(
         delta = predict_delta(trace, spec) if reason is None else 0.0
         candidates.append(RankedCandidate(spec=spec, predicted_delta=delta, rejected_reason=reason))
 
-    candidates.sort(
-        key=lambda c: (c.rejected_reason is not None, -c.predicted_delta, c.spec.name)
+    def _rank(cs: list[RankedCandidate]) -> list[RankedCandidate]:
+        return sorted(cs, key=lambda c: (-c.predicted_delta, c.spec.name))
+
+    eligible = [c for c in candidates if c.rejected_reason is None]
+    rejected = sorted(
+        (c for c in candidates if c.rejected_reason is not None), key=lambda c: c.spec.name
     )
-    return candidates[:top_n]
+
+    # Balance the slate across the two mechanism classes instead of taking a flat
+    # top-N. Their predicted deltas are NOT commensurable: a kernel-attributable spec
+    # is scored against the time spent in the kernels it names, a scheduler knob
+    # against the GPU's idle time (see predict_delta). Ranking them on one axis lets
+    # whichever class happens to own the bigger denominator sweep every slot — which
+    # is precisely what happened: the first vllm-decode report's five claims were the
+    # five specs with no kernels declared, and fp8 KV was never even measured.
+    targeted = _rank([c for c in eligible if is_kernel_attributable(c.spec)])
+    broad = _rank([c for c in eligible if not is_kernel_attributable(c.spec)])
+
+    slate: list[RankedCandidate] = []
+    for i in range(max(len(targeted), len(broad))):
+        if i < len(targeted):
+            slate.append(targeted[i])
+        if i < len(broad):
+            slate.append(broad[i])
+        if len(slate) >= top_n:
+            break
+
+    return (slate + rejected)[:top_n]

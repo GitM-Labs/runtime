@@ -1,4 +1,5 @@
 """Driver/stack CUDA compatibility (gitm.cuda_env).
+
 Regression cover for the failure that ate three H100 runs: the pod was rescheduled
 onto a host with a CUDA 12.8 driver while torch and vLLM were CUDA 13 builds, and
 nothing said so until ~90s in, after the weight download, inside _cuda_init().
@@ -122,6 +123,7 @@ def test_pip_commands_install_vllm_before_torch():
 
 def test_cuda12_host_has_a_stack_too():
     """Production fleets run CUDA 12. Refusing them is not an answer.
+
     0.19.1 is the newest vLLM whose wheels link libcudart.so.12 — verified with
     readelf against the wheels themselves, not inferred from the torch pin.
     """
@@ -134,6 +136,7 @@ def test_cuda12_host_has_a_stack_too():
 
 def test_cuda12_row_warns_that_it_is_a_different_engine():
     """The rows pin different vLLMs, so results are NOT comparable across hosts.
+
     Every vLLM from 0.20.0 up is a CUDA 13 build, so a CUDA 12 host cannot run the
     same engine a CUDA 13 host runs. That has to be loud, not buried in a pin.
     """
@@ -154,6 +157,7 @@ def test_unsupported_driver_major_is_still_rejected(host, monkeypatch):
 
 def test_vllm_wheel_that_is_secretly_cuda13_is_caught_in_two_seconds(host):
     """The risk in the CUDA 12 row: vLLM's PyPI wheel is built against cu130 torch.
+
     If its extensions link libcudart.so.13 they cannot load on a 12.8 driver no matter
     what torch we install. We read that off the .so rather than trusting the pin.
     """

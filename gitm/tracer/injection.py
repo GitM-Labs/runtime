@@ -1,7 +1,8 @@
 """Cross-process trace collection via the CUDA driver's injection hook.
+
 The in-process CUPTI shim can only see kernels launched by the interpreter that
 imported it. vLLM's V1 engine runs the model in a separate ``EngineCore`` process,
-so that shim captures nothing for a vLLM run — the trace comes back empty and the
+so that shim captures *nothing* for a vLLM run — the trace comes back empty and the
 pipeline reports "no-data". Disabling vLLM's multiprocessing would fix the symptom
 and corrupt the measurement: ``EngineCore`` lives in its own process precisely to
 keep the scheduler loop off the GIL that the frontend holds for detokenization, and
@@ -12,9 +13,11 @@ So instead we let the CUDA driver load our collector into the child. Setting
 that initializes CUDA and call its ``InitializeInjection()`` before any kernel runs.
 It is an ordinary environment variable, so it is inherited across fork/spawn. vLLM's
 process model is untouched; it never knows we are there.
+
 Each process writes ``$GITM_TRACE_OUT.<pid>`` (see ``cupti_inject.c``). This module
 is the other half: it arms the window, merges the shards, and drops records outside
 the window.
+
 Both environment variables must be set **before the traced process starts CUDA**,
 which for vLLM means before the engine is constructed — the driver reads
 ``CUDA_INJECTION64_PATH`` at CUDA init, long before ``capture()`` is entered. Export
@@ -37,7 +40,7 @@ ENV_SETTLE = "GITM_TRACE_SETTLE_S"
 LIB_NAME = "libgitm_inject.so"
 
 # How long to wait, after the workload finishes, for in-flight CUPTI buffers in
-# other processes to land on disk. We cannot reach into the child to force a
+# *other* processes to land on disk. We cannot reach into the child to force a
 # flush, so the injected library flushes on a period (GITM_TRACE_FLUSH_MS, default
 # 100ms) and we wait out one period plus slack before merging. Too short and the
 # tail of the trace is silently missing.
@@ -52,7 +55,8 @@ def lib_path() -> Path:
 
 
 def active() -> bool:
-    """True when this run is being collected by our injection library.
+    """True when this run is being collected by *our* injection library.
+
     Checks that the injection path actually points at ``libgitm_inject.so``: another
     profiler (nsys sets this variable too) means the trace is not ours to merge, and
     we must not silently claim its records or skip our own in-process collection.
@@ -105,6 +109,7 @@ def _shard_pid(path: Path) -> int | None:
 
 def _pid_alive(pid: int) -> bool:
     """Signal 0 — probe for existence, portable, and never touches /proc.
+
     Errs toward "alive": a pid we can see but may not signal (PermissionError) is
     still a process, and deleting its shard is the failure this whole check exists to
     prevent. Guessing "dead" costs a silently empty trace; guessing "alive" costs a
@@ -127,13 +132,15 @@ def clear_shards() -> None:
 
 def clear_stale_shards() -> None:
     """Drop shards from dead processes, and ONLY from dead processes.
+
     A shard is created and held open by the injected library the moment its process
-    initializes CUDA — which, for vLLM, is while the engine is being built, before
+    initializes CUDA — which, for vLLM, is while the engine is being built, *before*
     ``capture()`` is ever entered. Unlinking it here would pull the file out from
     under a live EngineCore: its FILE* keeps writing happily into a deleted inode,
     nothing reaches disk, and the merge comes back empty with no error anywhere.
     (That is exactly what happened, and it looked identical to the injection hook not
     firing at all.)
+
     So: only remove shards whose owning process is gone. Records that a live process
     already wrote before the window opened are excluded by the CUPTI-timestamp filter
     in ``read_shards``, not by deleting them.
@@ -200,6 +207,7 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
 
 def cupti_now() -> int | None:
     """Read the CUPTI clock, the time base the activity records use.
+
     Safe while the injection library owns collection: reading the clock does not
     register activity callbacks, so it cannot fight the injected collector for the
     process's single callback registration.

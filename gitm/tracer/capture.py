@@ -1,8 +1,11 @@
 """Trace capture context manager.
+
     with gitm.tracer.capture(out_path) as trace:
         run_workload()
     # trace.events populated; JSONL written to out_path
+
 Two collection modes:
+
 * **in-process** (default) — the compiled CUPTI shim collects kernels launched by
   this interpreter. Wired up behind ``_backend()``.
 * **injected** — when ``CUDA_INJECTION64_PATH`` points at ``libgitm_inject.so``, the
@@ -11,9 +14,11 @@ Two collection modes:
   the window, wait for in-flight buffers, and merge the per-pid shards. This is the
   only mode that sees vLLM's kernels, which run in a child ``EngineCore`` process.
   See :mod:`gitm.tracer.injection`.
+
 The two must never both collect. CUPTI allows one activity-callback registration per
 process, so calling ``backend.start()`` while the injected library holds the
 registration would silently clobber it.
+
 When no backend is available (dev box without GPU), capture is a no-op that still
 writes a well-formed empty trace — useful for plumbing tests.
 """
@@ -41,6 +46,7 @@ def capture(
     run_id: str | None = None,
 ) -> Iterator[Trace]:
     """Capture a CUPTI/rocprof trace into ``out_path`` as JSONL.
+
     The yielded ``Trace`` is updated in-place as events arrive; the file is
     flushed on context exit. Capture overhead target: <10% of workload runtime today,
     tightening to <5% on the roadmap.
@@ -95,6 +101,7 @@ def capture(
             backend = None
             trace.vendor = "none"
             trace.device_count = 0
+
     try:
         yield trace
     finally:
@@ -117,8 +124,11 @@ def capture(
                 warnings.warn(f"trace capture incomplete: backend.stop() failed: {exc}", stacklevel=2)
         trace.duration_ns = ended_ns - started_ns
         _write_jsonl(out_path, trace)
+
+
 def write_trace_jsonl(path: str | Path, trace: Trace) -> None:
     """Write a trace to JSONL — header line, then one event per line.
+
     The canonical on-disk trace format, shared by ``capture()`` and the
     deviation-only trace writer so the two never drift. Creates the parent dir.
     """
@@ -131,12 +141,15 @@ def write_trace_jsonl(path: str | Path, trace: Trace) -> None:
         for ev in trace.events:
             fh.write(ev.model_dump_json())
             fh.write("\n")
+
+
 # Back-compat internal alias.
 _write_jsonl = write_trace_jsonl
 
 
 def _device_count(backend, injected: bool) -> int:
     """Device count for the trace header.
+
     Under injection we never construct a backend — collection belongs to the driver-
     loaded library — but the compiled shim is still importable and counting devices
     doesn't touch CUPTI's activity callbacks, so it stays safe to ask.
@@ -156,6 +169,7 @@ def _device_count(backend, injected: bool) -> int:
 
 def _backend():
     """Return the active CUPTI/rocprof backend, or ``None`` if unavailable.
+
     Tries the CUPTI backend (real, via the compiled shim — see
     :mod:`gitm.tracer.cupti`). When the shim isn't built (CPU-only host, or a
     GPU box where ``python -m gitm.tracer._cupti.build`` hasn't run),

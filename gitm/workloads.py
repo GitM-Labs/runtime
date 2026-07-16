@@ -792,13 +792,16 @@ def _vllm_synthetic_runner(n_prompts: int, max_tokens: int) -> WorkloadRunner:
 
 def set_decode_run_defaults() -> dict[str, str]:
     """Populate the env a traced, KV-pressured vllm-decode run needs.
+
     So ``python scripts/fp8_ab.py`` Just Works with zero manual exports. Every value
     uses ``setdefault``, so anything you already exported wins — override any single
     knob without re-listing the rest.
+
     MUST be called before the engine is built (before CUDA init): the driver reads
     ``CUDA_INJECTION64_PATH`` at CUDA init, which is when the child EngineCore comes
     up, and the child inherits this process's environment. Returns the resolved
     values for logging.
+
     The defaults encode the two things this experiment gets wrong by accident:
     ``GPU_MEM=0.45`` so the baseline and the restart candidate both fit at once, and
     512x2048 so the ~151k-token KV cache is ~8x oversubscribed — without that,
@@ -818,6 +821,7 @@ def set_decode_run_defaults() -> dict[str, str]:
         os.environ.setdefault(k, v)
     Path(os.environ["GITM_TRACE_OUT"]).parent.mkdir(parents=True, exist_ok=True)
     return {k: os.environ[k] for k in defaults}
+
 
 def sync_device() -> None:
     """Block until queued GPU work completes, so all kernels land in the trace
