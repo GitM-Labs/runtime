@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+from gitm.tracer.nvtx_correlate import correlate_kernels_to_ranges
 from gitm.tracer.schema import KernelEvent, MemcpyEvent, SyncEvent, TraceEvent
 
 Endpoint = Literal["host", "device", "unified"]
@@ -71,6 +72,8 @@ def decode_kernel(d: dict) -> KernelEvent:
         block_x=int(block[0]), block_y=int(block[1]), block_z=int(block[2]),
         shared_mem_bytes=int(d.get("static_shared_mem", 0)) + int(d.get("dynamic_shared_mem", 0)),
         registers_per_thread=int(d.get("registers_per_thread", 0)),
+        range_op=d.get("range_op"),
+        range_layer=_opt_int(d.get("range_layer")),
     )
 
 
@@ -111,10 +114,24 @@ def decode_record(d: dict) -> TraceEvent | None:
 def decode_records(records: list[dict]) -> list[TraceEvent]:
     """Decode a shim record batch, dropping unmodeled kinds, sorted by start.
 
+    Kernel dicts are first run through :func:`correlate_kernels_to_ranges` so
+    ``range_op``/``range_layer`` are populated whenever the capture carries
+    NVTX range instrumentation (``runtime``/``marker`` records) — a no-op
+    today since the shim doesn't emit those kinds yet, and harmless on any
+    trace that doesn't have them (``decode_kernel`` just sees ``None``).
+    ``runtime``/``marker`` records themselves are consumed by correlation and
+    never reach ``_DECODERS`` — GITM doesn't model them as events.
+
     Sorting by ``start_ns`` gives a stable timeline regardless of the order
     CUPTI flushed buffers (concurrent kernels on multiple streams interleave).
     """
-    events = [ev for d in records if (ev := decode_record(d)) is not None]
+    enriched_kernels = iter(correlate_kernels_to_ranges(records))
+    events: list[TraceEvent] = []
+    for d in records:
+        if d.get("kind") == "kernel":
+            events.append(decode_kernel(next(enriched_kernels)))
+        elif (ev := decode_record(d)) is not None:
+            events.append(ev)
     events.sort(key=lambda e: e.start_ns)
     return events
 

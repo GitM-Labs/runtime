@@ -16,9 +16,13 @@ from gitm.planner.graph import predict_graph
 from gitm.tracer.schema import KernelEvent, Trace
 
 
-def _k(name: str, dur_s: float, t0: int = 0) -> KernelEvent:
+def _k(
+    name: str, dur_s: float, t0: int = 0,
+    range_op: str | None = None, range_layer: int | None = None,
+) -> KernelEvent:
     return KernelEvent(
-        name=name, start_ns=t0, end_ns=t0 + int(dur_s * 1e9), stream_id=0, device_id=0
+        name=name, start_ns=t0, end_ns=t0 + int(dur_s * 1e9), stream_id=0, device_id=0,
+        range_op=range_op, range_layer=range_layer,
     )
 
 
@@ -80,6 +84,39 @@ def test_summary_keys_by_the_observed_kernels_op():
     ])
     summary = deviation_summary(tr, g)
     assert summary["kept_ops"] == {"attn_score_value": 1, "<unmodeled>": 1}
+
+
+def test_range_identity_classifies_a_bare_gemm_that_name_matching_cannot():
+    """The dominant real-world gap: bare cuBLAS/cutlass GEMMs carry no
+    projection tag in their name (test_classify_op_matches_real_vllm_kernel_names
+    above), so classify_op alone always calls them unmodeled. An NVTX range
+    identity sidesteps the name entirely."""
+    g = predict_graph()
+    t_qkv = next(n.prediction.t_pred_s for n in g.nodes if n.op == "qkv_proj")
+    bare_gemm = "ampere_fp16_s16816gemm_fp16_128x128_ldg8_relu_f2f_stages_32x5_tn"
+    assert classify_op(bare_gemm) is None  # unattributable by name alone
+
+    tr = _trace([_k(bare_gemm, t_qkv * 8, range_op="qkv_proj", range_layer=1)])
+    dev = deviating_kernel_indices(tr, g)
+    assert dev.kept_indices == [0]  # correctly identified and flagged as a departure
+
+    summary = deviation_summary(tr, g)
+    assert summary["kept_ops"] == {"qkv_proj": 1}  # not "<unmodeled>"
+
+
+def test_range_identity_takes_priority_over_name_classification():
+    """Name says attention (would classify to attn_score_value); the range
+    identity says qkv_proj -- range wins, and recovers the real layer, which
+    name-based classification can never do."""
+    from gitm.optimizer.monitor import residuals
+
+    g = predict_graph()
+    t_qkv = next(n.prediction.t_pred_s for n in g.nodes if n.op == "qkv_proj")
+    tr = _trace([_k("flash_attn_kernel", t_qkv, range_op="qkv_proj", range_layer=5)])
+    res = residuals(tr, g)
+    assert len(res.per_kernel) == 1
+    assert res.per_kernel[0].op == "qkv_proj"
+    assert res.per_kernel[0].layer == 5
 
 
 def test_no_predicted_graph_keeps_everything():

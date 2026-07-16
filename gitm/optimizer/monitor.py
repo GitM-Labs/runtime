@@ -44,12 +44,14 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
 
     The old ordinal pairing matched a handful of early kernels against
     unrelated ops (orders of magnitude fewer predicted nodes than real
-    kernels), producing runaway r_kt ratios. Each kernel is now classified by
-    name (:func:`gitm.optimizer.deviation.classify_op`) against one
-    representative node per op (per-layer nodes share a prediction);
-    unmodeled kernels get no residual, and ``layer`` is always ``None``
-    (unrecoverable from name-based classification). Carries the matched op's
-    roofline ``bound`` for bottleneck classification.
+    kernels), producing runaway r_kt ratios. Each kernel is classified by its
+    NVTX-range identity when the capture has one (``range_op``/``range_layer``
+    — see :mod:`gitm.tracer.nvtx_correlate`), else by name
+    (:func:`gitm.optimizer.deviation.classify_op`) against one representative
+    node per op (per-layer nodes share a prediction); unmodeled kernels get no
+    residual. ``layer`` is the real per-kernel layer index when range-
+    identified, else ``None`` (unrecoverable from a name guess alone). Carries
+    the matched op's roofline ``bound`` for bottleneck classification.
     """
     obs = trace.kernels()
     pred = graph.nodes
@@ -60,7 +62,7 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
         by_op.setdefault(pn.op, pn)
 
     for ok in obs:
-        op = classify_op(ok.name)
+        op = ok.range_op or classify_op(ok.name)
         pn = by_op.get(op) if op is not None else None
         if pn is None:
             continue
@@ -76,7 +78,7 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
 
         res.per_kernel.append(
             KernelResidual(
-                op=pn.op, layer=None, r_kt=r_kt, r_mt=r_mt,
+                op=pn.op, layer=ok.range_layer, r_kt=r_kt, r_mt=r_mt,
                 t_obs_s=t_obs, t_pred_s=t_pred, bound=pn.prediction.bound,
             )
         )
