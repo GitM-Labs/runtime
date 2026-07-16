@@ -1,0 +1,129 @@
+{
+  "before": {
+    "kernels": 5000000,
+    "max_wall_s": 300.0,
+    "max_rss_bytes": 4294967296,
+    "all_passed": false,
+    "results": {
+      "chrome_trace_json": {
+        "format": "chrome-trace-json",
+        "kernels": 5000000,
+        "input_bytes": 839420910,
+        "generate_wall_s": 5.9,
+        "analyze_wall_s": 1100.0,
+        "peak_rss_bytes": 47546368,
+        "peak_rss_gib": 0.044,
+        "n_kernels_imported": null,
+        "passed": false,
+        "error": "killed after >1100s wall still running; brace-stream path thrashing (RSS ~46MiB). Prior 500k linear scale projected ~12GiB RSS if full materialization completes.",
+        "note": "FAIL: wall >> 300s. RSS low only because analysis never completed a full materialization."
+      },
+      "nsys_sqlite": {
+        "format": "nsys-sqlite",
+        "kernels": 5000000,
+        "analyze_wall_s": null,
+        "peak_rss_bytes": null,
+        "passed": false,
+        "error": "not reached \u2014 chrome-trace phase still running when killed"
+      }
+    },
+    "also_from_scale_study": {
+      "500k_full_materialize": {
+        "wall_s": 21.691,
+        "peak_rss_gib": 1.219
+      },
+      "projected_5m_if_materialize": {
+        "est_wall_s": 216.9,
+        "est_rss_gib": 12.19,
+        "pass_rss": false
+      }
+    }
+  },
+  "passed": true,
+  "after": {
+    "results": {
+      "chrome_trace_json": {
+        "analyze_wall_s": 94.052,
+        "peak_rss_bytes": 2012413952,
+        "peak_rss_gib": 1.874,
+        "n_workloads": 1,
+        "n_devices": 2,
+        "n_kernels_imported": 4999999,
+        "passed": true,
+        "returncode": 0,
+        "stderr_tail": "bench_5000000.json: multi-GPU kernel counts {0: 2500000, 1: 2499999}; analyzing 2 device trace(s)\n",
+        "format": "chrome-trace-json",
+        "kernels": 5000000,
+        "input_bytes": 839420910,
+        "generate_wall_s": 5.797,
+        "max_wall_s": 300.0,
+        "max_rss_bytes": 4294967296,
+        "platform": "darwin",
+        "python": "3.12.13"
+      },
+      "nsys_sqlite": {
+        "analyze_wall_s": 95.297,
+        "peak_rss_bytes": 1982808064,
+        "peak_rss_gib": 1.847,
+        "n_workloads": 1,
+        "n_devices": 2,
+        "n_kernels_imported": 5000000,
+        "passed": true,
+        "returncode": 0,
+        "stderr_tail": "bench_5000000.sqlite: multi-GPU kernel counts {0: 2500000, 1: 2500000}; analyzing 2 device trace(s)\n",
+        "format": "nsys-sqlite",
+        "kernels": 5000000,
+        "input_bytes": 222089216,
+        "generate_wall_s": 6.908,
+        "max_wall_s": 300.0,
+        "max_rss_bytes": 4294967296,
+        "platform": "darwin",
+        "python": "3.12.13"
+      }
+    },
+    "all_passed": true,
+    "kernels": 5000000,
+    "max_wall_s": 300.0,
+    "max_rss_bytes": 4294967296
+  },
+  "results": {
+    "chrome_trace_json": {
+      "analyze_wall_s": 94.052,
+      "peak_rss_bytes": 2012413952,
+      "peak_rss_gib": 1.874,
+      "n_workloads": 1,
+      "n_devices": 2,
+      "n_kernels_imported": 4999999,
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "bench_5000000.json: multi-GPU kernel counts {0: 2500000, 1: 2499999}; analyzing 2 device trace(s)\n",
+      "format": "chrome-trace-json",
+      "kernels": 5000000,
+      "input_bytes": 839420910,
+      "generate_wall_s": 5.797,
+      "max_wall_s": 300.0,
+      "max_rss_bytes": 4294967296,
+      "platform": "darwin",
+      "python": "3.12.13"
+    },
+    "nsys_sqlite": {
+      "analyze_wall_s": 95.297,
+      "peak_rss_bytes": 1982808064,
+      "peak_rss_gib": 1.847,
+      "n_workloads": 1,
+      "n_devices": 2,
+      "n_kernels_imported": 5000000,
+      "passed": true,
+      "returncode": 0,
+      "stderr_tail": "bench_5000000.sqlite: multi-GPU kernel counts {0: 2500000, 1: 2500000}; analyzing 2 device trace(s)\n",
+      "format": "nsys-sqlite",
+      "kernels": 5000000,
+      "input_bytes": 222089216,
+      "generate_wall_s": 6.908,
+      "max_wall_s": 300.0,
+      "max_rss_bytes": 4294967296,
+      "platform": "darwin",
+      "python": "3.12.13"
+    }
+  }
+}

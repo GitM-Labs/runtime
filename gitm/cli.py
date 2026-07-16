@@ -85,6 +85,57 @@ def _parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="Probe environment, GPUs, and data locations.")
 
+    analyze = sub.add_parser(
+        "analyze",
+        help="Ingest customer Nsight/PyTorch profiler dumps into a headroom report.",
+    )
+    analyze.add_argument(
+        "paths",
+        nargs="+",
+        type=Path,
+        help="Profiler files and/or directories (scanned recursively).",
+    )
+    analyze.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="Write the combined customer markdown report here.",
+    )
+    analyze.add_argument(
+        "--sku",
+        default=None,
+        help="Override GPU SKU label (else read from file metadata).",
+    )
+    analyze.add_argument(
+        "--workload-id",
+        default=None,
+        help="Override workload id (single recognized input only).",
+    )
+    analyze.add_argument(
+        "--device",
+        type=int,
+        default=None,
+        help="Optional device filter: analyze only this device index (default: all devices).",
+    )
+    analyze.add_argument(
+        "--json",
+        dest="json_out",
+        type=Path,
+        default=None,
+        help="Optional machine-readable summary JSON path.",
+    )
+    analyze.add_argument(
+        "--keep-traces",
+        type=Path,
+        default=None,
+        help="Optional directory to write intermediate gitm JSONL traces.",
+    )
+    analyze.add_argument(
+        "--strict",
+        action="store_true",
+        help="Any per-file failure aborts the run.",
+    )
+
     return p
 
 
@@ -187,6 +238,33 @@ def main(argv: list[str] | None = None) -> int:
         report = doctor()
         print(json.dumps(report, indent=2))
         return 0
+
+    if args.cmd == "analyze":
+        from gitm.importers.analyze import analyze_paths
+
+        result = analyze_paths(
+            args.paths,
+            out=args.out,
+            sku=args.sku,
+            workload_id=args.workload_id,
+            device=args.device,
+            json_out=args.json_out,
+            keep_traces=args.keep_traces,
+            strict=args.strict,
+        )
+        # Brief stdout summary for operators; full prose is in --out.
+        print(
+            json.dumps(
+                {
+                    "n_workloads": result.summary.get("n_workloads", 0),
+                    "n_failures": result.summary.get("n_failures", 0),
+                    "out": str(args.out),
+                    "json": str(args.json_out) if args.json_out else None,
+                },
+                indent=2,
+            )
+        )
+        return 0 if result.workloads else 1
 
     return 2
 

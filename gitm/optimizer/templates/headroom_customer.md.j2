@@ -1,0 +1,128 @@
+# GPU headroom assessment
+
+Diagnostic read from customer profiler exports. This is **not** a floor commitment.
+
+{% for s in sections %}
+---
+
+## {{ s.workload_id }}
+
+| | |
+|---|---|
+| **Workload** | {{ s.workload_id }} |
+| **SKU (as reported)** | {{ s.sku }} |
+| **Capture date** | {{ s.capture_date }} |
+| **Source format** | {{ s.source_format }} |
+| **Input** | `{{ s.path }}` |
+| **Devices analyzed** | {{ s.n_devices }} |
+| **Confidence** | **{{ s.confidence }}** |
+
+### Confidence & method
+
+{% if s.confidence == "trace-only" -%}
+This section is a **trace-only** diagnostic: computed from profiler timing only, without live device state or a gitm-attached capture.
+{%- else -%}
+This section uses a full capture with device state telemetry.
+{%- endif %}
+
+{% for c in s.caveats -%}
+- {{ c }}
+{% endfor %}
+
+{% if s.qualification_diagnostic -%}
+- {{ s.qualification_diagnostic }}
+{%- endif %}
+
+{% if s.multi_device -%}
+### Node summary
+
+| | |
+|---|---|
+| Node recoverable headroom (duration-weighted) | **{{ s.node_ceiling_pct }}%** of wall time |
+| Device busy-fraction skew (max − min) | {{ s.skew_pct }}% |
+
+#### Device skew
+
+| Device | Busy fraction | Wall time | Recoverable headroom |
+|---|---|---|---|
+{% for row in s.device_busy_rows -%}
+| {{ row.device_id }} | {{ row.busy_pct }}% | {{ row.wall_ms }} ms | {{ row.ceiling_pct }}% |
+{% endfor %}
+
+{% if s.has_straggler -%}
+One or more devices spend materially more time idle than the busiest device; in multi-GPU workloads this usually indicates load imbalance or synchronization waits on the slowest rank.
+{%- endif %}
+
+#### Communication
+
+{% if s.comm_inconclusive -%}
+Communication analysis was **inconclusive**: this is a multi-device trace but no kernels matched known collective name patterns. That does **not** mean the run had zero communication — only that this export's kernel names did not match the classifiers we ship.
+{%- else -%}
+| Device | Comm share of busy | Exposed comm (share of wall) |
+|---|---|---|
+{% for row in s.comm_rows -%}
+| {{ row.device_id }} | {{ row.comm_share_pct }}% | {{ row.exposed_pct }}% |
+{% endfor %}
+
+Exposed communication is collective kernel time that does **not** overlap any non-collective kernel on the same device. Exposed communication is recoverable headroom: the device is waiting on the network fabric (or peers) instead of doing independent compute.
+{%- endif %}
+
+{%- endif %}
+
+{% for d in s.devices %}
+### Device {{ d.device_id }}
+
+**Recoverable headroom: {{ d.ceiling_pct }}% of current wall time.**
+
+| | |
+|---|---|
+| Observed wall time | {{ '%.3f'|format(d.observed_ms) }} ms |
+| Predicted floor | {{ '%.3f'|format(d.predicted_floor_ms) }} ms |
+| Busy fraction | {{ '%.1f'|format(d.busy_fraction * 100) }}% |
+| Kernels in trace | {{ d.n_kernels }} |
+
+{% if d.already_optimized -%}
+> Distance to the predicted floor is small — this device looks near its timing floor under the assumptions above.
+{%- endif %}
+
+#### Gap breakdown
+
+Where the recoverable headroom sits, by class. Percentages are shares of **current wall time**.
+
+| Class | Share of wall | What this means |
+|---|---|---|
+| Idle / stall | {{ d.gap_idle_pct }}% | The GPU was not running kernels for this fraction of wall time — waiting on the host, on copies, on sync, or genuinely idle. |
+| Memory-bound | {{ d.gap_memory_pct }}%{% if d.indicative_split %} *(indicative)*{% endif %} | Of the recoverable gap, the portion associated with memory traffic pressure relative to the SKU's peak bandwidth. |
+| Compute-bound | {{ d.gap_compute_pct }}%{% if d.indicative_split %} *(indicative)*{% endif %} | Of the recoverable gap, the portion associated with arithmetic intensity rather than bandwidth. |
+
+{% if d.indicative_split -%}
+Memory vs compute shares are **indicative** on this export: the profiler file does not include hardware FLOP counters, so the split uses available bandwidth signal only (50/50 when that signal is weak).
+{%- endif %}
+
+{% endfor %}
+
+### What we'd do next
+
+A gitm-attached run confirms these reads with full telemetry (kernel events plus device state) and qualifies the workload for our guaranteed optimization floor. **Floor commitment requires a gitm-captured run, not an imported profiler file.** Import-only assessments stay diagnostic so commercial commitments track measured gains.
+
+{% if s.import_warnings -%}
+### Import notes
+
+{% for w in s.import_warnings -%}
+- {{ w }}
+{% endfor %}
+{%- endif %}
+
+{% endfor %}
+
+{% if failures -%}
+---
+
+## Appendix — files not ingested
+
+| File | Reason |
+|---|---|
+{% for f in failures -%}
+| `{{ f.path }}` | {{ f.error }} |
+{% endfor %}
+{%- endif %}

@@ -38,6 +38,14 @@ def fingerprint(trace: Trace) -> str:
     return f"{trace.vendor}:{digest}"
 
 
+_IMPORT_SOURCES = frozenset({"nsys-import", "torch-import"})
+
+_IMPORT_DIAGNOSTIC = (
+    "Imported trace: diagnostic headroom read only. Floor commitment requires "
+    "a gitm-captured run."
+)
+
+
 def qualify(trace: Trace, target_floor: float = 0.15) -> QualificationResult:
     """Decide whether to commit to ``target_floor`` for this workload.
 
@@ -45,8 +53,20 @@ def qualify(trace: Trace, target_floor: float = 0.15) -> QualificationResult:
     "already-tuned" is signaled by low residual headroom in the kernel mix.
     A richer fingerprint check is on the roadmap; this version routes the
     plumbing end-to-end.
+
+    Imported profiler traces (``nsys-import`` / ``torch-import``) never commit:
+    the 15% floor and refund clause require a gitm-captured run.
     """
     fp = fingerprint(trace)
+    source = getattr(trace, "source", "cupti") or "cupti"
+    if source in _IMPORT_SOURCES:
+        return QualificationResult(
+            commit=False,
+            floor=target_floor,
+            fingerprint=fp,
+            diagnostic=_IMPORT_DIAGNOSTIC,
+        )
+
     kernels = trace.kernels()
     if not kernels:
         return QualificationResult(

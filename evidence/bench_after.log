@@ -1,0 +1,46 @@
+generating chrome-trace 5000000 kernels → /tmp/gitm-bench-clean/bench_5000000.json
+  generated in 5.8s, 839.4 MB
+  analyzing chrome-trace ...
+{
+  "analyze_wall_s": 94.052,
+  "peak_rss_bytes": 2012413952,
+  "peak_rss_gib": 1.874,
+  "n_workloads": 1,
+  "n_devices": 2,
+  "n_kernels_imported": 4999999,
+  "passed": true,
+  "returncode": 0,
+  "stderr_tail": "bench_5000000.json: multi-GPU kernel counts {0: 2500000, 1: 2499999}; analyzing 2 device trace(s)\n",
+  "format": "chrome-trace-json",
+  "kernels": 5000000,
+  "input_bytes": 839420910,
+  "generate_wall_s": 5.797,
+  "max_wall_s": 300.0,
+  "max_rss_bytes": 4294967296,
+  "platform": "darwin",
+  "python": "3.12.13"
+}
+generating nsys sqlite 5000000 kernels → /tmp/gitm-bench-clean/bench_5000000.sqlite
+  generated in 6.9s, 222.1 MB
+  analyzing nsys sqlite ...
+{
+  "analyze_wall_s": 95.297,
+  "peak_rss_bytes": 1982808064,
+  "peak_rss_gib": 1.847,
+  "n_workloads": 1,
+  "n_devices": 2,
+  "n_kernels_imported": 5000000,
+  "passed": true,
+  "returncode": 0,
+  "stderr_tail": "bench_5000000.sqlite: multi-GPU kernel counts {0: 2500000, 1: 2500000}; analyzing 2 device trace(s)\n",
+  "format": "nsys-sqlite",
+  "kernels": 5000000,
+  "input_bytes": 222089216,
+  "generate_wall_s": 6.908,
+  "max_wall_s": 300.0,
+  "max_rss_bytes": 4294967296,
+  "platform": "darwin",
+  "python": "3.12.13"
+}
+wrote evidence/perf.json
+PASS

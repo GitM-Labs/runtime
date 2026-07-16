@@ -1,0 +1,1145 @@
+{
+  "traceEvents": [
+    {
+      "name": "process_name",
+      "ph": "M",
+      "pid": 1,
+      "args": {
+        "name": "NVIDIA A100-SXM4-40GB"
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "cutlass_gemm",
+      "ts": 1000.0,
+      "dur": 10.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1000,
+        "grid": [
+          128,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 4096,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "ampere_fp16_s16816gemm",
+      "ts": 1012.0,
+      "dur": 11.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1001,
+        "grid": [
+          129,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "vectorized_elementwise",
+      "ts": 1023.5,
+      "dur": 12.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1002,
+        "grid": [
+          130,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "flash_fwd_kernel",
+      "ts": 1036.0,
+      "dur": 13.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1003,
+        "grid": [
+          131,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 4096,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "cub_DeviceReduce",
+      "ts": 1049.5,
+      "dur": 14.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1004,
+        "grid": [
+          128,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "triton_poi_fused_add",
+      "ts": 1064.0,
+      "dur": 10.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1005,
+        "grid": [
+          129,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "cublasLt_gemm",
+      "ts": 1074.5,
+      "dur": 11.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1006,
+        "grid": [
+          130,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 4096,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "ncclAllReduce",
+      "ts": 1086.0,
+      "dur": 12.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1007,
+        "grid": [
+          131,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "cutlass_gemm",
+      "ts": 1100.0,
+      "dur": 13.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1008,
+        "grid": [
+          128,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "ampere_fp16_s16816gemm",
+      "ts": 1113.5,
+      "dur": 14.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1009,
+        "grid": [
+          129,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 4096,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "vectorized_elementwise",
+      "ts": 1128.0,
+      "dur": 10.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1010,
+        "grid": [
+          130,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "flash_fwd_kernel",
+      "ts": 1138.5,
+      "dur": 11.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1011,
+        "grid": [
+          131,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "cub_DeviceReduce",
+      "ts": 1150.0,
+      "dur": 12.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1012,
+        "grid": [
+          128,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 4096,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "triton_poi_fused_add",
+      "ts": 1162.5,
+      "dur": 13.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1013,
+        "grid": [
+          129,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "cublasLt_gemm",
+      "ts": 1176.0,
+      "dur": 14.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1014,
+        "grid": [
+          130,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "ncclAllReduce",
+      "ts": 1192.0,
+      "dur": 10.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1015,
+        "grid": [
+          131,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 4096,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "cutlass_gemm",
+      "ts": 1202.5,
+      "dur": 11.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1016,
+        "grid": [
+          128,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "ampere_fp16_s16816gemm",
+      "ts": 1214.0,
+      "dur": 12.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1017,
+        "grid": [
+          129,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "vectorized_elementwise",
+      "ts": 1226.5,
+      "dur": 13.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1018,
+        "grid": [
+          130,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 4096,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "flash_fwd_kernel",
+      "ts": 1240.0,
+      "dur": 14.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1019,
+        "grid": [
+          131,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "cub_DeviceReduce",
+      "ts": 1254.5,
+      "dur": 10.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1020,
+        "grid": [
+          128,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "triton_poi_fused_add",
+      "ts": 1265.0,
+      "dur": 11.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1021,
+        "grid": [
+          129,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 4096,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "cublasLt_gemm",
+      "ts": 1278.0,
+      "dur": 12.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1022,
+        "grid": [
+          130,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "ncclAllReduce",
+      "ts": 1290.5,
+      "dur": 13.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1023,
+        "grid": [
+          131,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "cutlass_gemm",
+      "ts": 1304.0,
+      "dur": 14.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1024,
+        "grid": [
+          128,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 4096,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "ampere_fp16_s16816gemm",
+      "ts": 1318.5,
+      "dur": 10.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1025,
+        "grid": [
+          129,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "vectorized_elementwise",
+      "ts": 1329.0,
+      "dur": 11.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1026,
+        "grid": [
+          130,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "flash_fwd_kernel",
+      "ts": 1340.5,
+      "dur": 12.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1027,
+        "grid": [
+          131,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 4096,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "cub_DeviceReduce",
+      "ts": 1353.0,
+      "dur": 13.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1028,
+        "grid": [
+          128,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "triton_poi_fused_add",
+      "ts": 1368.0,
+      "dur": 14.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1029,
+        "grid": [
+          129,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "cublasLt_gemm",
+      "ts": 1382.5,
+      "dur": 10.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1030,
+        "grid": [
+          130,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 4096,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "ncclAllReduce",
+      "ts": 1393.0,
+      "dur": 11.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1031,
+        "grid": [
+          131,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "cutlass_gemm",
+      "ts": 1404.5,
+      "dur": 12.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1032,
+        "grid": [
+          128,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "ampere_fp16_s16816gemm",
+      "ts": 1417.0,
+      "dur": 13.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1033,
+        "grid": [
+          129,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 4096,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "vectorized_elementwise",
+      "ts": 1430.5,
+      "dur": 14.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1034,
+        "grid": [
+          130,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "flash_fwd_kernel",
+      "ts": 1445.0,
+      "dur": 10.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1035,
+        "grid": [
+          131,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "cub_DeviceReduce",
+      "ts": 1457.0,
+      "dur": 11.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1036,
+        "grid": [
+          128,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 4096,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "triton_poi_fused_add",
+      "ts": 1468.5,
+      "dur": 12.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1037,
+        "grid": [
+          129,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "cublasLt_gemm",
+      "ts": 1481.0,
+      "dur": 13.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "correlation": 1038,
+        "grid": [
+          130,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 0,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "kernel",
+      "name": "ncclAllReduce",
+      "ts": 1494.5,
+      "dur": 14.0,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "stream": 1,
+        "device": 0,
+        "correlation": 1039,
+        "grid": [
+          131,
+          1,
+          1
+        ],
+        "block": [
+          64,
+          1,
+          1
+        ],
+        "shared memory": 4096,
+        "registers per thread": 32
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "gpu_memcpy",
+      "name": "Memcpy HtoD",
+      "ts": 1050.0,
+      "dur": 5.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "bytes": 1000000
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "gpu_memcpy",
+      "name": "Memcpy DtoH",
+      "ts": 1060.0,
+      "dur": 2.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "bytes": 500000
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "gpu_memcpy",
+      "name": "Memcpy DtoD",
+      "ts": 1070.0,
+      "dur": 1.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "bytes": 256000
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "gpu_memcpy",
+      "name": "Memcpy HtoD",
+      "ts": 1080.0,
+      "dur": 1.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "bytes": 128000
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "gpu_memcpy",
+      "name": "Memcpy HtoD",
+      "ts": 1090.0,
+      "dur": 2.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "stream": 0,
+        "device": 0,
+        "bytes": 64000
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "gpu_memset",
+      "name": "Memset",
+      "ts": 2000.0,
+      "dur": 1.0,
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "device": 0
+      }
+    },
+    {
+      "ph": "X",
+      "cat": "cpu_op",
+      "name": "aten::add",
+      "ts": 0.0,
+      "dur": 100.0,
+      "pid": 0,
+      "tid": 0,
+      "args": {}
+    }
+  ],
+  "displayTimeUnit": "ms"
+}
