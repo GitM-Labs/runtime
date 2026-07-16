@@ -19,6 +19,7 @@ writes a well-formed empty trace — useful for plumbing tests.
 """
 
 from __future__ import annotations
+
 import json
 import time
 import uuid
