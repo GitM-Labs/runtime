@@ -147,9 +147,15 @@ def vllm_cuda_major() -> int | None:
 
     pkg = Path(vllm.__file__).resolve().parent
     majors: set[int] = set()
-    for so in pkg.glob("*.so"):
+    # rglob, not glob: vLLM's extensions live in subpackages (vllm/_C*.so,
+    # vllm/vllm_flash_attn/*.so), so a top-level-only scan misses them and the
+    # whole vLLM check silently no-ops. readelf (-d) reads the dynamic section
+    # without executing the .so, unlike ldd.
+    for so in pkg.rglob("*.so"):
         try:
-            out = subprocess.check_output(["ldd", str(so)], text=True, stderr=subprocess.DEVNULL)
+            out = subprocess.check_output(
+                ["readelf", "-d", str(so)], text=True, stderr=subprocess.DEVNULL
+            )
         except Exception:
             continue
         majors.update(int(m) for m in re.findall(r"libcudart\.so\.(\d+)", out))
