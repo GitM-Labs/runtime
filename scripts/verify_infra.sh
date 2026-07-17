@@ -35,7 +35,7 @@ check "intervention library validates" "$PY -c 'from gitm.kernels import load_li
 check "wheel build + data files"        "$PY -m build --wheel >/dev/null 2>&1 && $PY - <<'EOF'
 import zipfile, glob
 n = zipfile.ZipFile(sorted(glob.glob('dist/*.whl'))[-1]).namelist()
-for f in ['gitm/bench/templates/results.md.j2','gitm/tracer/_cupti/cupti_shim.c','gitm/kernels/library.yaml']:
+for f in ['gitm/bench/templates/results.md.j2','gitm/tracer/_cupti/cupti_shim.c','gitm/tracer/_cupti/cupti_core.c','gitm/tracer/_cupti/cupti_core.h','gitm/tracer/_cupti/cupti_inject.c','gitm/kernels/library.yaml']:
     assert f in n, f
 EOF"
 rm -rf dist build gitm.egg-info 2>/dev/null
@@ -59,9 +59,18 @@ typedef void (*CUpti_BuffersCallbackCompleteFunc)(CUcontext,uint32_t,uint8_t*,si
 CUptiResult cuptiActivityRegisterCallbacks(CUpti_BuffersCallbackRequestFunc,CUpti_BuffersCallbackCompleteFunc);
 CUptiResult cuptiActivityEnable(CUpti_ActivityKind); CUptiResult cuptiActivityDisable(CUpti_ActivityKind);
 CUptiResult cuptiActivityFlushAll(uint32_t); CUptiResult cuptiActivityGetNextRecord(uint8_t*,size_t,CUpti_Activity**);
+CUptiResult cuptiActivityFlushPeriod(uint32_t);
+CUptiResult cuptiGetTimestamp(uint64_t*);
 CUptiResult cuptiGetResultString(CUptiResult,const char**);
 EOF
-  check "CUPTI shim compiles (stub headers)" "clang -fsyntax-only -I'$STUB' -I'$PYINC' gitm/tracer/_cupti/cupti_shim.c"
+  CI="-I'$STUB' -Igitm/tracer/_cupti"
+  check "CUPTI core compiles (stub headers)" "clang -fsyntax-only -Wall -Wextra $CI gitm/tracer/_cupti/cupti_core.c"
+  check "CUPTI shim compiles (stub headers)" "clang -fsyntax-only -Wall -Wextra $CI -I'$PYINC' gitm/tracer/_cupti/cupti_shim.c"
+  # The injection lib must never pull in libpython: the CUDA driver dlopens it into
+  # arbitrary processes at CUDA init. Compiling it with NO Python include path is
+  # the check — if someone adds #include <Python.h>, this fails.
+  check "CUPTI injection lib compiles without libpython" \
+    "clang -fsyntax-only -Wall -Wextra $CI gitm/tracer/_cupti/cupti_inject.c"
   rm -rf "$STUB"
 fi
 

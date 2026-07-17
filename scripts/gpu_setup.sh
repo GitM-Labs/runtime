@@ -45,12 +45,47 @@ echo "==> GPU compute libs (RAPIDS cuDF + CuPy, CUDA 12)"
 pip install -q --extra-index-url=https://pypi.nvidia.com cudf-cu12 cupy-cuda12x \
   || echo "WARN: cuDF/CuPy install failed — HFT harness will fall back to pandas"
 
-echo "==> build CUPTI tracer shim (toolkit or wheels, whichever is present)"
+echo "==> vLLM stack pinned to this host's driver"
+# A pod's NVIDIA driver belongs to the HOST, and RunPod reschedules pods across
+# hosts: the same pod has come up with a CUDA 13 driver one hour and CUDA 12.8 the
+# next. Left alone, `pip install vllm` resolves whatever it likes (today: torch
+# 2.11.0+cu130) and the mismatch only surfaces ~90s into a run, after the weight
+# download, inside torch._C._cuda_init(). So: read the driver, install the exact
+# (torch, vLLM) pair pinned for it in gitm/cuda_env.py, and refuse the host outright
+# if no pinned stack can run there. Never resolve, never guess.
+if PLAN=$(python -m gitm.cuda_env --plan) && [ -n "$PLAN" ]; then
+  echo "$PLAN" | while IFS= read -r cmd; do
+    echo "    + $cmd"
+    eval "$cmd" -q || echo "WARN: failed: $cmd"
+  done
+  pip install -q nvidia-cuda-nvrtc || true
+  python -m gitm.cuda_env || echo "WARN: stack still mismatched — see above"
+else
+  python -m gitm.cuda_env || true   # prints the unsupported-host diagnosis + fix
+  echo "WARN: no pinned vLLM stack for this driver — vllm-decode will refuse to run."
+  echo "      Everything else (hft/edge/biotech, the tracer) still works."
+fi
+
+echo "==> build CUPTI tracer targets (in-process shim + injection lib)"
 # Explicit build so a missing toolchain fails here, not on first run. (gitm also
 # auto-builds the shim on first capture, so this step is belt-and-suspenders.)
 python -m gitm.tracer._cupti.build
+
+INJECT_LIB="$(python -c 'from gitm.tracer.injection import lib_path; print(lib_path())' 2>/dev/null || true)"
 
 echo "==> done."
 echo "    Smoke check : ./scripts/verify_infra.sh"
 echo "    Real run    : gitm run --workload hft-lob   # auto-stages a smoke dataset"
 echo "    Full driver : gitm-run-workload --workload hft --seed 42 --stage \$GITM_BENCH_STAGE"
+echo
+echo "    Tracing vLLM (or anything that runs CUDA in a CHILD process):"
+echo "    the in-process shim cannot see those kernels — vLLM V1 runs the model in a"
+echo "    separate EngineCore process — so let the CUDA driver inject the collector:"
+echo
+echo "      export CUDA_INJECTION64_PATH=$INJECT_LIB"
+echo "      export GITM_TRACE_OUT=\$GITM_SCRATCH/traces/vllm.jsonl"
+echo
+echo "    Both must be exported BEFORE the engine is built (the driver reads them at"
+echo "    CUDA init). Do NOT set VLLM_ENABLE_V1_MULTIPROCESSING=0 to work around this:"
+echo "    it folds EngineCore back onto the frontend's GIL and injects idle gaps into"
+echo "    the very stall/idle signal the trace is measuring."
