@@ -47,7 +47,7 @@ from gitm.optimizer.vllm_knobs import (
     knob_kind,
     unmet_prerequisite,
 )
-from gitm.planner.context import build_planner_context
+from gitm.planner.context import build_planner_context, hardware_spec_for
 from gitm.planner.graph import predict_graph
 from gitm.safety.audit import AuditLog, _write_report
 from gitm.tracer.capture import capture
@@ -425,10 +425,22 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # not the Llama-2-7B default — otherwise residuals/deviation score the real
     # kernels against the wrong graph. Falls back to the default graph when there
     # is no engine or its config can't be read (CPU boxes, tests, dry-run).
+    #
+    # Same for hardware: predict_graph's own default is A100-SXM4-80GB peaks,
+    # which silently over-predicts on anything weaker (T4/L4/...) and
+    # produces a run-level kernel-time residual that saturates the report's
+    # +/-100% clamp on every claim. pctx is built here (moved up from Phase 3)
+    # so its NVML-detected SKU peak feeds the graph before residuals are ever
+    # computed against it.
+    pctx = build_planner_context(cfg.engine, workload=workload)
     _spec = _model_spec_from_engine(cfg.engine)
-    graph = predict_graph(model=_spec) if _spec is not None else predict_graph()
+    _hw = hardware_spec_for(pctx.peak)
+    graph = predict_graph(model=_spec, hw=_hw) if _spec is not None else predict_graph(hw=_hw)
     (run_dir / "predicted_graph.json").write_text(
-        json.dumps({"nodes": len(graph.nodes), "total_pred_s": graph.total_pred_s}, indent=2)
+        json.dumps(
+            {"nodes": len(graph.nodes), "total_pred_s": graph.total_pred_s, "hardware": _hw.name},
+            indent=2,
+        )
     )
 
     # Phase 2 — residuals + attribution
@@ -492,7 +504,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         write_deviation_jsonl(deviation_trace(trace, graph), run_dir / "deviation_trace.jsonl")
 
     # Phase 3 — library + counterfactual replay ranking
-    pctx = build_planner_context(cfg.engine, workload = workload)
+    # pctx was built earlier (Phase 1) so its hardware peak could feed predict_graph.
     # Relative/swept levers resolve against the live engine here, once, before
     # ranking. See expand_relative_candidates.
     library = [

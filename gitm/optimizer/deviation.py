@@ -140,7 +140,7 @@ def deviating_kernel_indices(
 
     kept: list[int] = []
     for i, ok in enumerate(obs):
-        op = classify_op(ok.name)
+        op = ok.range_op or classify_op(ok.name)
         pn = by_op.get(op) if op is not None else None
         if pn is None:
             kept.append(i)  # unmodeled op → keep as a departure
@@ -172,15 +172,17 @@ def deviation_summary(
 ) -> dict:
     """Compact summary of the deviation filter — for the run dir / report.
 
-    ``kept_ops`` counts departures per *classified* op (the observed kernel's own
-    op, via :func:`classify_op`), so the report says which ops actually departed —
-    ``<unmodeled>`` for kernels that map to no predicted op.
+    ``kept_ops`` counts departures per op — the kernel's NVTX-range identity
+    when the capture has it, else its :func:`classify_op` name guess — so the
+    report says which ops actually departed. ``<unmodeled>`` for kernels that
+    map to no predicted op either way.
     """
     obs = trace.kernels()
     dev = deviating_kernel_indices(trace, graph, invariants)
     kept_ops: dict[str, int] = {}
     for i in dev.kept_indices:
-        op = classify_op(obs[i].name) or "<unmodeled>"
+        ok = obs[i]
+        op = ok.range_op or classify_op(ok.name) or "<unmodeled>"
         kept_ops[op] = kept_ops.get(op, 0) + 1
     return {
         "n_observed": dev.n_observed,

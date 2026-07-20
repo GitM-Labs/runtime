@@ -35,6 +35,12 @@ class KernelEvent(_TraceEventBase):
     registers_per_thread: int = 0
     bytes_read: int | None = None  # filled by attribution layer when available
     bytes_written: int | None = None
+    # Exact op/layer identity recovered from an enclosing NVTX range (see
+    # gitm.tracer.nvtx_correlate), when the capture had range instrumentation.
+    # None means no range was found — callers fall back to name-based
+    # classify_op(). Never guessed or backfilled; only set by correlation.
+    range_op: str | None = None
+    range_layer: int | None = None
 
 
 class MemcpyEvent(_TraceEventBase):

@@ -19,9 +19,13 @@ from typing import Any
 
 from gitm.optimizer.metrics import HardwarePeak
 from gitm.optimizer.preconditions import GateContext
+from gitm.planner.roofline import HardwareSpec
 
 # Dense fp16/bf16 tensor-core peaks (FLOP/s) and HBM bandwidth (bytes/s) by SKU
-# substring. Conservative vendor figures; used for HFU/MFU/MBU denominators.
+# substring. Conservative vendor figures; used for HFU/MFU/MBU denominators
+# (below) and, via :func:`hardware_spec_for`, for the roofline prediction
+# itself. "L40" must stay ordered before "L4" (see peak_for_sku) since "l4" is
+# a substring of "l40" and the first substring match wins.
 _PEAKS: dict[str, tuple[float, float]] = {
     "H100": (989e12, 3350e9),
     "H200": (989e12, 4800e9),
@@ -29,6 +33,7 @@ _PEAKS: dict[str, tuple[float, float]] = {
     "A100": (312e12, 1555e9),  # PCIe / 40GB fallback
     "L40": (181e12, 864e9),
     "L4": (121e12, 300e9),
+    "T4": (65e12, 320e9),  # the common free-tier Colab GPU
     "V100": (125e12, 900e9),
 }
 
@@ -77,6 +82,26 @@ def peak_for_sku(sku: str | None) -> HardwarePeak | None:
         if key.lower() in sku.lower():
             return HardwarePeak(name=sku, peak_flops=flops, peak_bw_bytes_s=bw)
     return None
+
+
+def hardware_spec_for(peak: HardwarePeak | None) -> HardwareSpec:
+    """Roofline :class:`HardwareSpec` for the detected GPU peak.
+
+    Falls back to ``HardwareSpec()`` (A100-SXM4-80GB) when the SKU wasn't
+    recognized (unknown NVML name, ``GITM_GPU_SKU`` unset, no GPU) — the same
+    default ``predict_graph`` silently used everywhere before this existed.
+    ``peak_flops`` covers fp16/bf16 (the only dtypes the decode graph
+    predicts); fp32 peak isn't in the catalogue and stays at the dataclass
+    default since nothing currently predicts fp32 kernels.
+    """
+    if peak is None:
+        return HardwareSpec()
+    return HardwareSpec(
+        name=peak.name,
+        peak_flops_fp16_per_s=peak.peak_flops,
+        peak_flops_bf16_per_s=peak.peak_flops,
+        peak_mem_bw_bytes_per_s=peak.peak_bw_bytes_s,
+    )
 
 
 def _engine_dtype(engine: Any) -> str | None:

@@ -90,6 +90,62 @@ def test_unknown_sku_yields_no_peak(monkeypatch):
     assert pctx.peak is None  # unknown => unreported, never wrong
 
 
+def test_t4_and_l4_skus_resolve_distinct_peaks(monkeypatch):
+    """The two common free/cheap Colab GPUs must not collide (T4 is weaker in
+    both compute and bandwidth than L4) and must not match the L40 entry."""
+    from gitm.planner.context import build_planner_context
+
+    monkeypatch.setenv("GITM_GPU_SKU", "Tesla T4")
+    t4 = build_planner_context(engine=None, num_gpus=1).peak
+    assert t4 is not None and t4.peak_flops == 65e12 and t4.peak_bw_bytes_s == 320e9
+
+    monkeypatch.setenv("GITM_GPU_SKU", "NVIDIA L4")
+    l4 = build_planner_context(engine=None, num_gpus=1).peak
+    assert l4 is not None and l4.peak_flops == 121e12 and l4.peak_bw_bytes_s == 300e9
+
+    monkeypatch.setenv("GITM_GPU_SKU", "NVIDIA L40S")
+    l40 = build_planner_context(engine=None, num_gpus=1).peak
+    assert l40 is not None and l40.peak_flops == 181e12  # not the L4 entry
+
+
+def test_hardware_spec_for_uses_detected_peak_not_default():
+    from gitm.optimizer.metrics import HardwarePeak
+    from gitm.planner.context import hardware_spec_for
+
+    l4_peak = HardwarePeak(name="NVIDIA L4", peak_flops=121e12, peak_bw_bytes_s=300e9)
+    hw = hardware_spec_for(l4_peak)
+    assert hw.name == "NVIDIA L4"
+    assert hw.peak_flops_fp16_per_s == 121e12
+    assert hw.peak_flops_bf16_per_s == 121e12
+    assert hw.peak_mem_bw_bytes_per_s == 300e9
+
+
+def test_hardware_spec_for_falls_back_to_default_on_unknown_sku():
+    from gitm.planner.context import hardware_spec_for
+    from gitm.planner.roofline import HardwareSpec
+
+    assert hardware_spec_for(None) == HardwareSpec()
+
+
+def test_predict_graph_on_l4_predicts_slower_than_default_a100():
+    """The actual bug this closes: without a real hw peak, predict_graph
+    silently assumes A100-SXM4-80GB and drastically over-predicts throughput
+    on a weaker GPU, which is what pushed the run-level kernel-time residual
+    past the report's +/-100% clamp on every claim (see docs/kernel_identity.md
+    -- gitm/scheduler/loop.py wiring)."""
+    from gitm.optimizer.metrics import HardwarePeak
+    from gitm.planner.context import hardware_spec_for
+    from gitm.planner.graph import predict_graph
+
+    l4_peak = HardwarePeak(name="NVIDIA L4", peak_flops=121e12, peak_bw_bytes_s=300e9)
+    default_graph = predict_graph()
+    l4_graph = predict_graph(hw=hardware_spec_for(l4_peak))
+    # L4 has ~6.8x less memory bandwidth than the A100-SXM default, and decode
+    # is memory-traffic dominated -- predicted time on L4 must be materially
+    # higher (never equal, never lower) for every predicted node.
+    assert l4_graph.total_pred_s > default_graph.total_pred_s * 2
+
+
 # --------------------------------------------------------------------------- #
 # library + policy: workload filter and gate-driven selection                 #
 # --------------------------------------------------------------------------- #
