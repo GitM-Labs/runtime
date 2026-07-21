@@ -64,10 +64,17 @@ _LAUNCH_LATENCY_NS = 20_000
 
 def _merge_intervals(spans: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
     """Merge overlapping [start, end) intervals into a sorted, disjoint list."""
-    merged: list[tuple[int, int]] = []
-    for start, end in sorted(spans):
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    # Materialize once; avoid re-sorting generators that are already nearly ordered.
+    items = list(spans) if not isinstance(spans, list) else spans
+    if not items:
+        return []
+    items.sort(key=lambda x: x[0])
+    merged: list[tuple[int, int]] = [items[0]]
+    for start, end in items[1:]:
+        last_s, last_e = merged[-1]
+        if start <= last_e:
+            if end > last_e:
+                merged[-1] = (last_s, end)
         else:
             merged.append((start, end))
     return merged
@@ -111,8 +118,8 @@ def _clip_union_ns(spans: list[tuple[int, int]], lo: int, hi: int) -> int:
 
 def _classify_stalls(
     gaps: list[tuple[int, int]],
-    memcpys: list[MemcpyEvent],
-    syncs: list[SyncEvent],
+    memcpys: list,
+    syncs: list,
     wall_ns: int,
 ) -> dict[str, float]:
     """Attribute each idle gap to a stall cause, as fractions of wall time.
@@ -122,9 +129,17 @@ def _classify_stalls(
     uncovered remainder is ``launch_latency`` for short gaps (dispatch latency),
     else ``idle``. The four fractions sum to ``stall_fraction``.
     """
+    ns = {"sync_wait": 0, "transfer_bound": 0, "launch_latency": 0, "idle": 0}
+    if wall_ns <= 0:
+        return {k: 0.0 for k in ns}
+    # Fast path: no memcpy/sync overlays — just classify gaps by length.
+    if not memcpys and not syncs:
+        for g0, g1 in gaps:
+            residual = g1 - g0
+            ns["launch_latency" if residual <= _LAUNCH_LATENCY_NS else "idle"] += residual
+        return {k: v / wall_ns for k, v in ns.items()}
     cp = [(e.start_ns, e.end_ns) for e in memcpys]
     sy = [(e.start_ns, e.end_ns) for e in syncs]
-    ns = {"sync_wait": 0, "transfer_bound": 0, "launch_latency": 0, "idle": 0}
     for g0, g1 in gaps:
         transfer = _clip_union_ns(cp, g0, g1)
         transfer_or_sync = _clip_union_ns(cp + sy, g0, g1)
@@ -132,8 +147,6 @@ def _classify_stalls(
         ns["sync_wait"] += transfer_or_sync - transfer  # sync time not already a copy
         residual = (g1 - g0) - transfer_or_sync
         ns["launch_latency" if (g1 - g0) <= _LAUNCH_LATENCY_NS else "idle"] += residual
-    if wall_ns <= 0:
-        return {k: 0.0 for k in ns}
     return {k: v / wall_ns for k, v in ns.items()}
 
 
@@ -154,8 +167,8 @@ def compute_metrics(
         raise ValueError(f"recompute_fraction must be in [0, 1), got {recompute_fraction}")
 
     kernels = trace.kernels()
-    memcpys = [e for e in trace.events if isinstance(e, MemcpyEvent)]
-    syncs = [e for e in trace.events if isinstance(e, SyncEvent)]
+    memcpys = [e for e in trace.events if getattr(e, "kind", None) == "memcpy"]
+    syncs = [e for e in trace.events if getattr(e, "kind", None) == "sync"]
     wall_s = trace.duration_ns / 1e9
     busy_fraction = (_merged_busy_ns(kernels) / trace.duration_ns) if trace.duration_ns else 0.0
     gaps = _idle_gaps(kernels, trace.duration_ns)

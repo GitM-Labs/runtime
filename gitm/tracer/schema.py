@@ -75,9 +75,14 @@ class Trace(BaseModel):
     captured_at_ns: int
     duration_ns: int
     events: list[TraceEvent] = Field(default_factory=list)
+    # Provenance of the event plane. Default "cupti" preserves every existing
+    # capture/test construction; importers set nsys-import / torch-import.
+    source: Literal["cupti", "rocprof", "nsys-import", "torch-import", "none"] = "cupti"
 
     def kernels(self) -> list[KernelEvent]:
-        return [e for e in self.events if isinstance(e, KernelEvent)]
+        # Duck-type on ``kind`` so importers can store slotted lightweight
+        # events at multi-million scale without full pydantic instances.
+        return [e for e in self.events if getattr(e, "kind", None) == "kernel"]  # type: ignore[return-value]
 
     def by_stream(self) -> dict[int, list[TraceEvent]]:
         out: dict[int, list[TraceEvent]] = {}

@@ -76,6 +76,7 @@ packages = ["gitm"]
 "gitm/tracer/_cupti/cupti_shim.c" = "gitm/tracer/_cupti/cupti_shim.c"
 "gitm/tracer/_cupti/cupti_inject.c" = "gitm/tracer/_cupti/cupti_inject.c"
 "gitm/kernels/library.yaml" = "gitm/kernels/library.yaml"
+"gitm/optimizer/templates/headroom_customer.md.j2" = "gitm/optimizer/templates/headroom_customer.md.j2"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

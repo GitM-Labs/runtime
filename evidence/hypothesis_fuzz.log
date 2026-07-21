@@ -1,0 +1,32 @@
+........................................................................ [ 96%]
+...                                                                      [100%]
+=============================== warnings summary ===============================
+tests/test_importers_hypothesis.py::test_prop_normalize_nonneg_and_ordered
+  /Users/jalon/runtime-analyze/tests/test_importers_hypothesis.py:112: UserWarning: dropped 2 event(s) with end < start (66.7% of unique) — >1% dropped
+    cleaned, _deduped, _dropped = normalize_and_clean(events, strict=False)
+
+tests/test_importers_hypothesis.py::test_prop_normalize_nonneg_and_ordered
+  /Users/jalon/runtime-analyze/tests/test_importers_hypothesis.py:112: UserWarning: dropped 1 event(s) with end < start (12.5% of unique) — >1% dropped
+    cleaned, _deduped, _dropped = normalize_and_clean(events, strict=False)
+
+tests/test_importers_hypothesis.py::test_prop_normalize_nonneg_and_ordered
+  /Users/jalon/runtime-analyze/tests/test_importers_hypothesis.py:112: UserWarning: dropped 1 event(s) with end < start (10.0% of unique) — >1% dropped
+    cleaned, _deduped, _dropped = normalize_and_clean(events, strict=False)
+
+tests/test_importers_hypothesis.py::test_prop_normalize_nonneg_and_ordered
+  /Users/jalon/runtime-analyze/tests/test_importers_hypothesis.py:112: UserWarning: dropped 1 event(s) with end < start (6.7% of unique) — >1% dropped
+    cleaned, _deduped, _dropped = normalize_and_clean(events, strict=False)
+
+tests/test_importers_hypothesis.py::test_prop_normalize_nonneg_and_ordered
+  /Users/jalon/runtime-analyze/tests/test_importers_hypothesis.py:112: UserWarning: dropped 2 event(s) with end < start (40.0% of unique) — >1% dropped
+    cleaned, _deduped, _dropped = normalize_and_clean(events, strict=False)
+
+tests/test_importers_hypothesis.py::test_prop_normalize_nonneg_and_ordered
+  /Users/jalon/runtime-analyze/tests/test_importers_hypothesis.py:112: UserWarning: dropped 1 event(s) with end < start (100.0% of unique) — >1% dropped
+    cleaned, _deduped, _dropped = normalize_and_clean(events, strict=False)
+
+tests/test_importers_hypothesis.py::test_prop_normalize_nonneg_and_ordered
+  /Users/jalon/runtime-analyze/tests/test_importers_hypothesis.py:112: UserWarning: dropped 1 event(s) with end < start (33.3% of unique) — >1% dropped
+    cleaned, _deduped, _dropped = normalize_and_clean(events, strict=False)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html

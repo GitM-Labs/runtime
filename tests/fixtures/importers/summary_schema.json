@@ -1,0 +1,19 @@
+{
+  "required": ["workloads", "failures", "n_workloads", "n_failures"],
+  "workload_required": [
+    "workload_id",
+    "path",
+    "source_format",
+    "sku",
+    "ceiling_distance",
+    "gap_by_stall_class",
+    "confidence",
+    "caveats",
+    "commit",
+    "qualification_diagnostic",
+    "observed_s",
+    "predicted_floor_s",
+    "busy_fraction",
+    "mbu"
+  ]
+}

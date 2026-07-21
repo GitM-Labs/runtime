@@ -17,9 +17,30 @@ metrics → one report-ready object.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from typing import Literal
 
 from gitm.optimizer.metrics import MetricsResult
 from gitm.tracer.schema import Trace
+
+# Sources whose event plane lacks NVML state and per-kernel DRAM counters.
+_IMPORT_SOURCES = frozenset({"nsys-import", "torch-import"})
+
+_CAVEAT_MBU = (
+    "MBU computed from memcpy traffic only; per-kernel DRAM counters are not "
+    "present in profiler exports."
+)
+_CAVEAT_NO_STATE = (
+    "No device state plane (power, clocks, throttling); throttle-induced stalls "
+    "appear as idle."
+)
+_CAVEAT_CATALOGUE = (
+    "Predicted floor uses catalogue peak rates for the reported SKU; unvalidated "
+    "against live telemetry."
+)
+_CAVEAT_TORCH_SYNC = (
+    "Sync events absent from this trace format; sync-wait vs launch-latency "
+    "attribution is coarse."
+)
 
 
 @dataclass
@@ -34,9 +55,20 @@ class HeadroomReport:
     busy_fraction: float = 0.0
     mbu: float = 0.0
     hfu: float | None = None
+    confidence: Literal["full", "trace-only"] = "full"
+    caveats: list[str] = field(default_factory=list)
+    # When True, memory/compute split is indicative (HFU unavailable / import path).
+    indicative_mem_compute_split: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def _import_caveats(source: str) -> list[str]:
+    caveats = [_CAVEAT_MBU, _CAVEAT_NO_STATE, _CAVEAT_CATALOGUE]
+    if source == "torch-import":
+        caveats.append(_CAVEAT_TORCH_SYNC)
+    return caveats
 
 
 def build_headroom(
@@ -62,6 +94,7 @@ def build_headroom(
     idle = metrics.stall_fraction
     hfu = metrics.hfu or 0.0
     denom = metrics.mbu + hfu
+    # Stall split with HFU=None keeps the existing 50/50 fallback.
     mem_share = (metrics.mbu / denom) if denom > 0 else 0.5
     busy = max(0.0, 1.0 - idle)
     shares = {
@@ -70,6 +103,16 @@ def build_headroom(
         "compute_bound": busy * (1.0 - mem_share),
     }
     gap = {k: round(v * ceiling_distance, 4) for k, v in shares.items()}
+
+    source = getattr(trace, "source", "cupti") or "cupti"
+    if source in _IMPORT_SOURCES:
+        confidence: Literal["full", "trace-only"] = "trace-only"
+        caveats = _import_caveats(source)
+        indicative = True  # HFU typically None; mem/compute split is indicative
+    else:
+        confidence = "full"
+        caveats = []
+        indicative = metrics.hfu is None
 
     return HeadroomReport(
         workload=workload,
@@ -82,6 +125,9 @@ def build_headroom(
         busy_fraction=round(metrics.busy_fraction, 4),
         mbu=round(metrics.mbu, 4),
         hfu=round(metrics.hfu, 4) if metrics.hfu is not None else None,
+        confidence=confidence,
+        caveats=caveats,
+        indicative_mem_compute_split=indicative,
     )
 
 

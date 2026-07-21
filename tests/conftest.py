@@ -100,6 +100,7 @@ def make_trace(
     vendor: str = "nvidia",
     captured_at_ns: int = 0,
     duration_ns: int = 1000,
+    source: str = "cupti",
 ) -> Trace:
     return Trace(
         workload_id=workload_id,
@@ -110,4 +111,5 @@ def make_trace(
         captured_at_ns=captured_at_ns,
         duration_ns=duration_ns,
         events=events or [],
+        source=source,  # type: ignore[arg-type]
     )
