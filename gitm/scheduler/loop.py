@@ -35,6 +35,7 @@ from gitm.optimizer.apply import (
     apply_intervention,
 )
 from gitm.optimizer.attribution import attribute
+from gitm.optimizer.collective_signal import collective_causes, worst_device_comm
 from gitm.optimizer.deviation import deviation_summary, deviation_trace, write_deviation_jsonl
 from gitm.optimizer.dr import attribute_dr
 from gitm.optimizer.measure import measure_trace, measurement_claims, measurement_summary
@@ -42,6 +43,11 @@ from gitm.optimizer.monitor import check_invariants, residuals
 from gitm.optimizer.qualification import qualify
 from gitm.optimizer.report import Claim, build_provenance, write_report
 from gitm.optimizer.scheduler_attribution import scheduler_causes
+from gitm.optimizer.verification_export import (
+    VerificationRecord,
+    build_record,
+    write_verification,
+)
 from gitm.optimizer.vllm_knobs import (
     expand_relative_candidates,
     knob_kind,
@@ -51,7 +57,7 @@ from gitm.planner.context import build_planner_context, hardware_spec_for
 from gitm.planner.graph import predict_graph
 from gitm.safety.audit import AuditLog, _write_report
 from gitm.tracer.capture import capture
-from gitm.tracer.vllm_stats import sample_scheduler_stats
+from gitm.tracer.vllm_stats import sample_scheduler_stats, summarize_requests
 from gitm.workloads import WorkloadRunner, get_factory, sync_device
 
 _BUDGET_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd])\s*$")
@@ -297,13 +303,14 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # Sample the engine scheduler (queue depth, batch occupancy, preemptions)
     # over the same window as the CUPTI capture — engine-level telemetry the GPU
     # trace can't see. A no-op when no engine is attached (empty series).
+    run_out: Any = None
     with (
         capture(trace_path, workload_id=workload, run_id=run_id) as trace,
         sample_scheduler_stats(cfg.engine) as sched_stats,
     ):
         if runner is not None:
             try:
-                runner()
+                run_out = runner()
                 sync_device()  # ensure all kernels land in the trace before stop
             except Exception as exc:
                 runner_error = f"workload run failed: {exc}"
@@ -313,10 +320,23 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # evidence below) — empty when no engine produced samples.
     sched_summary = sched_stats.summary()
     sched_causes = scheduler_causes(sched_summary)
-    if sched_stats.samples:
+    # Per-request serving latency, when the runner reported request records
+    # (vllm-decode does; synthetic runners don't). Same window as the scheduler
+    # series and the trace — joined via SchedulerStatsSummary.t0_wall_ns.
+    req_records = list(run_out.get("requests") or []) if isinstance(run_out, dict) else []
+    serving_summary = summarize_requests(req_records) if req_records else None
+    # Collective-communication causes from the same trace — ranked beside the
+    # scheduler causes below. Empty when the trace holds no collective kernels.
+    coll_causes = collective_causes(worst_device_comm(trace))
+    if sched_stats.samples or serving_summary is not None:
         (run_dir / "scheduler_stats.json").write_text(
             json.dumps(
-                {"summary": asdict(sched_summary), "samples": sched_stats.to_records()},
+                {
+                    "summary": asdict(sched_summary),
+                    "samples": sched_stats.to_records(),
+                    "serving": asdict(serving_summary) if serving_summary else None,
+                    "requests": [asdict(r) for r in req_records],
+                },
                 indent=2,
             )
         )
@@ -486,6 +506,14 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                      "note": c.note, "motivates_knobs": c.motivates_knobs}
                     for c in sched_causes
                 ],
+                # Collective (NCCL) causes — communication time the kernel-time
+                # residuals can't distinguish from compute. Empty on single-GPU
+                # runs and on any trace with no collective kernels.
+                "collective_causes": [
+                    {"signal": c.signal, "effect": c.effect, "severity": c.severity,
+                     "note": c.note, "motivates_knobs": c.motivates_knobs}
+                    for c in coll_causes
+                ],
             },
             indent=2,
         )
@@ -556,6 +584,10 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     claims: list[Claim] = []
     rolled_back: list[str] = []
     rejected: list[str] = []
+    # Customer-verification records: the full A/B behind each claim, captured as
+    # it happens. EngineABResult lives on applicator.last_result and is
+    # overwritten by the next candidate, so it has to be taken per-iteration.
+    verification: list[VerificationRecord] = []
     # Aggregate kernel-time residual for the report (was hardcoded 0.0). Same for
     # every claim in a run — it describes the run's gap vs the predicted graph.
     kt_residual = _agg_kt_residual(res)
@@ -570,10 +602,29 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         if cfg.engine is not None and live_restart_fn is None and knob_kind(c.spec.knob) == "structural":
             rejected.append(f"{c.spec.name} (structural knob: needs engine restart, no restart_fn)")
             continue
+        # Snapshot the engine config BEFORE the apply: a hot-swap mutates these
+        # kwargs in place and a restart replaces the engine outright, so reading
+        # them afterwards would report the candidate on both sides of the diff.
+        baseline_cfg = dict(getattr(cfg.engine, "gitm_llm_kwargs", None) or {})
         result = apply_intervention(c.spec, applicator, min_keep_delta=0.0)
         ab = getattr(applicator, "last_result", None)
         if result.rolled_back:
             rolled_back.append(c.spec.name)
+        if ab is not None:
+            # Read the candidate config off whichever engine the applicator is
+            # holding now — for a restart A/B that is the rebuilt engine, not
+            # the original. Falls back to the knob delta over the baseline.
+            live_engine = getattr(applicator, "engine", cfg.engine)
+            candidate_cfg = dict(getattr(live_engine, "gitm_llm_kwargs", None) or {})
+            if not candidate_cfg and baseline_cfg:
+                candidate_cfg = {**baseline_cfg, **(c.spec.knobs or {c.spec.knob: c.spec.value})}
+            verification.append(
+                build_record(
+                    c.spec, ab, result,
+                    baseline_config=baseline_cfg,
+                    candidate_config=candidate_cfg,
+                )
+            )
         # Causal evidence: the measured A/B verdict when live, else the Granger
         # signal that motivated the candidate. The kept/rolled-back wording comes
         # from the authoritative ApplyResult (the real gate decision), not from
@@ -709,6 +760,14 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     )
     provenance.rejected_candidates = rejected
     provenance.rolled_back = rolled_back
+
+    # Customer-verification export: the A/B numbers the markdown report states as
+    # a percentage, emitted as structured data with the config each side ran
+    # under. Written only when a live A/B actually produced results.
+    if verification:
+        write_verification(
+            verification, provenance, run_dir / "verification.json", gpu_sku=pctx.sku
+        )
 
     sched_note = _scheduler_note(sched_summary)
     report_md = write_report(
