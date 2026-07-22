@@ -61,6 +61,184 @@ class SchedulerStatsSummary:
     total_preemptions: int | None  # delta of cumulative counter over the window
     peak_gpu_cache_usage: float | None
     peak_swapped: int | None
+    # Wall clock (``time.time_ns``) at sampling start. Samples carry ``t_ns``
+    # relative to that instant, so ``t0_wall_ns + sample.t_ns`` puts the scheduler
+    # series on the same wall clock as vLLM's per-request timestamps and as
+    # ``Trace.captured_at_ns`` — the join across the three views. 0 when unset.
+    t0_wall_ns: int = 0
+
+
+# SLO defaults for goodput. Serving-shaped starting points, not tuned: a request
+# is "good" only if it met both. Callers override per workload.
+DEFAULT_TTFT_SLO_S = 1.0
+DEFAULT_TPOT_SLO_S = 0.05
+
+
+@dataclass
+class RequestRecord:
+    """One request's lifecycle, in wall-clock seconds as vLLM reports them.
+
+    vLLM exposes these as ``time.time()`` floats on ``RequestOutput.metrics``.
+    Any field is ``None`` when the build didn't populate it — V1 leaves
+    ``metrics`` unset on some point releases — so a missing timestamp reads as
+    "unknown" and drops out of the percentiles, never as a zero that would make
+    latency look better than it was.
+    """
+
+    arrival_wall_s: float | None = None
+    first_token_wall_s: float | None = None
+    finished_wall_s: float | None = None
+    n_output_tokens: int = 0
+
+    @property
+    def ttft_s(self) -> float | None:
+        """Time to first token — the queue+prefill wait the user actually feels."""
+        if self.arrival_wall_s is None or self.first_token_wall_s is None:
+            return None
+        return max(self.first_token_wall_s - self.arrival_wall_s, 0.0)
+
+    @property
+    def tpot_s(self) -> float | None:
+        """Mean time per output token after the first.
+
+        The first token's cost is TTFT, so the inter-token rate covers the
+        ``n - 1`` tokens that followed it. A single-token response has no
+        inter-token interval at all and yields ``None`` rather than a number
+        derived from a zero-length gap.
+        """
+        if self.first_token_wall_s is None or self.finished_wall_s is None:
+            return None
+        if self.n_output_tokens < 2:
+            return None
+        span = max(self.finished_wall_s - self.first_token_wall_s, 0.0)
+        return span / (self.n_output_tokens - 1)
+
+    def meets_slo(self, ttft_slo_s: float, tpot_slo_s: float) -> bool:
+        """True if every *measurable* latency component cleared its SLO.
+
+        TTFT must be present — without it there is no evidence the request was
+        served in time, so it cannot count toward goodput. TPOT is allowed to be
+        ``None`` (a one-token response), which must not be penalised for lacking
+        an interval it could never have had.
+        """
+        ttft = self.ttft_s
+        if ttft is None or ttft > ttft_slo_s:
+            return False
+        tpot = self.tpot_s
+        return tpot is None or tpot <= tpot_slo_s
+
+
+@dataclass
+class ServingSummary:
+    """Per-request latency + goodput over the window, the serving-side companion
+    to :class:`SchedulerStatsSummary`.
+
+    ``n_ttft`` / ``n_tpot`` report how many requests actually yielded each
+    measurement, so a percentile computed from two samples is visibly weak rather
+    than silently authoritative.
+    """
+
+    n_requests: int
+    n_ttft: int
+    n_tpot: int
+    ttft_p50_s: float | None
+    ttft_p95_s: float | None
+    ttft_p99_s: float | None
+    tpot_p50_s: float | None
+    tpot_p95_s: float | None
+    tpot_p99_s: float | None
+    n_met_slo: int
+    goodput_rps: float | None  # SLO-meeting requests per second over the window
+    window_s: float | None
+    ttft_slo_s: float
+    tpot_slo_s: float
+
+
+def _percentile(vals: list[float], q: float) -> float | None:
+    """Nearest-rank percentile of ``vals`` at quantile ``q`` (0..1).
+
+    Deliberately stdlib-only: this module is imported on the capture path and
+    stays free of numpy so a tracer-only install keeps working.
+    """
+    if not vals:
+        return None
+    ordered = sorted(vals)
+    idx = min(max(int(round(q * (len(ordered) - 1))), 0), len(ordered) - 1)
+    return ordered[idx]
+
+
+def request_records_from_outputs(outputs: Any) -> list[RequestRecord]:
+    """Build :class:`RequestRecord`s from vLLM ``RequestOutput`` objects.
+
+    Duck-typed and best-effort in the same spirit as the scheduler reads: a
+    build that exposes no ``metrics`` still yields one record per request
+    carrying the token count, which is the honest "requests ran, latency
+    unavailable" outcome rather than an empty series or an invented timestamp.
+    """
+    records: list[RequestRecord] = []
+    for o in outputs or []:
+        rec = RequestRecord()
+        outs = getattr(o, "outputs", None)
+        if outs:
+            try:
+                rec.n_output_tokens = len(outs[0].token_ids)
+            except (AttributeError, TypeError, IndexError):
+                pass
+        metrics = getattr(o, "metrics", None)
+        if metrics is not None:
+            for field_name, attr in (
+                ("arrival_wall_s", "arrival_time"),
+                ("first_token_wall_s", "first_token_time"),
+                ("finished_wall_s", "finished_time"),
+            ):
+                val = getattr(metrics, attr, None)
+                if isinstance(val, int | float):
+                    setattr(rec, field_name, float(val))
+        records.append(rec)
+    return records
+
+
+def summarize_requests(
+    records: list[RequestRecord],
+    *,
+    ttft_slo_s: float = DEFAULT_TTFT_SLO_S,
+    tpot_slo_s: float = DEFAULT_TPOT_SLO_S,
+) -> ServingSummary:
+    """Aggregate per-request records into TTFT/TPOT percentiles and goodput.
+
+    Goodput is SLO-meeting requests per second over the observed window
+    (first arrival → last completion). Without those bounds the rate has no
+    denominator, so it is reported as ``None`` rather than divided by a guess.
+    """
+    ttfts = [t for t in (r.ttft_s for r in records) if t is not None]
+    tpots = [t for t in (r.tpot_s for r in records) if t is not None]
+    met = [r for r in records if r.meets_slo(ttft_slo_s, tpot_slo_s)]
+
+    arrivals = [r.arrival_wall_s for r in records if r.arrival_wall_s is not None]
+    finishes = [r.finished_wall_s for r in records if r.finished_wall_s is not None]
+    window_s: float | None = None
+    if arrivals and finishes:
+        window_s = max(max(finishes) - min(arrivals), 0.0)
+    # A zero-length window (single instantaneous request, or clock granularity)
+    # has no meaningful rate — report the count, not a division by ~0.
+    goodput = (len(met) / window_s) if window_s else None
+
+    return ServingSummary(
+        n_requests=len(records),
+        n_ttft=len(ttfts),
+        n_tpot=len(tpots),
+        ttft_p50_s=_percentile(ttfts, 0.50),
+        ttft_p95_s=_percentile(ttfts, 0.95),
+        ttft_p99_s=_percentile(ttfts, 0.99),
+        tpot_p50_s=_percentile(tpots, 0.50),
+        tpot_p95_s=_percentile(tpots, 0.95),
+        tpot_p99_s=_percentile(tpots, 0.99),
+        n_met_slo=len(met),
+        goodput_rps=goodput,
+        window_s=window_s,
+        ttft_slo_s=ttft_slo_s,
+        tpot_slo_s=tpot_slo_s,
+    )
 
 
 def _first_attr(obj: Any, *paths: str) -> Any:
@@ -262,11 +440,16 @@ class SchedulerStatsSampler:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._t0_ns: int = 0
+        self._t0_wall_ns: int = 0
 
     def start(self) -> None:
         if self._thread is not None or self.engine is None:
             return
+        # Two clocks taken together: monotonic for sample spacing (immune to wall
+        # clock jumps), wall for the join against request timestamps and the
+        # trace. Captured adjacently so the offset between them is exact.
         self._t0_ns = time.perf_counter_ns()
+        self._t0_wall_ns = time.time_ns()
         # Take one snapshot synchronously so even a decode shorter than one
         # sampling interval still yields a scheduler reading (no start/stop race).
         try:
@@ -300,20 +483,22 @@ class SchedulerStatsSampler:
         # Snapshot first: stop() joins with a timeout, so in the pathological case
         # where the daemon thread is still alive, summarize must iterate a stable
         # copy rather than a list being appended to concurrently.
-        return summarize(list(self.samples))
+        return summarize(list(self.samples), t0_wall_ns=self._t0_wall_ns)
 
     def to_records(self) -> list[dict[str, Any]]:
         """Samples as plain dicts, ready for JSONL alongside the kernel trace."""
         return [asdict(s) for s in list(self.samples)]
 
 
-def summarize(samples: list[SchedulerSample]) -> SchedulerStatsSummary:
+def summarize(
+    samples: list[SchedulerSample], *, t0_wall_ns: int = 0
+) -> SchedulerStatsSummary:
     """Aggregate a sample series into the compact summary attribution consumes."""
     if not samples:
         return SchedulerStatsSummary(
             n_samples=0, duration_s=0.0, peak_queue_depth=None, mean_running=None,
             peak_running=None, mean_batch_occupancy=None, total_preemptions=None,
-            peak_gpu_cache_usage=None, peak_swapped=None,
+            peak_gpu_cache_usage=None, peak_swapped=None, t0_wall_ns=t0_wall_ns,
         )
 
     def _vals(attr: str) -> list[float]:
@@ -340,6 +525,7 @@ def summarize(samples: list[SchedulerSample]) -> SchedulerStatsSummary:
         total_preemptions=int(max(preempt) - min(preempt)) if preempt else None,
         peak_gpu_cache_usage=max(cache) if cache else None,
         peak_swapped=int(max(swapped)) if swapped else None,
+        t0_wall_ns=t0_wall_ns,
     )
 
 

@@ -685,7 +685,16 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         outputs = active.generate(prompts, params)
         produced = sum(len(o.outputs[0].token_ids) for o in outputs)
         sync_device()
-        return {"prompts": len(prompts), "generated_tokens": produced, "model": model}
+        # Per-request lifecycle alongside the token count: the loop turns these
+        # into TTFT/TPOT/goodput. Empty on builds that don't populate metrics.
+        from gitm.tracer.vllm_stats import request_records_from_outputs
+
+        return {
+            "prompts": len(prompts),
+            "generated_tokens": produced,
+            "model": model,
+            "requests": request_records_from_outputs(outputs),
+        }
 
     def _throughput(eng: Any) -> float:
         """Decode-throughput probe (tokens/sec) for the Phase-4 A/B.
