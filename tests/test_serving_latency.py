@@ -68,6 +68,20 @@ def test_empty_records_summarize_to_zeros_not_crash():
     assert s.ttft_p50_s is None and s.goodput_rps is None
 
 
+def test_arrival_without_first_token_meets_no_slo():
+    # A build that reports arrival but never first_token_time: TTFT is
+    # unmeasurable, so no request can be shown to have met its latency SLO.
+    # Goodput must be 0-per-window, never credited for absent evidence.
+    records = [
+        RequestRecord(arrival_wall_s=0.0, finished_wall_s=1.0, n_output_tokens=8),
+        RequestRecord(arrival_wall_s=0.0, finished_wall_s=2.0, n_output_tokens=8),
+    ]
+    s = summarize_requests(records)
+    assert s.n_ttft == 0
+    assert s.n_met_slo == 0
+    assert s.goodput_rps == 0.0  # window is known (2.0s), zero requests met SLO
+
+
 # --------------------------------------------------------------------------- #
 # goodput                                                                     #
 # --------------------------------------------------------------------------- #
