@@ -41,7 +41,7 @@ def test_prop_us_to_ns_monotonic(ts: float, dur: float):
         }
     )
     # Default import path uses LightKernel for scale; --strict uses KernelEvent.
-    assert isinstance(ev, (KernelEvent, LightKernel))
+    assert isinstance(ev, KernelEvent | LightKernel)
     assert ev.start_ns == int(ts * 1000.0)
     assert ev.end_ns == int((ts + dur) * 1000.0)
     assert ev.end_ns >= ev.start_ns or dur == 0.0
@@ -74,7 +74,7 @@ def test_prop_missing_args_never_crash(cat, name, has_grid, has_stream, has_devi
     )
     # May be None for weird name/cat combos; must not raise.
     if ev is not None:
-        assert isinstance(ev, (KernelEvent, MemcpyEvent, LightKernel, LightMemcpy))
+        assert isinstance(ev, KernelEvent | MemcpyEvent | LightKernel | LightMemcpy)
         assert getattr(ev, "kind", None) in ("kernel", "memcpy")
         assert ev.end_ns >= ev.start_ns
         # Light events are not pydantic; only validate the full Trace path
