@@ -447,7 +447,9 @@ class SchedulerStatsSampler:
             return
         # Two clocks taken together: monotonic for sample spacing (immune to wall
         # clock jumps), wall for the join against request timestamps and the
-        # trace. Captured adjacently so the offset between them is exact.
+        # trace. Captured back-to-back so the offset between the two clocks is
+        # sub-microsecond — far below the 50ms sampling interval and the
+        # second-scale request latencies this anchor is used to align.
         self._t0_ns = time.perf_counter_ns()
         self._t0_wall_ns = time.time_ns()
         # Take one snapshot synchronously so even a decode shorter than one
