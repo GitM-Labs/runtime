@@ -24,7 +24,7 @@ from gitm.importers._common import (
     finish_trace,
     per_device_kernel_counts,
 )
-from gitm.tracer.schema import KernelEvent, MemcpyEvent, Trace, TraceEvent
+from gitm.tracer.schema import MemcpyEvent, Trace, TraceEvent
 
 # Max decompressed size for .json.gz (customer dumps can be multi-GB).
 DEFAULT_MAX_DECOMPRESSED_BYTES = 20 * 1024 ** 3  # 20 GiB
@@ -91,7 +91,7 @@ def _arg_get(args: dict[str, Any] | None, keys: tuple[str, ...]) -> Any:
 def _as_dims(val: Any) -> tuple[int, int, int]:
     if val is None:
         return (1, 1, 1)
-    if isinstance(val, (list, tuple)) and len(val) >= 1:
+    if isinstance(val, list | tuple) and len(val) >= 1:
         x = as_int(val[0], 1) if len(val) > 0 else 1
         y = as_int(val[1], 1) if len(val) > 1 else 1
         z = as_int(val[2], 1) if len(val) > 2 else 1

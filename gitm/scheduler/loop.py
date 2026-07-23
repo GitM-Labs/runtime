@@ -339,15 +339,15 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # delta is measured even on a box without CUPTI. (Runs before the empty-trace
     # guard for that reason; attribution below is included only if kernels exist.)
     if workload in _HFT_INTERVENTION_WORKLOADS:
-        applicator = getattr(runner, "applicator", None)
-        if applicator is not None:
+        runner_applicator = getattr(runner, "applicator", None)
+        if runner_applicator is not None:
             return _hft_intervention_result(
                 run_dir=run_dir,
                 run_id=run_id,
                 workload=workload,
                 trace=trace,
                 qual=qual,
-                applicator=applicator,
+                applicator=runner_applicator,
                 started_ns=started_ns,
                 trace_path=trace_path,
             )
@@ -357,15 +357,15 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # A/B, gated on plDDT-equivalence). Before the empty-trace guard so the A/B
     # still runs on a box without CUPTI; attribution is included if kernels exist.
     if workload in _OPENFOLD_INTERVENTION_WORKLOADS:
-        applicator = getattr(runner, "applicator", None)
-        if applicator is not None:
+        runner_applicator = getattr(runner, "applicator", None)
+        if runner_applicator is not None:
             return _openfold_intervention_result(
                 run_dir=run_dir,
                 run_id=run_id,
                 workload=workload,
                 trace=trace,
                 qual=qual,
-                applicator=applicator,
+                applicator=runner_applicator,
                 started_ns=started_ns,
                 trace_path=trace_path,
             )
@@ -375,15 +375,15 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # the fp32-vs-fp16 A/B, gated on detection-equivalence). Before the empty-
     # trace guard so the A/B still runs on a box without CUPTI.
     if workload in _EDGE_INTERVENTION_WORKLOADS:
-        applicator = getattr(runner, "applicator", None)
-        if applicator is not None:
+        runner_applicator = getattr(runner, "applicator", None)
+        if runner_applicator is not None:
             return _edge_intervention_result(
                 run_dir=run_dir,
                 run_id=run_id,
                 workload=workload,
                 trace=trace,
                 qual=qual,
-                applicator=applicator,
+                applicator=runner_applicator,
                 started_ns=started_ns,
                 trace_path=trace_path,
             )
