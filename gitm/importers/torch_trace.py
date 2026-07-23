@@ -24,7 +24,7 @@ from gitm.importers._common import (
     finish_trace,
     per_device_kernel_counts,
 )
-from gitm.tracer.schema import KernelEvent, MemcpyEvent, Trace, TraceEvent
+from gitm.tracer.schema import MemcpyEvent, Trace, TraceEvent
 
 # Max decompressed size for .json.gz (customer dumps can be multi-GB).
 DEFAULT_MAX_DECOMPRESSED_BYTES = 20 * 1024 ** 3  # 20 GiB

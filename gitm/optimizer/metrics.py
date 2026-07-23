@@ -26,7 +26,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
-from gitm.tracer.schema import KernelEvent, MemcpyEvent, SyncEvent, Trace
+from gitm.tracer.schema import KernelEvent, Trace
 
 FlopsModel = Callable[[KernelEvent], float]
 

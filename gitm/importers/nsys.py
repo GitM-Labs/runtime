@@ -17,11 +17,8 @@ from gitm.importers._common import (
     ImportError,
     ImportStats,
     as_int,
-    device_count_from_events,
     file_mtime_ns,
-    filter_device,
     finish_trace,
-    per_device_kernel_counts,
 )
 from gitm.tracer.schema import KernelEvent, MemcpyEvent, SyncEvent, Trace, TraceEvent
 
