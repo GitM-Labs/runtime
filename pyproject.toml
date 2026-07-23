@@ -59,6 +59,7 @@ dev = [
     "mypy>=1.10",
     "build>=1.0",  # `python -m build` for the wheel-build verification check
     "pre-commit>=3.5",  # local lint/test gate; see .pre-commit-config.yaml
+    "hypothesis>=6.0",  # property tests in tests/test_importers_hypothesis.py
 ]
 
 [project.scripts]
