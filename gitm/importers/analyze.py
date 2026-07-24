@@ -18,7 +18,7 @@ from gitm.optimizer.preconditions import GateContext
 from gitm.optimizer.qualification import QualificationResult, qualify
 from gitm.planner.context import peak_for_sku
 from gitm.tracer.capture import write_trace_jsonl
-from gitm.tracer.schema import KernelEvent, Trace
+from gitm.tracer.schema import Trace
 
 # Default catalogue peak when SKU is unknown (A100 PCIe figures; called out in caveats).
 _DEFAULT_PEAK = HardwarePeak(name="A100", peak_flops=312e12, peak_bw_bytes_s=1555e9)
