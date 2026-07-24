@@ -555,6 +555,10 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         GITM_VLLM_MODEL       HF model id (default facebook/opt-125m)
         GITM_VLLM_PROMPTS     number of prompts to decode (default 64)
         GITM_VLLM_MAX_TOKENS  tokens to generate per prompt (default 128)
+        GITM_VLLM_KV_DTYPE    kv_cache_dtype for the engine (e.g. "fp8"); unset
+                              -> vLLM's "auto". Lets a serial A/B build each leg
+                              directly in its dtype, one engine per process, so
+                              each can use the full GITM_VLLM_GPU_MEM budget.
         GITM_VLLM_SYNTHETIC   "1" -> CPU-only decode stand-in instead of vLLM
                               (exercises the wire/registry path with no GPU or
                               vLLM; produces no GPU kernels)
@@ -586,6 +590,14 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     _base_kwargs: dict[str, Any] = {}
     if _gpu_mem is not None:
         _base_kwargs["gpu_memory_utilization"] = float(_gpu_mem)
+    # Optional KV-cache dtype (GITM_VLLM_KV_DTYPE, e.g. "fp8"). Lets the baseline
+    # engine be built directly in the target dtype, so a serial A/B can run each
+    # leg in its own process at the full GPU budget — instead of the restart path,
+    # which builds the candidate alongside the live baseline and therefore caps
+    # both at ~0.45. Unset (the default) leaves vLLM's own "auto".
+    _kv_dtype = os.environ.get("GITM_VLLM_KV_DTYPE")
+    if _kv_dtype:
+        _base_kwargs["kv_cache_dtype"] = _kv_dtype
     # Disable CUDA graphs so CUPTI captures decode kernels on platforms where
     # graph-replayed kernels aren't attributed (and speed up every engine build).
     # Inherited by restart candidates (kwargs = dict(_base_kwargs)) for a fair A/B.
