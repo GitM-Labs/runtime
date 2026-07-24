@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from gitm.optimizer.metrics import _merge_intervals
-from gitm.tracer.schema import KernelEvent, Trace
+from gitm.tracer.schema import Trace
 
 # Collective kernel name patterns (case-insensitive). One module-level table;
 # each entry is a substring match against the demangled/exported kernel name.
