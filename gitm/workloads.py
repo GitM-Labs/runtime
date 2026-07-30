@@ -569,6 +569,13 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
                               torch.compile + graph capture, so engine builds
                               (and restart-A/B candidates) are much faster.
 
+        GITM_VLLM_MAX_MODEL_LEN / GITM_VLLM_TP / GITM_VLLM_ENABLE_EP /
+        GITM_VLLM_TRUST_REMOTE_CODE / GITM_VLLM_EXTRA_JSON
+                              MoE + long-context build knobs (see the block below
+                              where ``_base_kwargs`` is assembled). Needed to build
+                              models like Qwen3.6-35B-A3B and to reach their
+                              structural levers in the restart-A/B.
+
     On a box without vLLM/GPU the import raises; ``run_loop`` catches it and the
     empty-trace guard reports "no-data" rather than fabricating a result.
     """
@@ -603,6 +610,39 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     # Inherited by restart candidates (kwargs = dict(_base_kwargs)) for a fair A/B.
     if os.environ.get("GITM_VLLM_ENFORCE_EAGER") == "1":
         _base_kwargs["enforce_eager"] = True
+
+    # --- MoE / long-context / structural build knobs -------------------------
+    # Extra ``LLM()`` kwargs so mixture-of-experts, long-context models (e.g.
+    # Qwen3.6-35B-A3B) build correctly and their structural levers are reachable
+    # by the restart-A/B. Each flows through ``_base_kwargs`` -> ``gitm_llm_kwargs``,
+    # so restart candidates inherit them for a fair baseline. All are opt-in via
+    # env, so nothing changes for the existing small-model default path.
+    #     GITM_VLLM_MAX_MODEL_LEN  max_model_len (long context, e.g. 16384)
+    #     GITM_VLLM_TP             tensor_parallel_size (e.g. 2)
+    #     GITM_VLLM_ENABLE_EP=1    enable_expert_parallel (MoE expert parallelism)
+    #     GITM_VLLM_TRUST_REMOTE_CODE=1  trust_remote_code (custom model code)
+    #     GITM_VLLM_EXTRA_JSON     JSON object merged verbatim into the kwargs —
+    #                              the escape hatch for any structural MoE lever
+    #                              (compilation_config, quantization, cpu_offload_gb,
+    #                              preemption_mode, …) without a new env var each.
+    _max_len = os.environ.get("GITM_VLLM_MAX_MODEL_LEN")
+    if _max_len:
+        _base_kwargs["max_model_len"] = int(_max_len)
+    _tp = os.environ.get("GITM_VLLM_TP")
+    if _tp:
+        _base_kwargs["tensor_parallel_size"] = int(_tp)
+    if os.environ.get("GITM_VLLM_ENABLE_EP") == "1":
+        _base_kwargs["enable_expert_parallel"] = True
+    if os.environ.get("GITM_VLLM_TRUST_REMOTE_CODE") == "1":
+        _base_kwargs["trust_remote_code"] = True
+    _extra = os.environ.get("GITM_VLLM_EXTRA_JSON")
+    if _extra:
+        import json as _json
+
+        extra = _json.loads(_extra)
+        if not isinstance(extra, dict):
+            raise ValueError("GITM_VLLM_EXTRA_JSON must be a JSON object of LLM() kwargs")
+        _base_kwargs.update(extra)
 
     engine_ref: dict[str, Any] = {}
 
