@@ -44,6 +44,31 @@ def test_moe_kernels_beat_the_gemm_and_elementwise_rules():
     assert classify_kernel("topk_softmax_kernel") == "moe"
 
 
+def test_gated_deltanet_kernels_are_linear_attention_not_other():
+    """This model is 30 DeltaNet layers to 10 full-attention layers. None of the
+    softmax-attention needles match a linear-attention kernel, so without these the
+    dominant layer type lands in 'other' and the breakdown describes nothing."""
+    for name in ("chunk_gated_delta_rule_fwd_kernel_h",
+                 "fused_recurrent_gated_delta_rule_fwd_kernel",
+                 "chunk_local_cumsum_scalar_kernel",
+                 "solve_tril_kernel",
+                 "wy_fast_fwd_prepare_wy_repr_kernel"):
+        assert classify_kernel(name) == "linear_attn", name
+
+
+def test_linear_and_softmax_attention_stay_separable():
+    """A hybrid model's whole point is the split — collapsing both into one bucket
+    would hide which of the two layer types costs anything."""
+    assert classify_kernel("chunk_gated_delta_rule_fwd") == "linear_attn"
+    assert classify_kernel("_ZN5flash24flash_fwd_splitkv_kernelI") == "attention"
+
+
+def test_topp_sampling_cumsum_is_not_mistaken_for_linear_attention():
+    """Guard on a needle that was briefly too loose: top-p runs a cumulative sum
+    over sorted probs, and 'cumsum' alone would file it as DeltaNet work."""
+    assert classify_kernel("top_p_sampling_cumsum_kernel") == "sampling"
+
+
 def test_nccl_allreduce_is_a_collective():
     """TP=2 puts an all-reduce in the critical path every layer; it must not be
     filed as elementwise 'reduce' work."""

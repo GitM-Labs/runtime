@@ -33,6 +33,7 @@ import argparse
 import json
 import os
 import random
+import re
 import signal
 import subprocess
 import sys
@@ -40,16 +41,18 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 # The experiment this script was written for. Overridable by passing a full command
 # after ``--``; kept here so the pinned run is reproducible without a shell history.
 # --host/--port are appended by the script (it needs to know where to send load).
+# --tensor-parallel-size is deliberately absent: it defaults to however many GPUs
+# this box actually exposes (see visible_devices), so the same command is correct on
+# a 2x and a 4x pod. Pass it explicitly here or after `--` to pin it.
 DEFAULT_SERVE_ARGV = [
     "vllm", "serve", "Qwen/Qwen3.6-35B-A3B-FP8",
     "--trust-remote-code",
-    "--tensor-parallel-size", "2",
     "--gpu-memory-utilization", "0.95",
     "--max-num-batched-tokens", "8192",
     "--max-num-seqs", "256",
@@ -91,42 +94,138 @@ def _arg_of(argv: list[str], flag: str) -> str | None:
     return None
 
 
-def check_gpus(tp: int) -> list[Check]:
-    rc, out = _run(["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader"])
+@dataclass
+class Devices:
+    """The GPUs this run can actually use.
+
+    ``indices`` are *physical* indices — the ones `nvidia-smi topo -m` labels its
+    rows with — and are ``None`` when they cannot be resolved, which happens when
+    ``CUDA_VISIBLE_DEVICES`` is set to UUIDs rather than ordinals. The count is
+    still known in that case; only per-pair topology lookup is impossible.
+    """
+
+    indices: list[int] | None
+    count: int
+    source: str
+    names: list[str] = field(default_factory=list)
+
+
+def visible_devices() -> Devices:
+    """How many GPUs this run gets, honouring ``CUDA_VISIBLE_DEVICES``.
+
+    nvidia-smi reports every card in the box regardless of that variable, but vLLM
+    only ever sees the masked subset — so sizing tensor parallelism off nvidia-smi
+    alone would ask for 4 ranks on a box where CUDA exposes 2, and the failure lands
+    deep inside distributed init rather than here.
+    """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd is not None and cvd.strip():
+        parts = [p.strip() for p in cvd.split(",") if p.strip()]
+        if all(p.isdigit() for p in parts):
+            return Devices(indices=[int(p) for p in parts], count=len(parts),
+                           source="CUDA_VISIBLE_DEVICES")
+        # UUID form (GPU-xxxxxxxx): the count is trustworthy, the mapping to
+        # topology rows is not.
+        return Devices(indices=None, count=len(parts),
+                       source="CUDA_VISIBLE_DEVICES (UUIDs)")
+
+    rc, out = _run(["nvidia-smi", "--query-gpu=index,name", "--format=csv,noheader"])
     if rc != 0:
-        return [Check("gpus", "fail", f"nvidia-smi unavailable: {out.strip()[:200]}")]
-    gpus = [ln.strip() for ln in out.splitlines() if ln.strip()]
-    status = "pass" if len(gpus) >= tp else "fail"
-    return [Check("gpus", status, f"{len(gpus)} visible (need {tp} for TP={tp}): " + "; ".join(gpus))]
+        return Devices(indices=None, count=0, source="nvidia-smi unavailable")
+    idx, names = [], []
+    for ln in out.splitlines():
+        if not ln.strip():
+            continue
+        head, _, name = ln.partition(",")
+        if head.strip().isdigit():
+            idx.append(int(head.strip()))
+            names.append(name.strip())
+    return Devices(indices=idx, count=len(idx), source="nvidia-smi", names=names)
 
 
-def check_nvlink(tp: int) -> list[Check]:
-    """Warn — loudly — when the pod's GPUs are not NVLink-peered.
+def check_gpus(tp: int, devices: Devices) -> list[Check]:
+    if devices.count == 0:
+        return [Check("gpus", "fail", f"no GPUs visible ({devices.source})")]
+    detail = f"{devices.count} visible via {devices.source}"
+    if devices.names:
+        detail += ": " + "; ".join(devices.names)
+    if devices.count < tp:
+        return [Check("gpus", "fail", f"{detail} — but TP={tp} needs {tp}")]
+    if devices.count > tp:
+        # Not an error: a deliberate TP smaller than the box is a legitimate
+        # experiment. It is worth saying out loud, because idle GPUs in a
+        # throughput number are the kind of thing nobody notices in a report.
+        detail += f" — running TP={tp}, leaving {devices.count - tp} GPU(s) idle"
+    return [Check("gpus", "pass", detail)]
 
-    TP=2 decode does an all-reduce every layer every step. On PCIe those all-reduces
-    land in the critical path and the numbers describe the interconnect, not the
-    model. Same command, same flags, a different conclusion — so this is worth
-    catching before the run, not after.
+
+def parse_topo(out: str) -> dict[int, list[str]]:
+    """Parse ``nvidia-smi topo -m`` into {gpu_index: [link to GPU0, GPU1, ...]}.
+
+    Row labels are ``GPU<n>``; the trailing columns (CPU Affinity, NUMA, …) are
+    kept and simply never indexed, since callers only ever look up GPU columns.
+    """
+    rows: dict[int, list[str]] = {}
+    for ln in out.splitlines():
+        parts = ln.split()
+        if parts and re.fullmatch(r"GPU\d+", parts[0]):
+            rows[int(parts[0][3:])] = parts[1:]
+    return rows
+
+
+def check_nvlink(tp: int, devices: Devices | None = None) -> list[Check]:
+    """Warn — loudly — when the ranks a collective spans are not NVLink-peered.
+
+    Decode does an all-reduce across every TP rank, every layer, every step. On PCIe
+    those land in the critical path and the numbers describe the interconnect rather
+    than the model — same command, same flags, a different conclusion.
+
+    Every *pair* among the first ``tp`` ranks matters, not just the first two: a
+    collective is only as fast as its worst edge, and a box can be NVLink-peered
+    within a pair while crossing PCIe or QPI between pairs. Checking GPU0<->GPU1 and
+    calling a 4-GPU box healthy is exactly the mistake that makes a TP=4 result
+    look inexplicably worse than TP=2.
     """
     if tp < 2:
         return []
     rc, out = _run(["nvidia-smi", "topo", "-m"])
     if rc != 0:
         return [Check("nvlink", "warn", "could not read `nvidia-smi topo -m`")]
-    link = None
-    for ln in out.splitlines():
-        if ln.startswith("GPU0"):
-            cells = ln.split()
-            if len(cells) > 2:
-                link = cells[2]  # GPU0 row, GPU1 column
-            break
-    if link is None:
-        return [Check("nvlink", "warn", "could not parse the topology matrix")]
-    if link.startswith("NV"):
-        return [Check("nvlink", "pass", f"GPU0<->GPU1 = {link}")]
+
+    rows = parse_topo(out)
+
+    # The ranks this run occupies, in physical index space — CUDA_VISIBLE_DEVICES=2,3
+    # means the pairs that matter are (2,3), not (0,1).
+    if devices is not None and devices.indices is None:
+        return [Check("nvlink", "warn",
+                      f"cannot map {devices.source} to topology rows; "
+                      f"interconnect between the {devices.count} visible GPUs unverified")]
+    phys = list(devices.indices)[:tp] if devices and devices.indices else list(range(tp))
+    if len(rows) < len(phys) or any(p not in rows for p in phys):
+        return [Check("nvlink", "warn",
+                      f"topology matrix has {len(rows)} GPU rows, need {phys}")]
+
+    weak: list[str] = []
+    links: list[str] = []
+    for a, i in enumerate(phys):
+        for j in phys[a + 1:]:
+            try:
+                link = rows[i][j]
+            except (KeyError, IndexError):
+                return [Check("nvlink", "warn", "could not parse the topology matrix")]
+            links.append(f"{i}<->{j}={link}")
+            if not link.startswith("NV"):
+                weak.append(f"GPU{i}<->GPU{j} = {link}")
+
+    if not weak:
+        kinds = sorted({x.split("=")[1] for x in links})
+        return [Check("nvlink", "pass",
+                      f"all {len(links)} pairs across {tp} ranks {phys} are NVLink "
+                      f"({', '.join(kinds)})")]
     return [Check("nvlink", "warn",
-                  f"GPU0<->GPU1 = {link}, NOT NVLink. TP={tp} all-reduces will run over "
-                  f"{link}; decode latency here is not comparable with an NVLink SKU.")]
+                  f"{len(weak)} of {len(links)} rank pairs are NOT NVLink: {'; '.join(weak)}. "
+                  f"TP={tp} collectives run at the speed of the worst edge, so these "
+                  f"numbers are not comparable with a fully NVLink-peered SKU.")]
 
 
 def check_driver_stack() -> list[Check]:
@@ -221,11 +320,26 @@ def check_serve_args(serve_argv: list[str]) -> list[Check]:
     return [Check("serve-args", "fail", f"vLLM rejects these flags:\n{out[-800:]}")]
 
 
-def preflight(serve_argv: list[str], *, skip_args: bool = False) -> list[Check]:
-    tp = int(_arg_of(serve_argv, "--tensor-parallel-size") or _arg_of(serve_argv, "-tp") or 1)
+def resolve_tp(serve_argv: list[str], devices: Devices, override: int | None) -> int:
+    """Tensor-parallel size for this run: explicit wins, else the whole box.
+
+    Defaulting to every visible GPU is what makes one command correct on a 2x and a
+    4x pod. Falls back to 1 rather than 0 when no GPU is visible, so the preflight
+    reports "no GPUs" instead of a nonsense TP.
+    """
+    explicit = _arg_of(serve_argv, "--tensor-parallel-size") or _arg_of(serve_argv, "-tp")
+    if explicit and explicit.isdigit():
+        return int(explicit)
+    if override:
+        return override
+    return max(devices.count, 1)
+
+
+def preflight(serve_argv: list[str], devices: Devices, tp: int,
+              *, skip_args: bool = False) -> list[Check]:
     checks: list[Check] = []
-    checks += check_gpus(tp)
-    checks += check_nvlink(tp)
+    checks += check_gpus(tp, devices)
+    checks += check_nvlink(tp, devices)
     checks += check_driver_stack()
     checks += check_injection_lib()
     checks += check_cupti_clock()
@@ -436,6 +550,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-ignore-eos", action="store_true", help="let the model stop early")
     ap.add_argument("--health-timeout", type=float, default=1800.0)
     ap.add_argument("--request-timeout", type=float, default=600.0)
+    ap.add_argument("--tp", type=int, default=None,
+                    help="tensor-parallel size (default: every visible GPU)")
     ap.add_argument("--dry-run", action="store_true", help="preflight only; never starts a server")
     ap.add_argument("--skip-preflight", action="store_true")
     ap.add_argument("--keep-server", action="store_true", help="leave the server up after capture")
@@ -454,9 +570,18 @@ def main(argv: list[str] | None = None) -> int:
     # the children's shards instead of collecting in-process.
     from gitm.tracer import injection
 
+    devices = visible_devices()
+    tp = resolve_tp(serve_argv, devices, args.tp)
+    # Pin it into the command now, before preflight validates the flags, so what gets
+    # checked is exactly what gets launched.
+    serve_argv = list(serve_argv)
+    if not (_arg_of(serve_argv, "--tensor-parallel-size") or _arg_of(serve_argv, "-tp")):
+        serve_argv += ["--tensor-parallel-size", str(tp)]
+
     print(f"==> out dir: {out_dir}")
+    print(f"==> {devices.count} GPU(s) via {devices.source} -> tensor-parallel-size {tp}")
     print("==> preflight")
-    checks = [] if args.skip_preflight else preflight(serve_argv, skip_args=False)
+    checks = [] if args.skip_preflight else preflight(serve_argv, devices, tp, skip_args=False)
     print_checks(checks)
     if any(c.status == "fail" for c in checks):
         (out_dir / "preflight.json").write_text(json.dumps([asdict(c) for c in checks], indent=2))
