@@ -320,25 +320,54 @@ def check_serve_args(serve_argv: list[str]) -> list[Check]:
     return [Check("serve-args", "fail", f"vLLM rejects these flags:\n{out[-800:]}")]
 
 
-def resolve_tp(serve_argv: list[str], devices: Devices, override: int | None) -> int:
-    """Tensor-parallel size for this run: explicit wins, else the whole box.
+def resolve_dp(serve_argv: list[str]) -> int:
+    """Data-parallel size from the serve command (1 when unset)."""
+    raw = _arg_of(serve_argv, "--data-parallel-size") or _arg_of(serve_argv, "-dp")
+    return int(raw) if raw and raw.isdigit() else 1
 
-    Defaulting to every visible GPU is what makes one command correct on a 2x and a
-    4x pod. Falls back to 1 rather than 0 when no GPU is visible, so the preflight
-    reports "no GPUs" instead of a nonsense TP.
+
+def resolve_tp(serve_argv: list[str], devices: Devices, override: int | None) -> int:
+    """Tensor-parallel size for this run: explicit wins, else the box divided by DP.
+
+    vLLM's world size is TP x DP, so "default to every visible GPU" is only right
+    when DP=1. With ``--data-parallel-size 4`` on a 4-GPU box the correct TP is 1;
+    filling in 4 would ask for 16 GPUs and die in distributed init. Falls back to 1
+    rather than 0 so a CPU box reports "no GPUs" instead of a nonsense TP.
     """
     explicit = _arg_of(serve_argv, "--tensor-parallel-size") or _arg_of(serve_argv, "-tp")
     if explicit and explicit.isdigit():
         return int(explicit)
     if override:
         return override
-    return max(devices.count, 1)
+    return max(devices.count // max(resolve_dp(serve_argv), 1), 1)
+
+
+def check_world(tp: int, dp: int, devices: Devices) -> list[Check]:
+    """vLLM needs exactly TP x DP GPUs. Catch the mismatch before distributed init.
+
+    Asking for more ranks than exist fails somewhere deep in NCCL bootstrap with a
+    message that does not mention either flag. Asking for fewer silently leaves GPUs
+    idle, which is worse: the run succeeds and the throughput number is quietly wrong.
+    """
+    world = tp * dp
+    if devices.count == 0:
+        return []
+    if world > devices.count:
+        return [Check("world-size", "fail",
+                      f"TP={tp} x DP={dp} needs {world} GPUs, only {devices.count} visible")]
+    if world < devices.count:
+        return [Check("world-size", "warn",
+                      f"TP={tp} x DP={dp} uses {world} of {devices.count} GPUs — "
+                      f"{devices.count - world} idle, so per-GPU throughput is not "
+                      f"comparable with a run that uses the whole box")]
+    return [Check("world-size", "pass", f"TP={tp} x DP={dp} = {world} GPUs")]
 
 
 def preflight(serve_argv: list[str], devices: Devices, tp: int,
               *, skip_args: bool = False) -> list[Check]:
     checks: list[Check] = []
     checks += check_gpus(tp, devices)
+    checks += check_world(tp, resolve_dp(serve_argv), devices)
     checks += check_nvlink(tp, devices)
     checks += check_driver_stack()
     checks += check_injection_lib()
@@ -579,7 +608,8 @@ def main(argv: list[str] | None = None) -> int:
         serve_argv += ["--tensor-parallel-size", str(tp)]
 
     print(f"==> out dir: {out_dir}")
-    print(f"==> {devices.count} GPU(s) via {devices.source} -> tensor-parallel-size {tp}")
+    print(f"==> {devices.count} GPU(s) via {devices.source} -> "
+          f"TP={tp} x DP={resolve_dp(serve_argv)}")
     print("==> preflight")
     checks = [] if args.skip_preflight else preflight(serve_argv, devices, tp, skip_args=False)
     print_checks(checks)
