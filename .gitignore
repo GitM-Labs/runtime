@@ -20,6 +20,17 @@ dist/
 venv/
 .env
 
+# Profiler artifacts. nsys exports its report as SQLite and these land wherever
+# the command was run; they are large, binary, and never source. The importer's
+# checked-in fixtures under tests/fixtures/ are the deliberate exception — they
+# are already tracked, and .gitignore does not apply to tracked files.
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.nsys-rep
+*.qdrep
+!tests/fixtures/**/*.sqlite
+
 # Tooling
 .pytest_cache/
 .mypy_cache/
