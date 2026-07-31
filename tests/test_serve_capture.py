@@ -162,8 +162,8 @@ def test_prompt_length_tracks_the_requested_token_count():
 
 def test_default_serve_argv_is_the_pinned_experiment():
     assert sc.DEFAULT_SERVE_ARGV[:2] == ["vllm", "serve"]
-    assert sc._arg_of(sc.DEFAULT_SERVE_ARGV, "--tensor-parallel-size") == "2"
     assert sc._arg_of(sc.DEFAULT_SERVE_ARGV, "--max-num-seqs") == "256"
+    assert sc._arg_of(sc.DEFAULT_SERVE_ARGV, "--gpu-memory-utilization") == "0.95"
 
 
 def test_arg_of_reads_both_spellings():
@@ -187,8 +187,151 @@ def test_serve_args_check_is_a_warn_when_vllm_is_absent():
     assert "could not validate" in checks[0].detail
 
 
+# --- topology ---------------------------------------------------------------
+
+# Real `nvidia-smi topo -m` shapes. The leading tab on the header line and the
+# " X " diagonal (spaces around it) are what a hand-rolled parser gets wrong.
+TOPO_NVSWITCH_4 = """\t GPU0\tGPU1\tGPU2\tGPU3\tCPU Affinity\tNUMA Affinity
+GPU0\t X \tNV18\tNV18\tNV18\t0-51\t0
+GPU1\tNV18\t X \tNV18\tNV18\t0-51\t0
+GPU2\tNV18\tNV18\t X \tNV18\t0-51\t0
+GPU3\tNV18\tNV18\tNV18\t X \t0-51\t0
+"""
+
+# Two NVLink-bridged pairs, PCIe between them — the topology that makes TP=4 look
+# inexplicably worse than TP=2 while a GPU0<->GPU1 spot check reports "healthy".
+TOPO_SPLIT_PAIRS = """\t GPU0\tGPU1\tGPU2\tGPU3\tCPU Affinity
+GPU0\t X \tNV4\tSYS\tSYS\t0-23
+GPU1\tNV4\t X \tSYS\tSYS\t0-23
+GPU2\tSYS\tSYS\t X \tNV4\t24-47
+GPU3\tSYS\tSYS\tNV4\t X \t24-47
+"""
+
+
+def test_topo_parser_handles_the_real_matrix_shape():
+    rows = sc.parse_topo(TOPO_NVSWITCH_4)
+    assert sorted(rows) == [0, 1, 2, 3]
+    assert rows[0][1] == "NV18"      # GPU0 -> GPU1
+    assert rows[2][3] == "NV18"      # GPU2 -> GPU3
+    assert rows[0][0] == "X"         # diagonal survives the split
+
+
+def test_all_pairs_nvlink_passes(monkeypatch):
+    monkeypatch.setattr(sc, "_run", lambda *a, **k: (0, TOPO_NVSWITCH_4))
+    checks = sc.check_nvlink(4)
+    assert [c.status for c in checks] == ["pass"]
+    assert "6 pairs" in checks[0].detail   # 4 choose 2
+
+
+def test_split_pairs_caught_at_tp4_but_not_tp2(monkeypatch):
+    """The regression this test exists for: checking only GPU0<->GPU1 calls this
+    box healthy, and a TP=4 run then measures PCIe while reporting NVLink."""
+    monkeypatch.setattr(sc, "_run", lambda *a, **k: (0, TOPO_SPLIT_PAIRS))
+
+    at_4 = sc.check_nvlink(4)
+    assert at_4[0].status == "warn"
+    assert "4 of 6 rank pairs" in at_4[0].detail
+    assert "GPU0<->GPU2 = SYS" in at_4[0].detail
+
+    # TP=2 uses only GPU0/GPU1, which really are bridged — no false alarm
+    assert sc.check_nvlink(2)[0].status == "pass"
+
+
+def test_masked_devices_check_the_physical_pairs_they_actually_use(monkeypatch):
+    """CUDA_VISIBLE_DEVICES=2,3 means the pair that matters is (2,3), not (0,1).
+    On the split box those two ARE bridged, so checking (0,1) by habit would be
+    right by luck here and wrong the moment the mask is 1,2."""
+    monkeypatch.setattr(sc, "_run", lambda *a, **k: (0, TOPO_SPLIT_PAIRS))
+
+    masked_23 = sc.Devices(indices=[2, 3], count=2, source="CUDA_VISIBLE_DEVICES")
+    assert sc.check_nvlink(2, masked_23)[0].status == "pass"
+
+    masked_12 = sc.Devices(indices=[1, 2], count=2, source="CUDA_VISIBLE_DEVICES")
+    checks = sc.check_nvlink(2, masked_12)
+    assert checks[0].status == "warn"
+    assert "GPU1<->GPU2 = SYS" in checks[0].detail
+
+
+def test_uuid_mask_cannot_be_mapped_and_says_so(monkeypatch):
+    monkeypatch.setattr(sc, "_run", lambda *a, **k: (0, TOPO_NVSWITCH_4))
+    dev = sc.Devices(indices=None, count=2, source="CUDA_VISIBLE_DEVICES (UUIDs)")
+    checks = sc.check_nvlink(2, dev)
+    assert checks[0].status == "warn"
+    assert "unverified" in checks[0].detail
+
+
+def test_too_few_gpus_for_the_requested_tp(monkeypatch):
+    monkeypatch.setattr(sc, "_run", lambda *a, **k: (0, TOPO_SPLIT_PAIRS))
+    checks = sc.check_nvlink(8)
+    assert checks[0].status == "warn"
+    assert "4 GPU rows" in checks[0].detail
+
+
+def test_single_gpu_run_skips_the_check(monkeypatch):
+    monkeypatch.setattr(sc, "_run", lambda *a, **k: (0, TOPO_NVSWITCH_4))
+    assert sc.check_nvlink(1) == []
+
+
+# --- device detection / TP sizing -------------------------------------------
+
+SMI_4 = ("0, NVIDIA H100 80GB HBM3\n1, NVIDIA H100 80GB HBM3\n"
+         "2, NVIDIA H100 80GB HBM3\n3, NVIDIA H100 80GB HBM3\n")
+
+
+def test_detects_every_gpu_when_unmasked(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(sc, "_run", lambda *a, **k: (0, SMI_4))
+    dev = sc.visible_devices()
+    assert dev.count == 4 and dev.indices == [0, 1, 2, 3]
+    assert dev.names[0].startswith("NVIDIA H100")
+
+
+def test_cuda_visible_devices_wins_over_nvidia_smi(monkeypatch):
+    """nvidia-smi reports all 4 cards regardless of the mask, but vLLM only sees
+    the subset — sizing TP off nvidia-smi would ask for 4 ranks on a 2-GPU run."""
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,3")
+    monkeypatch.setattr(sc, "_run", lambda *a, **k: (0, SMI_4))
+    dev = sc.visible_devices()
+    assert dev.count == 2 and dev.indices == [2, 3]
+
+
+def test_uuid_mask_keeps_the_count_but_not_the_mapping(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-abc123,GPU-def456")
+    dev = sc.visible_devices()
+    assert dev.count == 2 and dev.indices is None
+
+
+def test_tp_defaults_to_the_whole_box():
+    dev = sc.Devices(indices=[0, 1, 2, 3], count=4, source="nvidia-smi")
+    assert sc.resolve_tp(["vllm", "serve", "m"], dev, None) == 4
+
+
+def test_explicit_tp_in_the_serve_command_wins():
+    dev = sc.Devices(indices=[0, 1, 2, 3], count=4, source="nvidia-smi")
+    argv = ["vllm", "serve", "m", "--tensor-parallel-size", "2"]
+    assert sc.resolve_tp(argv, dev, None) == 2
+    assert sc.resolve_tp(argv, dev, 4) == 2      # the command still wins over --tp
+    assert sc.resolve_tp(["vllm", "serve", "m"], dev, 2) == 2   # --tp when unset
+
+
+def test_tp_never_resolves_to_zero_on_a_cpu_box():
+    dev = sc.Devices(indices=[], count=0, source="nvidia-smi unavailable")
+    assert sc.resolve_tp(["vllm", "serve", "m"], dev, None) == 1
+
+
+def test_default_command_carries_no_tp_so_it_fits_any_box():
+    assert sc._arg_of(sc.DEFAULT_SERVE_ARGV, "--tensor-parallel-size") is None
+
+
+def test_extra_gpus_beyond_tp_are_reported_not_hidden():
+    dev = sc.Devices(indices=[0, 1, 2, 3], count=4, source="nvidia-smi")
+    check = sc.check_gpus(2, dev)[0]
+    assert check.status == "pass"
+    assert "leaving 2 GPU(s) idle" in check.detail
+
+
 def test_preflight_fails_closed_without_a_gpu():
     """On a box with no nvidia-smi the driver must refuse to launch (exit 2), not
     start a server that cannot possibly work."""
-    checks = sc.check_gpus(2)
-    assert checks[0].status == "fail"
+    dev = sc.Devices(indices=[], count=0, source="nvidia-smi unavailable")
+    assert sc.check_gpus(2, dev)[0].status == "fail"

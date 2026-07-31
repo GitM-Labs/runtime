@@ -45,7 +45,7 @@ NAME_MAX = 255
 #     quantise/dequantise passes.
 _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("moe", ("moe", "expert", "topk_softmax", "grouped_gemm", "group_gemm",
-             "groupedgemm", "gather_scatter", "sort_tokens")),
+             "groupedgemm", "gather_scatter", "sort_tokens", "routing", "router")),
     # "cross_device_reduce" is vLLM's own custom all-reduce (the fast path TP=2 takes
     # on NVLink). Without it the generic "reduce" needle files it as elementwise and
     # the collective cost disappears into the noise — which is the one cost a TP run
@@ -53,6 +53,17 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("collective", ("nccl", "all_reduce", "allreduce", "reduce_scatter", "reducescatter",
                     "all_gather", "allgather", "custom_ar", "cross_device", "one_shot",
                     "two_shot")),
+    # Linear / recurrent attention, kept separate from softmax attention. Hybrid
+    # models (Qwen3-Next-style Gated DeltaNet, Mamba, RWKV) run mostly these and only
+    # a few full-attention layers, so folding them together hides the split that
+    # matters — and none of the softmax needles below match them, which would leave
+    # the dominant layer type sitting in "other". Names come from the flash-linear-
+    # attention kernels these models ship with.
+    # "local_cumsum", not bare "cumsum": top-p sampling runs a cumulative sum over
+    # sorted probabilities, and the loose needle would file it as linear attention.
+    ("linear_attn", ("delta_rule", "gated_delta", "deltanet", "fused_recurrent",
+                     "linear_attn", "solve_tril", "wy_fast", "local_cumsum",
+                     "chunk_o", "chunk_h", "selective_scan", "mamba")),
     ("attention", ("flash_fwd", "flash_attn", "flashattn", "fmha", "paged_attention",
                    "paged_attn", "attention", "attn_score", "splitkv", "merge_attn",
                    "mha_fwd", "cutlass_mla", "flashinfer")),
@@ -63,7 +74,8 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
               "gemv", "splitk")),
     ("quant", ("quant", "dequant", "scaled_fp8", "per_token_group", "awq", "gptq",
                "fp8_", "int8_", "nvfp4", "mxfp4")),
-    ("norm", ("rms_norm", "rmsnorm", "layer_norm", "layernorm", "fused_add_rms")),
+    ("norm", ("rms_norm", "rmsnorm", "layer_norm", "layernorm", "fused_add_rms",
+              "l2norm", "l2_norm")),
     ("rope", ("rope", "rotary")),
     ("activation", ("silu", "gelu", "swiglu", "act_and_mul", "relu")),
     ("sampling", ("sample", "argmax", "top_k", "top_p", "softmax", "penalt",
