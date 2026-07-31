@@ -314,6 +314,27 @@ def test_explicit_tp_in_the_serve_command_wins():
     assert sc.resolve_tp(["vllm", "serve", "m"], dev, 2) == 2   # --tp when unset
 
 
+def test_tp_accounts_for_data_parallel_size():
+    """vLLM's world is TP x DP. On a 4-GPU box `--data-parallel-size 4` means TP=1;
+    defaulting TP to the whole box would request 16 GPUs and die in NCCL bootstrap."""
+    dev = sc.Devices(indices=[0, 1, 2, 3], count=4, source="nvidia-smi")
+    assert sc.resolve_tp(["vllm", "serve", "m", "--data-parallel-size", "4"], dev, None) == 1
+    assert sc.resolve_tp(["vllm", "serve", "m", "--data-parallel-size", "2"], dev, None) == 2
+    assert sc.resolve_tp(["vllm", "serve", "m"], dev, None) == 4
+
+
+def test_world_size_must_match_the_box():
+    dev = sc.Devices(indices=[0, 1, 2, 3], count=4, source="nvidia-smi")
+    assert sc.check_world(2, 2, dev)[0].status == "pass"
+    assert sc.check_world(1, 4, dev)[0].status == "pass"
+
+    over = sc.check_world(4, 4, dev)[0]
+    assert over.status == "fail" and "needs 16 GPUs" in over.detail
+
+    under = sc.check_world(2, 1, dev)[0]
+    assert under.status == "warn" and "2 idle" in under.detail
+
+
 def test_tp_never_resolves_to_zero_on_a_cpu_box():
     dev = sc.Devices(indices=[], count=0, source="nvidia-smi unavailable")
     assert sc.resolve_tp(["vllm", "serve", "m"], dev, None) == 1
