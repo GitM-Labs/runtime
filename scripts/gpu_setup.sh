@@ -89,3 +89,9 @@ echo "    Both must be exported BEFORE the engine is built (the driver reads the
 echo "    CUDA init). Do NOT set VLLM_ENABLE_V1_MULTIPROCESSING=0 to work around this:"
 echo "    it folds EngineCore back onto the frontend's GIL and injects idle gaps into"
 echo "    the very stall/idle signal the trace is measuring."
+echo
+echo "    Tracing an OpenAI SERVER (\`vllm serve\`) — sets both variables itself,"
+echo "    waits out the engine build, and arms the window only around the load:"
+echo
+echo "      python scripts/serve_capture.py --dry-run   # preflight: topo, stack, flags"
+echo "      python scripts/serve_capture.py            # launch + drive + capture"

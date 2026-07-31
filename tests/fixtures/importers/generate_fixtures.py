@@ -289,8 +289,19 @@ def _write_torch_array(path: Path, events: list[dict]) -> None:
 
 
 def _write_torch_gz(path: Path, events: list[dict]) -> None:
+    """Write the gzipped fixture with a fixed header, so the bytes are stable.
+
+    ``gzip.open`` stamps the current time into the 4-byte mtime header field, and
+    the generator re-runs on every pytest session (see the session fixture in
+    tests/test_importers.py). The compressed body is identical every time, but that
+    header is not — so the checked-in fixture showed up modified in ``git status``
+    after any test run, and got swept into unrelated commits. ``mtime=0`` and an
+    empty stored filename make the output a pure function of the events.
+    """
     payload = json.dumps({"traceEvents": events}).encode("utf-8")
-    with gzip.open(path, "wb") as fh:
+    with open(path, "wb") as raw, gzip.GzipFile(
+        filename="", mode="wb", fileobj=raw, mtime=0
+    ) as fh:
         fh.write(payload)
 
 
