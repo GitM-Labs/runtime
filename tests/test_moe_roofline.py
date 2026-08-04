@@ -424,6 +424,46 @@ def test_hf_half_configured_moe_stays_dense():
     assert _moe_fields_from_hf(OnlyExpertCount()) == {}
 
 
+# --- real batch from scheduler stats -----------------------------------------
+
+
+def test_batch_config_from_stats_uses_observed_concurrency():
+    from gitm.scheduler.loop import _batch_config_from_stats
+
+    class Sched:
+        n_samples = 12
+        mean_running = 15.6
+
+    cfg = _batch_config_from_stats(Sched())
+    assert cfg is not None and cfg.batch == 16  # rounded
+
+
+def test_batch_config_falls_back_when_no_samples():
+    """No stats -> None, so the caller keeps the documented default rather than
+    inventing a batch."""
+    from gitm.scheduler.loop import _batch_config_from_stats
+
+    class NoSamples:
+        n_samples = 0
+        mean_running = 8.0
+
+    class NoRunning:
+        n_samples = 5
+        mean_running = None
+
+    assert _batch_config_from_stats(None) is None
+    assert _batch_config_from_stats(NoSamples()) is None
+    assert _batch_config_from_stats(NoRunning()) is None
+
+
+def test_wrong_batch_badly_misprices_expert_traffic():
+    """Why the batch source matters: scoring a batch-16 step against the batch-1
+    default understates expert weight traffic by ~10x on a top-8-of-256 mixture."""
+    at1 = _node(MOE, 1, "mlp_gate_up").bytes
+    at16 = _node(MOE, 16, "mlp_gate_up").bytes
+    assert at16 / at1 > 8, f"expected a large gap, got {at16 / at1:.1f}x"
+
+
 def test_total_prediction_is_finite_and_positive_across_shapes():
     """Versatility guard: a spread of real MoE shapes all predict sanely."""
     shapes = [

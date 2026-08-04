@@ -237,6 +237,36 @@ _ATTN_ALIASES: dict[str, tuple[str, ...]] = {
 _QUANT_WEIGHT_BYTES: dict[str, int] = {"fp8": 1, "compressed-tensors": 1, "modelopt_fp8": 1}
 
 
+def _batch_config_from_stats(sched: Any):
+    """A :class:`BatchConfig` carrying the *observed* decode batch, or ``None``.
+
+    ``predict_graph``'s default is ``batch=1``. That is wrong for any real serving
+    window and especially wrong for a mixture-of-experts model, where weight
+    traffic scales with the distinct experts a batch activates: at top-8 of 256,
+    a batch of 1 touches 8 experts but a batch of 16 touches ~100, so scoring a
+    batch-16 step against the batch-1 ceiling understates expert traffic by more
+    than 10x. ``mean_running`` is vLLM's own count of concurrently running
+    sequences, which is exactly the decode batch.
+
+    Returns ``None`` (caller falls back to the default) when no scheduler samples
+    were taken — a CPU box, a dry run, or an engine that exposes no stats. Better
+    a documented default than a fabricated batch.
+
+    ``kv_cache_len`` is deliberately left at its default: nothing in the sampled
+    stats gives a token count (``peak_gpu_cache_usage`` is a fraction of blocks,
+    not a length), and inventing one would move the full-attention ceiling on a
+    guess. Sourcing it is tracked separately.
+    """
+    from gitm.planner.roofline import BatchConfig
+
+    if sched is None or getattr(sched, "n_samples", 0) == 0:
+        return None
+    running = getattr(sched, "mean_running", None)
+    if running is None or running < 1:
+        return None
+    return BatchConfig(batch=max(int(round(float(running))), 1))
+
+
 def _read_int_aliases(hf: Any, table: dict[str, tuple[str, ...]]) -> dict[str, Any]:
     """First positive int found for each field across its aliases. Duck-typed."""
     out: dict[str, Any] = {}
@@ -533,7 +563,14 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     pctx = build_planner_context(cfg.engine, workload=workload)
     _spec = _model_spec_from_engine(cfg.engine)
     _hw = hardware_spec_for(pctx.peak)
-    graph = predict_graph(model=_spec, hw=_hw) if _spec is not None else predict_graph(hw=_hw)
+    # Batch matters for the same reason the model does — and more so on a
+    # mixture, where weight traffic follows the *distinct* experts a batch
+    # activates: distinct(1)=top_k but distinct(16) is an order of magnitude
+    # larger, so predicting a batch-16 step at the batch-1 default understates
+    # expert traffic ~12x. Read the real concurrency off the sampled scheduler
+    # rather than defaulting.
+    _batch = _batch_config_from_stats(sched_summary)
+    graph = predict_graph(model=_spec, hw=_hw, batch=_batch)
     (run_dir / "predicted_graph.json").write_text(
         json.dumps(
             {"nodes": len(graph.nodes), "total_pred_s": graph.total_pred_s, "hardware": _hw.name},
