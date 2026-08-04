@@ -196,6 +196,7 @@ def _model_spec_from_engine(engine: Any):
         n_heads = int(hf.num_attention_heads)
         n_kv = int(getattr(hf, "num_key_value_heads", n_heads) or n_heads)
         head_dim = int(getattr(hf, "head_dim", 0) or (hidden // n_heads))
+        moe = _moe_fields_from_hf(hf)
         return ModelSpec(
             hidden=hidden,
             n_layers=int(hf.num_hidden_layers),
@@ -204,9 +205,65 @@ def _model_spec_from_engine(engine: Any):
             head_dim=head_dim,
             intermediate=int(getattr(hf, "intermediate_size", 4 * hidden)),
             vocab=int(hf.vocab_size),
+            **moe,
         )
     except Exception:
         return None
+
+
+#: HF config field aliases per MoE family — the same quantity is spelled
+#: differently by Qwen / Mixtral / DeepSeek, so try each in order.
+_MOE_ALIASES: dict[str, tuple[str, ...]] = {
+    "num_experts": ("num_experts", "num_local_experts", "n_routed_experts"),
+    "experts_per_token": ("num_experts_per_tok", "moe_top_k", "num_selected_experts"),
+    "moe_intermediate": ("moe_intermediate_size", "expert_intermediate_size"),
+    "shared_experts": ("n_shared_experts", "num_shared_experts"),
+    "shared_expert_intermediate": ("shared_expert_intermediate_size",),
+}
+
+#: quant_method -> bytes per weight element. MoE decode is weight-fetch bound,
+#: so using the activation width for a quantized checkpoint would overstate the
+#: dominant term by 2x (fp8) or 4x (4-bit).
+_QUANT_WEIGHT_BYTES: dict[str, int] = {"fp8": 1, "compressed-tensors": 1, "modelopt_fp8": 1}
+
+
+def _moe_fields_from_hf(hf: Any) -> dict[str, Any]:
+    """MoE ``ModelSpec`` kwargs read off an HF config, or ``{}`` for a dense model.
+
+    Every field is optional: a config with no expert fields yields ``{}`` and the
+    spec stays dense, which is the correct read for a non-MoE model rather than a
+    guess. Duck-typed across families and tolerant of partial configs.
+    """
+    out: dict[str, Any] = {}
+    for field, aliases in _MOE_ALIASES.items():
+        for alias in aliases:
+            raw = getattr(hf, alias, None)
+            if raw is None:
+                continue
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                out[field] = value
+                break
+
+    # Only a routed-expert count *and* a top-k make the FFN a mixture; without
+    # both, leave the spec dense rather than half-configured.
+    if not (out.get("num_experts") and out.get("experts_per_token")):
+        return {}
+
+    quant = getattr(hf, "quantization_config", None)
+    method = None
+    if isinstance(quant, dict):
+        method = quant.get("quant_method")
+    elif quant is not None:
+        method = getattr(quant, "quant_method", None)
+    if isinstance(method, str):
+        wb = _QUANT_WEIGHT_BYTES.get(method.lower())
+        if wb:
+            out["weight_dtype_bytes"] = wb
+    return out
 
 
 def _clamp_pct(value: float) -> float:

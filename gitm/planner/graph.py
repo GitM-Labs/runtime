@@ -17,8 +17,70 @@ from gitm.planner.roofline import (
     HardwareSpec,
     ModelSpec,
     RooflinePrediction,
+    distinct_experts,
     roofline,
 )
+
+
+def _ffn_terms(model: ModelSpec, b: int) -> tuple[float, float, float, float]:
+    """``(gate_up_flops, gate_up_bytes, down_flops, down_bytes)`` for one layer.
+
+    Dense (``num_experts == 0``) reproduces the original single-FFN arithmetic
+    exactly. For MoE the two costs are driven by *different* counts, which is the
+    whole point of the mixture:
+
+    * **flops** scale with the experts each token activates — ``b * top_k``
+      routed (plus every shared expert for every token), so compute grows
+      linearly with batch;
+    * **weight bytes** scale with the *distinct* experts the batch touches
+      (:func:`distinct_experts`), because an expert's weights are read once per
+      step however many tokens route to it — so traffic grows sublinearly and
+      saturates at ``num_experts``.
+
+    Weights use ``model.w_bytes`` and activations ``model.dtype_bytes``, so a
+    quantized MoE checkpoint (fp8 weights, bf16 activations) is modeled with the
+    right width on the term that dominates.
+
+    The router GEMM (``[b, hidden] @ [hidden, num_experts]``) is folded into
+    gate_up rather than given its own node: it is real but ~1% of expert-GEMM
+    cost, and adding an op would change the canonical vocabulary that
+    ``classify_op`` and ``library.yaml``'s ``applies_to_kernels`` key off.
+    """
+    h = model.hidden
+    dt = model.dtype_bytes  # activations
+    wb = model.w_bytes  # weights (may be narrower, e.g. fp8)
+
+    if not model.is_moe:
+        # Dense: one FFN, weights fetched once, every token through all of it.
+        ff = model.intermediate
+        gate_up_flops = 2 * 2 * b * h * ff
+        gate_up_bytes = dt * (b * h + 2 * b * ff) + wb * (2 * h * ff)
+        down_flops = 2 * b * ff * h
+        down_bytes = dt * (b * ff + b * h) + wb * (ff * h)
+        return gate_up_flops, gate_up_bytes, down_flops, down_bytes
+
+    k = model.top_k
+    ff = model.expert_intermediate
+    n_shared = model.shared_experts
+    sff = model.shared_intermediate
+    # Expected distinct routed experts whose weights this step must fetch.
+    distinct = distinct_experts(b, model.num_experts, k)
+
+    # Compute: every token pays k routed experts plus all shared ones.
+    gate_up_flops = 2 * 2 * b * (k * h * ff + n_shared * h * sff)
+    down_flops = 2 * b * (k * ff * h + n_shared * sff * h)
+    # Router: [b, h] @ [h, num_experts], folded in above.
+    gate_up_flops += 2 * b * h * model.num_experts
+
+    # Weight traffic: distinct routed experts once each, plus the shared experts
+    # (always resident in the step) and the router matrix.
+    gate_up_weight_bytes = wb * (distinct * 2 * h * ff + n_shared * 2 * h * sff + h * model.num_experts)
+    down_weight_bytes = wb * (distinct * ff * h + n_shared * sff * h)
+    # Activations: in [b, h], out [b, k*ff] (+ shared) for gate_up; mirrored for down.
+    act_out = b * (k * ff + n_shared * sff)
+    gate_up_bytes = dt * (b * h + 2 * act_out) + gate_up_weight_bytes
+    down_bytes = dt * (act_out + b * h) + down_weight_bytes
+    return gate_up_flops, gate_up_bytes, down_flops, down_bytes
 
 
 @dataclass
@@ -93,18 +155,17 @@ def predict_graph(
             PredictedNode("attn_out_proj", layer, roofline("attn_out_proj", flops, bytes_moved, hw))
         )
 
-        # MLP gate+up
-        flops = 2 * 2 * b * h * model.intermediate
-        bytes_moved = dt * (b * h + 2 * h * model.intermediate + 2 * b * model.intermediate)
+        # MLP gate+up / down. On an MoE model these two ops carry the expert
+        # GEMMs, so their flops/bytes come from the mixture model instead of a
+        # single dense FFN (see _ffn_terms).
+        gate_up_flops, gate_up_bytes, down_flops, down_bytes = _ffn_terms(model, b)
         g.nodes.append(
-            PredictedNode("mlp_gate_up", layer, roofline("mlp_gate_up", flops, bytes_moved, hw))
+            PredictedNode(
+                "mlp_gate_up", layer, roofline("mlp_gate_up", gate_up_flops, gate_up_bytes, hw)
+            )
         )
-
-        # MLP down
-        flops = 2 * b * model.intermediate * h
-        bytes_moved = dt * (b * model.intermediate + model.intermediate * h + b * h)
         g.nodes.append(
-            PredictedNode("mlp_down", layer, roofline("mlp_down", flops, bytes_moved, hw))
+            PredictedNode("mlp_down", layer, roofline("mlp_down", down_flops, down_bytes, hw))
         )
 
     # Final vocab projection
