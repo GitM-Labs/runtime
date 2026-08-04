@@ -127,12 +127,22 @@ _KNOBS: dict[str, KnobSpec] = {
     "distributed_executor_backend": KnobSpec(
         "distributed_executor_backend", "parallel_config.distributed_executor_backend", "structural"
     ),
+    # Mixture-of-Experts. All read at construction (they change how expert
+    # weights are sharded and which fused-MoE kernel is built) → structural.
+    "enable_expert_parallel": KnobSpec(
+        "enable_expert_parallel", "parallel_config.enable_expert_parallel", "structural"
+    ),
+    "enable_eplb": KnobSpec("enable_eplb", "parallel_config.enable_eplb", "structural"),
+    "data_parallel_size": KnobSpec(
+        "data_parallel_size", "parallel_config.data_parallel_size", "structural"
+    ),
     # Env-var knob: read by vLLM at construction → structural.
     "VLLM_ATTENTION_BACKEND": KnobSpec(
         "VLLM_ATTENTION_BACKEND", "env:VLLM_ATTENTION_BACKEND", "structural"
     ),
     # Prerequisite flags for the table below — not applied standalone, only read.
     "enable_dbo": KnobSpec("enable_dbo", "scheduler_config.enable_dbo", "structural"),
+    "moe_backend": KnobSpec("moe_backend", "model_config.moe_backend", "structural"),
 }
 
 
@@ -231,6 +241,10 @@ KNOB_PREREQUISITES: tuple[tuple[str, str], ...] = (
     ("partial_prefill", "enable_chunked_prefill"),
     ("long_prefill_token_threshold", "enable_chunked_prefill"),
     ("dbo", "enable_dbo"),
+    # Expert-parallel load balancing only means anything under EP: with plain TP
+    # every rank slices every expert, so routing skew is symmetric across ranks
+    # and there is no straggler for EPLB to rebalance.
+    ("eplb", "enable_expert_parallel"),
 )
 
 

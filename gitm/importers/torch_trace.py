@@ -407,6 +407,33 @@ def _load_json_capped(
     return json.loads(buf.decode("utf-8"))
 
 
+def _line_brace_delta(line: str) -> int:
+    """Net ``{…}`` depth change on one line, ignoring braces inside JSON strings.
+
+    Chrome-trace events never carry a string that spans lines, so per-line string
+    tracking is exact and stays O(line length). Kept cheap: the caller only
+    invokes it for lines that actually contain a brace.
+    """
+    depth = 0
+    in_str = False
+    esc = False
+    for ch in line:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+    return depth
+
+
 def _iter_chrome_event_dicts(
     path: Path,
     *,
@@ -415,96 +442,78 @@ def _iter_chrome_event_dicts(
 ) -> Iterator[dict[str, Any]]:
     """Yield raw chrome-trace event dicts without loading the whole file.
 
-    Strategy (in order):
-      1. Compact one-JSON-object-per-line inside ``traceEvents`` (bench + many
-         kineto exports) — line-oriented ``json.loads`` per line.
-      2. Fallback brace-stream for pretty-printed multi-line objects.
-    Never uses a whole-file ``json.load`` of multi-million-event dumps.
+    Single O(file) streaming pass with O(one-object) memory that handles **both**
+    layouts real exporters produce:
+      * compact one-JSON-object-per-line (bench, many kineto exports), and
+      * pretty-printed multi-line objects (``torch.profiler.export_chrome_trace``).
+
+    Line-oriented: accumulates lines by brace depth (string-aware, see
+    :func:`_line_brace_delta`) and ``json.loads`` one object at a time. Works on
+    plain or gzipped input. Never does a whole-file ``json.load`` of a
+    multi-million-event dump — which is what made large gzipped, pretty-printed
+    customer traces take tens of minutes and gigabytes of RAM.
     """
     opener: Any = gzip.open if gzipped else open
     total = 0
+    started = False
+    pre = ""
+    depth = 0
+    buf: list[str] = []
+
+    def _emit(chunk_lines: list[str]) -> dict[str, Any] | None:
+        s = "".join(chunk_lines).strip()
+        if s.endswith(","):
+            s = s[:-1].rstrip()
+        if not s.startswith("{"):
+            return None
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            return None
+        return obj if isinstance(obj, dict) else None
+
     with opener(path, "rt", encoding="utf-8", errors="replace") as fh:  # type: ignore[arg-type]
-        # Seek to the start of the events array.
-        head = fh.read(65536)
-        total += len(head.encode("utf-8", errors="replace"))
-        m = re.search(r'"traceEvents"\s*:\s*\[', head)
-        if m:
-            rest = head[m.end() :]
-            array_form = False
-        elif head.lstrip().startswith("["):
-            rest = head.lstrip()[1:]
-            array_form = True
-        else:
-            # Maybe key is later — read more until found or give up.
-            buf = head
-            while True:
-                chunk = fh.read(1 << 20)
-                if not chunk:
-                    raise ImportError(f"{path.name}: no 'traceEvents' array found")
-                total += len(chunk.encode("utf-8", errors="replace"))
-                if total > max_decompressed_bytes:
-                    raise ImportError(
-                        f"{path.name}: decompressed size exceeds limit of "
-                        f"{max_decompressed_bytes} bytes"
-                    )
-                buf += chunk
-                m = re.search(r'"traceEvents"\s*:\s*\[', buf)
-                if m:
-                    rest = buf[m.end() :]
-                    array_form = False
-                    break
-                if len(buf) > 50_000_000:
-                    raise ImportError(f"{path.name}: no 'traceEvents' array found")
-
-        # Line-oriented fast path for compact dumps (one object per line).
-        # Process residual + remaining lines.
-        def _handle_line(line: str) -> dict[str, Any] | None:
-            s = line.strip()
-            if not s:
-                return None
-            if s[0] == "]":
-                return None  # end marker handled by caller
-            if s[-1] == ",":
-                s = s[:-1]
-            if not s.startswith("{"):
-                return None
-            try:
-                obj = json.loads(s)
-            except json.JSONDecodeError:
-                return None
-            return obj if isinstance(obj, dict) else None
-
-        # Prefer line mode for compact one-object-per-line dumps.
-        # If ``rest`` ends mid-line (head cut), carry the incomplete prefix into
-        # the first line from the file so we never drop a boundary event.
-        carry = ""
-        nl = rest.rfind("\n")
-        if nl >= 0:
-            complete, carry = rest[: nl + 1], rest[nl + 1 :]
-            for line in complete.splitlines(keepends=True):
-                if line.strip().startswith("]"):
-                    return
-                obj = _handle_line(line)
-                if obj is not None:
-                    yield obj
-        else:
-            carry = rest
-        for line in fh:
-            total += len(line.encode("utf-8", errors="replace"))
+        for raw in fh:
+            total += len(raw)
             if total > max_decompressed_bytes:
                 raise ImportError(
                     f"{path.name}: decompressed size exceeds limit of "
                     f"{max_decompressed_bytes} bytes"
                 )
-            if carry:
-                line = carry + line
-                carry = ""
-            if line.strip().startswith("]"):
-                return
-            obj = _handle_line(line)
-            if obj is not None:
-                yield obj
-        _ = array_form  # reserved
+            line = raw
+            if not started:
+                # Locate the events array; it may sit past a large metadata head.
+                pre += line
+                m = re.search(r'"traceEvents"\s*:\s*\[', pre)
+                if m:
+                    line = pre[m.end() :]
+                elif pre.lstrip().startswith("["):
+                    line = pre.lstrip()[1:]
+                elif len(pre) > 64 * 1024 * 1024:
+                    raise ImportError(f"{path.name}: no 'traceEvents' array found")
+                else:
+                    continue
+                started = True
+                pre = ""
+                # Fall through and process the remainder of the header line.
+
+            if depth == 0:
+                if "{" not in line:
+                    if line.lstrip().startswith("]"):
+                        return  # end of the traceEvents array
+                    continue  # whitespace / commas between objects
+                buf = [line]
+                depth = _line_brace_delta(line)
+            else:
+                buf.append(line)
+                depth += _line_brace_delta(line)
+
+            if depth <= 0 and buf:
+                obj = _emit(buf)
+                buf = []
+                depth = 0
+                if obj is not None:
+                    yield obj
 
 
 def _device_id_from_chrome_obj(obj: dict[str, Any]) -> int | None:
@@ -606,8 +615,11 @@ def _workload_stem(path: Path) -> str:
 
 
 # Files below this size use a full json.load (pretty-printed fixtures, small
-# customer dumps). Larger compact dumps use the line-stream multi-pass path.
-_FULL_LOAD_MAX_BYTES = 80 * 1024 * 1024  # 80 MiB
+# customer dumps). Larger dumps use the line-stream path. Gzip has a smaller
+# on-disk threshold because it decompresses ~8-10x, so a 24 MiB gzip is already
+# a ~200 MiB DOM — stream those instead of loading the whole thing.
+_FULL_LOAD_MAX_BYTES = 80 * 1024 * 1024  # 80 MiB (uncompressed)
+_GZIP_FULL_LOAD_MAX_BYTES = 24 * 1024 * 1024  # 24 MiB (compressed)
 
 
 def _import_torch_from_event_dicts(
@@ -719,7 +731,10 @@ def import_torch_trace(
             gzipped = fh.read(2) == b"\x1f\x8b"
 
     size = path.stat().st_size
-    use_full_load = gzipped or size <= _FULL_LOAD_MAX_BYTES
+    if gzipped:
+        use_full_load = size <= _GZIP_FULL_LOAD_MAX_BYTES
+    else:
+        use_full_load = size <= _FULL_LOAD_MAX_BYTES
 
     if use_full_load:
         try:
@@ -767,7 +782,7 @@ def import_torch_trace(
     n_raw = 0
     try:
         for obj in _iter_chrome_event_dicts(
-            path, gzipped=False, max_decompressed_bytes=max_decompressed_bytes
+            path, gzipped=bool(gzipped), max_decompressed_bytes=max_decompressed_bytes
         ):
             n_raw += 1
             if scanned_sku is None and obj.get("name") in ("process_name", "thread_name"):
