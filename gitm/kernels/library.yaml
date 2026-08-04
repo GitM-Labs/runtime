@@ -432,6 +432,120 @@ interventions:
       notes: Execution-backend swap with restart; validate end-to-end before keep.
     review: null
 
+  # --- Mixture-of-Experts levers ---------------------------------------------
+  # MoE decode is weight-fetch-bandwidth-bound: a token activates top-k of E
+  # experts, but the batch loads the *union* of experts any token selected, so
+  # the working set grows with batch and saturates at E. These four levers act on
+  # the three things that distinguishes MoE from a dense FFN — which expert-GEMM
+  # kernel runs, how experts are sharded, how evenly routing loads them, and
+  # whether the resulting collectives overlap compute. They target
+  # ``mlp_gate_up``/``mlp_down`` (the FFN path, which is the expert path on an
+  # MoE model) rather than every op.
+
+  - name: moe_backend_deep_gemm
+    summary: Select the DeepGEMM fused-MoE backend for the fp8 expert GEMMs.
+    knob: moe_backend
+    value: deep_gemm
+    applies_to_kernels: [mlp_gate_up, mlp_down]  # the routed-expert GEMMs
+    expected_delta_mean: 0.05
+    expected_delta_lo: -0.05
+    expected_delta_hi: 0.20
+    source: https://docs.vllm.ai/en/stable/configuration/engine_args/
+    applicability:
+      workloads: [vllm-decode]
+      requires_dtype: [fp8]
+      other: >-
+        Per-expert decode GEMMs are tall-skinny and low-occupancy, so the backend
+        choice matters more than for a dense FFN. No single backend wins across
+        the batch range — weight-only kernels favour the memory-bound low-batch
+        regime, grouped-GEMM kernels the compute-bound high-batch one. Other
+        choices to sweep: auto (default), triton, cutlass, flashinfer_trtllm,
+        marlin. Requires a build whose vLLM exposes --moe-backend.
+    safety:
+      tier: moderate
+      requires_rollback_window_s: 180
+      notes: >-
+        Kernel-variant selection; backends are mathematically equivalent but
+        differ in fp8 accumulation order, so gate on an accuracy sentinel.
+        Structural — takes effect on a fresh engine.
+    review: null
+
+  - name: enable_expert_parallel
+    summary: Shard whole experts across ranks (EP) instead of slicing each one (TP).
+    knob: enable_expert_parallel
+    value: true
+    applies_to_kernels: [mlp_gate_up, mlp_down]  # MoE layers only, per vLLM docs
+    expected_delta_mean: 0.00
+    expected_delta_lo: -0.20
+    expected_delta_hi: 0.25
+    source: https://docs.vllm.ai/en/stable/configuration/engine_args/
+    applicability:
+      workloads: [vllm-decode]
+      requires_hardware: [A100, H100, H200]
+      other: >-
+        Multi-GPU only. Trades per-layer all-reduce for all-to-all dispatch/combine
+        and keeps per-expert GEMMs full-width instead of halving them, but makes
+        rank load routing-dependent (a hot expert stalls the step). Wins when
+        decode is weight-fetch-bound; loses at small batch where all-to-all is
+        latency-bound.
+    safety:
+      tier: high_risk
+      requires_qualification_commit: true
+      requires_rollback_window_s: 300
+      notes: >-
+        Topology change requiring an engine restart — heavy rollback, gate
+        strictly. Pair with the expert-imbalance signal before keeping.
+    review: null
+
+  - name: enable_eplb
+    summary: Rebalance expert placement across ranks to cut routing-induced stragglers.
+    knob: enable_eplb
+    value: true
+    applies_to_kernels: [mlp_gate_up, mlp_down]  # expert load is the FFN path
+    expected_delta_mean: 0.03
+    expected_delta_lo: -0.02
+    expected_delta_hi: 0.15
+    source: https://docs.vllm.ai/en/stable/configuration/engine_args/
+    applicability:
+      workloads: [vllm-decode]
+      other: >-
+        Requires expert parallelism (see enable_expert_parallel) — under TP every
+        rank slices every expert, so routing skew is symmetric and there is no
+        straggler to fix. Only pays off when measured per-expert load is actually
+        uneven; near-zero on balanced routing, and rebalancing itself costs.
+    safety:
+      tier: moderate
+      requires_rollback_window_s: 180
+      notes: >-
+        Changes expert placement; structural (fresh engine). Verify the
+        max/mean per-expert load actually falls before keeping.
+    review: null
+
+  - name: enable_dbo
+    summary: Overlap two micro-batches so collectives hide behind compute.
+    knob: enable_dbo
+    value: true
+    applies_to_kernels: *all_ops  # overlap reshapes the whole step's execution
+    expected_delta_mean: 0.04
+    expected_delta_lo: -0.03
+    expected_delta_hi: 0.12
+    source: https://docs.vllm.ai/en/stable/configuration/engine_args/
+    applicability:
+      workloads: [vllm-decode]
+      other: >-
+        Only helps when communication is *exposed* — TP/EP collectives sit on the
+        critical path because the next layer consumes their result, so there is no
+        independent work to hide them behind unless a second micro-batch supplies
+        it. Check exposed-comm share first; near-zero benefit single-GPU, where
+        there are no collectives at all.
+    safety:
+      tier: moderate
+      requires_rollback_window_s: 180
+      notes: >-
+        Splitting the batch shrinks each micro-batch, which can cost more in
+        GEMM efficiency than overlap recovers. Structural (fresh engine).
+    review: null
+
   # unified non vLLM levels 
   # catalog workloads levels, workload tagged load_library + the gate keep them scoped
   # the measure delta still comes from each benchmarks A/B

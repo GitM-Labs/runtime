@@ -204,7 +204,7 @@ def test_library_has_validated_levers_with_values():
     from gitm.kernels import load_library
 
     specs = load_library()
-    assert len(specs) == 24
+    assert len(specs) == 28
     for s in specs:
         assert s.value is not None, f"{s.name} missing value"
         assert s.expected_delta_lo <= s.expected_delta_mean <= s.expected_delta_hi

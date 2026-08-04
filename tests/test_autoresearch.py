@@ -835,7 +835,7 @@ def test_engineargs_proposer_bounds_a_large_surface_by_default() -> None:
     # The vLLM binding caps by default so the real ~100-field surface can't flood.
     knobs = [Knob(f"prefill_{i}", "bool", default=False) for i in range(100)]
     specs = EngineArgsProposer(knobs=knobs, catalog_knobs=set()).propose("idle_stall")
-    assert 0 < len(specs) <= 24
+    assert 0 < len(specs) <= 28
 
 
 def test_candidate_spec_helper_forces_safety_and_delta() -> None:
