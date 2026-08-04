@@ -8,6 +8,68 @@ import sys
 from pathlib import Path
 
 
+def _add_capture(sub) -> None:
+    """``gitm capture serve|attach`` — get a kernel trace out of a vLLM server.
+
+    Two modes rather than one with a flag, because they take different inputs and
+    have different blast radii: ``serve`` starts and owns a process, ``attach``
+    touches nothing but a marker file next to a server somebody else is running.
+    Collapsing them would mean a single command where half the flags are ignored
+    depending on the other half, and where ``--dry-run`` means two different things.
+    """
+    from gitm.serve.vllm import add_serve_arguments
+
+    cap = sub.add_parser(
+        "capture",
+        help="Capture GPU kernels from a vLLM server (launch one, or attach to a running one).",
+    )
+    cap.set_defaults(capture_help=cap.print_help)
+    modes = cap.add_subparsers(dest="capture_mode")
+
+    serve = modes.add_parser(
+        "serve",
+        help="Launch `vllm serve` under the collector and capture a window.",
+        epilog="Pass a full serve command after `--` to override the pinned experiment.",
+    )
+    add_serve_arguments(serve)
+
+    attach = modes.add_parser(
+        "attach",
+        help="Attach to an already-running vLLM server and capture a window.",
+        epilog=(
+            "The server must have been started with CUDA_INJECTION64_PATH pointing at "
+            "libgitm_inject.so — the CUDA driver reads it only at CUDA init, so it "
+            "cannot be added to a live process. `gitm capture attach --list` reports "
+            "which servers on this box qualify."
+        ),
+    )
+    attach.add_argument("--list", action="store_true",
+                        help="List the vLLM servers on this box and whether each can be traced.")
+    who = attach.add_mutually_exclusive_group()
+    who.add_argument("--pid", type=int, default=None, help="Target PID (the server frontend).")
+    who.add_argument("--port", type=int, default=None,
+                     help="Resolve the target from whoever is listening on this port.")
+    attach.add_argument("--base-url", default=None,
+                        help="Server base URL (default http://127.0.0.1:<its own --port>).")
+    attach.add_argument("--out", default=None,
+                        help="Output dir (default $GITM_SCRATCH/traces/vllm-attach-<ts>).")
+    attach.add_argument("--duration", type=float, default=30.0,
+                        help="Observe mode: seconds to watch the server's own traffic.")
+    attach.add_argument("--requests", type=int, default=0,
+                        help="Drive mode: issue this many synthetic requests instead of observing.")
+    attach.add_argument("--concurrency", type=int, default=64, help="Drive mode: in-flight requests.")
+    attach.add_argument("--input-tokens", type=int, default=1024)
+    attach.add_argument("--output-tokens", type=int, default=256)
+    attach.add_argument("--seed", type=int, default=42)
+    attach.add_argument("--no-ignore-eos", action="store_true",
+                        help="Drive mode: let the model stop early.")
+    attach.add_argument("--request-timeout", type=float, default=600.0)
+    attach.add_argument("--metrics-interval", type=float, default=1.0,
+                        help="Seconds between /metrics gauge samples during the window.")
+    attach.add_argument("--dry-run", action="store_true",
+                        help="Verify the target and stop; never opens a window.")
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="gitm",
@@ -82,6 +144,8 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Plan the attach without touching the live process.",
     )
+
+    _add_capture(sub)
 
     sub.add_parser("doctor", help="Probe environment, GPUs, and data locations.")
 
@@ -176,7 +240,53 @@ def _apply_hft_run_flags(args) -> None:
             os.environ[k] = v
 
 
+def _run_capture(args, serve_argv: list[str] | None) -> int:
+    if args.capture_mode == "serve":
+        from gitm.serve.vllm import launch_and_capture
+
+        rc, _ = launch_and_capture(args, serve_argv)
+        return rc
+
+    from gitm.serve.attach import AttachOptions, attach_and_capture, print_targets
+
+    if args.list:
+        return print_targets()
+
+    rc, _ = attach_and_capture(
+        AttachOptions(
+            pid=args.pid,
+            port=args.port,
+            base_url=args.base_url,
+            out=Path(args.out) if args.out else None,
+            duration_s=args.duration,
+            requests=args.requests,
+            concurrency=args.concurrency,
+            input_tokens=args.input_tokens,
+            output_tokens=args.output_tokens,
+            seed=args.seed,
+            ignore_eos=not args.no_ignore_eos,
+            request_timeout=args.request_timeout,
+            metrics_interval=args.metrics_interval,
+            dry_run=args.dry_run,
+        )
+    )
+    return rc
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+
+    # Under ``capture``, everything after ``--`` is a serve command to hand to vLLM
+    # verbatim, not gitm's own flags. Split before argparse sees it: `vllm serve M
+    # --port 9000` shares flag names with this parser, and letting argparse claim them
+    # would silently retarget the capture at a port the server was never told about.
+    # Scoped to ``capture`` because argparse's own ``--`` (end-of-flags, e.g.
+    # `gitm analyze -- ./-weird-name.json`) still has to work everywhere else.
+    serve_argv: list[str] | None = None
+    if argv[:1] == ["capture"] and "--" in argv:
+        i = argv.index("--")
+        argv, serve_argv = argv[:i], argv[i + 1:]
+
     args = _parser().parse_args(argv)
 
     if args.version:
@@ -231,6 +341,14 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(plan, indent=2))
         # no_target is an operator-actionable miss, not a crash — signal it.
         return 0 if plan.get("status") in {"attached", "planned"} else 4
+
+    if args.cmd == "capture":
+        if getattr(args, "capture_mode", None) is None:
+            # Print help but exit non-zero: `gitm capture` on its own is an incomplete
+            # command, and a script that runs it should not read that as success.
+            args.capture_help()
+            return 2
+        return _run_capture(args, serve_argv)
 
     if args.cmd == "doctor":
         from gitm.doctor import doctor
