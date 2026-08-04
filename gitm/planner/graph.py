@@ -142,10 +142,21 @@ def predict_graph(
             PredictedNode("qkv_proj", layer, roofline("qkv_proj", flops, bytes_moved, hw))
         )
 
-        # Attention scores + softmax + value: KV-cache traffic dominates at decode.
-        # Reads: K, V over kv_len tokens, grouped to n_kv heads.
-        kv_bytes = dt * 2 * kv_len * n_kv * head_dim * b
-        attn_flops = 2 * b * n_h * head_dim * kv_len * 2  # qk + sv
+        # Attention scores + softmax + value. Full-attention layers re-read a KV
+        # cache that grows with context; linear/recurrent layers (gated DeltaNet,
+        # Mamba) carry a fixed-size state instead, so their traffic is flat in
+        # sequence length. Pricing the latter as KV overstates traffic by roughly
+        # kv_len / head_dim — over 100x at 16k context.
+        if model.is_full_attention_layer(layer):
+            # Reads: K, V over kv_len tokens, grouped to n_kv heads.
+            kv_bytes = dt * 2 * kv_len * n_kv * head_dim * b
+            attn_flops = 2 * b * n_h * head_dim * kv_len * 2  # qk + sv
+        else:
+            # Read the recurrent state, update it, write it back: 2x state per
+            # sequence. FLOPs are the state-sized matmuls, also context-free.
+            state = model.linear_attn_state_elems
+            kv_bytes = dt * 2 * state * b
+            attn_flops = 2 * b * state * 2  # state-vector product + state update
         g.nodes.append(
             PredictedNode(
                 "attn_score_value",

@@ -224,21 +224,23 @@ _MOE_ALIASES: dict[str, tuple[str, ...]] = {
     "moe_layer_step": ("decoder_sparse_step", "moe_layer_freq"),
 }
 
+#: Attention-shape aliases. Deliberately separate from the MoE table: hybrid
+#: attention and a mixture FFN are independent choices, and a hybrid model with a
+#: dense FFN (or a plain MoE transformer) must still get the right one.
+_ATTN_ALIASES: dict[str, tuple[str, ...]] = {
+    "full_attn_layer_step": ("full_attention_interval", "attn_layer_freq"),
+}
+
 #: quant_method -> bytes per weight element. MoE decode is weight-fetch bound,
 #: so using the activation width for a quantized checkpoint would overstate the
 #: dominant term by 2x (fp8) or 4x (4-bit).
 _QUANT_WEIGHT_BYTES: dict[str, int] = {"fp8": 1, "compressed-tensors": 1, "modelopt_fp8": 1}
 
 
-def _moe_fields_from_hf(hf: Any) -> dict[str, Any]:
-    """MoE ``ModelSpec`` kwargs read off an HF config, or ``{}`` for a dense model.
-
-    Every field is optional: a config with no expert fields yields ``{}`` and the
-    spec stays dense, which is the correct read for a non-MoE model rather than a
-    guess. Duck-typed across families and tolerant of partial configs.
-    """
+def _read_int_aliases(hf: Any, table: dict[str, tuple[str, ...]]) -> dict[str, Any]:
+    """First positive int found for each field across its aliases. Duck-typed."""
     out: dict[str, Any] = {}
-    for field, aliases in _MOE_ALIASES.items():
+    for field, aliases in table.items():
         for alias in aliases:
             raw = getattr(hf, alias, None)
             if raw is None:
@@ -250,11 +252,27 @@ def _moe_fields_from_hf(hf: Any) -> dict[str, Any]:
             if value > 0:
                 out[field] = value
                 break
+    return out
+
+
+def _moe_fields_from_hf(hf: Any) -> dict[str, Any]:
+    """Shape ``ModelSpec`` kwargs read off an HF config.
+
+    Covers two *independent* axes — whether the FFN is a mixture, and whether
+    attention is hybrid — so a hybrid-attention dense model still gets its
+    attention shape, and a plain MoE transformer still gets its experts. Every
+    field is optional; anything absent falls back to the dense/conventional
+    default rather than being guessed. Tolerant of partial configs.
+    """
+    # Attention shape is independent of the FFN, so it survives the MoE gate.
+    out: dict[str, Any] = _read_int_aliases(hf, _ATTN_ALIASES)
+    moe = _read_int_aliases(hf, _MOE_ALIASES)
 
     # Only a routed-expert count *and* a top-k make the FFN a mixture; without
-    # both, leave the spec dense rather than half-configured.
-    if not (out.get("num_experts") and out.get("experts_per_token")):
-        return {}
+    # both, leave the FFN dense rather than half-configured.
+    if not (moe.get("num_experts") and moe.get("experts_per_token")):
+        return out
+    out.update(moe)
 
     quant = getattr(hf, "quantization_config", None)
     method = None

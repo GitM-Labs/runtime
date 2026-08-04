@@ -80,6 +80,11 @@ class ModelSpec:
     #: Among the remaining layers, every ``moe_layer_step``-th one is MoE and the
     #: rest stay dense (Qwen ``decoder_sparse_step``). 1 = every layer is MoE.
     moe_layer_step: int = 1
+    #: Hybrid attention: every ``full_attn_layer_step``-th layer uses softmax
+    #: attention over a growing KV cache; the rest use linear/recurrent attention
+    #: (gated DeltaNet, Mamba) whose state is *constant* in sequence length.
+    #: 1 = every layer is full attention, i.e. a conventional transformer.
+    full_attn_layer_step: int = 1
 
     @property
     def is_moe(self) -> bool:
@@ -104,6 +109,51 @@ class ModelSpec:
     def n_moe_layers(self) -> int:
         """How many layers actually carry the mixture FFN."""
         return sum(1 for i in range(self.n_layers) if self.is_moe_layer(i))
+
+    def is_full_attention_layer(self, layer: int) -> bool:
+        """Whether layer ``layer`` uses softmax attention over a KV cache.
+
+        Hybrid models (Qwen3-Next-style gated DeltaNet, Mamba/Jamba) interleave a
+        few full-attention layers among many linear-attention ones. The two have
+        fundamentally different memory behaviour at decode:
+
+        * **full attention** re-reads a KV cache that grows with context, so its
+          traffic scales with ``kv_cache_len``;
+        * **linear attention** carries a fixed-size recurrent state per sequence,
+          so its traffic is *constant* in sequence length.
+
+        Modeling every layer as full attention overstates KV traffic by the ratio
+        of context length to state size — at 16k context that is over an order of
+        magnitude, and it is why a hybrid model can serve long contexts with only
+        a few percent of KV-cache utilisation.
+        """
+        step = max(self.full_attn_layer_step, 1)
+        return layer % step == 0
+
+    @property
+    def n_full_attention_layers(self) -> int:
+        """How many layers use softmax attention over a growing KV cache."""
+        return sum(1 for i in range(self.n_layers) if self.is_full_attention_layer(i))
+
+    @property
+    def is_hybrid_attention(self) -> bool:
+        """True when some layers use linear/recurrent attention instead of KV."""
+        return max(self.full_attn_layer_step, 1) > 1
+
+    @property
+    def linear_attn_state_elems(self) -> int:
+        """Recurrent-state elements per sequence for one linear-attention layer.
+
+        Gated DeltaNet (and linear attention generally) keeps a ``[head_dim,
+        head_dim]`` state matrix per head instead of a per-token KV cache, so the
+        state is ``n_heads * head_dim^2`` and does **not** grow with context.
+
+        An approximation: architectures vary in whether the linear-attention
+        heads share the softmax heads' dimensions. It is the right *shape* — flat
+        in sequence length rather than linear in it — which is what makes the
+        prediction directionally correct where treating it as KV does not.
+        """
+        return self.n_heads * self.head_dim * self.head_dim
 
     @property
     def w_bytes(self) -> int:

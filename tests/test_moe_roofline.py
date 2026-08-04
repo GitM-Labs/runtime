@@ -325,6 +325,105 @@ def test_param_accounting_is_internally_consistent():
     assert m.active_params == 2 * (attn + experts_active + shared + router) + embed
 
 
+# --- hybrid attention: linear layers do not carry a growing KV cache ---------
+
+
+def test_conventional_transformer_is_all_full_attention():
+    m = ModelSpec(n_layers=4)
+    assert [m.is_full_attention_layer(i) for i in range(4)] == [True] * 4
+    assert m.n_full_attention_layers == 4
+    assert not m.is_hybrid_attention
+
+
+def test_hybrid_places_one_full_attention_layer_every_step():
+    m = ModelSpec(n_layers=8, full_attn_layer_step=4)
+    assert [m.is_full_attention_layer(i) for i in range(8)] == [
+        True, False, False, False, True, False, False, False
+    ]
+    assert m.n_full_attention_layers == 2
+    assert m.is_hybrid_attention
+
+
+def test_linear_attention_traffic_is_flat_in_context():
+    """The defining property: a recurrent state does not grow with sequence length,
+    so a linear layer's traffic is identical at 1k and 16k context."""
+    m = ModelSpec(hidden=2048, n_layers=2, n_heads=32, num_kv_heads=4,
+                  head_dim=128, full_attn_layer_step=2)  # layer 0 full, layer 1 linear
+    short = predict_graph(m, H100, BatchConfig(batch=8, kv_cache_len=1024))
+    long = predict_graph(m, H100, BatchConfig(batch=8, kv_cache_len=16384))
+    lin_short = [n for n in short.nodes if n.op == "attn_score_value"][1].prediction
+    lin_long = [n for n in long.nodes if n.op == "attn_score_value"][1].prediction
+    assert lin_short.bytes == lin_long.bytes, "linear-attention state must be context-free"
+    # ...while the full-attention layer scales with context, 16x here.
+    full_short = [n for n in short.nodes if n.op == "attn_score_value"][0].prediction
+    full_long = [n for n in long.nodes if n.op == "attn_score_value"][0].prediction
+    assert full_long.bytes == pytest.approx(16 * full_short.bytes)
+
+
+def test_hybrid_cuts_long_context_attention_traffic_dramatically():
+    """Why a hybrid model serves 16k context at a few percent KV utilisation:
+    pricing every layer as full attention overstates traffic by ~an order of
+    magnitude."""
+    shape = dict(hidden=2048, n_layers=8, n_heads=32, num_kv_heads=4, head_dim=128)
+    conventional = ModelSpec(**shape)
+    hybrid = ModelSpec(**shape, full_attn_layer_step=4)
+    cfg = BatchConfig(batch=16, kv_cache_len=16384)
+    total = lambda m: sum(  # noqa: E731
+        n.prediction.bytes for n in predict_graph(m, H100, cfg).nodes
+        if n.op == "attn_score_value"
+    )
+    assert total(hybrid) < total(conventional) / 3
+
+
+def test_hybrid_attention_does_not_change_the_op_vocabulary():
+    """Linear-attention layers still emit attn_score_value — the canonical
+    vocabulary that classify_op and library.yaml key off is unchanged."""
+    ops = [n.op for n in predict_graph(
+        ModelSpec(n_layers=4, full_attn_layer_step=2), H100, BatchConfig(batch=2)
+    ).nodes]
+    assert ops.count("attn_score_value") == 4
+    assert set(ops) == {n.op for n in predict_graph(ModelSpec(n_layers=4)).nodes}
+
+
+def test_hybrid_and_moe_compose():
+    """The two axes are independent: a model can be hybrid-attention AND MoE."""
+    m = ModelSpec(hidden=2048, n_layers=8, intermediate=768, n_heads=32,
+                  num_kv_heads=4, head_dim=128, num_experts=64, experts_per_token=4,
+                  moe_intermediate=768, full_attn_layer_step=4, first_dense_layers=1)
+    assert m.is_moe and m.is_hybrid_attention
+    assert m.n_full_attention_layers == 2
+    assert m.n_moe_layers == 7  # layer 0 dense FFN
+    g = predict_graph(m, H100, BatchConfig(batch=8, kv_cache_len=4096))
+    assert g.total_pred_s > 0
+    assert all(n.prediction.bytes > 0 for n in g.nodes)
+
+
+def test_hf_attention_shape_survives_a_dense_ffn():
+    """Regression: attention shape and FFN sparsity are independent axes, so a
+    hybrid model with a dense FFN must still get full_attn_layer_step."""
+    from gitm.scheduler.loop import _moe_fields_from_hf
+
+    class HybridDense:  # hybrid attention, no experts
+        full_attention_interval = 4
+
+    class PlainMoE:  # experts, conventional attention
+        num_experts = 64
+        num_experts_per_tok = 4
+
+    assert _moe_fields_from_hf(HybridDense()) == {"full_attn_layer_step": 4}
+    got = _moe_fields_from_hf(PlainMoE())
+    assert got["num_experts"] == 64 and "full_attn_layer_step" not in got
+
+
+def test_hf_half_configured_moe_stays_dense():
+    from gitm.scheduler.loop import _moe_fields_from_hf
+
+    class OnlyExpertCount:
+        num_experts = 64  # no top-k
+
+    assert _moe_fields_from_hf(OnlyExpertCount()) == {}
+
+
 def test_total_prediction_is_finite_and_positive_across_shapes():
     """Versatility guard: a spread of real MoE shapes all predict sanely."""
     shapes = [
