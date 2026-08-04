@@ -72,6 +72,27 @@ gitm attach --job <job-id>
 
 The install itself is a few lines and adds no rewrite to the workload. Containers still pass through your normal image-scanning and authorization process before deployment.
 
+### vLLM servers
+
+An inference server is a long-lived process, so kernel capture is a *window* inside its lifetime rather than a run of its own. Git.M can obtain that window two ways.
+
+```bash
+# Launch the server under the collector and capture a driven window.
+# --keep-server leaves it up for further windows.
+gitm capture serve --keep-server -- vllm serve <model> --tensor-parallel-size 4
+
+# Attach to a server that is already up and watch its real traffic for 60s.
+# Nothing is launched, restarted, or rerouted; the server is never signalled.
+gitm capture attach --duration 60
+
+# Which servers on this box can be traced, and why the others cannot.
+gitm capture attach --list
+```
+
+Attach works because the collection window is opened by a marker file that the injected collector polls, so the process opening the window need not be the one that started the server. The same mechanism sets the one hard limit: the CUDA driver reads `CUDA_INJECTION64_PATH` once, at CUDA init, so a server started without it cannot be traced while it runs. `--list` reports that up front — with the exact restart that fixes it — instead of letting the run end in an empty trace.
+
+Both paths write the same artifacts (`trace.jsonl`, `kernel_breakdown.json`, `run_manifest.json`, `serving_summary.json`), so a driven benchmark and a production observation of the same server are directly comparable.
+
 -----
 
 ## Permissions and access

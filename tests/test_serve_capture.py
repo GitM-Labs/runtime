@@ -1,4 +1,4 @@
-"""Tests for the traced ``vllm serve`` driver (scripts/serve_capture.py).
+"""Tests for the traced ``vllm serve`` driver (gitm/serve/vllm.py).
 
 GPU-free. The parts that only ever run on a pod — CUPTI, the engine — are not
 exercised, but everything that decides whether the pod run produces a usable
@@ -9,33 +9,13 @@ passthrough, and the preflight's classification of a rejected serve flag.
 
 from __future__ import annotations
 
-import importlib.util
 import json
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-
-
-def _load():
-    """Import scripts/serve_capture.py by path — scripts/ is not a package.
-
-    The module must be in sys.modules *before* it executes: @dataclass resolves
-    annotations through sys.modules[cls.__module__], which is None otherwise.
-    """
-    spec = importlib.util.spec_from_file_location("serve_capture", REPO / "scripts" / "serve_capture.py")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-sc = _load()
-
+from gitm.serve import vllm as sc
 
 # --- streaming request: the TTFT measurement --------------------------------
 
