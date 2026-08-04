@@ -22,8 +22,14 @@ from gitm.planner.roofline import (
 )
 
 
-def _ffn_terms(model: ModelSpec, b: int) -> tuple[float, float, float, float]:
+def _ffn_terms(model: ModelSpec, b: int, *, moe_layer: bool = True) -> tuple[
+    float, float, float, float
+]:
     """``(gate_up_flops, gate_up_bytes, down_flops, down_bytes)`` for one layer.
+
+    ``moe_layer`` selects the mixture arithmetic for *this* layer. MoE
+    checkpoints are not uniformly sparse (see :meth:`ModelSpec.is_moe_layer`), so
+    a dense block inside an MoE model is priced as a dense FFN.
 
     Dense (``num_experts == 0``) reproduces the original single-FFN arithmetic
     exactly. For MoE the two costs are driven by *different* counts, which is the
@@ -50,7 +56,7 @@ def _ffn_terms(model: ModelSpec, b: int) -> tuple[float, float, float, float]:
     dt = model.dtype_bytes  # activations
     wb = model.w_bytes  # weights (may be narrower, e.g. fp8)
 
-    if not model.is_moe:
+    if not (model.is_moe and moe_layer):
         # Dense: one FFN, weights fetched once, every token through all of it.
         ff = model.intermediate
         gate_up_flops = 2 * 2 * b * h * ff
@@ -158,7 +164,9 @@ def predict_graph(
         # MLP gate+up / down. On an MoE model these two ops carry the expert
         # GEMMs, so their flops/bytes come from the mixture model instead of a
         # single dense FFN (see _ffn_terms).
-        gate_up_flops, gate_up_bytes, down_flops, down_bytes = _ffn_terms(model, b)
+        gate_up_flops, gate_up_bytes, down_flops, down_bytes = _ffn_terms(
+            model, b, moe_layer=model.is_moe_layer(layer)
+        )
         g.nodes.append(
             PredictedNode(
                 "mlp_gate_up", layer, roofline("mlp_gate_up", gate_up_flops, gate_up_bytes, hw)

@@ -219,6 +219,9 @@ _MOE_ALIASES: dict[str, tuple[str, ...]] = {
     "moe_intermediate": ("moe_intermediate_size", "expert_intermediate_size"),
     "shared_experts": ("n_shared_experts", "num_shared_experts"),
     "shared_expert_intermediate": ("shared_expert_intermediate_size",),
+    # Per-layer placement: MoE checkpoints are not uniformly sparse.
+    "first_dense_layers": ("first_k_dense_replace",),
+    "moe_layer_step": ("decoder_sparse_step", "moe_layer_freq"),
 }
 
 #: quant_method -> bytes per weight element. MoE decode is weight-fetch bound,

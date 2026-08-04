@@ -223,6 +223,108 @@ def test_quantized_weights_cut_the_dominant_term():
     assert 0.45 < fp8 / bf16 < 0.6, f"expected ~half, got {fp8 / bf16:.2f}"
 
 
+# --- per-layer placement: MoE checkpoints are not uniformly sparse -----------
+
+
+def test_all_layers_moe_by_default():
+    m = ModelSpec(n_layers=4, num_experts=64, experts_per_token=4)
+    assert [m.is_moe_layer(i) for i in range(4)] == [True] * 4
+    assert m.n_moe_layers == 4
+
+
+def test_leading_dense_layers_are_dense():
+    """DeepSeek-style first_k_dense_replace."""
+    m = ModelSpec(n_layers=6, num_experts=64, experts_per_token=4, first_dense_layers=2)
+    assert [m.is_moe_layer(i) for i in range(6)] == [False, False, True, True, True, True]
+    assert m.n_moe_layers == 4
+
+
+def test_moe_layer_step_interleaves():
+    """Qwen-style decoder_sparse_step: every Nth layer is MoE."""
+    m = ModelSpec(n_layers=6, num_experts=64, experts_per_token=4, moe_layer_step=2)
+    assert [m.is_moe_layer(i) for i in range(6)] == [True, False, True, False, True, False]
+    assert m.n_moe_layers == 3
+
+
+def test_dense_model_has_no_moe_layers():
+    m = ModelSpec(n_layers=4)
+    assert not any(m.is_moe_layer(i) for i in range(4))
+    assert m.n_moe_layers == 0
+
+
+def test_dense_layers_are_priced_as_dense_in_the_graph():
+    """A dense block inside an MoE model must use dense FFN arithmetic — pricing
+    it as MoE would inflate the predicted ceiling for that layer."""
+    m = ModelSpec(hidden=2048, n_layers=4, intermediate=768, num_experts=256,
+                  experts_per_token=8, moe_intermediate=768, first_dense_layers=2)
+    g = predict_graph(m, H100, BatchConfig(batch=16))
+    gate_ups = [n for n in g.nodes if n.op == "mlp_gate_up"]
+    assert len(gate_ups) == 4
+    dense_bytes = gate_ups[0].prediction.bytes   # layer 0 -> dense
+    moe_bytes = gate_ups[2].prediction.bytes     # layer 2 -> MoE
+    assert dense_bytes != moe_bytes
+    # The dense layer must match the plain single-FFN formula exactly.
+    dt, wb, h, ff = m.dtype_bytes, m.w_bytes, m.hidden, m.intermediate
+    b = 16
+    assert dense_bytes == dt * (b * h + 2 * b * ff) + wb * (2 * h * ff)
+    # And the MoE layer reads many experts, so it moves strictly more.
+    assert moe_bytes > dense_bytes
+
+
+# --- active vs total params ---------------------------------------------------
+
+
+def test_dense_model_active_equals_total():
+    m = ModelSpec()
+    assert m.active_params == m.total_params
+
+
+def test_moe_active_is_a_small_fraction_of_total():
+    """The '35B-A3B' property: only top_k of num_experts participate per token."""
+    assert MOE.active_params < MOE.total_params
+    assert MOE.active_params / MOE.total_params < 0.2
+
+
+def test_expert_params_scale_with_k_over_e():
+    """Isolate the expert term: doubling top_k roughly doubles the active expert
+    params, while total is unchanged."""
+    base = dict(hidden=2048, n_layers=8, intermediate=768, num_experts=64,
+                moe_intermediate=768, vocab=1000)
+    k4 = ModelSpec(**base, experts_per_token=4)
+    k8 = ModelSpec(**base, experts_per_token=8)
+    assert k4.total_params == k8.total_params
+    # Difference is exactly 4 more experts' worth of FFN per MoE layer.
+    delta = k8.active_params - k4.active_params
+    expected = k4.n_moe_layers * 4 * 3 * 2048 * 768
+    assert delta == expected
+
+
+def test_dense_layers_shift_params_from_experts_to_dense_ffn():
+    base = dict(hidden=2048, n_layers=8, intermediate=768, num_experts=64,
+                experts_per_token=4, moe_intermediate=768, vocab=1000)
+    all_moe = ModelSpec(**base)
+    half = ModelSpec(**base, first_dense_layers=4)
+    # Fewer MoE layers => far fewer total params (experts dominate the count).
+    assert half.total_params < all_moe.total_params
+    assert half.n_moe_layers == 4 and all_moe.n_moe_layers == 8
+
+
+def test_param_accounting_is_internally_consistent():
+    """Hand-derive both sides for a small shape so the formula is pinned, not
+    just self-consistent."""
+    m = ModelSpec(hidden=64, n_layers=2, n_heads=4, num_kv_heads=4, head_dim=16,
+                  intermediate=128, vocab=100, num_experts=8, experts_per_token=2,
+                  moe_intermediate=32, shared_experts=1)
+    attn = 64 * (4 + 2 * 4) * 16 + 4 * 16 * 64          # qkv + out proj
+    router = 64 * 8
+    experts_total = 8 * 3 * 64 * 32
+    experts_active = 2 * 3 * 64 * 32
+    shared = 1 * 3 * 64 * 32
+    embed = 2 * 100 * 64
+    assert m.total_params == 2 * (attn + experts_total + shared + router) + embed
+    assert m.active_params == 2 * (attn + experts_active + shared + router) + embed
+
+
 def test_total_prediction_is_finite_and_positive_across_shapes():
     """Versatility guard: a spread of real MoE shapes all predict sanely."""
     shapes = [

@@ -73,11 +73,37 @@ class ModelSpec:
     #: are the common case, and MoE decode is dominated by weight traffic — using
     #: the activation width for weights would overstate it by 2x or more.
     weight_dtype_bytes: int | None = None
+    #: Leading layers that keep a *dense* FFN (DeepSeek ``first_k_dense_replace``).
+    #: MoE models commonly leave the first block(s) dense; modeling them as MoE
+    #: overstates both their weight footprint and their traffic.
+    first_dense_layers: int = 0
+    #: Among the remaining layers, every ``moe_layer_step``-th one is MoE and the
+    #: rest stay dense (Qwen ``decoder_sparse_step``). 1 = every layer is MoE.
+    moe_layer_step: int = 1
 
     @property
     def is_moe(self) -> bool:
-        """True when the FFN should be modeled as a mixture of experts."""
+        """True when *any* layer's FFN should be modeled as a mixture of experts."""
         return self.num_experts > 0 and self.experts_per_token > 0
+
+    def is_moe_layer(self, layer: int) -> bool:
+        """Whether layer index ``layer`` uses the mixture FFN rather than a dense one.
+
+        Real MoE checkpoints are not uniformly sparse: DeepSeek keeps the first
+        ``first_k_dense_replace`` layers dense, and Qwen places MoE blocks every
+        ``decoder_sparse_step`` layers. Treating every layer as MoE inflates the
+        predicted weight footprint (and therefore the ceiling) by whatever
+        fraction is actually dense.
+        """
+        if not self.is_moe or layer < self.first_dense_layers:
+            return False
+        step = max(self.moe_layer_step, 1)
+        return (layer - self.first_dense_layers) % step == 0
+
+    @property
+    def n_moe_layers(self) -> int:
+        """How many layers actually carry the mixture FFN."""
+        return sum(1 for i in range(self.n_layers) if self.is_moe_layer(i))
 
     @property
     def w_bytes(self) -> int:
@@ -93,6 +119,64 @@ class ModelSpec:
     def shared_intermediate(self) -> int:
         """Per-shared-expert FFN width (falls back to the routed width)."""
         return self.shared_expert_intermediate or self.expert_intermediate
+
+    # --- parameter accounting -------------------------------------------------
+    # The "35B-A3B" naming convention: total parameters vs the ones a single
+    # token actually multiplies against. FLOPs follow *active*, checkpoint size
+    # and (at saturation) weight traffic follow *total* — conflating them is the
+    # 10x error that makes an MoE ceiling meaningless.
+
+    @property
+    def _attn_params_per_layer(self) -> int:
+        qkv = self.hidden * (self.n_heads + 2 * self.num_kv_heads) * self.head_dim
+        out = self.n_heads * self.head_dim * self.hidden
+        return qkv + out
+
+    def _dense_ffn_params(self, width: int) -> int:
+        """gate + up + down for an FFN of the given intermediate width."""
+        return 3 * self.hidden * width
+
+    @property
+    def total_params(self) -> int:
+        """Every weight in the checkpoint, including all experts.
+
+        Embedding and LM head are counted separately (untied); a tied-embedding
+        model has ``vocab * hidden`` fewer, which is under a percent for the
+        large-vocab models this matters for.
+        """
+        n_moe = self.n_moe_layers
+        n_dense = self.n_layers - n_moe
+        total = self.n_layers * self._attn_params_per_layer
+        total += n_dense * self._dense_ffn_params(self.intermediate)
+        if n_moe:
+            per_moe = (
+                self.num_experts * self._dense_ffn_params(self.expert_intermediate)
+                + self.shared_experts * self._dense_ffn_params(self.shared_intermediate)
+                + self.hidden * self.num_experts  # router
+            )
+            total += n_moe * per_moe
+        return total + 2 * self.vocab * self.hidden  # embedding + lm_head
+
+    @property
+    def active_params(self) -> int:
+        """Weights one token actually multiplies against on a decode step.
+
+        For a dense model this equals :attr:`total_params`. For a mixture only
+        ``top_k`` of ``num_experts`` participate per token (plus shared experts),
+        which is what makes a 35B model cost 3B of compute per token.
+        """
+        n_moe = self.n_moe_layers
+        n_dense = self.n_layers - n_moe
+        active = self.n_layers * self._attn_params_per_layer
+        active += n_dense * self._dense_ffn_params(self.intermediate)
+        if n_moe:
+            per_moe = (
+                self.top_k * self._dense_ffn_params(self.expert_intermediate)
+                + self.shared_experts * self._dense_ffn_params(self.shared_intermediate)
+                + self.hidden * self.num_experts  # router runs for every token
+            )
+            active += n_moe * per_moe
+        return active + 2 * self.vocab * self.hidden
 
     @property
     def top_k(self) -> int:
