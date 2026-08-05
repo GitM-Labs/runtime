@@ -196,6 +196,7 @@ def _model_spec_from_engine(engine: Any):
         n_heads = int(hf.num_attention_heads)
         n_kv = int(getattr(hf, "num_key_value_heads", n_heads) or n_heads)
         head_dim = int(getattr(hf, "head_dim", 0) or (hidden // n_heads))
+        moe = _moe_fields_from_hf(hf)
         return ModelSpec(
             hidden=hidden,
             n_layers=int(hf.num_hidden_layers),
@@ -204,9 +205,116 @@ def _model_spec_from_engine(engine: Any):
             head_dim=head_dim,
             intermediate=int(getattr(hf, "intermediate_size", 4 * hidden)),
             vocab=int(hf.vocab_size),
+            **moe,
         )
     except Exception:
         return None
+
+
+#: HF config field aliases per MoE family — the same quantity is spelled
+#: differently by Qwen / Mixtral / DeepSeek, so try each in order.
+_MOE_ALIASES: dict[str, tuple[str, ...]] = {
+    "num_experts": ("num_experts", "num_local_experts", "n_routed_experts"),
+    "experts_per_token": ("num_experts_per_tok", "moe_top_k", "num_selected_experts"),
+    "moe_intermediate": ("moe_intermediate_size", "expert_intermediate_size"),
+    "shared_experts": ("n_shared_experts", "num_shared_experts"),
+    "shared_expert_intermediate": ("shared_expert_intermediate_size",),
+    # Per-layer placement: MoE checkpoints are not uniformly sparse.
+    "first_dense_layers": ("first_k_dense_replace",),
+    "moe_layer_step": ("decoder_sparse_step", "moe_layer_freq"),
+}
+
+#: Attention-shape aliases. Deliberately separate from the MoE table: hybrid
+#: attention and a mixture FFN are independent choices, and a hybrid model with a
+#: dense FFN (or a plain MoE transformer) must still get the right one.
+_ATTN_ALIASES: dict[str, tuple[str, ...]] = {
+    "full_attn_layer_step": ("full_attention_interval", "attn_layer_freq"),
+}
+
+#: quant_method -> bytes per weight element. MoE decode is weight-fetch bound,
+#: so using the activation width for a quantized checkpoint would overstate the
+#: dominant term by 2x (fp8) or 4x (4-bit).
+_QUANT_WEIGHT_BYTES: dict[str, int] = {"fp8": 1, "compressed-tensors": 1, "modelopt_fp8": 1}
+
+
+def _batch_config_from_stats(sched: Any):
+    """A :class:`BatchConfig` carrying the *observed* decode batch, or ``None``.
+
+    ``predict_graph``'s default is ``batch=1``. That is wrong for any real serving
+    window and especially wrong for a mixture-of-experts model, where weight
+    traffic scales with the distinct experts a batch activates: at top-8 of 256,
+    a batch of 1 touches 8 experts but a batch of 16 touches ~100, so scoring a
+    batch-16 step against the batch-1 ceiling understates expert traffic by more
+    than 10x. ``mean_running`` is vLLM's own count of concurrently running
+    sequences, which is exactly the decode batch.
+
+    Returns ``None`` (caller falls back to the default) when no scheduler samples
+    were taken — a CPU box, a dry run, or an engine that exposes no stats. Better
+    a documented default than a fabricated batch.
+
+    ``kv_cache_len`` is deliberately left at its default: nothing in the sampled
+    stats gives a token count (``peak_gpu_cache_usage`` is a fraction of blocks,
+    not a length), and inventing one would move the full-attention ceiling on a
+    guess. Sourcing it is tracked separately.
+    """
+    from gitm.planner.roofline import BatchConfig
+
+    if sched is None or getattr(sched, "n_samples", 0) == 0:
+        return None
+    running = getattr(sched, "mean_running", None)
+    if running is None or running < 1:
+        return None
+    return BatchConfig(batch=max(int(round(float(running))), 1))
+
+
+def _read_int_aliases(hf: Any, table: dict[str, tuple[str, ...]]) -> dict[str, Any]:
+    """First positive int found for each field across its aliases. Duck-typed."""
+    out: dict[str, Any] = {}
+    for field, aliases in table.items():
+        for alias in aliases:
+            raw = getattr(hf, alias, None)
+            if raw is None:
+                continue
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                out[field] = value
+                break
+    return out
+
+
+def _moe_fields_from_hf(hf: Any) -> dict[str, Any]:
+    """Shape ``ModelSpec`` kwargs read off an HF config.
+
+    Covers two *independent* axes — whether the FFN is a mixture, and whether
+    attention is hybrid — so a hybrid-attention dense model still gets its
+    attention shape, and a plain MoE transformer still gets its experts. Every
+    field is optional; anything absent falls back to the dense/conventional
+    default rather than being guessed. Tolerant of partial configs.
+    """
+    # Attention shape is independent of the FFN, so it survives the MoE gate.
+    out: dict[str, Any] = _read_int_aliases(hf, _ATTN_ALIASES)
+    moe = _read_int_aliases(hf, _MOE_ALIASES)
+
+    # Only a routed-expert count *and* a top-k make the FFN a mixture; without
+    # both, leave the FFN dense rather than half-configured.
+    if not (moe.get("num_experts") and moe.get("experts_per_token")):
+        return out
+    out.update(moe)
+
+    quant = getattr(hf, "quantization_config", None)
+    method = None
+    if isinstance(quant, dict):
+        method = quant.get("quant_method")
+    elif quant is not None:
+        method = getattr(quant, "quant_method", None)
+    if isinstance(method, str):
+        wb = _QUANT_WEIGHT_BYTES.get(method.lower())
+        if wb:
+            out["weight_dtype_bytes"] = wb
+    return out
 
 
 def _clamp_pct(value: float) -> float:
@@ -455,7 +563,14 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     pctx = build_planner_context(cfg.engine, workload=workload)
     _spec = _model_spec_from_engine(cfg.engine)
     _hw = hardware_spec_for(pctx.peak)
-    graph = predict_graph(model=_spec, hw=_hw) if _spec is not None else predict_graph(hw=_hw)
+    # Batch matters for the same reason the model does — and more so on a
+    # mixture, where weight traffic follows the *distinct* experts a batch
+    # activates: distinct(1)=top_k but distinct(16) is an order of magnitude
+    # larger, so predicting a batch-16 step at the batch-1 default understates
+    # expert traffic ~12x. Read the real concurrency off the sampled scheduler
+    # rather than defaulting.
+    _batch = _batch_config_from_stats(sched_summary)
+    graph = predict_graph(model=_spec, hw=_hw, batch=_batch)
     (run_dir / "predicted_graph.json").write_text(
         json.dumps(
             {"nodes": len(graph.nodes), "total_pred_s": graph.total_pred_s, "hardware": _hw.name},
