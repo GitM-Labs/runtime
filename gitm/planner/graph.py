@@ -17,6 +17,8 @@ from gitm.planner.roofline import (
     HardwareSpec,
     ModelSpec,
     RooflinePrediction,
+    ShardingConfig,
+    SparseMoEModelSpec,
     distinct_experts,
     roofline,
 )
@@ -101,14 +103,43 @@ class PredictedNode:
 
 @dataclass
 class Graph:
-    model: ModelSpec
+    # Dense (:func:`predict_graph`) or sparse-MoE
+    # (:func:`gitm.planner.moe_graph.predict_moe_graph`) — the node list is the
+    # same shape either way, so everything downstream of the planner (residuals,
+    # deviation, attribution) consumes both without branching.
+    model: ModelSpec | SparseMoEModelSpec
     hw: HardwareSpec
     batch: BatchConfig
     nodes: list[PredictedNode] = field(default_factory=list)
+    # How the model is spread across ranks. The default (1/1/1) means the graph
+    # is whole-model, which is what every dense caller wants.
+    sharding: ShardingConfig = field(default_factory=ShardingConfig)
 
     @property
     def total_pred_s(self) -> float:
         return sum(n.prediction.t_pred_s for n in self.nodes)
+
+    @property
+    def has_unpriced_collectives(self) -> bool:
+        """True if a collective moves bytes but predicts zero time.
+
+        Happens when the SKU has no interconnect bandwidth in the catalogue. The
+        node is still in the graph — it just costs nothing, which would quietly
+        credit a sharded deployment with a free all-to-all. Louder to ask than to
+        discover it in a report.
+        """
+        return any(
+            n.prediction.bytes > 0 and n.prediction.t_pred_s == 0.0 for n in self.nodes
+        )
+
+    @property
+    def has_fallback_peaks(self) -> bool:
+        """True if any node was priced against a dtype it doesn't run in.
+
+        The report must surface this: a graph built on fallback peaks has a
+        systematically low ceiling, so its headroom is an overestimate.
+        """
+        return any(n.prediction.peak_is_fallback for n in self.nodes)
 
 
 def predict_graph(

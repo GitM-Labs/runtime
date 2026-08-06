@@ -42,8 +42,39 @@ from gitm.tracer.schema import KernelEvent, Trace
 # vLLM's `reshape_and_cache_flash_kernel`/`_compute_slot_mapping_kernel`
 # weren't covered before.
 _OP_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
+    # ── sparse-MoE / compressed-attention ops, first because their vocabularies
+    # are subsets of the generic ones below: `moe_align_block_size` contains
+    # "moe" but is routing, not an expert GEMM; `shared_expert` contains
+    # "expert" but is unconditional work with a completely different cost curve;
+    # and the indexer must never fall through to a bare "index" rule, which is
+    # how it currently gets misfiled as elementwise in the coarse taxonomy.
+    #
+    # Needles are deliberately narrow ("indexer", not "index") — a loose needle
+    # here silently reattributes ordinary gather/scatter work to attention, and
+    # a wrong attribution is worse than an unmodeled one because it is invisible.
+    # Collectives first of all. NCCL names every kernel `ncclDevKernel_<Op>`, so
+    # a generic "nccl" needle would swallow the all-to-all — and expert-parallel
+    # dispatch is the one collective whose cost a MoE deployment exists to
+    # trade against, so it must not disappear into a bucket labelled all-reduce.
+    (("alltoall", "all_to_all", "_a2a", "dispatch_combine"), "moe_all_to_all"),
+    (("nccl", "allreduce", "all_reduce", "custom_ar", "cross_device",
+      "one_shot", "two_shot", "reduce_scatter", "all_gather"), "tp_all_reduce"),
+    (("indexer", "lightning_index", "index_topk", "topk_indices"), "attn_index_score"),
+    (("shared_expert", "moe_shared"), "moe_shared"),
+    (("moe_align", "topk_softmax", "router", "routing", "sinkhorn",
+      "expert_bias"), "moe_router"),
+    (("moe", "expert", "grouped_gemm", "group_gemm", "groupedgemm"), "moe_routed"),
+    (("dspark",), "dspark"),
+    (("flash_mla", "mla_sparse", "sparse_mla", "cutlass_mla",
+      "sparse_fwd"), "attn_score_value"),
     (("flash_attn", "flashattn", "flash_fwd", "paged_attention", "paged_attn", "fmha",
       "attention", "attn_score", "reshape_and_cache", "slot_mapping"), "attn_score_value"),
+    (("q_a_proj", "q_lora", "q_down"), "attn_q_a"),
+    (("q_b_proj", "q_up"), "attn_q_b"),
+    # `kv_b_proj` is absent on purpose: in the absorbed decode form it is folded
+    # into the query and output projections, so there is no node to map it to and
+    # a guess would attribute real work to the wrong op.
+    (("kv_a_proj", "kv_lora", "kv_down", "compress_kv"), "attn_kv_a"),
     (("qkv",), "qkv_proj"),
     (("o_proj", "out_proj", "attn_out"), "attn_out_proj"),
     (("gate_up", "gate_proj", "up_proj", "swiglu", "silu_and_mul"), "mlp_gate_up"),

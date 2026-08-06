@@ -27,6 +27,17 @@ from gitm.planner.roofline import HardwareSpec
 # itself. "L40" must stay ordered before "L4" (see peak_for_sku) since "l4" is
 # a substring of "l40" and the first substring match wins.
 _PEAKS: dict[str, tuple[float, float]] = {
+    # "GB200" must precede "B200": the latter is a substring of the former, and
+    # the first substring match wins. Both are the same silicon per GPU, so the
+    # ordering is cosmetic here — it stops mattering the moment they diverge.
+    # Blackwell Ultra raises dense fp4 by ~1.67x and doubles HBM, but leaves
+    # bf16/fp8 and — decisively for decode — memory bandwidth unchanged at
+    # 8 TB/s. A memory-bound decode step therefore sees essentially none of the
+    # uplift, which is only visible if these are separate entries.
+    "GB300": (2250e12, 8000e9),
+    "B300": (2250e12, 8000e9),
+    "GB200": (2250e12, 8000e9),
+    "B200": (2250e12, 8000e9),
     "H100": (989e12, 3350e9),
     "H200": (989e12, 4800e9),
     "A100-SXM": (312e12, 2039e9),
@@ -36,6 +47,64 @@ _PEAKS: dict[str, tuple[float, float]] = {
     "T4": (65e12, 320e9),  # the common free-tier Colab GPU
     "V100": (125e12, 900e9),
 }
+
+# Low-precision tensor-core peaks (FLOP/s), keyed by the same SKU substrings as
+# ``_PEAKS``. A SKU absent here has no fp8/fp4 path *or* no catalogue entry yet;
+# both resolve identically in :func:`gitm.planner.roofline.resolve_peak`, which
+# falls back up the precision ladder and flags the prediction.
+#
+# Dense figures, no 2:4 sparsity — the sparsity-doubled numbers in vendor
+# marketing do not apply to a dense decode step, and using them would halve every
+# predicted compute time and so double the apparent headroom.
+#
+_QUANT_PEAKS: dict[str, dict[str, float]] = {
+    # Blackwell Ultra: 15 PFLOPS dense fp4, with fp8/bf16 carried over from B200.
+    "GB300": {"fp8": 4500e12, "fp4": 15000e12},
+    "B300": {"fp8": 4500e12, "fp4": 15000e12},
+    "GB200": {"fp8": 4500e12, "fp4": 9000e12},
+    "B200": {"fp8": 4500e12, "fp4": 9000e12},
+    # Hopper has fp8 tensor cores; it has no fp4 path (MXFP4 runs dequantised
+    # through Marlin, which is why an fp4 checkpoint traced on H100/H200 prices
+    # against fp8 and still shows a compute-bound expert GEMM).
+    "H100": {"fp8": 1979e12},
+    "H200": {"fp8": 1979e12},
+}
+
+
+# Per-GPU bidirectional NVLink bandwidth (bytes/s), same substring keys. Used to
+# price the collectives a sharded graph emits. A SKU absent here leaves the spec
+# at 0.0, which makes the sharded planner report collectives as unpriced instead
+# of predicting them as free — an unpriced node is a visible gap, a free one is a
+# wrong ceiling.
+_INTERCONNECT: dict[str, float] = {
+    "GB300": 1800e9,  # NVLink 5
+    "B300": 1800e9,
+    "GB200": 1800e9,
+    "B200": 1800e9,
+    "H100": 900e9,  # NVLink 4
+    "H200": 900e9,
+    "A100": 600e9,  # NVLink 3
+}
+
+
+def quant_peaks_for_sku(sku: str | None) -> dict[str, float]:
+    """Low-precision peaks for a SKU string (substring match), else empty."""
+    if not sku:
+        return {}
+    for key, peaks in _QUANT_PEAKS.items():
+        if key.lower() in sku.lower():
+            return peaks
+    return {}
+
+
+def interconnect_bw_for_sku(sku: str | None) -> float:
+    """Per-GPU bidirectional NVLink bandwidth for a SKU, else ``0.0``."""
+    if not sku:
+        return 0.0
+    for key, bw in _INTERCONNECT.items():
+        if key.lower() in sku.lower():
+            return bw
+    return 0.0
 
 
 @dataclass
@@ -90,17 +159,23 @@ def hardware_spec_for(peak: HardwarePeak | None) -> HardwareSpec:
     Falls back to ``HardwareSpec()`` (A100-SXM4-80GB) when the SKU wasn't
     recognized (unknown NVML name, ``GITM_GPU_SKU`` unset, no GPU) — the same
     default ``predict_graph`` silently used everywhere before this existed.
-    ``peak_flops`` covers fp16/bf16 (the only dtypes the decode graph
-    predicts); fp32 peak isn't in the catalogue and stays at the dataclass
-    default since nothing currently predicts fp32 kernels.
+    ``peak_flops`` covers fp16/bf16; fp8/fp4 come from ``_QUANT_PEAKS`` when the
+    SKU has them, and stay ``0.0`` otherwise so ``resolve_peak`` can fall back
+    and mark the prediction rather than pricing an fp4 GEMM at the bf16 rate.
+    fp32 peak isn't in the catalogue and stays at the dataclass default since
+    nothing currently predicts fp32 kernels.
     """
     if peak is None:
         return HardwareSpec()
+    quant = quant_peaks_for_sku(peak.name)
     return HardwareSpec(
         name=peak.name,
         peak_flops_fp16_per_s=peak.peak_flops,
         peak_flops_bf16_per_s=peak.peak_flops,
+        peak_flops_fp8_per_s=quant.get("fp8", 0.0),
+        peak_flops_fp4_per_s=quant.get("fp4", 0.0),
         peak_mem_bw_bytes_per_s=peak.peak_bw_bytes_s,
+        interconnect_bw_bytes_per_s=interconnect_bw_for_sku(peak.name),
     )
 
 

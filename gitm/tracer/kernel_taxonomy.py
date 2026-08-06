@@ -64,9 +64,17 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("linear_attn", ("delta_rule", "gated_delta", "deltanet", "fused_recurrent",
                      "linear_attn", "solve_tril", "wy_fast", "local_cumsum",
                      "chunk_o", "chunk_h", "selective_scan", "mamba")),
+    # Sparse/compressed attention needles ride in this bucket rather than a
+    # separate one: they are attention by cost and by what a lever would target.
+    # The indexer needles are load-bearing — a "lightning_indexer" kernel matches
+    # the "index" needle in the elementwise rule below, so without an earlier
+    # claim it lands as elementwise. That is worse than `other`: `other` is a
+    # visible finding, whereas a misfiled kernel makes the attention bucket look
+    # cheap and the elementwise bucket look inexplicably expensive.
     ("attention", ("flash_fwd", "flash_attn", "flashattn", "fmha", "paged_attention",
                    "paged_attn", "attention", "attn_score", "splitkv", "merge_attn",
-                   "mha_fwd", "cutlass_mla", "flashinfer")),
+                   "mha_fwd", "cutlass_mla", "flash_mla", "mla_sparse", "sparse_mla",
+                   "indexer", "lightning_index", "flashinfer")),
     ("kv_cache", ("reshape_and_cache", "slot_mapping", "copy_blocks", "swap_blocks",
                   "concat_and_cache", "block_table")),
     ("gemm", ("gemm", "cutlass", "sgemm", "hgemm", "s16816", "s161616", "matmul",
