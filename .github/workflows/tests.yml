@@ -1,10 +1,28 @@
 name: Tests
 
-# Run the full pytest suite on every commit and PR. No GPU on the runners, so
+# Run the full pytest suite on every PR and on main. No GPU on the runners, so
 # the HFT harness exercises its pandas/NumPy fallback (same as a CPU dev box).
+#
+# `push` is scoped to main deliberately. Unscoped, a push to a branch with an
+# open PR fires this workflow twice — once for `push`, once for `pull_request` —
+# and each firing is 4 jobs (3 Python versions + lint). Branch pushes are covered
+# by the `pull_request` event; this keeps post-merge validation on main.
 on:
   push:
+    branches: [main]
   pull_request:
+
+# Supersede in-flight runs for the same ref. Without this, pushing three fixes to
+# a PR in quick succession leaves the first two matrices running to completion on
+# code nobody will merge.
+#
+# Cancellation is limited to pull requests on purpose. Each push to main is a
+# distinct commit that may be released or bisected against, so its run is allowed
+# to finish even when the next merge lands moments later; a superseded PR run has
+# no such value.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   pytest:
