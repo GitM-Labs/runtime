@@ -78,28 +78,38 @@ from gitm.planner.roofline import (
 def effective_kv_tokens(spec: SparseMoEModelSpec, layer: int, kv_len: int) -> int:
     """KV positions the attention *core* reads for ``layer`` at ``kv_len`` context.
 
-    Three mechanisms compose, in this order:
+    Two layer kinds, and conflating them is the error this function exists to
+    avoid:
 
-    1. **Compression.** A layer with ratio ``r`` keeps one compressed entry per
-       ``r`` tokens, so the candidate set is ``ceil(kv_len / r)``. Ratio 0 or 1
-       means the layer is uncompressed and attends to everything.
-    2. **Selection.** The indexer scores those candidates and keeps at most
-       ``index_topk``.
-    3. **Sliding window.** The most recent ``sliding_window`` tokens are read
-       uncompressed regardless of what selection chose.
+    **Ratio 0 — sliding-window attention.** The layer is *not* compressed, but it
+    is also not global: it reads at most ``sliding_window`` recent tokens. Reading
+    ``0`` as "uncompressed, therefore attends to everything" is the natural
+    mistake and it is wrong by ``kv_len / sliding_window`` — 512x at 64K, 8192x at
+    1M. It is also self-refuting: if any layer read the whole cache, a
+    million-token context could not be served at all, which is the headline
+    capability of the checkpoint.
 
-    The consequence worth internalising: once ``kv_len / r`` exceeds
-    ``index_topk``, the core's read is *constant in context length*. A layer with
-    ratio 128 and one with ratio 4 read the same number of tokens at 64K context
-    — they differ in KV *storage* and in how much the indexer has to scan, not in
-    what attention itself costs. A residual that scales with context therefore
-    belongs to the indexer node, and blaming it on attention is the mistake this
-    split exists to prevent.
+    **Ratio > 1 — compressed and selected.** The layer keeps one entry per ``r``
+    tokens, an indexer scores those candidates and keeps at most ``index_topk``,
+    and the recent ``sliding_window`` tokens are read regardless.
+
+    (Ratio 1 means genuinely uncompressed global attention. No layer of this
+    checkpoint uses it; it is kept for other architectures.)
+
+    The consequence worth internalising: **no layer's read grows with context.**
+    Once ``kv_len / r`` exceeds ``index_topk``, the core's read is constant, and
+    the sliding-window layers were bounded from the start. A layer with ratio 128
+    and one with ratio 4 read the same number of tokens at 64K — they differ in
+    KV *storage* and in how much the indexer has to scan, not in what attention
+    itself costs. So a residual that scales with context belongs to the indexer
+    node, and blaming it on attention is the mistake this split prevents.
     """
     if kv_len <= 0:
         return 0
     r = spec.compress_ratio(layer)
-    if r <= 1:
+    if r == 0:
+        return min(kv_len, spec.sliding_window)
+    if r == 1:
         return kv_len
     candidates = math.ceil(kv_len / r)
     selected = min(spec.index_topk, candidates)
@@ -109,13 +119,20 @@ def effective_kv_tokens(spec: SparseMoEModelSpec, layer: int, kv_len: int) -> in
 def index_candidates(spec: SparseMoEModelSpec, layer: int, kv_len: int) -> int:
     """Positions the indexer must score for ``layer`` — the compressed set.
 
-    Unbounded in context length, which is what makes this the node that decides
-    whether a million-token deployment is viable.
+    Zero for sliding-window layers: a fixed recent window needs no selection, so
+    those layers run no indexer at all and the graph emits no indexer node for
+    them. Scoring a candidate set there would invent both a kernel and its cost.
+
+    For compressed layers this is unbounded in context length — the node that
+    decides whether a million-token deployment is viable, and now the *only* term
+    in the attention path that still grows with context.
     """
     if kv_len <= 0:
         return 0
     r = spec.compress_ratio(layer)
-    if r <= 1:
+    if r == 0:
+        return 0
+    if r == 1:
         return kv_len
     return math.ceil(kv_len / r)
 
@@ -166,20 +183,44 @@ def model_weight_bytes(
 
 
 def kv_bytes_per_token(spec: SparseMoEModelSpec) -> float:
-    """Resident KV-cache bytes for one token of context, across all layers.
+    """KV bytes that grow with each additional token of context.
 
-    Compression is per-layer, so this is a sum and not a multiplication: on this
-    checkpoint two layers store a full latent, twenty store a quarter of one, and
-    twenty-one store 1/128th. Using any single ratio is wrong by up to 128x, and
-    KV footprint is what sets the concurrency ceiling.
+    Compression is per-layer, so this is a sum and not a multiplication: twenty
+    layers store a quarter of a latent per token and twenty-one store 1/128th.
+    Using any single ratio is wrong by up to 128x, and KV footprint is what sets
+    the concurrency ceiling.
+
+    **Sliding-window layers are excluded.** They hold a fixed
+    ``sliding_window``-sized buffer per sequence however long the context grows,
+    so they belong in :func:`kv_fixed_bytes_per_sequence`, not in a per-token
+    rate. Counting them here would make footprint appear to grow ~4x faster than
+    it does and would cap concurrency far below what the hardware allows.
     """
     kw = weight_bytes(spec.kv_dtype)
     total = 0.0
     for layer in range(spec.n_layers):
-        r = max(1, spec.compress_ratio(layer))
+        r = spec.compress_ratio(layer)
+        if r == 0:
+            continue  # bounded buffer, not per-token growth
         # The latent, plus the indexer's key for the same (compressed) position.
-        total += (spec.kv_latent_dim + spec.index_head_dim) * kw / r
+        total += (spec.kv_latent_dim + spec.index_head_dim) * kw / max(1, r)
     return total
+
+
+def kv_fixed_bytes_per_sequence(spec: SparseMoEModelSpec) -> float:
+    """KV bytes a sequence costs regardless of how long its context grows.
+
+    The sliding-window layers: each holds ``sliding_window`` tokens of latent and
+    nothing more, so their cost is paid once per sequence rather than per token.
+
+    In magnitude this is small — on this checkpoint it is worth about 40 tokens
+    of context, so it never drives a sizing decision. It exists because the
+    *rate* was wrong without it: counting these layers per-token inflated
+    :func:`kv_bytes_per_token` by 37% at every context length.
+    """
+    kw = weight_bytes(spec.kv_dtype)
+    swa_layers = sum(1 for i in range(spec.n_layers) if spec.compress_ratio(i) == 0)
+    return swa_layers * spec.sliding_window * spec.kv_latent_dim * kw
 
 
 def _linear(rows: float, k: int, n: int, act_b: float, w_b: float) -> tuple[float, float]:
@@ -245,18 +286,23 @@ def _emit_layer(
     add("attn_kv_a", f, b + positions * spec.kv_latent_dim * kw, wd)
 
     # ── indexer: project the query, then scan the compressed candidate set ───
-    f, b = _linear(positions, h, spec.index_n_heads * spec.index_head_dim // tp, aw, ww)
-    add("attn_index_proj", f, b, wd)
-
+    # Sliding-window layers have no indexer — a fixed recent window needs no
+    # selection — so they emit neither node. Emitting them anyway would put two
+    # kernels per such layer into the predicted graph that no kernel can ever
+    # align to, which reads downstream as "predicted work that never ran".
     cand = index_candidates(spec, layer, kv_len)
-    add(
-        "attn_index_score",
-        2.0 * positions * (spec.index_n_heads // tp) * spec.index_head_dim * cand,
-        # Index keys live in the cache: read once per sequence, not per position,
-        # and replicated across TP ranks alongside the KV latent.
-        sequences * cand * spec.index_head_dim * kw,
-        wd,
-    )
+    if cand > 0:
+        f, b = _linear(positions, h, spec.index_n_heads * spec.index_head_dim // tp, aw, ww)
+        add("attn_index_proj", f, b, wd)
+
+        add(
+            "attn_index_score",
+            2.0 * positions * (spec.index_n_heads // tp) * spec.index_head_dim * cand,
+            # Index keys live in the cache: read once per sequence, not per
+            # position, and replicated across TP ranks alongside the KV latent.
+            sequences * cand * spec.index_head_dim * kw,
+            wd,
+        )
 
     # ── attention core over the selected positions ──────────────────────────
     t_eff = effective_kv_tokens(spec, layer, kv_len)

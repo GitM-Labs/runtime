@@ -23,6 +23,7 @@ from gitm.planner.moe_graph import (
     effective_kv_tokens,
     index_candidates,
     kv_bytes_per_token,
+    kv_fixed_bytes_per_sequence,
     model_weight_bytes,
     predict_moe_graph,
     spec_from_hf_config,
@@ -127,10 +128,43 @@ def test_expert_fetch_is_driven_by_positions_not_sequences(spec, b200):
 # ── compressed, selected attention ──────────────────────────────────────────
 
 
-def test_uncompressed_layer_reads_the_whole_cache(spec):
-    """Layers 0-1 carry ratio 0 — full attention, no selection."""
-    assert spec.compress_ratio(0) == 0
-    assert effective_kv_tokens(spec, 0, 65536) == 65536
+def test_ratio_zero_layers_are_sliding_window_not_global(spec):
+    """Layers 0-1 carry ratio 0, which means sliding-window — *not* global.
+
+    Reading 0 as "uncompressed, therefore attends to everything" is the natural
+    mistake and it is wrong by ``kv_len / sliding_window``: 512x at 64K. It is
+    also self-refuting — if any layer read the whole cache, the 1M context this
+    checkpoint advertises could not be served.
+    """
+    assert spec.compress_ratio(0) == spec.compress_ratio(1) == 0
+    assert effective_kv_tokens(spec, 0, 65536) == spec.sliding_window
+    assert effective_kv_tokens(spec, 1, 1_048_576) == spec.sliding_window
+
+
+def test_no_layer_read_grows_with_context(spec):
+    """The property that makes a million-token deployment possible at all.
+
+    Sliding-window layers are bounded from the start; compressed layers stop
+    growing once selection saturates. So the whole attention path is flat in
+    context length, and any observed growth is a real deviation rather than
+    something the architecture explains away.
+    """
+    at_64k = sum(effective_kv_tokens(spec, i, 65536) for i in range(spec.n_layers))
+    at_1m = sum(effective_kv_tokens(spec, i, 1_048_576) for i in range(spec.n_layers))
+    assert at_64k == at_1m
+
+
+def test_sliding_window_layers_run_no_indexer(spec, b200):
+    """A fixed recent window needs no selection, so no indexer node is emitted.
+
+    Emitting one would put predicted work into the graph that no kernel can align
+    to, which downstream reads as "predicted work that never ran".
+    """
+    assert index_candidates(spec, 0, 65536) == 0
+    g = predict_moe_graph(spec, b200, BatchConfig(batch=1, kv_cache_len=65536))
+    indexer_layers = {n.layer for n in g.nodes if n.op.startswith("attn_index")}
+    assert 0 not in indexer_layers and 1 not in indexer_layers
+    assert 2 in indexer_layers
 
 
 def test_compressed_layer_read_is_bounded_by_window_plus_topk(spec):
@@ -569,31 +603,46 @@ def test_tensor_parallel_shrinks_the_resident_footprint(spec):
     assert sharded < whole / 6  # replicated q_a/kv_a/router keep it above exactly 1/8
 
 
-def test_kv_footprint_sums_per_layer_compression(spec):
-    """Two uncompressed layers dominate a 43-layer cache.
+def test_kv_footprint_splits_growing_from_fixed(spec):
+    """Sliding-window layers cost per *sequence*; compressed layers cost per token.
 
-    Applying any single ratio to all layers is wrong by up to 128x, and KV
-    footprint is what sets the concurrency ceiling.
+    Folding the window layers into the per-token rate inflates it ~37% and caps
+    concurrency well below what the hardware allows. Applying any single ratio to
+    all 41 compressed layers is separately wrong by up to 128x.
     """
     per_token = kv_bytes_per_token(spec)
-    uncompressed = spec.n_layers * (spec.kv_latent_dim + spec.index_head_dim)
-    assert per_token < uncompressed / 5
-    assert per_token > (spec.kv_latent_dim + spec.index_head_dim) * 2  # the two full layers
+    fixed = kv_fixed_bytes_per_sequence(spec)
+
+    # Growth comes only from the 41 compressed layers, at 1/4 or 1/128 of a latent.
+    naive_all_layers = spec.n_layers * (spec.kv_latent_dim + spec.index_head_dim)
+    assert per_token < naive_all_layers / 5
+
+    # The two window layers are real, bounded, and paid once per sequence.
+    assert fixed == 2 * spec.sliding_window * spec.kv_latent_dim * weight_bytes(spec.kv_dtype)
+    # In magnitude the fixed term is tiny — worth ~40 tokens of context, so it
+    # never drives a sizing decision. What mattered was excluding these layers
+    # from the *rate*, which is a 37% error on every sequence at every length.
+    assert fixed < 50 * per_token
+    naive = per_token + 2 * (spec.kv_latent_dim + spec.index_head_dim) * weight_bytes(
+        spec.kv_dtype
+    )
+    assert naive == pytest.approx(1.37 * per_token, rel=0.02)
 
 
 def test_b300_headroom_admits_a_full_replica_where_b200_is_marginal(spec):
     """The actual B300 value on this checkpoint: memory, not compute.
 
     156 GB of weights leaves ~21 GB on a 192 GB B200 and ~109 GB on a 288 GB
-    B300 — the difference between a data-parallel replica that can hold a real
-    batch and one that cannot.
+    B300. Asserted against a concrete serving point rather than a magic token
+    threshold, so the test says what it means: a data-parallel replica holding
+    batch 256 at 32K context fits on one and not the other.
     """
     resident = model_weight_bytes(spec)
-    b200_free = 192e9 * 0.92 - resident
-    b300_free = 288e9 * 0.92 - resident
-    kv = kv_bytes_per_token(spec)
-    assert b200_free / kv < 5e6  # tokens of KV
-    assert b300_free / kv > 20e6
+    batch, ctx = 256, 32768
+    need = batch * (kv_fixed_bytes_per_sequence(spec) + ctx * kv_bytes_per_token(spec))
+
+    assert 192e9 * 0.92 - resident < need  # B200: does not fit
+    assert 288e9 * 0.92 - resident > need  # B300: fits, with room
 
 
 def test_indexer_is_not_misfiled_as_elementwise():
