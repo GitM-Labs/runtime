@@ -29,6 +29,21 @@ class KernelResidual:
     t_obs_s: float | None = None
     t_pred_s: float | None = None
     bound: str | None = None  # the matched op's roofline bound: "compute" | "memory"
+    #: How many structurally distinct predictions the op has across layers. 1 for
+    #: every dense model and for most ops of a heterogeneous one. Above 1 without
+    #: a resolved ``layer`` means this residual was measured against an interval
+    #: rather than a point — see :func:`residuals`.
+    n_classes: int = 1
+
+    @property
+    def interval_based(self) -> bool:
+        """True when the op's layers disagree and this kernel's layer is unknown.
+
+        Such a residual is *conservative*: zero anywhere inside the span of the
+        op's per-layer predictions. It cannot be read as "this kernel matched
+        prediction", only as "it was not outside every prediction".
+        """
+        return self.n_classes > 1 and self.layer is None
 
 
 @dataclass
@@ -39,47 +54,125 @@ class Residuals:
     serialized_concurrency_fraction: float = 0.0
 
 
+def _class_key(pn: PredictedNode) -> tuple[float, float]:
+    """What makes two per-layer nodes of the same op structurally interchangeable.
+
+    Nodes computed by the same formula come out bit-identical, so exact equality
+    would do; the rounding is insurance against a future term that introduces
+    float drift between layers that are meant to be the same.
+    """
+    return (round(pn.prediction.t_pred_s, 15), round(pn.prediction.bytes, 6))
+
+
+def _interval_residual(obs: float, lo: float, hi: float) -> float:
+    """Signed residual against a prediction *interval* instead of a point.
+
+    Zero anywhere inside ``[lo, hi]``; outside, the distance to the nearest edge
+    relative to that edge. Deliberately conservative — when the op's layers
+    disagree and the kernel's layer is unknown, the honest prediction is the span
+    they cover, and only an observation outside all of it is evidence of
+    anything.
+    """
+    if obs < lo:
+        return (obs - lo) / lo if lo > 0 else 0.0
+    if obs > hi:
+        return (obs - hi) / hi if hi > 0 else 0.0
+    return 0.0
+
+
 def residuals(trace: Trace, graph: Graph) -> Residuals:
     """Pair observed kernels to predicted nodes by op identity, not position.
 
-    The old ordinal pairing matched a handful of early kernels against
-    unrelated ops (orders of magnitude fewer predicted nodes than real
-    kernels), producing runaway r_kt ratios. Each kernel is classified by its
-    NVTX-range identity when the capture has one (``range_op``/``range_layer``
-    — see :mod:`gitm.tracer.nvtx_correlate`), else by name
-    (:func:`gitm.optimizer.deviation.classify_op`) against one representative
-    node per op (per-layer nodes share a prediction); unmodeled kernels get no
-    residual. ``layer`` is the real per-kernel layer index when range-
-    identified, else ``None`` (unrecoverable from a name guess alone). Carries
-    the matched op's roofline ``bound`` for bottleneck classification.
+    The old ordinal pairing matched a handful of early kernels against unrelated
+    ops (orders of magnitude fewer predicted nodes than real kernels), producing
+    runaway r_kt ratios. Each kernel is classified by its NVTX-range identity when
+    the capture has one (``range_op``/``range_layer`` — see
+    :mod:`gitm.tracer.nvtx_correlate`), else by name
+    (:func:`gitm.optimizer.deviation.classify_op`).
+
+    **Pairing is per structural class, not one representative per op.** A dense
+    transformer repeats one layer, so any node stands for all of them — that
+    assumption is why this used to keep a single node per op. It does not survive
+    a heterogeneous stack. On a DeepSeek-V4-class model, layers 0-1 are
+    sliding-window (128 tokens, no indexer) while 2-42 are compressed (640
+    tokens), and the compressed layers themselves split 32x apart at the indexer.
+    Taking the first node per op made layer 0 the yardstick for all 43, which
+    scores a perfectly healthy compressed layer at ``r_kt = +4.0`` against a
+    ±0.4 band — and ``check_invariants`` treats a systematic offset as
+    *confirmation*, so multi-basis filtering amplifies the artefact instead of
+    rejecting it.
+
+    Three cases, in order:
+
+    * **Layer known** (NVTX capture): the exact ``(op, layer)`` node. Point
+      residual, and ``layer`` is carried through.
+    * **Layer unknown, op uniform**: the single class. Identical to the previous
+      behaviour, which is every dense model and 8 of V4's 10 per-layer ops.
+    * **Layer unknown, op heterogeneous**: an interval over the op's classes (see
+      :func:`_interval_residual`), flagged by ``n_classes > 1``. Real deviations
+      outside the whole span still surface; deviations *within* it are given up
+      rather than guessed at, because guessing is what produced the artefact.
+
+    The third case degrades to the first the moment NVTX ranges land, with no
+    change here.
     """
     obs = trace.kernels()
     pred = graph.nodes
 
     res = Residuals()
-    by_op: dict[str, PredictedNode] = {}
+    by_op_layer: dict[tuple[str, int], PredictedNode] = {}
+    classes: dict[str, dict[tuple[float, float], PredictedNode]] = {}
     for pn in pred:
-        by_op.setdefault(pn.op, pn)
+        if pn.layer is not None:
+            by_op_layer.setdefault((pn.op, pn.layer), pn)
+        classes.setdefault(pn.op, {}).setdefault(_class_key(pn), pn)
 
     for ok in obs:
         op = ok.range_op or classify_op(ok.name)
-        pn = by_op.get(op) if op is not None else None
-        if pn is None:
+        if op is None:
             continue
-        t_obs = max((ok.end_ns - ok.start_ns) / 1e9, 1e-12)
-        t_pred = max(pn.prediction.t_pred_s, 1e-12)
-        r_kt = (t_obs - t_pred) / t_pred
+        cls = list(classes.get(op, {}).values())
+        if not cls:
+            continue
 
-        if ok.bytes_read is not None and ok.bytes_written is not None and pn.prediction.bytes > 0:
-            b_obs = ok.bytes_read + ok.bytes_written
-            r_mt: float | None = (b_obs - pn.prediction.bytes) / pn.prediction.bytes
+        t_obs = max((ok.end_ns - ok.start_ns) / 1e9, 1e-12)
+        b_obs = (
+            ok.bytes_read + ok.bytes_written
+            if ok.bytes_read is not None and ok.bytes_written is not None
+            else None
+        )
+
+        pn: PredictedNode | None = None
+        if ok.range_layer is not None:
+            pn = by_op_layer.get((op, ok.range_layer))
+        if pn is None and len(cls) == 1:
+            pn = cls[0]
+
+        if pn is not None:
+            t_pred = max(pn.prediction.t_pred_s, 1e-12)
+            r_kt = (t_obs - t_pred) / t_pred
+            r_mt = (
+                (b_obs - pn.prediction.bytes) / pn.prediction.bytes
+                if b_obs is not None and pn.prediction.bytes > 0
+                else None
+            )
+            layer, bound = ok.range_layer, pn.prediction.bound
         else:
-            r_mt = None
+            ts = sorted(max(c.prediction.t_pred_s, 1e-12) for c in cls)
+            r_kt = _interval_residual(t_obs, ts[0], ts[-1])
+            bs = sorted(c.prediction.bytes for c in cls if c.prediction.bytes > 0)
+            r_mt = _interval_residual(b_obs, bs[0], bs[-1]) if b_obs is not None and bs else None
+            # Report the class the observation actually sits nearest, so the
+            # bound and t_pred in the record describe a real layer rather than an
+            # average of layers that don't resemble each other.
+            nearest = min(cls, key=lambda c: abs(c.prediction.t_pred_s - t_obs))
+            t_pred = nearest.prediction.t_pred_s
+            layer, bound = None, nearest.prediction.bound
 
         res.per_kernel.append(
             KernelResidual(
-                op=pn.op, layer=ok.range_layer, r_kt=r_kt, r_mt=r_mt,
-                t_obs_s=t_obs, t_pred_s=t_pred, bound=pn.prediction.bound,
+                op=op, layer=layer, r_kt=r_kt, r_mt=r_mt,
+                t_obs_s=t_obs, t_pred_s=t_pred, bound=bound, n_classes=len(cls),
             )
         )
 
