@@ -244,6 +244,12 @@ def attach_and_capture(opts: AttachOptions) -> tuple[int, CaptureResult | None]:
     print_checks(checks)
     write_preflight(out_dir, checks)
 
+    # Predict what this rank *should* be doing, from the server's own config, so the
+    # measured trace has an honest floor to sit next to. Independent of traceability
+    # and of the window — it reads the loaded model's shape, not the trace — so it
+    # runs here, before the fail/dry-run returns, and never blocks a capture.
+    _emit_predicted_graph(target, out_dir)
+
     if any(c.status == "fail" for c in checks):
         print("\ncannot attach — see the FAILs above.")
         if not target.traceable:
@@ -408,6 +414,80 @@ def attach_and_capture(opts: AttachOptions) -> tuple[int, CaptureResult | None]:
         # should not be reported as a pass by automation.
         return 1, result
     return 0, result
+
+
+def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
+    """Write ``predicted_moe_graph.json`` — a per-rank floor from the live config.
+
+    The first production consumer of :func:`predict_moe_graph`. On a config the
+    planner cannot honestly predict (missing dominant terms, unpriceable dtype) it
+    prints the named-key refusal and writes nothing — a defaulted DeepSeek prediction
+    next to a real trace would be read as a measurement, which is the one outcome the
+    gate exists to prevent. Never raises into the capture path.
+    """
+    from gitm.serve.model_config import LiveSpec, live_moe_spec
+
+    try:
+        resolved = live_moe_spec(target)
+    except Exception as e:  # a prediction sidecar must never sink a real capture
+        print(f"==> predicted graph: skipped ({type(e).__name__}: {e})")
+        return
+
+    if not isinstance(resolved, LiveSpec):
+        print("==> predicted graph: skipped — live config not predictable:")
+        for line in resolved.render().splitlines():
+            print(f"    {line}")
+        return
+
+    from gitm.planner.context import build_planner_context, hardware_spec_for
+    from gitm.planner.moe_graph import predict_moe_graph
+
+    hw = hardware_spec_for(build_planner_context().peak)
+    g = predict_moe_graph(resolved.spec, hw, resolved.batch, resolved.sharding)
+    sh, spec = resolved.sharding, resolved.spec
+
+    payload = {
+        "model_ref": resolved.model_ref,
+        "config_source": str(resolved.source_path),
+        "hardware": hw.name,
+        "sharding": {"tp": sh.tp, "ep": sh.ep, "dp": sh.dp},
+        "dtypes": {
+            "weight": spec.weight_dtype,
+            "expert": spec.expert_dtype,
+            "kv": spec.kv_dtype,
+            "act": spec.act_dtype,
+        },
+        "batch": {"batch": resolved.batch.batch, "kv_cache_len": resolved.batch.kv_cache_len},
+        "applied_overrides": resolved.applied_overrides,
+        "total_pred_s": g.total_pred_s,
+        "has_unpriced_collectives": g.has_unpriced_collectives,
+        "has_fallback_peaks": g.has_fallback_peaks,
+        "nodes": [
+            {
+                "op": n.op,
+                "layer": n.layer,
+                "t_pred_s": n.prediction.t_pred_s,
+                "bound": n.prediction.bound,
+                "dtype": n.prediction.dtype,
+                "flops": n.prediction.flops,
+                "bytes": n.prediction.bytes,
+                "estimated": n.prediction.estimated,
+            }
+            for n in g.nodes
+        ],
+    }
+    (out_dir / "predicted_moe_graph.json").write_text(json.dumps(payload, indent=2))
+
+    print(
+        f"==> predicted graph: {resolved.model_ref} per-rank floor "
+        f"{g.total_pred_s * 1e3:.2f} ms/step "
+        f"(TP={sh.tp} EP={sh.ep} DP={sh.dp}, "
+        f"w={spec.weight_dtype}/e={spec.expert_dtype}/kv={spec.kv_dtype})"
+    )
+    if g.has_unpriced_collectives:
+        print("    - collectives are unpriced (SKU has no interconnect bandwidth in the catalogue)")
+    if g.has_fallback_peaks:
+        print("    - priced against fallback peaks — the ceiling is low in a known direction")
 
 
 def describe_targets(proc: Path = discover.PROC) -> list[dict]:
