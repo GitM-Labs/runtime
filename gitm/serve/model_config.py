@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from gitm.planner.moe_graph import spec_from_hf_config
+from gitm.planner.moe_graph import is_sparse_moe_config, spec_from_hf_config
 from gitm.planner.roofline import (
     _WEIGHT_BYTES,
     BatchConfig,
@@ -334,6 +334,20 @@ def live_moe_spec(
         cfg = json.loads(cfg_path.read_text())
     except (OSError, ValueError) as e:
         return LiveSpecError(reason=f"could not read {cfg_path}: {e}", model_ref=model_ref)
+
+    # predict_moe_graph models DeepSeek-V4-class compressed/selected attention;
+    # feeding it a Mixtral-style MoE (standard attention) would mis-price the KV
+    # path. The dense planner is the right tool for those, so decline rather than
+    # emit a confident wrong floor.
+    if not is_sparse_moe_config(cfg):
+        return LiveSpecError(
+            reason=(
+                f"{model_ref!r} at {cfg_path} is not a DeepSeek-V4-class sparse-MoE model "
+                "(no index_topk / compress_ratios); its attention is not what "
+                "predict_moe_graph models."
+            ),
+            model_ref=model_ref,
+        )
 
     missing = validate_moe_config(cfg)
     if missing:

@@ -482,6 +482,21 @@ def predict_moe_graph(
     return g
 
 
+def is_sparse_moe_config(cfg: dict[str, Any]) -> bool:
+    """True for the DeepSeek-V4-class checkpoints :func:`predict_moe_graph` models.
+
+    Routed experts alone are not the signal: a Mixtral declares those too but runs
+    standard attention, which this graph's compressed-KV latent and indexer nodes
+    would mis-price. The discriminator is the sparse-attention machinery — an index
+    top-k or a per-layer compression schedule — which only the DSA family carries.
+    A config without it belongs to the dense graph, whose FFN already prices a
+    mixture.
+    """
+    routed = cfg.get("n_routed_experts") and cfg.get("num_experts_per_tok")
+    sparse_attn = cfg.get("index_topk") is not None or cfg.get("compress_ratios")
+    return bool(routed and sparse_attn)
+
+
 def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None) -> SparseMoEModelSpec:
     """Build a :class:`SparseMoEModelSpec` from a HuggingFace ``config.json``.
 

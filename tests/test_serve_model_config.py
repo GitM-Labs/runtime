@@ -32,6 +32,9 @@ def _deepseek_cfg(**over) -> dict:
         "n_routed_experts": 256,
         "num_experts_per_tok": 6,
         "moe_intermediate_size": 2048,
+        # DeepSeek Sparse Attention markers — what routes this to the MoE graph.
+        "index_topk": 512,
+        "compress_ratios": [0, 0, 4, 128],
         "quantization_config": {"quant_method": "fp8"},
         "expert_dtype": "fp4",
         "torch_dtype": "bfloat16",
@@ -164,13 +167,44 @@ def test_live_moe_spec_applies_config_and_serving_facts(tmp_path):
     assert r.spec.expert_dtype == "fp4"
 
 
-def test_live_moe_spec_refuses_unpredictable_config_with_named_keys(tmp_path):
+def test_live_moe_spec_refuses_dsa_config_missing_a_dominant_term(tmp_path):
+    ckpt = tmp_path / "ckpt"
+    # Passes the architecture gate (index_topk + routed experts) but never
+    # declares the expert intermediate size, which the graph would silently
+    # default — so it is refused with that key named.
+    _write_config(ckpt, {
+        "model_type": "deepseek_v4",
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 6,
+        "index_topk": 512,
+    })
+    r = mc.live_moe_spec(_target(["vllm", "serve", str(ckpt)]), environ={})
+    assert isinstance(r, mc.LiveSpecError)
+    assert any("expert intermediate size" in k for k in r.missing_keys)
+
+
+def test_live_moe_spec_refuses_dense_model_at_the_architecture_gate(tmp_path):
     ckpt = tmp_path / "ckpt"
     _write_config(ckpt, {"model_type": "dense", "hidden_size": 4096})  # no MoE fields
     r = mc.live_moe_spec(_target(["vllm", "serve", str(ckpt)]), environ={})
     assert isinstance(r, mc.LiveSpecError)
-    assert r.missing_keys
-    assert "routed expert count" in r.render()
+    assert "not a DeepSeek-V4-class" in r.reason
+
+
+def test_live_moe_spec_refuses_mixtral_style_moe(tmp_path):
+    # A real MoE, but standard attention — predict_moe_graph would mis-model its
+    # KV path, so the sidecar declines rather than emit a confident wrong floor.
+    ckpt = tmp_path / "ckpt"
+    _write_config(ckpt, {
+        "model_type": "mixtral",
+        "num_local_experts": 8,
+        "num_experts_per_tok": 2,
+        "intermediate_size": 14336,
+        "sliding_window": 4096,
+    })
+    r = mc.live_moe_spec(_target(["vllm", "serve", str(ckpt)]), environ={})
+    assert isinstance(r, mc.LiveSpecError)
+    assert "not a DeepSeek-V4-class" in r.reason
 
 
 def test_live_moe_spec_refuses_when_no_config_found(tmp_path):
