@@ -200,18 +200,16 @@ def _hf_config_dict(hf: Any) -> dict[str, Any]:
     return raw
 
 
-def _model_spec_from_engine(engine: Any):
-    """Build a dense ``ModelSpec`` from a live vLLM engine's HF config, or ``None``.
+def _model_spec_from_hf(hf: Any):
+    """Build a dense ``ModelSpec`` from an HF config object, or ``None``.
 
     ``predict_graph()`` with no model defaults to Llama-2-7B (32 layers). A run
     of a *different* model (e.g. opt-125m, 12 layers) is then scored against the
-    wrong predicted graph, which makes residuals and deviation meaningless. When
-    the loop has the live engine, read the real architecture off its HF config so
-    the predicted graph matches the model that actually ran. Duck-typed across
-    vLLM version drift; any failure returns ``None`` and the caller falls back to
-    the default graph rather than crashing.
+    wrong predicted graph, which makes residuals and deviation meaningless — so
+    read the real architecture off the config. Duck-typed across vLLM version
+    drift; any failure returns ``None`` and the caller falls back to the default
+    graph rather than crashing.
     """
-    hf = _hf_config_from_engine(engine)
     if hf is None:
         return None
     try:
@@ -234,6 +232,11 @@ def _model_spec_from_engine(engine: Any):
         )
     except Exception:
         return None
+
+
+def _model_spec_from_engine(engine: Any):
+    """Dense ``ModelSpec`` for a live engine's model — the config, then the spec."""
+    return _model_spec_from_hf(_hf_config_from_engine(engine))
 
 
 #: HF config field aliases per MoE family — the same quantity is spelled
@@ -361,7 +364,7 @@ def _execution_graph(engine: Any, hw: Any, batch: Any):
         if is_sparse_moe_config(cfg):
             spec = spec_from_hf_config(cfg, name=str(cfg.get("model_type") or "sparse-moe"))
             return predict_moe_graph(spec, hw, batch, ShardingConfig()), True
-    return predict_graph(model=_model_spec_from_engine(engine), hw=hw, batch=batch), False
+    return predict_graph(model=_model_spec_from_hf(hf), hw=hw, batch=batch), False
 
 
 def _clamp_pct(value: float) -> float:

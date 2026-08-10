@@ -493,7 +493,7 @@ def is_sparse_moe_config(cfg: dict[str, Any]) -> bool:
     mixture.
     """
     routed = cfg.get("n_routed_experts") and cfg.get("num_experts_per_tok")
-    sparse_attn = cfg.get("index_topk") is not None or cfg.get("compress_ratios")
+    sparse_attn = cfg.get("index_topk") or cfg.get("compress_ratios")
     return bool(routed and sparse_attn)
 
 
