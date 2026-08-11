@@ -93,9 +93,20 @@ def test_partial_trailing_line_from_a_killed_process_is_tolerated(run_env):
     shard = run_env.with_name(run_env.name + ".9335")
     shard.write_text(_kernel("decode_step", 10, 20) + "\n" + '{"kind":"kernel","na')
 
-    events = injection.read_shards()
+    with pytest.warns(RuntimeWarning, match="dropped 1 malformed or incomplete"):
+        events = injection.read_shards()
 
     assert [e.name for e in events] == ["decode_step"]
+
+
+@pytest.mark.parametrize("raw", ["not-a-number", "-1", "nan", "inf"])
+def test_invalid_settle_override_warns_and_uses_documented_default(monkeypatch, raw):
+    monkeypatch.setenv(injection.ENV_SETTLE, raw)
+
+    with pytest.warns(RuntimeWarning, match="invalid GITM_TRACE_SETTLE_S"):
+        value = injection.settle_seconds()
+
+    assert value == injection.DEFAULT_SETTLE_S
 
 
 def test_arm_marker_is_not_mistaken_for_a_shard(run_env):
