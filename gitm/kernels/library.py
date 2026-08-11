@@ -17,7 +17,9 @@ def load_library(path: Path | str | None = None, *, workload: str | None = None)
     """Load and validate every entry in the library."""
     p = Path(path) if path is not None else _library_path()
     if not p.exists():
-        return []
+        raise FileNotFoundError(
+            f"intervention library not found at {p}; candidate coverage is unavailable"
+        )
     with p.open() as fh:
         raw = yaml.safe_load(fh) or {}
     entries = raw.get("interventions", [])

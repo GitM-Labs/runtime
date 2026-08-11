@@ -161,10 +161,8 @@ def test_applicator_runs_through_the_apply_gate():
     assert apply_intervention(drift.spec, drift, min_keep_delta=0.0).rolled_back
 
 
-def test_edge_report_claim_labels_serialized_concurrency_not_kernel_time(tmp_path):
-    """The edge claim's residual is a serialized-concurrency fraction (from
-    measure_trace), not a kernel-time ratio — the report must label it
-    `stream_concurrency`, matching the HFT/AF2 claims, not `kernel_time`."""
+def test_edge_report_uses_ab_delta_when_trace_has_no_kernel_coverage(tmp_path):
+    """An empty trace must not become a plausible zero-concurrency residual."""
     from gitm.optimizer.qualification import QualificationResult
     from gitm.scheduler.loop import _edge_intervention_result
     from gitm.tracer.schema import Trace
@@ -187,5 +185,50 @@ def test_edge_report_claim_labels_serialized_concurrency_not_kernel_time(tmp_pat
         trace_path=tmp_path / "trace.jsonl",
     )
     md = result["report_md"]
-    assert "`stream_concurrency`" in md
+    assert "`throughput_delta`" in md
+    assert "`stream_concurrency`" not in md
     assert "`kernel_time`" not in md
+
+
+def test_edge_report_names_missing_ab_result_as_intervention_failure(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from gitm.benchmarks.edge.optimize import edge_intervention_spec
+    from gitm.optimizer.qualification import QualificationResult
+    from gitm.scheduler.loop import _edge_intervention_result
+    from gitm.tracer.schema import Trace
+
+    trace = Trace(
+        workload_id="kitti",
+        fingerprint="f",
+        run_id="r",
+        device_count=0,
+        vendor="none",
+        captured_at_ns=0,
+        duration_ns=1,
+        events=[],
+    )
+    applicator = SimpleNamespace(last_result=None, spec=edge_intervention_spec())
+    monkeypatch.setattr(
+        "gitm.optimizer.apply.apply_intervention",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            applied=False, rolled_back=True, measured_delta=None, error="measure failed"
+        ),
+    )
+
+    result = _edge_intervention_result(
+        run_dir=tmp_path,
+        run_id="r",
+        workload="kitti",
+        trace=trace,
+        qual=QualificationResult(commit=False, floor=0.0, fingerprint="f"),
+        applicator=applicator,
+        started_ns=0,
+        trace_path=tmp_path / "trace.jsonl",
+    )
+
+    assert result["summary"]["status"] == "intervention_failed"
+    assert result["summary"]["n_claims"] == 0
+    assert "produced no result" in result["report_md"]

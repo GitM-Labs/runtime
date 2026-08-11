@@ -9,6 +9,7 @@ partial run is still useful; the durable copy is synced to S3 afterwards.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -492,7 +493,12 @@ def _execution_graph(engine: Any, pctx: Any, sched: Any) -> ExecutionGraphResolu
     if graph.has_fallback_bytes:
         diagnostics.append("one or more nodes use fallback byte widths")
     if graph.has_unpriced_nodes:
-        diagnostics.append("one or more byte-moving nodes have no priceable bandwidth")
+        missing = []
+        if graph.has_unpriced_compute:
+            missing.append("compute throughput")
+        if graph.has_unpriced_memory:
+            missing.append("memory bandwidth")
+        diagnostics.append(f"one or more predicted nodes have unpriced {' and '.join(missing)}")
     n_estimated = sum(1 for node in graph.nodes if node.prediction.estimated)
     if n_estimated:
         diagnostics.append(f"{n_estimated} predicted node(s) use estimated cost models")
@@ -835,6 +841,8 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 },
                 "has_unpriced_collectives": graph.has_unpriced_collectives,
                 "has_unpriced_nodes": graph.has_unpriced_nodes,
+                "has_unpriced_compute": graph.has_unpriced_compute,
+                "has_unpriced_memory": graph.has_unpriced_memory,
                 "has_fallback_peaks": graph.has_fallback_peaks,
                 "has_fallback_bytes": graph.has_fallback_bytes,
                 "diagnostics": graph_resolution.diagnostics,
@@ -845,6 +853,8 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                         "estimated": node.prediction.estimated,
                         "peak_is_fallback": node.prediction.peak_is_fallback,
                         "bytes_are_fallback": node.prediction.bytes_are_fallback,
+                        "compute_is_unpriced": node.prediction.compute_is_unpriced,
+                        "memory_is_unpriced": node.prediction.memory_is_unpriced,
                     }
                     for node in graph.nodes
                 ],
@@ -900,6 +910,9 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                      "notes": h.notes}
                     for h in dr_hypotheses.top(5)
                 ],
+                "attribution_diagnostics": (
+                    hypotheses.diagnostics + dr_hypotheses.diagnostics
+                ),
                 # Engine-scheduler causes (from the vLLM stats adapter) ranked
                 # alongside the kernel-level hypotheses (the engine-signal causal link).
                 "scheduler_causes": [
@@ -936,9 +949,25 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # pctx was built earlier (Phase 1) so its hardware peak could feed predict_graph.
     # Relative/swept levers resolve against the live engine here, once, before
     # ranking. See expand_relative_candidates.
+    try:
+        raw_library = load_library(workload=workload)
+    except (FileNotFoundError, ValueError) as exc:
+        diagnostic = f"intervention candidate coverage unavailable: {type(exc).__name__}: {exc}"
+        return _measurement_result(
+            run_dir=run_dir,
+            run_id=run_id,
+            workload=workload,
+            trace=trace,
+            qual=qual,
+            started_ns=started_ns,
+            trace_path=trace_path,
+            diagnostic=diagnostic,
+            runtime_diagnostics=graph_resolution.diagnostics + [diagnostic],
+            status="candidate_coverage_unavailable",
+        )
     library = [
         resolved
-        for s in load_library(workload=workload)
+        for s in raw_library
         for resolved in expand_relative_candidates(s, cfg.engine)
     ]
     policy = Policy(require_qualification_commit=qual.commit, skip_high_risk=not qual.commit)
@@ -1177,7 +1206,13 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         claims=claims,
         provenance=provenance,
         qualification_diagnostic=qual.diagnostic,
-        runtime_diagnostics=graph_resolution.diagnostics + res.coverage_warnings,
+        runtime_diagnostics=(
+            graph_resolution.diagnostics
+            + res.coverage_warnings
+            + (serving_summary.warnings if serving_summary is not None else [])
+            + hypotheses.diagnostics
+            + dr_hypotheses.diagnostics
+        ),
         summary=(
             f"vLLM decode on {pctx.sku or 'unknown SKU'}: {len(claims)} candidate(s) "
             f"evaluated, {len(rolled_back)} rolled back. {sched_note}"
@@ -1235,6 +1270,8 @@ def _measurement_result(
             {
                 "n_kernels": result.n_kernels,
                 "n_memcpy": result.n_memcpy,
+                "n_invalid_duration": result.n_invalid_duration,
+                "diagnostics": result.diagnostics,
                 "serialized_concurrency_fraction": result.serialized_fraction,
                 "n_violations": len(result.violations),
                 "families": result.families,
@@ -1261,7 +1298,7 @@ def _measurement_result(
             "Measurement-only run: the runtime observed the workload and reports "
             "its real kernels. No intervention library applies to this workload."
         ),
-        runtime_diagnostics=runtime_diagnostics,
+        runtime_diagnostics=(runtime_diagnostics or []) + result.diagnostics,
         summary=measurement_summary(workload, result),
     )
     _write_report(run_dir, report_md)
@@ -1283,6 +1320,31 @@ def _measurement_result(
         "report_path": str(run_dir / "report.md"),
     }
     return {"summary": summary, "report_md": report_md, "run_dir": str(run_dir)}
+
+
+def _specialized_claim_basis(
+    mres: Any, ab: Any
+) -> tuple[tuple[str, float] | None, float | None, list[str]]:
+    """Choose an observed residual basis without fabricating trace coverage."""
+    diagnostics = list(mres.diagnostics)
+    if ab is None:
+        diagnostics.append("intervention A/B produced no result; no performance claim emitted")
+        return None, None, diagnostics
+    try:
+        measured_delta = float(ab.speedup) - 1.0
+    except (AttributeError, TypeError, ValueError):
+        diagnostics.append("intervention A/B result has no numeric speedup; no claim emitted")
+        return None, None, diagnostics
+    if not math.isfinite(measured_delta):
+        diagnostics.append("intervention A/B speedup is non-finite; no claim emitted")
+        return None, None, diagnostics
+    if mres.n_kernels > mres.n_invalid_duration:
+        return ("stream_concurrency", float(mres.serialized_fraction)), measured_delta, diagnostics
+    diagnostics.append(
+        "no positive-duration CUPTI kernels; claim residual uses the measured A/B "
+        "throughput delta instead of a fabricated stream-concurrency value"
+    )
+    return ("throughput_delta", measured_delta), measured_delta, diagnostics
 
 
 def _hft_intervention_result(
@@ -1330,6 +1392,9 @@ def _hft_intervention_result(
         spec, applicator, min_keep_delta=0.0, audit=AuditLog(run_dir / "audit.jsonl")
     )
     ab = applicator.last_result
+    basis, measured_delta, runtime_diagnostics = _specialized_claim_basis(mres, ab)
+    if apply_res.error:
+        runtime_diagnostics.append(f"intervention apply failed: {apply_res.error}")
 
     # Prove: one claim carrying the measured delta, gated on identical output.
     top = mres.top_hypotheses
@@ -1351,16 +1416,18 @@ def _hft_intervention_result(
 
     claims: list[Claim] = []
     rolled_back: list[str] = []
-    if ab is not None:
+    if basis is not None and ab is not None:
+        residual_invariant, residual_value = basis
         claims.append(
             Claim(
                 summary=spec.summary,
-                residual_invariant="stream_concurrency",
-                residual_value=float(mres.serialized_fraction),
+                residual_invariant=residual_invariant,
+                residual_value=residual_value,
+                residual_scope="run",
                 causal_evidence=evidence,
                 intervention_name=spec.name,
                 predicted_delta=predicted,
-                measured_delta=(ab.speedup - 1.0) if ab.identical else None,
+                measured_delta=measured_delta if ab.identical else None,
                 rolled_back=apply_res.rolled_back,
             )
         )
@@ -1383,6 +1450,8 @@ def _hft_intervention_result(
                 "speedup": getattr(ab, "speedup", None),
                 "serialized_concurrency_fraction": mres.serialized_fraction,
                 "families": mres.families,
+                "residual_basis": basis[0] if basis is not None else None,
+                "diagnostics": runtime_diagnostics,
             },
             indent=2,
         )
@@ -1401,6 +1470,7 @@ def _hft_intervention_result(
         claims=claims,
         provenance=provenance,
         qualification_diagnostic=qual.diagnostic,
+        runtime_diagnostics=runtime_diagnostics,
         summary=(
             f"HFT intervention {spec.name!r}: {verdict}. "
             f"{mres.n_kernels:,} kernels observed, serialized-concurrency="
@@ -1412,7 +1482,7 @@ def _hft_intervention_result(
     summary = {
         "run_id": run_id,
         "workload": workload,
-        "status": "ok",
+        "status": "ok" if basis is not None else "intervention_failed",
         "mode": "intervention",
         "fingerprint": qual.fingerprint,
         "commit": qual.commit,
@@ -1465,6 +1535,9 @@ def _openfold_intervention_result(
         spec, applicator, min_keep_delta=0.0, audit=AuditLog(run_dir / "audit.jsonl")
     )
     ab = applicator.last_result  # AF2ABResult
+    basis, measured_delta, runtime_diagnostics = _specialized_claim_basis(mres, ab)
+    if apply_res.error:
+        runtime_diagnostics.append(f"intervention apply failed: {apply_res.error}")
 
     top = mres.top_hypotheses
     if top:
@@ -1485,16 +1558,18 @@ def _openfold_intervention_result(
 
     claims: list[Claim] = []
     rolled_back: list[str] = []
-    if ab is not None:
+    if basis is not None and ab is not None:
+        residual_invariant, residual_value = basis
         claims.append(
             Claim(
                 summary=spec.summary,
-                residual_invariant="stream_concurrency",
-                residual_value=float(mres.serialized_fraction),
+                residual_invariant=residual_invariant,
+                residual_value=residual_value,
+                residual_scope="run",
                 causal_evidence=evidence,
                 intervention_name=spec.name,
                 # plDDT-equivalence is the AF2 correctness gate (vs byte-identical).
-                measured_delta=(ab.speedup - 1.0) if ab.equivalent else None,
+                measured_delta=measured_delta if ab.equivalent else None,
                 predicted_delta=predicted,
                 rolled_back=apply_res.rolled_back,
             )
@@ -1520,6 +1595,8 @@ def _openfold_intervention_result(
                 "speedup": getattr(ab, "speedup", None),
                 "serialized_concurrency_fraction": mres.serialized_fraction,
                 "families": mres.families,
+                "residual_basis": basis[0] if basis is not None else None,
+                "diagnostics": runtime_diagnostics,
             },
             indent=2,
         )
@@ -1538,6 +1615,7 @@ def _openfold_intervention_result(
         claims=claims,
         provenance=provenance,
         qualification_diagnostic=qual.diagnostic,
+        runtime_diagnostics=runtime_diagnostics,
         summary=(
             f"AF2 intervention {spec.name!r}: {verdict}. "
             f"{mres.n_kernels:,} kernels observed, serialized-concurrency="
@@ -1549,7 +1627,7 @@ def _openfold_intervention_result(
     summary = {
         "run_id": run_id,
         "workload": workload,
-        "status": "ok",
+        "status": "ok" if basis is not None else "intervention_failed",
         "mode": "intervention",
         "fingerprint": qual.fingerprint,
         "commit": qual.commit,
@@ -1604,6 +1682,9 @@ def _edge_intervention_result(
         spec, applicator, min_keep_delta=0.0, audit=AuditLog(run_dir / "audit.jsonl")
     )
     ab = applicator.last_result  # EdgeABResult
+    basis, measured_delta, runtime_diagnostics = _specialized_claim_basis(mres, ab)
+    if apply_res.error:
+        runtime_diagnostics.append(f"intervention apply failed: {apply_res.error}")
 
     top = mres.top_hypotheses
     if top:
@@ -1624,16 +1705,18 @@ def _edge_intervention_result(
 
     claims: list[Claim] = []
     rolled_back: list[str] = []
-    if ab is not None:
+    if basis is not None and ab is not None:
+        residual_invariant, residual_value = basis
         claims.append(
             Claim(
                 summary=spec.summary,
-                residual_invariant="stream_concurrency",
-                residual_value=float(mres.serialized_fraction),
+                residual_invariant=residual_invariant,
+                residual_value=residual_value,
+                residual_scope="run",
                 causal_evidence=evidence,
                 intervention_name=spec.name,
                 # detection-equivalence is the edge correctness gate.
-                measured_delta=(ab.speedup - 1.0) if ab.identical else None,
+                measured_delta=measured_delta if ab.identical else None,
                 predicted_delta=predicted,
                 rolled_back=apply_res.rolled_back,
             )
@@ -1657,6 +1740,8 @@ def _edge_intervention_result(
                 "speedup": getattr(ab, "speedup", None),
                 "serialized_concurrency_fraction": mres.serialized_fraction,
                 "families": mres.families,
+                "residual_basis": basis[0] if basis is not None else None,
+                "diagnostics": runtime_diagnostics,
             },
             indent=2,
         )
@@ -1675,6 +1760,7 @@ def _edge_intervention_result(
         claims=claims,
         provenance=provenance,
         qualification_diagnostic=qual.diagnostic,
+        runtime_diagnostics=runtime_diagnostics,
         summary=(
             f"edge intervention {spec.name!r}: {verdict}. "
             f"{mres.n_kernels:,} kernels observed, serialized-concurrency="
@@ -1686,7 +1772,7 @@ def _edge_intervention_result(
     summary = {
         "run_id": run_id,
         "workload": workload,
-        "status": "ok",
+        "status": "ok" if basis is not None else "intervention_failed",
         "mode": "intervention",
         "fingerprint": qual.fingerprint,
         "commit": qual.commit,

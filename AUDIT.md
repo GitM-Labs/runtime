@@ -7,7 +7,7 @@ Status: **in progress**. This ledger is the primary deliverable for the audit of
 turn missing knowledge into a confident wrong result, with answer-deciding byte
 traffic and dominant expert terms ranked above non-binding estimates.
 
-Highest-severity masks closed: **9 so far**. Wiring gaps confirmed: **3 so far**.
+Highest-severity masks closed: **19 so far**. Wiring gaps confirmed: **7 so far**.
 Deferred findings: **none so far**.
 
 The worktree already contained uncommitted scheduler/serve changes and two new
@@ -29,6 +29,16 @@ they will not be silently absorbed into an audit commit.
 | 8 | fixed | medium | sparse config resolution in loop and attach | Expert weights, often the dominant term | WARN | Missing `expert_dtype` inherited linear `weight_dtype`. Official V4 Flash configs declare it (Flash=`fp4`, Base=`fp8`), but uniform foreign MoEs may omit it legitimately. | Accepted inheritance now rides in `LiveSpec.warnings` / loop diagnostics and reaches artifacts plus human output; unpriceable inherited dtypes still refuse. |
 | 9 | fixed | medium | `gitm/planner/graph.py` | Zero-time byte-moving nodes | FLAG | `has_unpriced_collectives` scanned all nodes despite its narrow name. | Split `has_unpriced_nodes` (general safety net) from the genuinely collective-specific property; production trust consumers use the general flag and artifacts retain both. |
 | 10 | fixed | high | loop `predicted_graph.json`, summary, and Markdown diagnostics | Prediction trust diagnostics | FLAG/WARN | Loop artifacts omitted fallback, estimate, default, model, batch, sharding, and hardware provenance. | Artifact now carries model source, observed/pricing hardware, batch/sharding, graph flags, per-node diagnostics, and warnings; the report and run summary consume them. |
+| 11 | fixed | critical | `gitm/bench/schema.py`; `gitm/bench/baseline.py` | Benchmark saturation/sign-off gate | REFUSE | A missing `stall_breakdown` became 0% GPU active and could sign off a CPU/no-telemetry run as unsaturated. | Missing coverage is now `None` and fails saturation; code, manifest, and GPU identity have a separate provenance gate and safe report rendering. |
+| 12 | fixed | high | `gitm/tracer/vllm_stats.py`; `gitm/serve/vllm.py` | TPOT percentiles and SLO goodput | FLAG/WARN | SSE chunk counts undercounted multi-token chunks but entered TPOT and goodput as authoritative; missing counts passed the TPOT half of the SLO. | Usage/engine counts are authoritative, chunk estimates are excluded from TPOT/goodput, and coverage warnings reach CLI and loop reports. |
+| 13 | fixed | high | `gitm/planner/roofline.py`; `gitm/planner/graph.py` | Compute/HBM denominator | FLAG/WARN | Positive work with a zero catalogue rate was priced at zero and a sibling term could hide the missing denominator. | Per-dimension unpriced flags survive on each prediction, aggregate on the graph, and surface through loop/attach artifacts and diagnostics. |
+| 14 | fixed | high | `gitm/runtime_driver.py` | Trace coverage and every claimed runtime detail | REFUSE/WARN | Zero captured kernels still produced `PASS: ... all details measured`. | The driver now uses canonical measurement, emits NO DATA, records diagnostics, and exits 3 without any positive-duration kernel. |
+| 15 | fixed | high | `gitm/optimizer/attribution.py`; `gitm/optimizer/dr.py`; loop/driver/report consumers | Causal evidence | WARN | Import/fit failure became `no strong causal signal`; DR nuisance-model fallbacks emitted estimates silently. | Attribution carries import, sample-coverage, pair-fit, and nuisance-model diagnostics into JSON, CLI, and Markdown. |
+| 16 | fixed | high | `gitm/kernels/library.py`; scheduler caller | Intervention availability / candidate coverage | REFUSE/WARN | A missing library returned `[]`, indistinguishable from no applicable levers. | The loader refuses with the path; the scheduler emits a named candidate-coverage-unavailable measurement report and no optimization claims. |
+| 17 | fixed | medium | `gitm/telemetry/collector.py`; benchmark samplers and runtime-driver consumer | State-telemetry coverage | WARN | Sampling, sink, and close failures were swallowed, making empty telemetry look like a quiet GPU. | Collector failures are deduplicated warnings and report diagnostics; benchmark sampler failures ride into JSON and stdout. |
+| 18 | fixed | high | scheduler specialized HFT/OpenFold/edge intervention result paths | Residual and intervention status | FLAG/REFUSE | No CUPTI trace attached A/B speedup to fabricated `stream_concurrency=0.0`; missing A/B still reported `ok`. | All siblings use measured throughput delta without trace coverage; missing/non-finite A/B emits no claim and returns `intervention_failed`. |
+| 19 | fixed | medium | `gitm/optimizer/headroom_kernel_rank.py` | Compute and memory headroom | FLAG/WARN | Memory-only samples fabricated 100% compute headroom; utilization-only samples fabricated zero memory capacity. | Each dimension is optional, absent families stay `None`, and diagnostics name missing telemetry. |
+| 20 | fixed | medium | `gitm/optimizer/measure.py`; duplicated runtime-driver measurement | Kernel residual denominator | WARN/REFUSE | Zero-duration kernels used a fabricated 1 ns median and attribution filtering had no coverage diagnostic. | Invalid durations are excluded with counts, attribution abstention is diagnostic, and both consumers use canonical measurement. |
 
 Status values: `open`, `fixed`, `deferred (reason)`, or `won't fix (reason)`.
 
@@ -51,19 +61,19 @@ Status values: `open`, `fixed`, `deferred (reason)`, or `won't fix (reason)`.
 |---|---|---|---|
 | top-level runtime / API / CLI / workloads | Pending | Pending | |
 | agents | Pending | Pending | |
-| bench | Pending | Pending | |
-| benchmarks | Pending | Pending | |
+| bench | In progress | In progress | Saturation and provenance sign-off gates swept/fixed; remaining CLI/results paths under review. |
+| benchmarks | In progress | In progress | KITTI/edge telemetry fallbacks fixed; remaining harnesses under review. |
 | deploy | Pending | Pending | |
 | importers | Pending | Pending | |
 | kernels | Pending | Pending | |
-| optimizer | Pending | Pending | |
-| planner | Pending | Pending | |
+| optimizer | In progress | In progress | Attribution, headroom, and measurement masks fixed; apply/safety-audit paths remain under review. |
+| planner | In progress | In progress | Seed and denominator paths swept/fixed; dead KITTI planner path remains under review. |
 | routing | Pending | Pending | |
 | safety | Pending | Pending | |
-| scheduler | Pending | Pending | |
-| serve | Pending | Pending | |
-| telemetry | Pending | Pending | |
-| tracer | Pending | Pending | |
+| scheduler | In progress | In progress | Main vLLM and specialized intervention siblings swept/fixed; remaining orchestration fallbacks under review. |
+| serve | In progress | In progress | Launch/attach gates and token provenance swept/fixed; remaining CLI paths under review. |
+| telemetry | In progress | In progress | Optional fields and collector/backend/sink failures now surface; remaining call-site consumers under review. |
+| tracer | In progress | In progress | Capture backend failures warn/source-flag; scheduler sampling and request-summary fallbacks under review. |
 | scripts | Pending | Pending | |
 
 ## Diagnostic-consumer trace
@@ -74,7 +84,13 @@ human- or gate-visible consumer.
 
 | Producer | Diagnostic | Downstream consumer | User/gate boundary | Status |
 |---|---|---|---|---|
-| — | — | — | — | Inventory pending |
+| `RooflinePrediction` / `Graph` | peak, bytes, hardware fallback; estimated; per-dimension unpriced nodes | loop and attach serializers/diagnostics | JSON + Markdown/CLI | Traced/fixed |
+| `Residuals` | coverage counts/warnings | loop residual JSON, summary, report diagnostics | JSON + Markdown | Fixed |
+| `ImportStats` / importer rollup | warnings, drops, caveats, SKU/time provenance | analyze summary + customer report | JSON + Markdown | Traced |
+| `CaptureResult` / kernel taxonomy | warnings and capture status | serve artifacts + CLI | JSON + CLI exit | Traced |
+| `ServingSummary` | TTFT/TPOT sample counts and token-provenance warnings | serve/loop artifacts | JSON + CLI/Markdown | Traced/fixed |
+| `Collector` / `GpuHeadroom` | component failures and missing metric-family diagnostics | runtime driver and benchmark artifacts | warning + JSON/Markdown/stdout | Traced/fixed |
+| `FailOpenGuard` | revert failures | `failures` attribute + audit log | programmatic/audit artifact | Revert failures traced; broken audit-sink fallback under review |
 
 ## Sibling-path validation matrix
 

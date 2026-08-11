@@ -285,6 +285,39 @@ def test_vllm_workload_still_uses_intervention_path(tmp_path: Path, monkeypatch)
     assert result["summary"]["mode"] == "intervention"
 
 
+def test_vllm_missing_intervention_library_degrades_with_named_coverage_refusal(
+    tmp_path: Path, monkeypatch
+):
+    import gitm.scheduler.loop as loop
+
+    monkeypatch.setattr(loop, "capture", _fake_capture_with_kernels("paged_attention"))
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(
+        loop,
+        "load_library",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            FileNotFoundError("missing.yaml; candidate coverage is unavailable")
+        ),
+    )
+    monkeypatch.setenv("GITM_GPU_SKU", "NVIDIA B200")
+
+    from gitm import optimize
+
+    result = optimize(
+        _priceable_moe_engine(),
+        workload="vllm-decode",
+        budget="1s",
+        scratch=str(tmp_path),
+        workload_runner=lambda: {},
+    )
+
+    assert result["summary"]["status"] == "candidate_coverage_unavailable"
+    assert result["summary"]["mode"] == "measurement"
+    assert result["summary"]["n_claims"] == 0
+    assert "missing.yaml" in result["report_md"]
+    assert "candidate coverage" in result["report_md"]
+
+
 def test_vllm_without_live_model_refuses_prediction_claims(tmp_path: Path, monkeypatch):
     import gitm.scheduler.loop as loop
 

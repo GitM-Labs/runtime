@@ -454,9 +454,12 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
             f"pricing uses fallback {hw.name!r}"
         )
     if g.has_unpriced_nodes:
-        warnings.append(
-            "byte-moving nodes are unpriced (a required bandwidth is absent from the catalogue)"
-        )
+        missing = []
+        if g.has_unpriced_compute:
+            missing.append("compute throughput")
+        if g.has_unpriced_memory:
+            missing.append("memory bandwidth")
+        warnings.append(f"predicted nodes have unpriced {' and '.join(missing)}")
     if g.has_fallback_peaks:
         warnings.append("priced against fallback compute peaks; the ceiling is low")
     if g.has_fallback_bytes:
@@ -485,6 +488,8 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
         "total_pred_s": g.total_pred_s,
         "has_unpriced_collectives": g.has_unpriced_collectives,
         "has_unpriced_nodes": g.has_unpriced_nodes,
+        "has_unpriced_compute": g.has_unpriced_compute,
+        "has_unpriced_memory": g.has_unpriced_memory,
         "has_fallback_peaks": g.has_fallback_peaks,
         "has_fallback_bytes": g.has_fallback_bytes,
         "warnings": warnings,
@@ -499,6 +504,8 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
                 "bytes": n.prediction.bytes,
                 "estimated": n.prediction.estimated,
                 "bytes_are_fallback": n.prediction.bytes_are_fallback,
+                "compute_is_unpriced": n.prediction.compute_is_unpriced,
+                "memory_is_unpriced": n.prediction.memory_is_unpriced,
             }
             for n in g.nodes
         ],

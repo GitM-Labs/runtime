@@ -57,3 +57,13 @@ def test_load_library_filters_by_workload(tmp_path):
     )
     assert [s.name for s in load_library(p, workload="vllm-decode")] == ["v"]
     assert {s.name for s in load_library(p)} == {"v", "e"}  # unfiltered
+
+
+def test_missing_library_refuses_with_named_path(tmp_path):
+    import pytest
+
+    from gitm.kernels.library import load_library
+
+    missing = tmp_path / "missing.yaml"
+    with pytest.raises(FileNotFoundError, match="candidate coverage is unavailable"):
+        load_library(missing)
