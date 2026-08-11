@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from gitm._paths import runs_dir, traces_dir
+from gitm._timing import require_positive_duration, require_positive_work
 from gitm.agents.autoresearch import (
     AutoresearchRun,
     EngineArgsProposer,
@@ -57,7 +58,13 @@ from gitm.optimizer.vllm_knobs import (
 from gitm.planner.context import build_planner_context, hardware_spec_for
 from gitm.planner.graph import Graph, predict_graph
 from gitm.planner.moe_graph import predict_moe_graph, spec_from_hf_config
-from gitm.planner.roofline import BatchConfig, ModelSpec, ShardingConfig
+from gitm.planner.roofline import (
+    BatchConfig,
+    ModelSpec,
+    ShardingConfig,
+    weight_bytes,
+    weight_bytes_is_fallback,
+)
 from gitm.safety.audit import AuditLog, _write_report
 from gitm.serve.model_config import (
     is_sparse_moe_config,
@@ -120,16 +127,23 @@ def _engine_throughput_fn(engine: Any, runner: Any) -> Any:
     def _tps(_engine: Any) -> float:
         t0 = time.perf_counter()
         out = runner() if runner is not None else {}
-        dt = max(time.perf_counter() - t0, 1e-9)
+        dt = require_positive_duration(
+            time.perf_counter() - t0, context="live-engine throughput probe"
+        )
         # First key that is actually present wins — `or` would treat a legitimate
         # 0 (a window that produced no tokens) as missing and fabricate a count.
-        toks: float = 1.0
+        toks: float | None = None
         if isinstance(out, dict):
             for key in ("generated_tokens", "decode_steps", "events"):
                 if out.get(key) is not None:
                     toks = float(out[key])
                     break
-        return toks / dt
+        if toks is None:
+            raise RuntimeError(
+                "live-engine throughput work coverage unavailable: runner returned none of "
+                "generated_tokens, decode_steps, or events"
+            )
+        return float(require_positive_work(toks, context="live-engine throughput probe")) / dt
 
     return _tps
 
@@ -169,76 +183,10 @@ class LoopConfig:
     workload_runner: WorkloadRunner | None = None
 
 
-def _model_spec_from_engine(engine: Any):
-    """Build a ``ModelSpec`` from a live vLLM engine's HF config, or ``None``.
-
-    ``predict_graph()`` with no model defaults to Llama-2-7B (32 layers). A run
-    of a *different* model (e.g. opt-125m, 12 layers) is then scored against the
-    wrong predicted graph, which makes residuals and deviation meaningless. When
-    the loop has the live engine, read the real architecture off its HF config so
-    the predicted graph matches the model that actually ran. Duck-typed across
-    vLLM version drift; any failure returns ``None`` and the caller falls back to
-    the default graph rather than crashing.
-    """
-    if engine is None:
-        return None
-    hf: Any = None
-    for path in (
-        "llm_engine.model_config.hf_config",
-        "llm_engine.vllm_config.model_config.hf_config",
-        "model_config.hf_config",
-    ):
-        obj: Any = engine
-        for attr in path.split("."):
-            obj = getattr(obj, attr, None)
-            if obj is None:
-                break
-        if obj is not None:
-            hf = obj
-            break
-    if hf is None:
-        return None
-    try:
-        from gitm.planner.roofline import ModelSpec
-
-        hidden = int(hf.hidden_size)
-        n_heads = int(hf.num_attention_heads)
-        n_kv = int(getattr(hf, "num_key_value_heads", n_heads) or n_heads)
-        head_dim = int(getattr(hf, "head_dim", 0) or (hidden // n_heads))
-        moe = _moe_fields_from_hf(hf)
-        return ModelSpec(
-            hidden=hidden,
-            n_layers=int(hf.num_hidden_layers),
-            n_heads=n_heads,
-            num_kv_heads=n_kv,
-            head_dim=head_dim,
-            intermediate=int(getattr(hf, "intermediate_size", 4 * hidden)),
-            vocab=int(hf.vocab_size),
-            **moe,
-        )
-    except Exception:
-        return None
-
-
-#: HF config field aliases per MoE family — the same quantity is spelled
-#: differently by Qwen / Mixtral / DeepSeek, so try each in order.
-_MOE_ALIASES: dict[str, tuple[str, ...]] = {
-    "num_experts": ("num_experts", "num_local_experts", "n_routed_experts"),
-    "experts_per_token": ("num_experts_per_tok", "moe_top_k", "num_selected_experts"),
-    "moe_intermediate": ("moe_intermediate_size", "expert_intermediate_size"),
-    "shared_experts": ("n_shared_experts", "num_shared_experts"),
-    "shared_expert_intermediate": ("shared_expert_intermediate_size",),
-    # Per-layer placement: MoE checkpoints are not uniformly sparse.
-    "first_dense_layers": ("first_k_dense_replace",),
-    "moe_layer_step": ("decoder_sparse_step", "moe_layer_freq"),
-}
-
 #: Attention-shape aliases. Deliberately separate from the MoE table: hybrid
 #: attention and a mixture FFN are independent choices, and a hybrid model with a
 #: dense FFN (or a plain MoE transformer) must still get the right one.
-_ATTN_ALIASES: dict[str, tuple[str, ...]] = {
-    "full_attn_layer_step": ("full_attention_interval", "attn_layer_freq"),
-}
+_FULL_ATTN_ALIASES = ("full_attention_interval", "attn_layer_freq")
 
 #: quant_method -> bytes per weight element. MoE decode is weight-fetch bound,
 #: so using the activation width for a quantized checkpoint would overstate the
@@ -399,12 +347,28 @@ def _dense_spec_from_config(cfg: dict[str, Any]) -> tuple[ModelSpec | None, str]
         n_heads = int(cfg["num_attention_heads"])
         n_kv = int(cfg.get("num_key_value_heads", n_heads) or n_heads)
         head_dim = int(cfg.get("head_dim", 0) or (hidden // n_heads))
-        act = str(cfg.get("torch_dtype", "bf16")).lower()
-        dtype_bytes = 4 if act in ("fp32", "float32") else 2
+        act_raw = str(cfg.get("torch_dtype", "bf16")).lower().removeprefix("torch.")
+        act = {
+            "bfloat16": "bf16",
+            "float16": "fp16",
+            "half": "fp16",
+            "float32": "fp32",
+        }.get(act_raw, act_raw)
+        if weight_bytes_is_fallback(act):
+            return None, f"dense activation dtype {act!r} is not priceable"
+        dtype_bytes = int(weight_bytes(act))
         quant = cfg.get("quantization_config") or {}
         method = quant.get("quant_method") if isinstance(quant, dict) else None
         if method is not None and str(method).lower() not in _QUANT_WEIGHT_BYTES:
             return None, f"dense quantization method {method!r} is not priceable"
+        full_attn_layer_step = 1
+        for key in _FULL_ATTN_ALIASES:
+            raw = cfg.get(key)
+            if raw is not None:
+                full_attn_layer_step = int(raw)
+                if full_attn_layer_step <= 0:
+                    return None, f"dense attention interval {key} must be positive"
+                break
         return ModelSpec(
             name=str(cfg.get("_name_or_path") or cfg.get("model_type") or "live-dense"),
             hidden=hidden,
@@ -416,6 +380,7 @@ def _dense_spec_from_config(cfg: dict[str, Any]) -> tuple[ModelSpec | None, str]
             dtype_bytes=dtype_bytes,
             weight_dtype_bytes=_QUANT_WEIGHT_BYTES.get(str(method).lower()) if method else None,
             vocab=int(cfg["vocab_size"]),
+            full_attn_layer_step=full_attn_layer_step,
         ), ""
     except (TypeError, ValueError, ZeroDivisionError) as exc:
         return None, f"dense model config could not be parsed ({type(exc).__name__}: {exc})"
@@ -507,56 +472,6 @@ def _execution_graph(engine: Any, pctx: Any, sched: Any) -> ExecutionGraphResolu
         diagnostics,
         model_source="live_hf_config",
     )
-
-
-def _read_int_aliases(hf: Any, table: dict[str, tuple[str, ...]]) -> dict[str, Any]:
-    """First positive int found for each field across its aliases. Duck-typed."""
-    out: dict[str, Any] = {}
-    for field, aliases in table.items():
-        for alias in aliases:
-            raw = getattr(hf, alias, None)
-            if raw is None:
-                continue
-            try:
-                value = int(raw)
-            except (TypeError, ValueError):
-                continue
-            if value > 0:
-                out[field] = value
-                break
-    return out
-
-
-def _moe_fields_from_hf(hf: Any) -> dict[str, Any]:
-    """Shape ``ModelSpec`` kwargs read off an HF config.
-
-    Covers two *independent* axes — whether the FFN is a mixture, and whether
-    attention is hybrid — so a hybrid-attention dense model still gets its
-    attention shape, and a plain MoE transformer still gets its experts. Every
-    field is optional; anything absent falls back to the dense/conventional
-    default rather than being guessed. Tolerant of partial configs.
-    """
-    # Attention shape is independent of the FFN, so it survives the MoE gate.
-    out: dict[str, Any] = _read_int_aliases(hf, _ATTN_ALIASES)
-    moe = _read_int_aliases(hf, _MOE_ALIASES)
-
-    # Only a routed-expert count *and* a top-k make the FFN a mixture; without
-    # both, leave the FFN dense rather than half-configured.
-    if not (moe.get("num_experts") and moe.get("experts_per_token")):
-        return out
-    out.update(moe)
-
-    quant = getattr(hf, "quantization_config", None)
-    method = None
-    if isinstance(quant, dict):
-        method = quant.get("quant_method")
-    elif quant is not None:
-        method = getattr(quant, "quant_method", None)
-    if isinstance(method, str):
-        wb = _QUANT_WEIGHT_BYTES.get(method.lower())
-        if wb:
-            out["weight_dtype_bytes"] = wb
-    return out
 
 
 def _agg_kt_residual(res: Any) -> float:
@@ -672,7 +587,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # Collective-communication causes from the same trace — ranked beside the
     # scheduler causes below. Empty when the trace holds no collective kernels.
     coll_causes = collective_causes(worst_device_comm(trace))
-    if sched_stats.samples or serving_summary is not None:
+    if sched_stats.samples or sched_summary.diagnostics or serving_summary is not None:
         (run_dir / "scheduler_stats.json").write_text(
             json.dumps(
                 {
@@ -791,6 +706,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # Llama/A100 default prediction.
     pctx = build_planner_context(cfg.engine, workload=workload)
     graph_resolution = _execution_graph(cfg.engine, pctx, sched_summary)
+    graph_resolution.diagnostics.extend(sched_summary.diagnostics)
     if not graph_resolution.ok:
         (run_dir / "prediction_refusal.json").write_text(
             json.dumps(

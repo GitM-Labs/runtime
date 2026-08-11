@@ -393,8 +393,19 @@ def test_causes_sorted_by_severity_desc():
 # --------------------------------------------------------------------------- #
 # end-to-end: scheduler stats feed attribution + claim evidence (Task 2)      #
 # --------------------------------------------------------------------------- #
+class _DenseHFConfig:
+    def __init__(self):
+        self.hidden_size = 768
+        self.num_hidden_layers = 12
+        self.num_attention_heads = 12
+        self.intermediate_size = 3072
+        self.vocab_size = 50272
+        self.torch_dtype = "bf16"
+
+
 class _ModelCfgBf16:
     dtype = "torch.bfloat16"
+    hf_config = _DenseHFConfig()
 
 
 class _LowOccScheduler:
@@ -443,6 +454,7 @@ def test_run_loop_scheduler_stats_feed_attribution_and_claims(tmp_path, monkeypa
 
     monkeypatch.setattr(loop, "capture", fake_capture)
     monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setenv("GITM_GPU_SKU", "A100-SXM4-80GB")
 
     engine = _FullEngine()
     # Non-expiring budget: max_num_seqs_dynamic ranks low and this asserts it's

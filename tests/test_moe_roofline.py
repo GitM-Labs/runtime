@@ -398,32 +398,6 @@ def test_hybrid_and_moe_compose():
     assert all(n.prediction.bytes > 0 for n in g.nodes)
 
 
-def test_hf_attention_shape_survives_a_dense_ffn():
-    """Regression: attention shape and FFN sparsity are independent axes, so a
-    hybrid model with a dense FFN must still get full_attn_layer_step."""
-    from gitm.scheduler.loop import _moe_fields_from_hf
-
-    class HybridDense:  # hybrid attention, no experts
-        full_attention_interval = 4
-
-    class PlainMoE:  # experts, conventional attention
-        num_experts = 64
-        num_experts_per_tok = 4
-
-    assert _moe_fields_from_hf(HybridDense()) == {"full_attn_layer_step": 4}
-    got = _moe_fields_from_hf(PlainMoE())
-    assert got["num_experts"] == 64 and "full_attn_layer_step" not in got
-
-
-def test_hf_half_configured_moe_stays_dense():
-    from gitm.scheduler.loop import _moe_fields_from_hf
-
-    class OnlyExpertCount:
-        num_experts = 64  # no top-k
-
-    assert _moe_fields_from_hf(OnlyExpertCount()) == {}
-
-
 # --- real batch from scheduler stats -----------------------------------------
 
 

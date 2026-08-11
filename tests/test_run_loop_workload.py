@@ -476,6 +476,28 @@ def test_cli_run_refuses_malformed_loop_result(monkeypatch, tmp_path):
     assert "returned no machine-readable summary" in report.read_text()
 
 
+def test_default_engine_throughput_probe_refuses_missing_work_count(monkeypatch):
+    from gitm.scheduler.loop import _engine_throughput_fn
+
+    ticks = iter([1.0, 2.0])
+    monkeypatch.setattr("gitm.scheduler.loop.time.perf_counter", lambda: next(ticks))
+    probe = _engine_throughput_fn(object(), lambda: {})
+
+    with pytest.raises(RuntimeError, match="runner returned none"):
+        probe(object())
+
+
+def test_default_engine_throughput_probe_refuses_zero_work(monkeypatch):
+    from gitm.scheduler.loop import _engine_throughput_fn
+
+    ticks = iter([1.0, 2.0])
+    monkeypatch.setattr("gitm.scheduler.loop.time.perf_counter", lambda: next(ticks))
+    probe = _engine_throughput_fn(object(), lambda: {"generated_tokens": 0})
+
+    with pytest.raises(RuntimeError, match="work coverage unavailable"):
+        probe(object())
+
+
 def test_hft_harness_importable_from_package():
     """The harness must ship in the wheel, i.e. be importable from the package."""
     from gitm.benchmarks.hft import harness
