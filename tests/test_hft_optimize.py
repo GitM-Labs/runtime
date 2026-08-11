@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 
 def _make_df(n: int = 4000, seed: int = 0):
@@ -39,6 +40,14 @@ def test_optimize_keeps_only_correct_candidate():
     assert r.identical is True
     assert r.kept in {"candidate", "baseline"}  # CPU may not show the speedup; correctness is the gate
     assert r.baseline_eps > 0 and r.candidate_eps > 0
+
+
+@pytest.mark.parametrize("reps", [0, -1, True])
+def test_optimize_refuses_invalid_repetition_count(reps):
+    from gitm.benchmarks.hft.optimize import optimize_hft
+
+    with pytest.raises(ValueError, match="reps"):
+        optimize_hft(_make_df(), pd, reps=reps)
 
 
 def test_optimize_rolls_back_a_divergent_candidate(monkeypatch):

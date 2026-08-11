@@ -108,12 +108,14 @@ def optimize_hft(df, dflib, *, reps: int = 3, sync=None) -> ABResult:
     reduce launch-jitter noise. ``sync`` is an optional callable invoked after
     each run so GPU timing is honest (pass a device-sync; default no-op for CPU).
     """
+    if isinstance(reps, bool) or not isinstance(reps, int) or reps <= 0:
+        raise ValueError(f"reps must be a positive integer, got {reps!r}")
     sync = sync or (lambda: None)
 
     def _timed(fn) -> tuple[dict, float]:
         best = float("inf")
         summary: dict = {}
-        for _ in range(max(1, reps)):
+        for _ in range(reps):
             t0 = time.perf_counter()
             summary = fn(df, dflib)
             sync()

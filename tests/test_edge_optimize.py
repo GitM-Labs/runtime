@@ -69,11 +69,37 @@ def test_detections_equivalent_matches_per_frame():
     assert not detections_equivalent(base, _frames(n_frames=1, n_det=3))
 
 
+def test_zero_detection_tolerance_is_exact():
+    base = _frames(n_frames=1, n_det=3)
+
+    assert not detections_equivalent(base, _frames(n_frames=1, n_det=2), tol_frac=0.0)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"reps": 0}, "reps"),
+        ({"reps": -2}, "reps"),
+        ({"tol_frac": -0.1}, "tol_frac"),
+        ({"tol_frac": 1.1}, "tol_frac"),
+        ({"center_atol": float("nan")}, "center_atol"),
+    ],
+)
+def test_optimize_edge_refuses_invalid_gate_controls(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        optimize_edge(_fake_run_mode(), **kwargs)
+
+
 def test_specs_apply_to_edge_workloads():
     for spec in (edge_intervention_spec(), edge_batching_spec()):
         assert set(spec.applicability.workloads) >= {"edge", "kitti", "nuscenes"}
     assert edge_intervention_spec().name == "edge_fp16_autocast"
     assert edge_batching_spec().name == "edge_frame_batching"
+
+
+def test_edge_batching_refuses_invalid_batch_size():
+    with pytest.raises(ValueError, match="batch_size"):
+        EdgeBatchingApplicator(_fake_run_mode(), batch_size=0)
 
 
 def test_optimize_edge_keeps_faster_equivalent_candidate():
