@@ -92,6 +92,18 @@ def test_rollback_on_measure_crash():
     assert cfg == {"block_size": 8}  # restored despite the apply having mutated it
 
 
+def test_failopen_restores_on_baseexception_during_measurement():
+    cfg = {"block_size": 8}
+
+    def interrupt(_spec):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        apply_intervention(_spec(), DictApplicator(cfg, measure_fn=interrupt))
+
+    assert cfg == {"block_size": 8}
+
+
 # --- regression rollback ----------------------------------------------------
 
 

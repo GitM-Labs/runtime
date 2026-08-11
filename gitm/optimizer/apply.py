@@ -32,6 +32,7 @@ import yaml
 
 from gitm.kernels.spec import InterventionSpec
 from gitm.optimizer.vllm_knobs import get_knob, knob_kind, set_knob
+from gitm.safety.failopen import FailOpenGuard
 
 if TYPE_CHECKING:
     from gitm.safety.audit import AuditLog
@@ -88,54 +89,70 @@ def apply_intervention(
             error=f"baseline snapshot failed; intervention not applied: {exc}",
         )
 
-    # Step 2: apply. A bad value (validation error) rolls straight back.
-    try:
-        applicator.apply(spec)
-    except Exception as exc:
-        applicator.restore(snapshot)
-        _audit(audit, "revert", spec, cause=f"apply failed, restored: {exc}",
-               knobs=_knob_values(spec))
-        return ApplyResult(False, rolled_back=True, measured_delta=None,
-                           error=f"apply failed, restored: {exc}")
-    _audit(audit, "apply", spec, cause="applied live", knobs=_knob_values(spec))
+    def _apply_measure_decide() -> ApplyResult:
+        # Step 2: apply. A bad value (validation error) rolls straight back.
+        try:
+            applicator.apply(spec)
+        except Exception as exc:
+            applicator.restore(snapshot)
+            _audit(audit, "revert", spec, cause=f"apply failed, restored: {exc}",
+                   knobs=_knob_values(spec))
+            return ApplyResult(False, rolled_back=True, measured_delta=None,
+                               error=f"apply failed, restored: {exc}")
+        _audit(audit, "apply", spec, cause="applied live", knobs=_knob_values(spec))
 
-    # Step 3: measure. A crash mid-measurement also rolls back.
-    try:
-        delta = applicator.measure(spec)
-    except Exception as exc:
-        applicator.restore(snapshot)
-        _audit(audit, "revert", spec, cause=f"measure failed, restored: {exc}",
-               knobs=_knob_values(spec))
-        return ApplyResult(False, rolled_back=True, measured_delta=None,
-                           error=f"measure failed, restored: {exc}")
+        # Step 3: measure. A recoverable crash rolls back immediately. The
+        # surrounding fail-open guard also restores on BaseException/process
+        # exit paths that an Exception handler must not swallow.
+        try:
+            delta = applicator.measure(spec)
+        except Exception as exc:
+            applicator.restore(snapshot)
+            _audit(audit, "revert", spec, cause=f"measure failed, restored: {exc}",
+                   knobs=_knob_values(spec))
+            return ApplyResult(False, rolled_back=True, measured_delta=None,
+                               error=f"measure failed, restored: {exc}")
 
-    if delta is not None and (
-        isinstance(delta, bool)
-        or not isinstance(delta, int | float)
-        or not math.isfinite(float(delta))
-    ):
-        applicator.restore(snapshot)
-        error = f"measurement delta must be finite, got {delta!r}; intervention restored"
-        _audit(audit, "revert", spec, cause=error, knobs=_knob_values(spec))
-        return ApplyResult(False, rolled_back=True, measured_delta=None, error=error)
+        if delta is not None and (
+            isinstance(delta, bool)
+            or not isinstance(delta, int | float)
+            or not math.isfinite(float(delta))
+        ):
+            applicator.restore(snapshot)
+            error = f"measurement delta must be finite, got {delta!r}; intervention restored"
+            _audit(audit, "revert", spec, cause=error, knobs=_knob_values(spec))
+            return ApplyResult(False, rolled_back=True, measured_delta=None, error=error)
 
-    # Step 4: keep-or-rollback on the regression threshold.
-    if delta is None:
-        warnings.warn(
-            f"intervention {spec.name!r} was applied without a measurement; "
-            "the change is unverified",
-            RuntimeWarning,
-            stacklevel=2,
+        # Step 4: keep-or-rollback on the regression threshold.
+        if delta is None:
+            warnings.warn(
+                f"intervention {spec.name!r} was applied without a measurement; "
+                "the change is unverified",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if delta is not None and delta < min_keep_delta:
+            applicator.restore(snapshot)
+            _audit(audit, "revert", spec, knobs=_knob_values(spec),
+                   cause=f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}")
+            return ApplyResult(True, rolled_back=True, measured_delta=delta,
+                               error=f"regression {delta:+.3f} < keep threshold "
+                                     f"{min_keep_delta:+.3f}, restored")
+
+        return ApplyResult(True, rolled_back=False, measured_delta=delta)
+
+    with FailOpenGuard(audit=audit) as guard:
+        guard.register(
+            spec.name,
+            lambda: applicator.restore(snapshot),
+            cause="apply gate exited before a keep/rollback decision",
         )
-    if delta is not None and delta < min_keep_delta:
-        applicator.restore(snapshot)
-        _audit(audit, "revert", spec, knobs=_knob_values(spec),
-               cause=f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}")
-        return ApplyResult(True, rolled_back=True, measured_delta=delta,
-                           error=f"regression {delta:+.3f} < keep threshold "
-                                 f"{min_keep_delta:+.3f}, restored")
-
-    return ApplyResult(True, rolled_back=False, measured_delta=delta)
+        result = _apply_measure_decide()
+        # Every ordinary return above either kept the change deliberately or
+        # restored it synchronously. Exceptional exits retain the registration,
+        # so the context restores before propagating the interruption.
+        guard.disarm(spec.name)
+        return result
 
 
 def _audit(
