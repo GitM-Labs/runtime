@@ -326,12 +326,28 @@ def _loop_sharding(engine: Any) -> tuple[ShardingConfig, list[str]]:
         engine,
         ("parallel_config.enable_expert_parallel", "vllm_config.parallel_config.enable_expert_parallel"),
     )
-    if not isinstance(tp, int) or tp < 1:
+    if tp is not None and (isinstance(tp, bool) or not isinstance(tp, int) or tp < 1):
+        raise ValueError(f"tensor_parallel_size must be a positive integer, got {tp!r}")
+    if tp is None:
         return ShardingConfig(), [
             "sharding topology was not exposed; using whole-model tp=1 ep=1 dp=1"
         ]
-    dp_i = dp if isinstance(dp, int) and dp > 0 else 1
-    return ShardingConfig(tp=tp, ep=tp if bool(ep) else 1, dp=dp_i), []
+    diagnostics: list[str] = []
+    if dp is None:
+        dp_i = 1
+        diagnostics.append("data_parallel_size was not exposed; using dp=1")
+    elif isinstance(dp, bool) or not isinstance(dp, int) or dp < 1:
+        raise ValueError(f"data_parallel_size must be a positive integer, got {dp!r}")
+    else:
+        dp_i = dp
+    if ep is None:
+        ep_enabled = False
+        diagnostics.append("enable_expert_parallel was not exposed; using ep=1")
+    elif not isinstance(ep, bool):
+        raise ValueError(f"enable_expert_parallel must be boolean, got {ep!r}")
+    else:
+        ep_enabled = ep
+    return ShardingConfig(tp=tp, ep=tp if ep_enabled else 1, dp=dp_i), diagnostics
 
 
 def _dense_spec_from_config(cfg: dict[str, Any]) -> tuple[ModelSpec | None, str]:
@@ -411,6 +427,11 @@ def _execution_graph(engine: Any, pctx: Any, sched: Any) -> ExecutionGraphResolu
         )
     hw = hardware_spec_for(pctx.peak)
     batch, diagnostics = _loop_batch(engine, pctx, sched)
+    try:
+        sharding, sharding_diagnostics = _loop_sharding(engine)
+    except ValueError as exc:
+        return ExecutionGraphResolution(None, diagnostics, f"invalid live sharding topology: {exc}")
+    diagnostics.extend(sharding_diagnostics)
 
     if is_sparse_moe_config(cfg):
         invalid = validate_moe_config(cfg)
@@ -451,8 +472,6 @@ def _execution_graph(engine: Any, pctx: Any, sched: Any) -> ExecutionGraphResolu
         unpriceable = validate_priceable_dtypes(spec)
         if unpriceable:
             return ExecutionGraphResolution(None, diagnostics, "; ".join(unpriceable))
-        sharding, sharding_diagnostics = _loop_sharding(engine)
-        diagnostics.extend(sharding_diagnostics)
         graph = predict_moe_graph(spec, hw, batch, sharding)
     else:
         if cfg.get("num_key_value_heads") is None:
@@ -467,7 +486,12 @@ def _execution_graph(engine: Any, pctx: Any, sched: Any) -> ExecutionGraphResolu
         spec, error = _dense_spec_from_config(cfg)
         if spec is None:
             return ExecutionGraphResolution(None, diagnostics, error)
-        graph = predict_graph(model=spec, hw=hw, batch=batch)
+        try:
+            graph = predict_graph(model=spec, hw=hw, batch=batch, sharding=sharding)
+        except ValueError as exc:
+            return ExecutionGraphResolution(
+                None, diagnostics, f"dense sharding cannot be priced: {exc}"
+            )
 
     if graph.has_fallback_peaks:
         diagnostics.append("one or more nodes use fallback compute peaks")

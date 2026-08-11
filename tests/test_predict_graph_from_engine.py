@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 from gitm.planner.graph import predict_graph
+from gitm.planner.roofline import BatchConfig, ShardingConfig
 from gitm.scheduler.loop import _dense_spec_from_config
 
 # opt-125m: 12 layers, hidden 768, 12 heads (MHA), intermediate 3072.
@@ -85,3 +88,42 @@ def test_dense_parser_preserves_fp32_compute_dtype():
     assert spec is not None
     assert spec.compute_dtype == "fp32"
     assert spec.dtype_bytes == 4
+
+
+def test_dense_graph_prices_tensor_parallel_work_per_rank():
+    whole = predict_graph(model=_spec(num_key_value_heads=4))
+    sharded = predict_graph(
+        model=_spec(num_key_value_heads=4), sharding=ShardingConfig(tp=2)
+    )
+
+    whole_qkv = next(n.prediction for n in whole.nodes if n.op == "qkv_proj")
+    rank_qkv = next(n.prediction for n in sharded.nodes if n.op == "qkv_proj")
+    assert sharded.sharding.tp == 2
+    assert rank_qkv.flops == whole_qkv.flops / 2
+    assert any(n.op == "tp_all_reduce" for n in sharded.nodes)
+
+
+def test_quantized_dense_width_applies_to_attention_and_lm_head_weights():
+    bf16 = predict_graph(model=_spec())
+    fp8 = predict_graph(
+        model=_spec(quantization_config={"quant_method": "fp8"})
+    )
+
+    for op in ("qkv_proj", "attn_out_proj", "lm_head"):
+        bf16_bytes = next(n.prediction.bytes for n in bf16.nodes if n.op == op)
+        fp8_bytes = next(n.prediction.bytes for n in fp8.nodes if n.op == op)
+        assert fp8_bytes < bf16_bytes
+
+
+def test_dense_graph_honors_speculative_positions():
+    plain = predict_graph(model=_spec(), batch=BatchConfig(batch=2, speculative_tokens=0))
+    drafted = predict_graph(model=_spec(), batch=BatchConfig(batch=2, speculative_tokens=3))
+
+    plain_qkv = next(n.prediction for n in plain.nodes if n.op == "qkv_proj")
+    drafted_qkv = next(n.prediction for n in drafted.nodes if n.op == "qkv_proj")
+    assert drafted_qkv.flops == plain_qkv.flops * 4
+
+
+def test_dense_graph_refuses_incompatible_tensor_parallel_shape():
+    with pytest.raises(ValueError, match="n_heads"):
+        predict_graph(model=_spec(), sharding=ShardingConfig(tp=5))

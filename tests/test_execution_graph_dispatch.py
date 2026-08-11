@@ -148,3 +148,43 @@ def test_dense_mha_and_head_dimension_derivations_are_diagnostics():
     assert resolved.ok
     assert any("num_key_value_heads" in note and "MHA" in note for note in resolved.diagnostics)
     assert any("head_dim" in note and "derived" in note for note in resolved.diagnostics)
+
+
+def test_dense_execution_graph_consumes_live_tensor_parallel_topology():
+    engine = _engine(_dense_cfg(num_key_value_heads=4))
+    engine.parallel_config = SimpleNamespace(
+        tensor_parallel_size=2,
+        data_parallel_size=1,
+        enable_expert_parallel=False,
+    )
+
+    resolved = _execution_graph(engine, _pctx(), sched=None)
+
+    assert resolved.ok
+    assert resolved.graph.sharding.tp == 2
+    assert any(node.op == "tp_all_reduce" for node in resolved.graph.nodes)
+
+
+def test_malformed_live_expert_parallel_flag_refuses_topology():
+    engine = _engine(_dense_cfg())
+    engine.parallel_config = SimpleNamespace(
+        tensor_parallel_size=2,
+        data_parallel_size=1,
+        enable_expert_parallel="false",
+    )
+
+    resolved = _execution_graph(engine, _pctx(), sched=None)
+
+    assert not resolved.ok
+    assert "enable_expert_parallel must be boolean" in resolved.refusal_reason
+
+
+def test_partial_live_topology_names_each_assumption():
+    engine = _engine(_dense_cfg())
+    engine.parallel_config = SimpleNamespace(tensor_parallel_size=2)
+
+    resolved = _execution_graph(engine, _pctx(), sched=None)
+
+    assert resolved.ok
+    assert any("data_parallel_size" in note for note in resolved.diagnostics)
+    assert any("enable_expert_parallel" in note for note in resolved.diagnostics)
