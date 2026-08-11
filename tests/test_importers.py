@@ -352,9 +352,34 @@ def test_dedupe_identical_rows(tmp_path):
     conn.close()
     with pytest.warns(UserWarning, match="deduped"):
         traces, stats = import_nsys(dst, device=0)
-    # dedupe count is on the per-device finish_trace; check events cleaned
+    assert stats.deduped == 1
+    assert any("deduped 1" in note for note in stats.warnings)
     assert traces[0].kernels()
     Trace.model_validate(traces[0].model_dump())
+
+
+def test_invalid_event_drop_reaches_file_level_import_diagnostics(tmp_path):
+    src = FIXTURES / "parity_nsys.sqlite"
+    dst = tmp_path / "invalid.sqlite"
+    dst.write_bytes(src.read_bytes())
+    conn = sqlite3.connect(dst)
+    conn.execute(
+        "UPDATE CUPTI_ACTIVITY_KIND_KERNEL SET end = start - 1 "
+        "WHERE rowid = (SELECT rowid FROM CUPTI_ACTIVITY_KIND_KERNEL LIMIT 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.warns(UserWarning, match="dropped 1 event"):
+        traces, stats = import_nsys(dst, device=0)
+
+    assert traces[0].kernels()
+    assert stats.dropped_invalid == 1
+    assert any("dropped 1 event" in note for note in stats.warnings)
+
+    with pytest.warns(UserWarning, match="dropped 1 event"):
+        result = analyze_paths([dst], run_id="invalid-event-report")
+    assert "dropped 1 event" in result.report_md
 
 
 def test_atomic_write(tmp_path):

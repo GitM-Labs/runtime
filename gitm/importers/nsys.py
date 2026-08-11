@@ -19,6 +19,7 @@ from gitm.importers._common import (
     as_int,
     file_mtime_ns,
     finish_trace,
+    merge_normalization_stats,
 )
 from gitm.tracer.schema import KernelEvent, MemcpyEvent, SyncEvent, Trace, TraceEvent
 
@@ -553,6 +554,7 @@ def import_nsys(
         rid = run_id or f"import-{uuid.uuid4().hex}"
         dcount = meta_count or (max(all_counts.keys()) + 1)
         traces: list[Trace] = []
+        normalization_stats: list[ImportStats] = []
         total_events = 0
         # Pass 2: one device at a time — peak RAM ≈ max(per-device), not sum.
         for dev in device_ids:
@@ -578,6 +580,7 @@ def import_nsys(
                 strict=strict,
             )
             traces.append(trace)
+            normalization_stats.append(_st)
             del dev_events
 
         if not traces:
@@ -592,6 +595,7 @@ def import_nsys(
             per_device_kernel_counts=all_counts,
             total_raw_events=total_events,
         )
+        merge_normalization_stats(stats, normalization_stats)
         if len(device_ids) > 1:
             stats.warnings.append(
                 f"multi-GPU input: analyzing devices {device_ids}; "

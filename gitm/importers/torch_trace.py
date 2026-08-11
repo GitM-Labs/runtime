@@ -22,6 +22,7 @@ from gitm.importers._common import (
     file_mtime_ns,
     filter_device,
     finish_trace,
+    merge_normalization_stats,
     per_device_kernel_counts,
 )
 from gitm.tracer.schema import MemcpyEvent, Trace, TraceEvent
@@ -698,6 +699,7 @@ def _import_torch_from_event_dicts(
     rid = run_id or f"import-{uuid.uuid4().hex}"
     dcount = device_count_from_events(events)
     traces: list[Trace] = []
+    normalization_stats: list[ImportStats] = []
     for dev in device_ids:
         dev_events = filter_device(events, dev)
         if not dev_events:
@@ -713,6 +715,7 @@ def _import_torch_from_event_dicts(
             strict=strict,
         )
         traces.append(trace)
+        normalization_stats.append(_st)
     if not traces:
         raise ImportError(f"{path.name}: no events left after device filter")
     stats = ImportStats(
@@ -724,6 +727,7 @@ def _import_torch_from_event_dicts(
         per_device_kernel_counts=all_counts,
         total_raw_events=len(events),
     )
+    merge_normalization_stats(stats, normalization_stats)
     _append_launch_metadata_warnings(stats, metadata_fallbacks)
     if len(device_ids) > 1:
         stats.warnings.append(
@@ -861,6 +865,7 @@ def import_torch_trace(
     rid = run_id or f"import-{uuid.uuid4().hex}"
     dcount = max(device_ids) + 1
     traces: list[Trace] = []
+    normalization_stats: list[ImportStats] = []
     total_events = 0
     for dev in device_ids:
         dev_events = buckets.pop(dev)
@@ -876,6 +881,7 @@ def import_torch_trace(
             strict=strict,
         )
         traces.append(trace)
+        normalization_stats.append(_st)
 
     if not traces:
         raise ImportError(f"{path.name}: no events left after device filter")
@@ -889,6 +895,7 @@ def import_torch_trace(
         per_device_kernel_counts=dict(all_counts),
         total_raw_events=total_events,
     )
+    merge_normalization_stats(stats, normalization_stats)
     _append_launch_metadata_warnings(stats, metadata_fallbacks)
     if len(device_ids) > 1:
         stats.warnings.append(
