@@ -5,6 +5,7 @@ import time
 import pytest
 
 from gitm.telemetry.collector import Collector, CollectorConfig
+from gitm.telemetry.schema import Sample
 
 
 class _BrokenBackend:
@@ -34,3 +35,32 @@ def test_collector_names_missing_backend_instead_of_looking_idle():
         collector = Collector(CollectorConfig(backends=[]))
 
     assert collector.diagnostics
+
+
+class _PartialBackend:
+    def device_count(self):
+        return 1
+
+    def sample(self, _index, labels=None):
+        return Sample(
+            ts_ns=1,
+            node="n",
+            gpu_uuid="g",
+            gpu_index=0,
+            vendor="nvidia",
+            diagnostics=["clock throttle reasons unavailable (NVMLError: denied)"],
+        )
+
+    def close(self):
+        return None
+
+
+def test_collector_surfaces_partial_sample_field_failure():
+    collector = Collector(CollectorConfig(interval_s=0.001, backends=[_PartialBackend()]))
+
+    with pytest.warns(RuntimeWarning, match="clock throttle reasons unavailable"):
+        collector.start()
+        time.sleep(0.01)
+        collector.stop()
+
+    assert any("clock throttle reasons unavailable" in d for d in collector.diagnostics)

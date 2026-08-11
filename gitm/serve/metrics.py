@@ -20,9 +20,11 @@ a question two endpoint reads can answer.
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 import urllib.request
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -88,7 +90,7 @@ def parse_prometheus(text: str) -> dict[str, float]:
             value = float(value_str.split()[0])
         except (ValueError, IndexError):
             continue
-        if value != value:  # NaN: an untouched histogram, not a zero
+        if not math.isfinite(value):  # untouched/invalid metric, not an observed zero
             continue
         out[name] = out.get(name, 0.0) + value
     return out
@@ -170,8 +172,17 @@ def window_from_snapshots(
     w.ttft_mean_s = _mean(before, after, "ttft_sum", "ttft_count")
     w.tpot_mean_s = _mean(before, after, "tpot_sum", "tpot_count")
     w.e2e_mean_s = _mean(before, after, "e2e_sum", "e2e_count")
-    if w.generation_tokens is not None and window_s:
+    if (
+        w.generation_tokens is not None
+        and window_s is not None
+        and math.isfinite(window_s)
+        and window_s > 0.0
+    ):
         w.output_tokens_per_s = w.generation_tokens / window_s
+    elif window_s is not None and (not math.isfinite(window_s) or window_s <= 0.0):
+        w.notes.append(
+            f"throughput unavailable: capture window must be finite and positive, got {window_s!r}"
+        )
 
     if samples:
         w.n_samples = len(samples)
@@ -225,7 +236,7 @@ def snapshot_metrics(base_url: str, dest: Path, timeout: float = 15.0) -> str:
     """
     text = fetch_metrics(base_url, timeout)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(text)
+    dest.write_text(text, encoding="utf-8")
     return text
 
 
@@ -240,6 +251,13 @@ class MetricsSampler:
 
     def __init__(self, base_url: str, *, interval_s: float = 1.0) -> None:
         self.base_url = base_url
+        if not math.isfinite(interval_s) or interval_s <= 0.0:
+            raise ValueError(f"metrics sampling interval must be finite and positive, got {interval_s!r}")
+        self.diagnostics: list[str] = []
+        if interval_s < 0.05:
+            self._record_failure(
+                f"requested {interval_s!r}s; using the 0.05s minimum sampling interval"
+            )
         self.interval_s = max(interval_s, 0.05)
         self.samples: list[dict] = []
         self._stop = threading.Event()
@@ -254,6 +272,8 @@ class MetricsSampler:
     def _run(self) -> None:
         while not self._stop.is_set():
             text = fetch_metrics(self.base_url, timeout=min(self.interval_s * 4, 10.0))
+            if text.startswith("# unavailable:"):
+                self._record_failure(text.removeprefix("# unavailable:").strip())
             snap = parse_prometheus(text)
             if snap:
                 self.samples.append(
@@ -270,8 +290,17 @@ class MetricsSampler:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                self._record_failure("metrics sampler did not stop within 5 seconds")
             self._thread = None
         return self.samples
+
+    def _record_failure(self, detail: str) -> None:
+        message = f"metrics sampling degraded: {detail}"
+        if message in self.diagnostics:
+            return
+        self.diagnostics.append(message)
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
 
     def write(self, dest: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)

@@ -25,11 +25,13 @@ honest "no engine stats" outcome, never fabricated numbers.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
+import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -66,6 +68,7 @@ class SchedulerStatsSummary:
     # series on the same wall clock as vLLM's per-request timestamps and as
     # ``Trace.captured_at_ns`` — the join across the three views. 0 when unset.
     t0_wall_ns: int = 0
+    diagnostics: list[str] = field(default_factory=list)
 
 
 # SLO defaults for goodput. Serving-shaped starting points, not tuned: a request
@@ -103,7 +106,8 @@ class RequestRecord:
         """Time to first token — the queue+prefill wait the user actually feels."""
         if self.arrival_wall_s is None or self.first_token_wall_s is None:
             return None
-        return max(self.first_token_wall_s - self.arrival_wall_s, 0.0)
+        span = self.first_token_wall_s - self.arrival_wall_s
+        return span if math.isfinite(span) and span >= 0.0 else None
 
     @property
     def tpot_s(self) -> float | None:
@@ -120,7 +124,9 @@ class RequestRecord:
             return None
         if self.n_output_tokens < 2:
             return None
-        span = max(self.finished_wall_s - self.first_token_wall_s, 0.0)
+        span = self.finished_wall_s - self.first_token_wall_s
+        if not math.isfinite(span) or span < 0.0:
+            return None
         return span / (self.n_output_tokens - 1)
 
     @property
@@ -130,7 +136,9 @@ class RequestRecord:
             return None
         if self.first_token_wall_s is None or self.finished_wall_s is None:
             return None
-        span = max(self.finished_wall_s - self.first_token_wall_s, 0.0)
+        span = self.finished_wall_s - self.first_token_wall_s
+        if not math.isfinite(span) or span < 0.0:
+            return None
         return span / (self.n_output_tokens - 1)
 
     def meets_slo(self, ttft_slo_s: float, tpot_slo_s: float) -> bool:
@@ -245,16 +253,45 @@ def summarize_requests(
     estimated_tpots = [t for t in (r.estimated_tpot_s for r in records) if t is not None]
     met = [r for r in records if r.meets_slo(ttft_slo_s, tpot_slo_s)]
 
-    arrivals = [r.arrival_wall_s for r in records if r.arrival_wall_s is not None]
-    finishes = [r.finished_wall_s for r in records if r.finished_wall_s is not None]
+    arrivals = [
+        r.arrival_wall_s
+        for r in records
+        if r.arrival_wall_s is not None and math.isfinite(r.arrival_wall_s)
+    ]
+    finishes = [
+        r.finished_wall_s
+        for r in records
+        if r.finished_wall_s is not None and math.isfinite(r.finished_wall_s)
+    ]
     window_s: float | None = None
     if arrivals and finishes:
-        window_s = max(max(finishes) - min(arrivals), 0.0)
+        span = max(finishes) - min(arrivals)
+        window_s = span if span >= 0.0 else None
     # A zero-length window (single instantaneous request, or clock granularity)
     # has no meaningful rate — report the count, not a division by ~0.
     goodput = (len(met) / window_s) if window_s else None
 
     warnings: list[str] = []
+    def _has_invalid_timestamps(r: RequestRecord) -> bool:
+        pairs = (
+            (r.arrival_wall_s, r.first_token_wall_s),
+            (r.first_token_wall_s, r.finished_wall_s),
+        )
+        return any(
+            start is not None
+            and end is not None
+            and (not math.isfinite(start) or not math.isfinite(end) or end < start)
+            for start, end in pairs
+        )
+
+    invalid_timestamps = sum(_has_invalid_timestamps(r) for r in records)
+    if invalid_timestamps:
+        warnings.append(
+            f"latency coverage: {invalid_timestamps} request(s) have non-finite or "
+            "non-monotonic timestamps; excluded from latency and SLO goodput"
+        )
+    if records and arrivals and finishes and not window_s:
+        warnings.append("goodput unavailable: request window has no positive duration")
     if estimated_tpots:
         warnings.append(
             f"TPOT coverage: {len(estimated_tpots)} request(s) use SSE chunk-count estimates; "
@@ -419,14 +456,6 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
                     setattr(sample, field_name, val)
                     saw_any = True
 
-        # vLLM V1: fill running / waiting / cache from the scheduler's stat object
-        # where the VO deques weren't exposed (they read empty on V1)
-        for sch in schedulers:
-            for field_name, val in _v1_scheduler_stats(sch).items():
-                if getattr(sample, field_name) is None:
-                    setattr(sample, field_name, val)
-                    saw_any = True
-
     # Total unfinished — a stable public method on LLMEngine across versions.
     getter = _first_attr(
         engine,
@@ -481,6 +510,17 @@ class SchedulerStatsSampler:
 
     def __init__(self, engine: Any, *, interval_s: float = 0.05) -> None:
         self.engine = engine
+        if not math.isfinite(interval_s) or interval_s <= 0.0:
+            raise ValueError(
+                f"scheduler sampling interval must be finite and positive, got {interval_s!r}"
+            )
+        self.diagnostics: list[str] = []
+        self._diagnostic_keys: set[str] = set()
+        if interval_s < 1e-3:
+            self._record_failure(
+                "interval-clamped",
+                f"requested {interval_s!r}s; using the 0.001s minimum",
+            )
         self.interval_s = max(interval_s, 1e-3)
         self.samples: list[SchedulerSample] = []
         self._stop = threading.Event()
@@ -504,8 +544,8 @@ class SchedulerStatsSampler:
             s0 = read_scheduler_stats(self.engine, t_ns=0)
             if s0 is not None:
                 self.samples.append(s0)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._record_failure("initial-read", f"scheduler stats read failed: {exc}")
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="gitm-vllm-stats", daemon=True)
         self._thread.start()
@@ -516,8 +556,8 @@ class SchedulerStatsSampler:
                 s = read_scheduler_stats(self.engine, t_ns=time.perf_counter_ns() - self._t0_ns)
                 if s is not None:
                     self.samples.append(s)
-            except Exception:
-                pass  # best-effort; never let sampling crash the run
+            except Exception as exc:
+                self._record_failure("background-read", f"scheduler stats read failed: {exc}")
             self._stop.wait(self.interval_s)
 
     def stop(self) -> None:
@@ -525,13 +565,25 @@ class SchedulerStatsSampler:
             return
         self._stop.set()
         self._thread.join(timeout=2.0)
+        if self._thread.is_alive():
+            self._record_failure("join-timeout", "scheduler sampler did not stop within 2 seconds")
         self._thread = None
+
+    def _record_failure(self, key: str, detail: str) -> None:
+        if key in self._diagnostic_keys:
+            return
+        self._diagnostic_keys.add(key)
+        message = f"scheduler telemetry degraded [{key}]: {detail}"
+        self.diagnostics.append(message)
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
 
     def summary(self) -> SchedulerStatsSummary:
         # Snapshot first: stop() joins with a timeout, so in the pathological case
         # where the daemon thread is still alive, summarize must iterate a stable
         # copy rather than a list being appended to concurrently.
-        return summarize(list(self.samples), t0_wall_ns=self._t0_wall_ns)
+        result = summarize(list(self.samples), t0_wall_ns=self._t0_wall_ns)
+        result.diagnostics.extend(self.diagnostics)
+        return result
 
     def to_records(self) -> list[dict[str, Any]]:
         """Samples as plain dicts, ready for JSONL alongside the kernel trace."""

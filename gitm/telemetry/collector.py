@@ -92,6 +92,11 @@ class Collector:
                             f"sample failed ({type(exc).__name__}: {exc})",
                         )
                         continue
+                    for diagnostic in sample.diagnostics:
+                        self._record_failure(
+                            f"sample-field:{type(backend).__name__}:{idx}:{diagnostic.split(' ', 1)[0]}",
+                            diagnostic,
+                        )
                     for sink in self._cfg.sinks:
                         try:
                             sink.emit(sample)

@@ -45,6 +45,20 @@ def test_missing_timestamps_yield_none_not_zero():
     assert r.ttft_s is None and r.tpot_s is None
 
 
+def test_nonmonotonic_timestamps_are_excluded_and_warned():
+    record = _rec(10.0, 9.0, 8.0, 3)
+
+    summary = summarize_requests([record])
+
+    assert record.ttft_s is None
+    assert record.tpot_s is None
+    assert summary.n_ttft == 0
+    assert summary.n_tpot == 0
+    assert summary.n_met_slo == 0
+    assert summary.goodput_rps is None
+    assert any("non-monotonic" in warning for warning in summary.warnings)
+
+
 # --------------------------------------------------------------------------- #
 # summary: percentiles exclude unmeasurable requests                          #
 # --------------------------------------------------------------------------- #

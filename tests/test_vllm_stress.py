@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from gitm.kernels.spec import InterventionSpec
 from gitm.optimizer.apply import LiveEngineApplicator, apply_intervention
 from gitm.optimizer.deviation import deviating_kernel_indices, deviation_summary, deviation_trace
@@ -93,14 +95,17 @@ class _RaisingEngine:
         raise RuntimeError("engine busy")
 
 
-def test_sampler_swallows_engine_exceptions():
+def test_sampler_surfaces_engine_exceptions_without_crashing():
     sampler = SchedulerStatsSampler(_RaisingEngine(), interval_s=0.002)
-    sampler.start()
-    for _ in range(500):
-        pass
-    sampler.stop()  # must not raise
+    with pytest.warns(RuntimeWarning, match="scheduler telemetry degraded"):
+        sampler.start()
+        for _ in range(500):
+            pass
+        sampler.stop()  # must not raise
     # A raising engine yields no usable samples, summary is the empty shape.
-    assert sampler.summary().n_samples == 0
+    summary = sampler.summary()
+    assert summary.n_samples == 0
+    assert summary.diagnostics
 
 
 def test_sampler_repeated_start_stop_is_safe():
