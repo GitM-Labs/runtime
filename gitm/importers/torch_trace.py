@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -242,6 +243,17 @@ def event_from_chrome(
         ts = float(obj.get("ts", 0.0))
         dur = float(obj.get("dur", 0.0))
     except (TypeError, ValueError):
+        if strict:
+            raise ImportError(
+                f"invalid GPU event timestamp/duration: ts={obj.get('ts')!r}, "
+                f"dur={obj.get('dur')!r}"
+            ) from None
+        return None
+    if not math.isfinite(ts) or not math.isfinite(dur):
+        if strict:
+            raise ImportError(
+                f"non-finite GPU event timestamp/duration: ts={ts!r}, dur={dur!r}"
+            )
         return None
     start_ns = int(ts * 1000.0)
     end_ns = int((ts + dur) * 1000.0)
@@ -663,12 +675,15 @@ def _import_torch_from_event_dicts(
     """Shared finish path once raw chrome event dicts are in hand."""
     events: list[TraceEvent] = []
     metadata_fallbacks: dict[str, int] = {}
+    parse_dropped = 0
     for obj in raw_events:
         ev = event_from_chrome(obj, strict=strict)
         if ev is not None:
             events.append(ev)
             for field in _launch_metadata_fallbacks(obj):
                 metadata_fallbacks[field] = metadata_fallbacks.get(field, 0) + 1
+        elif _device_id_from_chrome_obj(obj) is not None:
+            parse_dropped += 1
     if not events:
         raise ImportError(
             f"{path.name}: no complete GPU kernel/memcpy events found in traceEvents"
@@ -725,9 +740,15 @@ def _import_torch_from_event_dicts(
         device_name=device_name,
         captured_at_source="mtime",
         per_device_kernel_counts=all_counts,
-        total_raw_events=len(events),
+        total_raw_events=len(raw_events),
     )
     merge_normalization_stats(stats, normalization_stats)
+    if parse_dropped:
+        stats.dropped_invalid += parse_dropped
+        stats.warnings.append(
+            f"dropped {parse_dropped} GPU event(s) with invalid timestamp/duration fields "
+            "during parsing"
+        )
     _append_launch_metadata_warnings(stats, metadata_fallbacks)
     if len(device_ids) > 1:
         stats.warnings.append(
@@ -815,6 +836,7 @@ def import_torch_trace(
     metadata_fallbacks: dict[str, int] = {}
     scanned_sku: str | None = None
     n_raw = 0
+    parse_dropped = 0
     try:
         for obj in _iter_chrome_event_dicts(
             path, gzipped=bool(gzipped), max_decompressed_bytes=max_decompressed_bytes
@@ -834,6 +856,8 @@ def import_torch_trace(
                     continue
             ev = event_from_chrome(obj, strict=strict)
             if ev is None:
+                if _device_id_from_chrome_obj(obj) is not None:
+                    parse_dropped += 1
                 continue
             for field in _launch_metadata_fallbacks(obj):
                 metadata_fallbacks[field] = metadata_fallbacks.get(field, 0) + 1
@@ -893,9 +917,15 @@ def import_torch_trace(
         device_name=scanned_sku,
         captured_at_source="mtime",
         per_device_kernel_counts=dict(all_counts),
-        total_raw_events=total_events,
+        total_raw_events=n_raw,
     )
     merge_normalization_stats(stats, normalization_stats)
+    if parse_dropped:
+        stats.dropped_invalid += parse_dropped
+        stats.warnings.append(
+            f"dropped {parse_dropped} GPU event(s) with invalid timestamp/duration fields "
+            "during parsing"
+        )
     _append_launch_metadata_warnings(stats, metadata_fallbacks)
     if len(device_ids) > 1:
         stats.warnings.append(

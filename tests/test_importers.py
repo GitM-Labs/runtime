@@ -382,6 +382,44 @@ def test_invalid_event_drop_reaches_file_level_import_diagnostics(tmp_path):
     assert "dropped 1 event" in result.report_md
 
 
+def test_malformed_gpu_event_parse_drop_reaches_customer_report(tmp_path):
+    trace_path = tmp_path / "malformed-gpu-event.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    {
+                        "ph": "X",
+                        "cat": "kernel",
+                        "name": "valid_kernel",
+                        "ts": 1.0,
+                        "dur": 100.0,
+                        "args": {"device": 0, "stream": 1},
+                    },
+                    {
+                        "ph": "X",
+                        "cat": "kernel",
+                        "name": "broken_kernel",
+                        "ts": "not-a-timestamp",
+                        "dur": 100.0,
+                        "args": {"device": 0, "stream": 1},
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    traces, stats = import_torch_trace(trace_path)
+    assert len(traces[0].kernels()) == 1
+    assert stats.total_raw_events == 2
+    assert stats.dropped_invalid == 1
+    assert any("dropped 1 GPU event" in note for note in stats.warnings)
+
+    result = analyze_paths([trace_path], run_id="malformed-gpu-event-report")
+    assert "dropped 1 GPU event" in result.report_md
+
+
 def test_atomic_write(tmp_path):
     out = tmp_path / "report.md"
     analyze_paths(
