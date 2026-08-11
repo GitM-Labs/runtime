@@ -124,7 +124,9 @@ def _load_frame_paths(data_root: Path) -> list[Path]:
     return paths
 
 
-def _sample_nvml(samples: list[dict], stop_event: threading.Event) -> None:
+def _sample_nvml(
+    samples: list[dict], stop_event: threading.Event, diagnostics: list[str]
+) -> None:
     """Background thread: sample GPU 0 util + memory at NVML_SAMPLE_HZ.
 
     Each sample is a dict with util_pct, mem_used_bytes, mem_total_bytes —
@@ -146,8 +148,10 @@ def _sample_nvml(samples: list[dict], stop_event: threading.Event) -> None:
             })
             time.sleep(interval)
         pynvml.nvmlShutdown()
-    except Exception:
-        pass  # no GPU or pynvml absent — headroom fields will be null in output
+    except Exception as exc:
+        diagnostics.append(
+            f"NVML telemetry unavailable: {type(exc).__name__}: {exc}"
+        )
 
 
 def _convergence_check(results: list[dict]) -> tuple[bool, float]:
@@ -230,9 +234,12 @@ def run_baseline(
     # Timed warm window
     warm_paths = run_paths[WARM_FRAMES:]
     nvml_samples: list[dict] = []
+    headroom_diagnostics: list[str] = []
     stop_event = threading.Event()
     nvml_thread = threading.Thread(
-        target=_sample_nvml, args=(nvml_samples, stop_event), daemon=True
+        target=_sample_nvml,
+        args=(nvml_samples, stop_event, headroom_diagnostics),
+        daemon=True,
     )
     nvml_thread.start()
 
@@ -286,17 +293,35 @@ def run_baseline(
         from gitm.optimizer.headroom_kernel_rank import gpu_headroom
 
         h = gpu_headroom(nvml_samples)
-        if h is not None:
-            headroom_dict = {
-                "compute_headroom_pct": round(h.compute_headroom_pct, 2),
-                "mean_util_pct": round(h.mean_util_pct, 2),
-                "peak_util_pct": round(h.peak_util_pct, 2),
-                "mem_free_at_peak_gb": round(h.mem_free_at_peak_bytes / 1e9, 3),
-                "mem_total_gb": round(h.mem_total_bytes / 1e9, 3),
-                "nvml_n_samples": h.n_samples,
-            }
-    except Exception:
-        pass  # graceful degradation if headroom_kernel_rank unavailable
+        headroom_dict = {
+            "compute_headroom_pct": (
+                round(h.compute_headroom_pct, 2)
+                if h.compute_headroom_pct is not None
+                else None
+            ),
+            "mean_util_pct": (
+                round(h.mean_util_pct, 2) if h.mean_util_pct is not None else None
+            ),
+            "peak_util_pct": (
+                round(h.peak_util_pct, 2) if h.peak_util_pct is not None else None
+            ),
+            "mem_free_at_peak_gb": (
+                round(h.mem_free_at_peak_bytes / 1e9, 3)
+                if h.mem_free_at_peak_bytes is not None
+                else None
+            ),
+            "mem_total_gb": (
+                round(h.mem_total_bytes / 1e9, 3)
+                if h.mem_total_bytes is not None
+                else None
+            ),
+            "nvml_n_samples": h.n_samples,
+        }
+        headroom_diagnostics.extend(h.diagnostics)
+    except Exception as exc:
+        headroom_diagnostics.append(
+            f"GPU headroom analysis unavailable: {type(exc).__name__}: {exc}"
+        )
 
     import platform
     import socket
@@ -310,6 +335,7 @@ def run_baseline(
         "sync_stall_pct": round(sync_stall_pct, 2),
         "cpu_pct": round(cpu_pct, 2),
         **headroom_dict,
+        "headroom_diagnostics": headroom_diagnostics,
         "stage_spread": spread,
         "total_detections": total_detections,
         "elapsed_s": round(elapsed, 3),
@@ -329,13 +355,24 @@ def run_baseline(
         f"\nResult: {fps:.1f} fps | GPU active {gpu_active_pct:.1f}% "
         f"| data stall {data_stall_pct:.1f}% | wrote {output_path}"
     )
-    if headroom_dict:
-        print(
-            f"Headroom: compute {headroom_dict['compute_headroom_pct']:.1f}% free "
-            f"| mem {headroom_dict['mem_free_at_peak_gb']:.1f} GB free at peak"
+    headroom_parts: list[str] = []
+    if headroom_dict.get("compute_headroom_pct") is not None:
+        headroom_parts.append(
+            f"compute {headroom_dict['compute_headroom_pct']:.1f}% free"
         )
+    if headroom_dict.get("mem_free_at_peak_gb") is not None:
+        headroom_parts.append(
+            f"mem {headroom_dict['mem_free_at_peak_gb']:.1f} GB free at peak"
+        )
+    if headroom_parts:
+        print(f"Headroom: {' | '.join(headroom_parts)}")
+    for diagnostic in headroom_diagnostics:
+        print(f"WARNING: {diagnostic}")
 
-    if headroom_dict.get("mean_util_pct", 0) > 85.0:
+    if (
+        headroom_dict.get("mean_util_pct") is not None
+        and headroom_dict["mean_util_pct"] > 85.0
+    ):
         print(
             f"\nWARNING: NVML util={headroom_dict['mean_util_pct']:.1f}% > 85% — "
             "flag for review: workload may be near-saturated. Consider the 500-frame fallback."

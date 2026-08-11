@@ -52,7 +52,13 @@ class DREffect:
     n_treated: int
 
 
-def doubly_robust_ate(y: np.ndarray, t: np.ndarray, X: np.ndarray) -> tuple[float, float]:
+def doubly_robust_ate(
+    y: np.ndarray,
+    t: np.ndarray,
+    X: np.ndarray,
+    *,
+    diagnostics: list[str] | None = None,
+) -> tuple[float, float]:
     """AIPW estimate of the ATE of ``t`` on ``y`` given covariates ``X``.
 
     Returns ``(ate, se)``. Robust to a misspecified outcome *or* propensity model.
@@ -81,7 +87,11 @@ def doubly_robust_ate(y: np.ndarray, t: np.ndarray, X: np.ndarray) -> tuple[floa
         # Propensity e = P(T=1|X); clip away from 0/1 to bound the IPW weights.
         try:
             e = sm.Logit(t, Xc).fit(disp=0).predict(Xc)
-        except Exception:
+        except Exception as exc:
+            if diagnostics is not None:
+                diagnostics.append(
+                    f"propensity model fell back to treated mean ({type(exc).__name__})"
+                )
             e = np.full(n, t.mean())
         e = np.clip(e, 0.05, 0.95)
 
@@ -91,7 +101,11 @@ def doubly_robust_ate(y: np.ndarray, t: np.ndarray, X: np.ndarray) -> tuple[floa
                 return np.full(n, float(y[mask].mean()) if mask.any() else 0.0)
             try:
                 return sm.OLS(y[mask], Xc[mask]).fit().predict(Xc)
-            except Exception:
+            except Exception as exc:
+                if diagnostics is not None:
+                    diagnostics.append(
+                        f"outcome model fell back to group mean ({type(exc).__name__})"
+                    )
                 return np.full(n, float(y[mask].mean()))
 
         m1 = _outcome(t == 1)
@@ -118,11 +132,18 @@ def attribute_dr(residuals: Residuals, graph: Graph, *, band: float = _KT_BAND) 
 
     ops = [op for op, v in series.items() if len(v) >= 4]
     if len(ops) < 2:
-        return RankedHypotheses(hypotheses=[])
+        return RankedHypotheses(
+            hypotheses=[],
+            diagnostics=[
+                f"doubly-robust attribution not run: need at least 2 op series with "
+                f"4+ samples; found {len(ops)}"
+            ],
+        )
     n = min(len(series[op]) for op in ops)
     pos = np.arange(n, dtype=float)
 
     effects: list[DREffect] = []
+    diagnostics: list[str] = []
     for cause in ops:
         t = (np.abs(np.asarray(series[cause][:n])) > band).astype(float)
         n_t = int(t.sum())
@@ -132,7 +153,11 @@ def attribute_dr(residuals: Residuals, graph: Graph, *, band: float = _KT_BAND) 
             if effect == cause:
                 continue
             y = np.asarray(series[effect][:n], dtype=float)
-            ate, se = doubly_robust_ate(y, t, pos)
+            pair_diagnostics: list[str] = []
+            ate, se = doubly_robust_ate(y, t, pos, diagnostics=pair_diagnostics)
+            diagnostics.extend(
+                f"{cause}->{effect}: {note}" for note in pair_diagnostics
+            )
             z = ate / se if se not in (0.0, float("inf")) else 0.0
             effects.append(DREffect(cause, effect, ate, se, z, int(t.sum())))
 
@@ -151,4 +176,9 @@ def attribute_dr(residuals: Residuals, graph: Graph, *, band: float = _KT_BAND) 
         )
         for d in effects
     ]
-    return RankedHypotheses(hypotheses=hyps)
+    if diagnostics:
+        diagnostics = [
+            f"doubly-robust attribution used {len(diagnostics)} nuisance-model fallback(s); "
+            f"first: {diagnostics[0]}"
+        ]
+    return RankedHypotheses(hypotheses=hyps, diagnostics=diagnostics)

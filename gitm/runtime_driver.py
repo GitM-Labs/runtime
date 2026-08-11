@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import time
 from contextlib import closing
 from pathlib import Path
@@ -40,25 +39,6 @@ def _sync():
         cupy.cuda.runtime.deviceSynchronize()
     except Exception:
         pass
-
-
-# Mangled CUDA kernel names → a small set of stable "families" so the residual
-# series feeding Granger are well-populated (a variable = a kernel *type*, not
-# every template instantiation). Noise tokens are dropped; the first distinctive
-# identifier after the library prefix names the family.
-_NOISE = {
-    "detail", "kernel", "void", "const", "unsigned", "int", "long", "float",
-    "double", "global", "device", "functor", "impl", "internal", "type",
-    "types", "common", "native", "operator", "policy", "dispatch", "agent",
-}
-
-
-def _kernel_family(name: str) -> str:
-    lib = ("cub" if "cub" in name else "cudf" if "cudf" in name
-           else "thrust" if "thrust" in name else "k")
-    toks = [t for t in re.findall(r"[a-z][a-z_]{3,}", name) if t not in _NOISE]
-    fn = toks[0] if toks else "anon"
-    return f"{lib}.{fn}"
 
 
 def _load_hft(stage: Path, seed: int, max_events: int | None):
@@ -307,18 +287,9 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("--optimize currently supports --workload hft")
         return _optimize_hft_cmd(args)
 
-    import numpy as np
-
     from gitm import __version__
-    from gitm.optimizer.attribution import attribute
-    from gitm.optimizer.monitor import (
-        KernelResidual,
-        Residuals,
-        _serialized_fraction,
-        check_invariants,
-    )
-    from gitm.optimizer.report import Claim, Provenance, write_report
-    from gitm.planner.graph import predict_graph
+    from gitm.optimizer.measure import measure_trace, measurement_claims
+    from gitm.optimizer.report import Provenance, write_report
     from gitm.tracer import capture
 
     stage = args.stage or Path(os.environ.get("GITM_BENCH_STAGE", "/workspace/hft/staging/hft"))
@@ -347,15 +318,19 @@ def main(argv: list[str] | None = None) -> int:
     trace_path = args.outdir / f"{args.workload}_seed{args.seed}_trace.jsonl"
     tele_path = args.outdir / f"{args.workload}_seed{args.seed}_telemetry.jsonl"
 
-    # State telemetry — best-effort; never block the run on it.
+    # State telemetry remains fail-open, but every degradation is carried into
+    # the measurement artifact and report.
     tele = None
+    telemetry_diagnostics: list[str] = []
     try:
         from gitm.telemetry import Collector, CollectorConfig
         from gitm.telemetry.sinks import build_sink
 
         tele = Collector(CollectorConfig(interval_s=0.25, sinks=[build_sink(f"jsonl:{tele_path}")]))
     except Exception as exc:
-        print(f"telemetry disabled (best-effort): {exc}")
+        diagnostic = f"telemetry unavailable: {type(exc).__name__}: {exc}"
+        telemetry_diagnostics.append(diagnostic)
+        print(f"WARN: {diagnostic}")
 
     started_ns = time.time_ns()
     if tele:
@@ -368,6 +343,7 @@ def main(argv: list[str] | None = None) -> int:
         elapsed = max(time.perf_counter() - t0, 1e-9)
     if tele:
         tele.stop()
+        telemetry_diagnostics.extend(tele.diagnostics)
     ended_ns = time.time_ns()
 
     units = summary.get("events", summary.get("frames", 0))
@@ -403,60 +379,27 @@ def main(argv: list[str] | None = None) -> int:
         "trace_path": str(trace_path),
     }
 
-    violations = []
-    top_hyps: list = []
-    sc = 0.0
-    if kernels:
-        sc = _serialized_fraction(kernels)
-        by_name: dict[str, list[int]] = {}
-        for k in kernels:
-            by_name.setdefault(k.name, []).append(k.end_ns - k.start_ns)
-        med = {nm: float(np.median(v)) for nm, v in by_name.items()}
-        res = Residuals()
-        res.serialized_concurrency_fraction = sc
-        for k in kernels:
-            m = med[k.name] or 1.0
-            res.per_kernel.append(
-                KernelResidual(op=k.name[:40], layer=None, r_kt=((k.end_ns - k.start_ns) - m) / m, r_mt=None)
-            )
-        v_mb = check_invariants(res, multi_basis=True)
-        v_raw = check_invariants(res, multi_basis=False)
-        violations = v_mb
-        print(
-            f"serialized_concurrency_fraction = {sc:.3f}  |  "
-            f"violations multi-basis={len(v_mb)} raw={len(v_raw)} "
-            f"(filter dropped {len(v_raw) - len(v_mb)})"
-        )
-        # Attribution: group kernels into families (see _kernel_family) and keep
-        # only families with enough samples, so Granger's per-op residual series
-        # are well-formed. attribute() truncates all series to the shortest, so a
-        # sparse op would otherwise collapse every pair to too few points.
-        from collections import Counter
-
-        fam_of = {nm: _kernel_family(nm) for nm in by_name}
-        fam_counts = Counter(fam_of[k.name] for k in kernels)
-        MIN_ATTR = 16
-        res_attr = Residuals()
-        res_attr.serialized_concurrency_fraction = sc
-        for k in kernels:
-            fam = fam_of[k.name]
-            if fam_counts[fam] < MIN_ATTR:
-                continue
-            m = med[k.name] or 1.0
-            res_attr.per_kernel.append(
-                KernelResidual(op=fam, layer=None, r_kt=((k.end_ns - k.start_ns) - m) / m, r_mt=None)
-            )
-        fams = sorted({kr.op for kr in res_attr.per_kernel})
-        print(f"attribution families (>= {MIN_ATTR} samples): {fams}")
-        ranked = attribute(res_attr, predict_graph())
-        top_hyps = ranked.top(5)
-        print(
-            "top Granger hypotheses:",
-            [(h.cause_op, h.effect_op, round(h.p_value, 4)) for h in top_hyps] or "none",
-        )
+    measured = measure_trace(tr)
+    measured.diagnostics.extend(telemetry_diagnostics)
+    violations = measured.violations
+    top_hyps = measured.top_hypotheses
+    sc = measured.serialized_fraction
+    print(
+        f"serialized_concurrency_fraction = {sc:.3f}  |  "
+        f"violations multi-basis={len(violations)}"
+    )
+    print(f"attribution families (>= 16 samples): {measured.families}")
+    print(
+        "top Granger hypotheses:",
+        [(h.cause_op, h.effect_op, round(h.p_value, 4)) for h in top_hyps] or "none",
+    )
+    for diagnostic in measured.diagnostics:
+        print(f"WARN: {diagnostic}")
 
     measure["serialized_concurrency_fraction"] = sc
     measure["n_violations"] = len(violations)
+    measure["n_invalid_duration"] = measured.n_invalid_duration
+    measure["diagnostics"] = measured.diagnostics
     measure["top_hypotheses"] = [
         {"cause": h.cause_op, "effect": h.effect_op, "p_value": h.p_value} for h in top_hyps
     ]
@@ -480,25 +423,8 @@ def main(argv: list[str] | None = None) -> int:
         ended_at_ns=ended_ns,
         trace_path=str(trace_path),
     )
-    claims: list[Claim] = []
-    for v in violations[:5]:
-        ev = (
-            f"top hypothesis: {top_hyps[0].cause_op[:30]} -> {top_hyps[0].effect_op[:30]} "
-            f"(p={top_hyps[0].p_value:.3g})"
-            if top_hyps
-            else "no ranked hypothesis"
-        )
-        claims.append(
-            Claim(
-                summary=f"{v.invariant} deviation on {v.node_op}",
-                residual_invariant=v.invariant,
-                residual_value=float(v.residual),
-                causal_evidence=ev,
-                intervention_name="(none — measurement run)",
-                predicted_delta=0.0,
-                measured_delta=None,
-            )
-        )
+    claims = measurement_claims(measured)
+    kernel_coverage_available = measured.n_kernels > measured.n_invalid_duration
     if args.workload == "hft":
         run_summary = (
             f"HFT cuDF/CuPy on {gpu_name}: {events_per_second:,.0f} events/s over {n:,} events; "
@@ -515,15 +441,28 @@ def main(argv: list[str] | None = None) -> int:
     report_md = write_report(
         claims,
         prov,
-        qualification_diagnostic="Measurement-only run: runtime observed the workload; "
-        "no intervention library applied.",
+        qualification_diagnostic=(
+            "NO DATA — tracer captured no positive-duration GPU kernels; "
+            "workload throughput was measured, "
+            "but runtime kernel details were not."
+            if not kernel_coverage_available
+            else "Measurement-only run: runtime observed the workload; "
+            "no intervention library applied."
+        ),
+        runtime_diagnostics=measured.diagnostics,
         summary=run_summary,
     )
     report_path = args.outdir / f"{args.workload}_seed{args.seed}_report.md"
     report_path.write_text(report_md)
     print(f"\nwrote: {trace_path}\n       {tele_path}\n       {report_path}\n       "
           f"{args.outdir / f'{args.workload}_seed{args.seed}_measure.json'}")
-    print("PASS: workload ran under the runtime; all details measured.")
+    if not kernel_coverage_available:
+        print(
+            "FAIL: workload ran, but no positive-duration GPU kernels were captured; "
+            "runtime details unavailable."
+        )
+        return 3
+    print("PASS: workload ran under the runtime; kernel details measured.")
     return 0
 
 

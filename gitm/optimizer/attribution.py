@@ -10,7 +10,7 @@ A doubly-robust estimator runs alongside Granger (see gitm/optimizer/dr.py).
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -30,6 +30,7 @@ class Hypothesis:
 @dataclass
 class RankedHypotheses:
     hypotheses: list[Hypothesis]
+    diagnostics: list[str] = field(default_factory=list)
 
     def top(self, n: int = 5) -> list[Hypothesis]:
         return self.hypotheses[:n]
@@ -54,8 +55,14 @@ def attribute(
         from statsmodels.tsa.stattools import (
             grangercausalitytests,  # type: ignore[import-not-found]
         )
-    except Exception:
-        return RankedHypotheses(hypotheses=[])
+    except Exception as exc:
+        return RankedHypotheses(
+            hypotheses=[],
+            diagnostics=[
+                f"Granger attribution unavailable: statsmodels import failed "
+                f"({type(exc).__name__}: {exc})"
+            ],
+        )
 
     # Group residuals by op into ordered time series (per layer-position step)
     series: dict[str, list[float]] = {}
@@ -64,10 +71,17 @@ def attribute(
 
     ops = [op for op, vals in series.items() if len(vals) >= max_lag + 2]
     if len(ops) < 2:
-        return RankedHypotheses(hypotheses=[])
+        return RankedHypotheses(
+            hypotheses=[],
+            diagnostics=[
+                f"Granger attribution not run: need at least 2 op series with "
+                f"{max_lag + 2}+ samples; found {len(ops)}"
+            ],
+        )
 
     n = min(len(series[op]) for op in ops)
     hypotheses: list[Hypothesis] = []
+    fit_failures: list[str] = []
     for cause in ops:
         for effect in ops:
             if cause == effect:
@@ -79,7 +93,8 @@ def attribute(
                     result = grangercausalitytests(arr, maxlag=max_lag, verbose=False)
                 pvals = [result[lag][0]["ssr_ftest"][1] for lag in range(1, max_lag + 1)]
                 p = float(min(pvals))
-            except Exception:
+            except Exception as exc:
+                fit_failures.append(f"{cause}->{effect}: {type(exc).__name__}: {exc}")
                 continue
             direction = "+ slower" if np.mean(series[cause]) > 0 else "- faster"
             hypotheses.append(
@@ -87,4 +102,10 @@ def attribute(
             )
 
     hypotheses.sort(key=lambda h: h.p_value)
-    return RankedHypotheses(hypotheses=hypotheses)
+    diagnostics = []
+    if fit_failures:
+        diagnostics.append(
+            f"Granger attribution skipped {len(fit_failures)} failed pair fit(s); "
+            f"first: {fit_failures[0]}"
+        )
+    return RankedHypotheses(hypotheses=hypotheses, diagnostics=diagnostics)

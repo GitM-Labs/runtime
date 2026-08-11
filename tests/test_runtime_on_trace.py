@@ -205,6 +205,42 @@ def test_doubly_robust_degenerate_inputs():
     assert ate == 0.0 and se == float("inf")
 
 
+def test_attribution_abstention_is_diagnostic_not_no_causal_signal():
+    from gitm.optimizer.attribution import attribute
+    from gitm.optimizer.dr import attribute_dr
+    from gitm.optimizer.monitor import KernelResidual, Residuals
+    from gitm.planner.graph import predict_graph
+
+    res = Residuals(per_kernel=[KernelResidual("only", None, 0.5, None)])
+
+    granger = attribute(res, predict_graph())
+    dr = attribute_dr(res, predict_graph())
+
+    assert granger.hypotheses == []
+    assert any("not run" in note for note in granger.diagnostics)
+    assert dr.hypotheses == []
+    assert any("not run" in note for note in dr.diagnostics)
+
+
+def test_measure_trace_excludes_zero_duration_kernels_with_diagnostic():
+    from gitm.optimizer.measure import measure_trace
+
+    trace = _trace(
+        [
+            _kernel("bad", start=10, end=10),
+            _kernel("good", start=20, end=30),
+            _kernel("good", start=40, end=50),
+        ]
+    )
+
+    result = measure_trace(trace, min_attr=1)
+
+    assert result.n_kernels == 3
+    assert result.n_invalid_duration == 1
+    assert any("excluded 1/3" in note for note in result.diagnostics)
+    assert all(v.node_op != "bad" for v in result.violations)
+
+
 def test_attribute_dr_ranks_pairs():
     from gitm.optimizer.dr import attribute_dr
     from gitm.optimizer.monitor import KernelResidual, Residuals

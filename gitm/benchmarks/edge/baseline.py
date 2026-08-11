@@ -46,7 +46,9 @@ NVML_SAMPLE_HZ = 5
 GPU_ACTIVE_WARN_PCT = 85.0
 
 
-def _sample_nvml(samples: list[float], stop_event: threading.Event) -> None:
+def _sample_nvml(
+    samples: list[float], stop_event: threading.Event, diagnostics: list[str]
+) -> None:
     """Background thread: sample GPU 0 utilization at NVML_SAMPLE_HZ."""
     try:
         import pynvml
@@ -59,8 +61,10 @@ def _sample_nvml(samples: list[float], stop_event: threading.Event) -> None:
             samples.append(float(util))
             time.sleep(interval)
         pynvml.nvmlShutdown()
-    except Exception:
-        pass  # no GPU or pynvml absent -> nvml_mean_pct null in output
+    except Exception as exc:
+        diagnostics.append(
+            f"NVML telemetry unavailable: {type(exc).__name__}: {exc}"
+        )
 
 
 def _convergence_check(results: list[dict]) -> tuple[bool, float]:
@@ -148,9 +152,12 @@ def run_baseline(
 
     warm_indices = run_indices[WARM_FRAMES:]
     nvml_samples: list[float] = []
+    telemetry_diagnostics: list[str] = []
     stop_event = threading.Event()
     nvml_thread = threading.Thread(
-        target=_sample_nvml, args=(nvml_samples, stop_event), daemon=True
+        target=_sample_nvml,
+        args=(nvml_samples, stop_event, telemetry_diagnostics),
+        daemon=True,
     )
     nvml_thread.start()
 
@@ -194,6 +201,7 @@ def run_baseline(
         "sync_stall_pct": round(sync_stall_pct, 2),
         "cpu_pct": round(cpu_pct, 2),
         "nvml_mean_util_pct": round(nvml_mean, 2) if nvml_mean is not None else None,
+        "telemetry_diagnostics": telemetry_diagnostics,
         "total_detections": total_detections,
         "elapsed_s": round(elapsed, 3),
         "max_sweeps": max_sweeps,
@@ -222,6 +230,8 @@ def run_baseline(
         else f"\nResult: {fps:.1f} fps | GPU active {gpu_active_pct:.1f}%"
     )
     print(f"Wrote {output_path}")
+    for diagnostic in telemetry_diagnostics:
+        print(f"WARNING: {diagnostic}")
 
     if nvml_mean is not None and nvml_mean > GPU_ACTIVE_WARN_PCT:
         print(

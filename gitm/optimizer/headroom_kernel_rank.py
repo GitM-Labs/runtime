@@ -19,7 +19,7 @@ target), so it lives in ``gitm.optimizer`` and is exported for the run loop.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Mangled CUDA kernel names -> a small set of stable families, so durations
 # aggregate per kernel *type* rather than per template instantiation. Shared
@@ -116,39 +116,53 @@ def render_roi_table(rows: list[KernelROI], *, floor_pct: float = 10.0, top: int
 
 @dataclass
 class GpuHeadroom:
-    mean_util_pct: float
-    peak_util_pct: float
-    compute_headroom_pct: float # 100 - mean util (coarse, time-based)
-    peak_mem_used_bytes: int
-    mem_total_bytes: int
-    mem_free_at_peak_bytes: int
+    mean_util_pct: float | None
+    peak_util_pct: float | None
+    compute_headroom_pct: float | None # 100 - mean util (coarse, time-based)
+    peak_mem_used_bytes: int | None
+    mem_total_bytes: int | None
+    mem_free_at_peak_bytes: int | None
     serialized_concurrency_fraction: float # fraction of kernel-time with no overlap
     n_samples: int
+    diagnostics: list[str] = field(default_factory=list)
 
-def gpu_headroom(samples, serialized_concurrency_fraction: float = 0.0) -> GpuHeadroom | None:
+def gpu_headroom(samples, serialized_concurrency_fraction: float = 0.0) -> GpuHeadroom:
     """Summarise GPU headroom from a list of telemetry sample dicts.
 
     Each sample is a dict with ``util_pct`` / ``mem_used_bytes`` /
     ``mem_total_bytes`` (the canonical :class:`gitm.telemetry.Sample` fields).
-    Returns ``None`` if there are no usable samples.
+    Missing metric families remain ``None`` and are named in ``diagnostics``;
+    memory-only telemetry must not become 100% compute headroom, or vice versa.
     """
     utils = [float(s["util_pct"]) for s in samples if s.get("util_pct") is not None]
     mems = [int(s["mem_used_bytes"]) for s in samples if s.get("mem_used_bytes") is not None]
-    total = next((int(s["mem_total_bytes"]) for s in samples if s.get("mem_total_bytes")), 0)
-    if not utils and not mems:
-        return None
-    mean_u = sum(utils) / len(utils) if utils else 0.0
-    peak_u = max(utils) if utils else 0.0
-    peak_m = max(mems) if mems else 0
+    totals = [int(s["mem_total_bytes"]) for s in samples if s.get("mem_total_bytes")]
+    diagnostics: list[str] = []
+    if not samples:
+        diagnostics.append("GPU headroom unavailable: telemetry contains no samples")
+    if not utils:
+        diagnostics.append("compute headroom unavailable: utilization telemetry is absent")
+    if not mems:
+        diagnostics.append("memory headroom unavailable: used-memory telemetry is absent")
+    if not totals:
+        diagnostics.append("memory headroom unavailable: total-memory telemetry is absent")
+    mean_u = sum(utils) / len(utils) if utils else None
+    peak_u = max(utils) if utils else None
+    peak_m = max(mems) if mems else None
+    total = max(totals) if totals else None
+    mem_free = (
+        max(0, total - peak_m) if total is not None and peak_m is not None else None
+    )
     return GpuHeadroom(
         mean_util_pct=mean_u,
         peak_util_pct=peak_u,
-        compute_headroom_pct=max(0.0, 100.0 - mean_u),
+        compute_headroom_pct=max(0.0, 100.0 - mean_u) if mean_u is not None else None,
         peak_mem_used_bytes=peak_m,
         mem_total_bytes=total,
-        mem_free_at_peak_bytes=max(0, total - peak_m),
+        mem_free_at_peak_bytes=mem_free,
         serialized_concurrency_fraction=serialized_concurrency_fraction,
         n_samples=len(samples),
+        diagnostics=diagnostics,
     )
 
 def live_gpu_headroom():
