@@ -92,10 +92,23 @@ def run_seed(
 
     payload = _last_json_line(proc.stdout)
 
+    provenance_warnings: list[str] = []
     manifest_sha = None
     resolved_manifest = _resolve_manifest(config, manifest_path, config_dir)
     if resolved_manifest and Path(resolved_manifest).exists():
         manifest_sha = manifest_digest(resolved_manifest)
+    else:
+        provenance_warnings.append(
+            f"dataset manifest unavailable at {resolved_manifest!s}; baseline cannot be signed off"
+        )
+
+    git_sha = _git_sha()
+    if git_sha == "unknown":
+        provenance_warnings.append("git SHA unavailable; baseline cannot be signed off")
+    if not payload.get("gpu_name"):
+        provenance_warnings.append("harness omitted gpu_name")
+    if payload.get("device_count") is None:
+        provenance_warnings.append("harness omitted device_count; defaulted to 1")
 
     breakdown = [StallPhase.model_validate(p) for p in payload.get("stall_breakdown", [])]
 
@@ -106,10 +119,11 @@ def run_seed(
         metric=config.metric,
         metric_value=float(payload["metric_value"]),
         warm_window_s=config.warm_window_s,
-        git_sha=_git_sha(),
+        git_sha=git_sha,
         gitm_version=__version__,
         harness_commit=payload.get("harness_commit"),
         manifest_sha256=manifest_sha,
+        provenance_warnings=provenance_warnings,
         gpu_name=payload.get("gpu_name", ""),
         device_count=int(payload.get("device_count", 1)),
         started_at_ns=started,

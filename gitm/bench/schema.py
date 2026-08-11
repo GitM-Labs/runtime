@@ -148,6 +148,7 @@ class BaselineRun(BaseModel):
     gitm_version: str
     harness_commit: str | None = None
     manifest_sha256: str | None = None  # sha256 of the dataset manifest itself
+    provenance_warnings: list[str] = Field(default_factory=list)
 
     gpu_name: str = ""
     device_count: int = 1
@@ -156,7 +157,7 @@ class BaselineRun(BaseModel):
 
     stall_breakdown: list[StallPhase] = Field(default_factory=list)
 
-    def gpu_active_overall(self) -> float:
+    def gpu_active_overall(self) -> float | None:
         """Wall-clock-weighted GPU active fraction across phases.
 
         This is the number checked against ``gpu_active_ceiling`` — a single
@@ -164,5 +165,5 @@ class BaselineRun(BaseModel):
         """
         total = sum(p.wall_clock_s for p in self.stall_breakdown)
         if total <= 0.0:
-            return 0.0
+            return None
         return sum(p.gpu_active * p.wall_clock_s for p in self.stall_breakdown) / total

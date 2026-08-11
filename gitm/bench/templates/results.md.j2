@@ -8,7 +8,7 @@
 | Mean | {{ "%.4g"|format(s.mean) }} |
 | Std dev | {{ "%.4g"|format(s.stddev) }} |
 | Spread (max−min)/mean | {{ pct(s.spread) }} |
-| GPU active (worst run) | {{ pct(s.gpu_active_overall) }} |
+| GPU active (worst run) | {{ pct(s.gpu_active_overall) if s.gpu_active_overall is not none else "unmeasured" }} |
 
 ## Sign-off gates
 
@@ -19,7 +19,11 @@
 {% endfor %}
 **Overall: {{ "✅ SIGNED OFF" if s.passed else "❌ NOT SIGNED OFF" }}**
 
+{% if s.gpu_active_overall is none %}
+GPU active coverage is **unmeasured; saturation sign-off refused**.
+{% else %}
 GPU active % {{ pct(s.gpu_active_overall) }} {{ "<" if s.gpu_active_overall < gpu_active_ceiling else "≥" }} ceiling {{ pct(gpu_active_ceiling) }}{% if s.gpu_active_overall >= gpu_active_ceiling %} — **saturated, swap rule applies**{% endif %}.
+{% endif %}
 
 ## Stall breakdown
 {% if breakdown %}

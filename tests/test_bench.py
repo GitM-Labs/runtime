@@ -124,6 +124,9 @@ def _run(seed: int, value: float, gpu: float = 0.7) -> object:
         warm_window_s=60,
         git_sha="abc1234",
         gitm_version="0.0.1",
+        manifest_sha256="manifest123",
+        gpu_name="A100",
+        device_count=1,
         stall_breakdown=[
             StallPhase(phase="all", cpu=0.03, data_stall=max(0.0, 1 - gpu - 0.03 - 0.05),
                        sync=0.05, gpu_active=gpu, throughput=value, wall_clock_s=60.0)
@@ -166,6 +169,36 @@ def test_baseline_fails_on_saturation():
     summary = aggregate(runs, cfg)
     assert not summary.passed
     assert any(g.name == "saturation" and not g.passed for g in summary.gates)
+
+
+def test_baseline_refuses_missing_gpu_activity_instead_of_substituting_zero():
+    from gitm.bench.baseline import aggregate
+
+    runs = [_run(42, 26e6), _run(43, 26e6), _run(44, 26e6)]
+    for run in runs:
+        run.stall_breakdown = []
+
+    summary = aggregate(runs, _hft_config())
+
+    assert summary.gpu_active_overall is None
+    gate = next(g for g in summary.gates if g.name == "saturation")
+    assert not gate.passed
+    assert "coverage unavailable" in gate.detail
+
+
+def test_baseline_refuses_cpu_or_unpinned_runs():
+    from gitm.bench.baseline import aggregate
+
+    runs = [_run(42, 26e6), _run(43, 26e6), _run(44, 26e6)]
+    runs[0].gpu_name = "cpu"
+    runs[1].manifest_sha256 = None
+
+    summary = aggregate(runs, _hft_config())
+
+    gate = next(g for g in summary.gates if g.name == "provenance")
+    assert not gate.passed
+    assert "GPU identity unavailable" in gate.detail
+    assert "manifest digest unavailable" in gate.detail
 
 
 def test_baseline_fails_on_too_few_runs_and_below_target():
@@ -326,7 +359,7 @@ def test_run_seed_end_to_end_with_echo_harness(tmp_path: Path, monkeypatch):
         'name="hft"\nvendor="nvidia"\nmetric="events_per_second"\n'
         'warm_window_s=60\nseeds=[42]\n'
         '[dataset]\nroot="hft"\n'
-        f'[work_unit]\ncommand="python {harness} --seed {{seed}}"\n'
+        f'[work_unit]\ncommand="python {harness.as_posix()} --seed {{seed}}"\n'
         '[expected_stall]\ncpu={lo=0,hi=0.05}\ndata_stall={lo=0.1,hi=0.25}\n'
         'sync={lo=0.05,hi=0.15}\ngpu_active={lo=0.6,hi=0.8}\n'
     )
