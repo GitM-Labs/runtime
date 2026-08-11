@@ -35,6 +35,34 @@ def test_no_data_guard_does_not_fabricate_claims(tmp_path: Path):
     assert "NO DATA" in result["report_md"]
 
 
+def test_zero_duration_kernel_does_not_bypass_no_data_guard(tmp_path, monkeypatch):
+    import gitm.scheduler.loop as loop
+
+    @contextmanager
+    def invalid_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield make_trace(
+            events=[make_kernel("invalid", start_ns=10, end_ns=10)],
+            vendor="nvidia",
+            run_id=run_id or "r",
+        )
+
+    monkeypatch.setattr(loop, "capture", invalid_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    from gitm import optimize
+
+    result = optimize(
+        workload="custom",
+        budget="1s",
+        scratch=str(tmp_path),
+        workload_runner=lambda: {"events": 1},
+    )
+
+    assert result["summary"]["status"] == "no_data"
+    assert result["summary"]["n_claims"] == 0
+    assert "positive-duration" in result["report_md"]
+
+
 _UNSET = object()  # identity sentinel — a real workload_id could legitimately be any string
 
 
@@ -416,6 +444,36 @@ def test_cli_run_returns_nonzero_on_no_data(tmp_path: Path, capsys):
 
     rc = main(["run", "--workload", "vllm-decode", "--budget", "1s", "--scratch", str(tmp_path)])
     assert rc == 3
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["prediction_refused", "candidate_coverage_unavailable", "intervention_failed"],
+)
+def test_cli_run_returns_nonzero_for_every_degraded_status(status, monkeypatch):
+    import gitm
+    from gitm.cli import main
+
+    monkeypatch.setattr(
+        gitm,
+        "optimize",
+        lambda **_kwargs: {"summary": {"status": status}, "report_md": "diagnostic"},
+    )
+
+    assert main(["run", "--workload", "vllm-decode", "--budget", "1s"]) == 3
+
+
+def test_cli_run_refuses_malformed_loop_result(monkeypatch, tmp_path):
+    import gitm
+    from gitm.cli import main
+
+    monkeypatch.setattr(gitm, "optimize", lambda **_kwargs: {})
+    report = tmp_path / "report.md"
+
+    rc = main(["run", "--workload", "vllm-decode", "--report", str(report)])
+
+    assert rc == 3
+    assert "returned no machine-readable summary" in report.read_text()
 
 
 def test_hft_harness_importable_from_package():

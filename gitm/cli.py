@@ -309,14 +309,26 @@ def main(argv: list[str] | None = None) -> int:
             target=_parse_target(args.target),
             scratch=args.scratch,
         )
-        summary = result.get("summary", {})
+        summary = result.get("summary")
+        if not isinstance(summary, dict):
+            summary = {
+                "status": "invalid_result",
+                "diagnostic": "optimization loop returned no machine-readable summary",
+            }
         if args.report is not None:
-            args.report.write_text(result.get("report_md", ""))
+            report_md = result.get("report_md")
+            if not isinstance(report_md, str) or not report_md.strip():
+                report_md = (
+                    "# Runtime result unavailable\n\n"
+                    f"{summary.get('diagnostic', 'optimization loop returned no report')}\n"
+                )
+            args.report.write_text(report_md, encoding="utf-8")
         else:
             print(json.dumps(summary, indent=2))
-        # Non-zero so automation notices a run that measured nothing (no GPU /
-        # CUPTI shim, or the workload never ran) instead of seeing a fake pass.
-        return 3 if summary.get("status") == "no_data" else 0
+        # Only the explicit success state is a shell success. Prediction/candidate
+        # refusals and failed A/Bs may still have useful measurement reports, but
+        # automation must not read those degraded outcomes as a completed run.
+        return 0 if summary.get("status") == "ok" else 3
 
     if args.cmd == "replay":
         from gitm.optimizer.replay import predict_delta_from_files
