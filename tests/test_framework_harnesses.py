@@ -89,6 +89,20 @@ def test_biotech_loader_raises_without_framework():
         load_openfold_runner(42)
 
 
+@pytest.mark.parametrize(
+    "timings",
+    [
+        [{"_t_featurize_s": 0.0, "_t_inference_s": 0.0, "_t_post_s": 0.0, "_t_total_s": 0.0}],
+        [{"_t_featurize_s": 0.6, "_t_inference_s": 0.6, "_t_post_s": 0.0, "_t_total_s": 1.0}],
+    ],
+)
+def test_biotech_stall_breakdown_refuses_invalid_timing(timings):
+    from benchmarks.biotech.harness import _build_stall_phase
+
+    with pytest.raises(RuntimeError, match="timing"):
+        _build_stall_phase(timings, 1.0)
+
+
 # --- edge -------------------------------------------------------------------
 
 
@@ -159,3 +173,17 @@ def test_edge_loader_raises_without_framework():
 
     with pytest.raises(RuntimeError, match="OpenPCDet"):
         load_openpcdet_runner()
+
+
+@pytest.mark.parametrize(
+    "timings",
+    [
+        [{"_t_load_s": 0.0, "_t_preprocess_s": 0.0, "_t_inference_s": 0.0, "_t_postprocess_s": 0.0, "_t_total_s": 0.0}],
+        [{"_t_load_s": 0.4, "_t_preprocess_s": 0.3, "_t_inference_s": 0.4, "_t_postprocess_s": 0.0, "_t_total_s": 1.0}],
+    ],
+)
+def test_edge_stall_breakdown_refuses_invalid_timing(timings):
+    from benchmarks.edge.harness import _build_stall_phase
+
+    with pytest.raises(RuntimeError, match="timing"):
+        _build_stall_phase(timings, 1.0)

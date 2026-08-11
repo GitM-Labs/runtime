@@ -33,6 +33,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Protocol
 
+from gitm._timing import require_positive_duration, require_timing_partition
+
 OPENPCDET_COMMIT = "v0.6.0"  # pinned; config hash pinned in datasets.md
 
 _OPENPCDET_DEFAULT_CFG = (
@@ -231,7 +233,9 @@ def run(stage: Path, *, warm: int, runner: Runner) -> dict:
             maps.append(float(result["map"]))
         if "_t_total_s" in result:
             timings.append(result)
-    elapsed = max(time.perf_counter() - t0, 1e-9)
+    elapsed = require_positive_duration(
+        time.perf_counter() - t0, context="edge harness"
+    )
 
     if n == 0:
         raise RuntimeError(f"no frames in {manifest}")
@@ -259,12 +263,20 @@ def _build_stall_phase(timings: list[dict], wall_clock_s: float) -> dict:
     t_pre = sum(t["_t_preprocess_s"] for t in timings)
     t_inf = sum(t["_t_inference_s"] for t in timings)
     t_post = sum(t["_t_postprocess_s"] for t in timings)
-    total = max(sum(t["_t_total_s"] for t in timings), 1e-9)
-
-    data_stall = min(1.0, (t_load + t_pre) / total)
-    gpu_active = min(1.0, t_inf / total)
-    sync = min(1.0, t_post / total)
-    cpu = max(0.0, 1.0 - data_stall - gpu_active - sync)
+    total = sum(t["_t_total_s"] for t in timings)
+    split = require_timing_partition(
+        total,
+        {
+            "data_stall": t_load + t_pre,
+            "gpu_active": t_inf,
+            "sync": t_post,
+        },
+        context="edge stall breakdown",
+    )
+    data_stall = split["data_stall"]
+    gpu_active = split["gpu_active"]
+    sync = split["sync"]
+    cpu = split["unattributed"]
 
     return {
         "phase": "all",

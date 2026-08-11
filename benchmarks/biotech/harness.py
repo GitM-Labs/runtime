@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Protocol
 
 from benchmarks.biotech.fetch import FastaRecord, read_fasta
+from gitm._timing import require_positive_duration, require_timing_partition
 
 OPENFOLD_COMMIT = "v1.0.1"  # pinned; weight hashes pinned in datasets.md
 MODEL_NAME = "model_1"      # single-model AF2 monomer; weights = params_model_1.npz
@@ -193,12 +194,16 @@ def _build_stall_phase(timings: list[dict], wall_clock_s: float) -> dict:
     t_feat = sum(t["_t_featurize_s"] for t in timings)
     t_inf = sum(t["_t_inference_s"] for t in timings)
     t_post = sum(t["_t_post_s"] for t in timings)
-    total = max(sum(t["_t_total_s"] for t in timings), 1e-9)
-
-    data_stall = min(1.0, t_feat / total)
-    gpu_active = min(1.0, t_inf / total)
-    sync = min(1.0, t_post / total)
-    cpu = max(0.0, 1.0 - data_stall - gpu_active - sync)
+    total = sum(t["_t_total_s"] for t in timings)
+    split = require_timing_partition(
+        total,
+        {"data_stall": t_feat, "gpu_active": t_inf, "sync": t_post},
+        context="biotech stall breakdown",
+    )
+    data_stall = split["data_stall"]
+    gpu_active = split["gpu_active"]
+    sync = split["sync"]
+    cpu = split["unattributed"]
 
     return {
         "phase": "all",
@@ -246,7 +251,9 @@ def run(
             plddts.append(float(result["plddt"]))
         if "_t_total_s" in result:
             timings.append(result)
-    elapsed = max(time.perf_counter() - t0, 1e-9)
+    elapsed = require_positive_duration(
+        time.perf_counter() - t0, context="biotech harness"
+    )
 
     structures_per_hour = len(proteins) / elapsed * 3600.0
     payload: dict = {
