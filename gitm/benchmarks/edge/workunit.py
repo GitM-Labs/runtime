@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from gitm._timing import require_positive_duration
+
 # SHA256 of cbgs_pp_centerpoint_nds6070.pth (OpenPCDet nuScenes
 # CenterPoint-PointPillar checkpoint). Confirm with:
 #   sha256sum cbgs_pp_centerpoint_nds6070.pth
@@ -73,21 +75,24 @@ class WorkUnitResult:
         With the dyn config, voxelization is on the GPU, so this reflects
         only the multi-sweep load. See the module STAGE-TIMING CAVEAT.
         """
-        if self.t_total_s <= 0:
-            return 0.0
-        return (self.t_load_s + self.t_preprocess_s) / self.t_total_s
+        wall = require_positive_duration(
+            self.t_total_s, context=f"nuScenes frame {self.frame_id}"
+        )
+        return (self.t_load_s + self.t_preprocess_s) / wall
 
     @property
     def sync_stall_frac(self) -> float:
-        if self.t_total_s <= 0:
-            return 0.0
-        return self.t_postprocess_s / self.t_total_s
+        wall = require_positive_duration(
+            self.t_total_s, context=f"nuScenes frame {self.frame_id}"
+        )
+        return self.t_postprocess_s / wall
 
     @property
     def gpu_active_frac(self) -> float:
-        if self.t_total_s <= 0:
-            return 0.0
-        return self.t_inference_s / self.t_total_s
+        wall = require_positive_duration(
+            self.t_total_s, context=f"nuScenes frame {self.frame_id}"
+        )
+        return self.t_inference_s / wall
 
 
 class NuScenesWorkUnit:

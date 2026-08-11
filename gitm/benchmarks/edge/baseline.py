@@ -41,6 +41,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from gitm._timing import require_positive_duration
+
 WARM_FRAMES = 100        # discarded before the timing window
 NVML_SAMPLE_HZ = 5
 GPU_ACTIVE_WARN_PCT = 85.0
@@ -181,7 +183,9 @@ def run_baseline(
     nvml_thread.join(timeout=5)
 
     n_warm = len(warm_indices)
-    elapsed = t_wall_end - t_wall_start
+    elapsed = require_positive_duration(
+        t_wall_end - t_wall_start, context="nuScenes baseline warm window"
+    )
     fps = n_warm / elapsed
 
     data_stall_pct = sum(data_stall_fracs) / n_warm * 100
@@ -223,7 +227,7 @@ def run_baseline(
         "captured_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
-    output_path.write_text(json.dumps(output, indent=2))
+    output_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
     print(
         f"\nResult: {fps:.1f} fps | GPU active {gpu_active_pct:.1f}% "
         f"(NVML {nvml_mean:.1f}%)" if nvml_mean is not None

@@ -239,10 +239,16 @@ def render_kitti_graph(
     ]
 
     if measured:
-        fps      = measured.get("frames_per_second", 0)
-        frame_ms = 1000 / fps if fps > 0 else 0
-        gpu_pct  = measured.get("gpu_active_pct", 0)
-        data_pct = measured.get("data_stall_pct", 0)
+        fps = measured.get("frames_per_second")
+        gpu_pct = measured.get("gpu_active_pct")
+        data_pct = measured.get("data_stall_pct")
+        if not isinstance(fps, int | float) or fps <= 0:
+            lines += ["", "Measured comparison refused: frames_per_second is missing or non-positive."]
+            return "\n".join(lines)
+        if not isinstance(gpu_pct, int | float) or not isinstance(data_pct, int | float):
+            lines += ["", "Measured comparison refused: stall coverage fields are missing."]
+            return "\n".join(lines)
+        frame_ms = 1000 / fps
         lines += [
             "",
             "Measured (baseline):",

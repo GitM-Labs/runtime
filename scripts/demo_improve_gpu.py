@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+import warnings
 from pathlib import Path
 
 from gitm._timing import require_positive_duration
@@ -64,8 +65,12 @@ def _run_observed(fn, label: str, outdir: Path) -> tuple[object, dict]:
         from gitm.telemetry.sinks import build_sink
 
         tele = Collector(CollectorConfig(interval_s=0.05, sinks=[build_sink(f"jsonl:{tele_path}")]))
-    except Exception:
-        pass
+    except Exception as exc:
+        warnings.warn(
+            f"demo telemetry unavailable: {type(exc).__name__}: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     if tele:
         tele.start()
@@ -84,6 +89,7 @@ def _run_observed(fn, label: str, outdir: Path) -> tuple[object, dict]:
         "serialized": _serialized(tr),
         "util_pct": _mean_util(tele_path),
         "n_kernels": len([e for e in tr.events if e.kind == "kernel"]),
+        "diagnostics": list(tele.diagnostics) if tele is not None else ["telemetry unavailable"],
     }
 
 
@@ -133,7 +139,10 @@ def main(argv=None) -> int:
           f"serialized {before['serialized']:.3f} | {before['n_kernels']} kernels\n")
 
     # --- 2. DECIDE ------------------------------------------------------------
-    idle = before["util_pct"] is None or before["util_pct"] < 85.0
+    if before["util_pct"] is None:
+        print("     telemetry unavailable — refusing an idle-GPU claim and intervention decision.")
+        return 1
+    idle = before["util_pct"] < 85.0
     serial_heavy = before["serialized"] > 0.5
     print("2. DECIDE (runtime maps headroom -> lever):")
     print("     why: an idle GPU running serialized, independent work is the signature that parallelizing across streams should help.")

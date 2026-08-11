@@ -149,6 +149,14 @@ def _parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="Probe environment, GPUs, and data locations.")
 
+    plan_kitti = sub.add_parser(
+        "plan-kitti", help="Render the PointPillars execution graph for a known GPU SKU."
+    )
+    plan_kitti.add_argument("--sku", required=True, help="GPU SKU from the hardware catalogue.")
+    plan_kitti.add_argument(
+        "--baseline", type=Path, default=None, help="Optional measured baseline JSON to compare."
+    )
+
     analyze = sub.add_parser(
         "analyze",
         help="Ingest customer Nsight/PyTorch profiler dumps into a headroom report.",
@@ -367,6 +375,25 @@ def main(argv: list[str] | None = None) -> int:
 
         report = doctor()
         print(json.dumps(report, indent=2))
+        return 0
+
+    if args.cmd == "plan-kitti":
+        from gitm.planner.context import hardware_spec_for, peak_for_sku
+        from gitm.planner.kitti_graph import predict_kitti_graph, render_kitti_graph
+
+        peak = peak_for_sku(args.sku)
+        if peak is None:
+            print(f"prediction refused: GPU SKU {args.sku!r} is not in the hardware catalogue")
+            return 3
+        measured = None
+        if args.baseline is not None:
+            try:
+                measured = json.loads(args.baseline.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                print(f"prediction refused: baseline {args.baseline} is unreadable ({exc})")
+                return 3
+        graph = predict_kitti_graph(hw=hardware_spec_for(peak))
+        print(render_kitti_graph(graph, measured=measured))
         return 0
 
     if args.cmd == "analyze":

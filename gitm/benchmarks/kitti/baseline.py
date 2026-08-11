@@ -38,6 +38,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from gitm._timing import require_positive_duration
+
 WARM_FRAMES = 100  # discard before timing window
 NVML_SAMPLE_HZ = 5
 
@@ -274,7 +276,9 @@ def run_baseline(
     nvml_thread.join(timeout=5)
 
     n_warm = len(warm_paths)
-    elapsed = t_wall_end - t_wall_start
+    elapsed = require_positive_duration(
+        t_wall_end - t_wall_start, context="KITTI baseline warm window"
+    )
     fps = n_warm / elapsed
 
     data_stall_pct = sum(data_stall_fracs) / n_warm * 100
@@ -347,10 +351,10 @@ def run_baseline(
         "captured_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
-    output_path.write_text(json.dumps(output, indent=2))
+    output_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
     # Save stage spread report alongside the JSON for easy review
     report_path = output_path.with_name(output_path.stem + "_stage_spread.txt")
-    report_path.write_text(spread_report)
+    report_path.write_text(spread_report, encoding="utf-8")
     print(
         f"\nResult: {fps:.1f} fps | GPU active {gpu_active_pct:.1f}% "
         f"| data stall {data_stall_pct:.1f}% | wrote {output_path}"

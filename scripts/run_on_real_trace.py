@@ -16,10 +16,7 @@ Exit 0 on success, 2 if no CUDA / shim, 1 on an unexpected failure. Run on the p
 from __future__ import annotations
 
 import sys
-import warnings
 from pathlib import Path
-
-warnings.filterwarnings("ignore")  # this is a diagnostic script; keep output clean
 
 
 def main() -> int:
@@ -56,10 +53,16 @@ def main() -> int:
         _ = c.sum().item()
         torch.cuda.synchronize()
 
-    kernels = [e for e in tr.events if e.kind == "kernel"]
+    all_kernels = [e for e in tr.events if e.kind == "kernel"]
+    kernels = [e for e in all_kernels if e.end_ns > e.start_ns]
     if not kernels:
-        print("FAIL: no kernels captured (is the CUPTI shim built? run gpu_setup.sh)")
+        print("FAIL: no positive-duration kernels captured (is the CUPTI shim built?)")
         return 1
+    if len(kernels) != len(all_kernels):
+        print(
+            f"WARN: excluded {len(all_kernels) - len(kernels)}/{len(all_kernels)} "
+            "kernels with invalid timestamps"
+        )
     print(f"captured {len(kernels)} real kernels on {torch.cuda.get_device_name(0)}")
 
     # Real stream-concurrency computed from the trace stream IDs.
@@ -75,7 +78,7 @@ def main() -> int:
     res = Residuals()
     res.serialized_concurrency_fraction = sc
     for k in kernels:
-        m = med[k.name] or 1.0
+        m = med[k.name]
         res.per_kernel.append(
             KernelResidual(op=k.name[:30], layer=None, r_kt=((k.end_ns - k.start_ns) - m) / m, r_mt=None)
         )
