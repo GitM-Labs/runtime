@@ -134,6 +134,7 @@ def test_vllm_factory_returns_runner_with_live_engine_hooks(monkeypatch):
         "vllm",
         types.SimpleNamespace(LLM=FakeLLM, SamplingParams=FakeSamplingParams),
     )
+    monkeypatch.setattr("gitm.cuda_env.require_compatible", lambda: None)
     monkeypatch.setattr(workloads, "sync_device", lambda: None)
     monkeypatch.setenv("GITM_VLLM_MODEL", "fake/model")
     monkeypatch.setenv("GITM_VLLM_PROMPTS", "2")

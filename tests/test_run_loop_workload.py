@@ -556,6 +556,7 @@ def test_vllm_decode_factory_returns_wired_runner(monkeypatch):
     fake.LLM = _LLM
     fake.SamplingParams = _SamplingParams
     monkeypatch.setitem(sys.modules, "vllm", fake)
+    monkeypatch.setattr("gitm.cuda_env.require_compatible", lambda: None)
     monkeypatch.setenv("GITM_VLLM_PROMPTS", "3")
     monkeypatch.setenv("GITM_VLLM_MAX_TOKENS", "5")
     monkeypatch.delenv("GITM_VLLM_SYNTHETIC", raising=False)

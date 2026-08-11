@@ -229,7 +229,12 @@ def require_compatible() -> None:
     inside ``torch._C._cuda_init()``, after the weights are already downloaded.
     """
     driver = driver_cuda()
-    if driver is not None and stack_for(driver) is None:
+    if driver is None:
+        raise RuntimeError(
+            "no NVIDIA driver detected; refusing to build a GPU workload on an "
+            "unverified CPU-only or driver-inaccessible host"
+        )
+    if stack_for(driver) is None:
         raise RuntimeError(
             f"unsupported host: this driver supports only CUDA {driver[0]}.{driver[1]}, "
             f"and vLLM's wheels are CUDA {max(SUPPORTED_STACKS)} builds. No torch "

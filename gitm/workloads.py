@@ -604,6 +604,10 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     if os.environ.get("GITM_VLLM_SYNTHETIC") == "1":
         return _vllm_synthetic_runner(n_prompts, max_tokens)
 
+    from gitm import cuda_env
+
+    cuda_env.require_compatible()
+
     import time
 
     from vllm import LLM, SamplingParams
