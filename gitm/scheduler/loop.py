@@ -317,12 +317,6 @@ def _moe_fields_from_hf(hf: Any) -> dict[str, Any]:
     return out
 
 
-def _clamp_pct(value: float) -> float:
-    """Bound a residual ratio to +/-100% so a bad/misaligned prediction (or a
-    small-sample outlier) can't blow up a report row into an absurd 18x."""
-    return max(-1.0, min(1.0, value))
-
-
 def _agg_kt_residual(res: Any) -> float:
     """Run-level kernel-time residual for the report: duration-weighted
     ``sum(obs - pred) / sum(pred)`` when timings are available, else the
@@ -339,7 +333,7 @@ def _agg_kt_residual(res: Any) -> float:
         kts = sorted(float(kr.r_kt) for kr in rows)
         mid = len(kts) // 2
         value = kts[mid] if len(kts) % 2 else (kts[mid - 1] + kts[mid]) / 2.0
-    return _clamp_pct(value)
+    return value
 
 
 def _ar_target_residual(ar_run: AutoresearchRun, fallback: float = 0.0) -> float:
@@ -349,7 +343,7 @@ def _ar_target_residual(ar_run: AutoresearchRun, fallback: float = 0.0) -> float
     target, fall back to the run-level kernel-time residual so generated claims
     do not all display a misleading +0.0% gap.
     """
-    return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else fallback
+    return ar_run.target.residual if ar_run.target is not None else fallback
 
 
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
@@ -764,6 +758,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 summary=c.spec.summary,
                 residual_invariant="kernel_time",
                 residual_value=kt_residual,
+                residual_scope="run",
                 causal_evidence=causal_evidence,
                 intervention_name=c.spec.name,
                 predicted_delta=c.predicted_delta,
@@ -825,6 +820,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 summary=r.spec.summary,
                 residual_invariant="kernel_time",
                 residual_value=ar_residual,
+                residual_scope=("target_op" if ar_run.target is not None else "run"),
                 causal_evidence=evidence,
                 intervention_name=r.spec.name,
                 predicted_delta=r.predicted_delta,

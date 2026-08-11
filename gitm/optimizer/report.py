@@ -7,6 +7,7 @@ rolled-back interventions stay visible. The report is the moat.
 
 from __future__ import annotations
 
+import math
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -25,7 +26,23 @@ class Claim:
     intervention_name: str
     predicted_delta: float
     measured_delta: float | None
+    # Whether the residual is specific to this claim, aggregated over the run,
+    # or tied to an autoresearch target op. The report hides the default label.
+    residual_scope: str = "claim"
     rolled_back: bool = False
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.residual_value):
+            raise ValueError("residual_value must be finite")
+
+    @property
+    def residual_display_value(self) -> float:
+        """Value used in the compact table cell; raw truth remains available."""
+        return max(-1.0, min(1.0, self.residual_value))
+
+    @property
+    def residual_saturated(self) -> bool:
+        return abs(self.residual_value) > 1.0
 
 
 @dataclass

@@ -19,8 +19,11 @@ this test on purpose.
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
+
+import pytest
 
 from gitm.optimizer.report import Claim, Provenance, write_report
 
@@ -109,3 +112,59 @@ def test_report_renders_byte_equal_to_golden(monkeypatch):
         "    UPDATE_GOLDENS=1 .venv/bin/pytest tests/test_report_snapshot.py\n"
         "and review the diff with `git diff tests/golden/` before committing."
     )
+
+
+@pytest.mark.parametrize(
+    ("raw", "display", "raw_text"),
+    [(17.8, "+100.0%", "+1780.0%"), (-3.0, "-100.0%", "-300.0%")],
+)
+def test_saturated_residual_renders_capped_display_and_raw_magnitude(raw, display, raw_text):
+    claim = Claim(
+        summary="model gap",
+        residual_invariant="kernel_time",
+        residual_value=raw,
+        residual_scope="run",
+        causal_evidence="trace",
+        intervention_name="candidate",
+        predicted_delta=0.01,
+        measured_delta=None,
+    )
+
+    rendered = write_report([claim], _fixed_provenance())
+
+    assert claim.residual_value == raw
+    assert claim.residual_saturated
+    assert display in rendered
+    assert f"raw {raw_text}" in rendered
+    assert "`kernel_time` (run)" in rendered
+
+
+@pytest.mark.parametrize("raw", [-1.0, 0.42, 1.0])
+def test_unsaturated_residual_has_no_raw_magnitude_note(raw):
+    claim = Claim(
+        summary="model gap",
+        residual_invariant="kernel_time",
+        residual_value=raw,
+        causal_evidence="trace",
+        intervention_name="candidate",
+        predicted_delta=0.01,
+        measured_delta=None,
+    )
+
+    assert claim.residual_display_value == raw
+    assert not claim.residual_saturated
+    assert "display capped" not in write_report([claim], _fixed_provenance())
+
+
+@pytest.mark.parametrize("raw", [math.nan, math.inf, -math.inf])
+def test_non_finite_residual_is_refused(raw):
+    with pytest.raises(ValueError, match="residual_value must be finite"):
+        Claim(
+            summary="model gap",
+            residual_invariant="kernel_time",
+            residual_value=raw,
+            causal_evidence="trace",
+            intervention_name="candidate",
+            predicted_delta=0.01,
+            measured_delta=None,
+        )

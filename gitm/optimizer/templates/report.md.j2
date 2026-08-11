@@ -25,7 +25,7 @@ _No claims._
 | # | Claim | Residual | Causal evidence | Intervention | Predicted Δ | Measured Δ |
 |---|---|---|---|---|---|---|
 {% for c in claims -%}
-| {{ loop.index }} | {{ c.summary }} | `{{ c.residual_invariant }}`: {{ '{:+.1%}'.format(c.residual_value) }} | {{ c.causal_evidence }} | `{{ c.intervention_name }}` | {{ '{:+.1%}'.format(c.predicted_delta) }} | {% if c.measured_delta is none %}—{% else %}{{ '{:+.1%}'.format(c.measured_delta) }}{% endif %}{% if c.rolled_back %} (rolled back){% endif %} |
+| {{ loop.index }} | {{ c.summary }} | `{{ c.residual_invariant }}`{% if c.residual_scope != 'claim' %} ({{ c.residual_scope }}){% endif %}: {{ '{:+.1%}'.format(c.residual_display_value) }}{% if c.residual_saturated %} (display capped; raw {{ '{:+.1%}'.format(c.residual_value) }}){% endif %} | {{ c.causal_evidence }} | `{{ c.intervention_name }}` | {{ '{:+.1%}'.format(c.predicted_delta) }} | {% if c.measured_delta is none %}—{% else %}{{ '{:+.1%}'.format(c.measured_delta) }}{% endif %}{% if c.rolled_back %} (rolled back){% endif %} |
 {% endfor %}
 {%- endif %}
 

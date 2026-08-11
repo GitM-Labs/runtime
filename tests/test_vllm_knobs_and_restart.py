@@ -464,7 +464,7 @@ def test_run_loop_scheduler_stats_feed_attribution_and_claims(tmp_path, monkeypa
     # Scheduler summary surfaced in the run summary (synchronous first sample).
     assert out["summary"]["scheduler_stats"] is not None
 
-def test_report_kernel_time_residual_uses_weighted_total_and_clamps():
+def test_report_kernel_time_residual_preserves_raw_weighted_total():
     from gitm.optimizer.monitor import KernelResidual, Residuals
     from gitm.scheduler.loop import _agg_kt_residual
 
@@ -475,7 +475,9 @@ def test_report_kernel_time_residual_uses_weighted_total_and_clamps():
         ]
     )
 
-    assert _agg_kt_residual(res) == 1.0
+    assert _agg_kt_residual(res) == pytest.approx(
+        (211e-6 - 10.01e-6) / 10.01e-6
+    )
 
     sane = Residuals(
         per_kernel=[
@@ -494,7 +496,7 @@ def test_ar_target_residual_uses_the_search_target_not_a_hardcoded_zero():
     empty = AutoresearchRun(bottleneck_class="idle_stall", results=[], target=None)
     assert _ar_target_residual(empty) == 0.0
 
-    # A real target -> its residual surfaces, clamped like every other residual.
+    # A real target -> its raw residual surfaces; display capping belongs to Claim.
     modest = AutoresearchRun(
         bottleneck_class="idle_stall", results=[],
         target=ResidualTarget(op="attn_score_value", residual=0.42, n_kernels=8),
@@ -505,4 +507,4 @@ def test_ar_target_residual_uses_the_search_target_not_a_hardcoded_zero():
         bottleneck_class="idle_stall", results=[],
         target=ResidualTarget(op="attn_score_value", residual=17.8, n_kernels=8),
     )
-    assert _ar_target_residual(huge) == 1.0
+    assert _ar_target_residual(huge) == 17.8
