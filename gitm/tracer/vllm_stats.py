@@ -370,6 +370,29 @@ def _schedulers(engine: Any) -> list[Any]:
     return list(sched) if isinstance(sched, list | tuple) else [sched]
 
 
+def _nonnegative_count(
+    value: Any, field_name: str, diagnostics: list[str] | None
+) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value >= 0:
+            return value
+        if diagnostics is not None:
+            diagnostics.append(f"{field_name} reported negative count {value}")
+    return None
+
+
+def _unit_fraction(
+    value: Any, field_name: str, diagnostics: list[str] | None
+) -> float | None:
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        result = float(value)
+        if math.isfinite(result) and 0.0 <= result <= 1.0:
+            return result
+        if diagnostics is not None:
+            diagnostics.append(f"{field_name} reported {value!r} outside [0, 1]")
+    return None
+
+
 def _v1_scheduler_stats(
     scheduler: Any, diagnostics: list[str] | None = None
 ) -> dict[str, Any]:
@@ -395,12 +418,12 @@ def _v1_scheduler_stats(
     out: dict[str, Any] = {}
     for field_name, attr in (("num_running", "num_running_reqs"),
                              ("num_waiting", "num_waiting_reqs")):
-        v = getattr(stats, attr, None)
-        if isinstance(v, int):
+        v = _nonnegative_count(getattr(stats, attr, None), attr, diagnostics)
+        if v is not None:
             out[field_name] = v
-    ku = getattr(stats, "kv_cache_usage", None)
-    if isinstance(ku, int | float):
-        out["gpu_cache_usage"] = float(ku)
+    ku = _unit_fraction(getattr(stats, "kv_cache_usage", None), "kv_cache_usage", diagnostics)
+    if ku is not None:
+        out["gpu_cache_usage"] = ku
     return out
 
 
@@ -442,7 +465,11 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
                 ("preemptions_cumulative", "num_cumulative_preemption", False),
             ):
                 raw = getattr(sch, attr, None)
-                val = _len_or_none(raw) if is_len else (raw if isinstance(raw, int) else None)
+                val = (
+                    _len_or_none(raw)
+                    if is_len
+                    else _nonnegative_count(raw, attr, sample.diagnostics)
+                )
                 if val is not None:
                     totals[field_name] = totals.get(field_name, 0) + val
         for field_name, val in totals.items():
@@ -472,8 +499,12 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
     )
     if callable(getter):
         try:
-            sample.num_unfinished = int(getter())
-            saw_any = True
+            count = _nonnegative_count(
+                getter(), "num_unfinished", sample.diagnostics
+            )
+            if count is not None:
+                sample.num_unfinished = count
+                saw_any = True
         except Exception as exc:
             sample.diagnostics.append(
                 f"unfinished-request probe failed: {type(exc).__name__}: {exc}"
@@ -487,7 +518,13 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
             # transient over-count (or a partially-exposed config) can never make a
             # half-empty engine read as full and silently suppress under_filled.
             capacity = max_seqs * max(len(schedulers), 1)
-            sample.batch_occupancy = min(1.0, sample.num_running / capacity)
+            if sample.num_running <= capacity:
+                sample.batch_occupancy = sample.num_running / capacity
+            else:
+                sample.diagnostics.append(
+                    f"num_running {sample.num_running} exceeds declared capacity {capacity}; "
+                    "batch occupancy unavailable"
+                )
 
     return sample if saw_any or sample.diagnostics else None
 
@@ -504,7 +541,19 @@ def _gpu_cache_usage(
     total = getattr(bm, "num_total_gpu_blocks", None)
     if callable(free_fn) and isinstance(total, int) and total > 0:
         try:
-            return max(0.0, 1.0 - free_fn() / total)
+            free = free_fn()
+            if (
+                isinstance(free, bool)
+                or not isinstance(free, int | float)
+                or not math.isfinite(float(free))
+                or not 0 <= free <= total
+            ):
+                if diagnostics is not None:
+                    diagnostics.append(
+                        f"KV-cache free-block probe reported {free!r} outside [0, {total}]"
+                    )
+                return None
+            return 1.0 - float(free) / total
         except Exception as exc:
             if diagnostics is not None:
                 diagnostics.append(
@@ -546,6 +595,9 @@ class SchedulerStatsSampler:
     def start(self) -> None:
         if self._thread is not None or self.engine is None:
             return
+        # A stopped sampler may be reused for a new window. Relative timestamps
+        # restart at zero, so old-window samples cannot remain in the same series.
+        self.samples.clear()
         # Two clocks taken together: monotonic for sample spacing (immune to wall
         # clock jumps), wall for the join against request timestamps and the
         # trace. Captured back-to-back so the offset between the two clocks is
@@ -643,7 +695,12 @@ def summarize(
     preempt = _vals("preemptions_cumulative")
     cache = _vals("gpu_cache_usage")
     swapped = _vals("num_swapped")
-    duration_s = max(samples[-1].t_ns - samples[0].t_ns, 0) / 1e9
+    if any(sample.t_ns < 0 for sample in samples) or any(
+        later.t_ns < earlier.t_ns
+        for earlier, later in zip(samples, samples[1:], strict=False)
+    ):
+        raise ValueError("scheduler sample timestamps are not monotonic non-negative values")
+    duration_s = (samples[-1].t_ns - samples[0].t_ns) / 1e9
 
     diagnostics = list(dict.fromkeys(note for sample in samples for note in sample.diagnostics))
     return SchedulerStatsSummary(

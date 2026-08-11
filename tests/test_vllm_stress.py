@@ -174,6 +174,13 @@ def test_read_scheduler_stats_surfaces_field_probe_failures():
     assert any("unfinished-request probe failed" in note for note in sample.diagnostics)
 
 
+def test_reversed_scheduler_sample_timeline_is_refused():
+    from gitm.tracer.vllm_stats import SchedulerSample
+
+    with pytest.raises(ValueError, match="timestamps are not monotonic"):
+        summarize([SchedulerSample(t_ns=10), SchedulerSample(t_ns=5)])
+
+
 def test_summarize_single_sample():
     s = read_scheduler_stats(
         type("E", (), {"scheduler": [type("S", (), {"running": [0, 1], "waiting": [], "swapped": []})()],
@@ -263,14 +270,15 @@ def test_occupancy_clamped_under_multiple_schedulers():
 
 
 def test_measure_rolls_back_on_nonpositive_baseline():
-    """An unmeasurable (zero) baseline must roll the candidate back, not keep it."""
+    """An unmeasurable baseline refuses before apply, so no rollback is claimed."""
     class _Idle:
         scheduler_config = _SchedCfg()
 
-    # Baseline probe returns 0 (idle engine), so measure() raises after apply.
+    # Baseline probe returns 0 (idle engine), so snapshot refuses before apply.
     app = LiveEngineApplicator(_Idle(), throughput_fn=lambda e: 0.0, restart_fn=lambda _e, _kv: _Idle())
     res = apply_intervention(_spec("max_num_seqs", 256), app, min_keep_delta=0.0)
-    assert not res.applied and res.rolled_back
+    assert not res.applied and not res.rolled_back
+    assert "intervention not applied" in res.error
 
 
 def test_deviation_multistep_does_not_keep_everything():

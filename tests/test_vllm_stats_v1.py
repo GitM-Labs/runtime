@@ -67,3 +67,14 @@ def test_v1_scheduler_read_failure_is_diagnostic():
         "make_stats failed" in note and "v1 stats moved" in note
         for note in sample.diagnostics
     )
+
+
+def test_v1_invalid_values_are_diagnostic_not_clamped():
+    sample = read_scheduler_stats(_v1_engine(running=300, waiting=-1, cache=1.2))
+
+    assert sample is not None
+    assert sample.num_waiting is None
+    assert sample.gpu_cache_usage is None
+    assert sample.batch_occupancy is None
+    assert any("outside [0, 1]" in note for note in sample.diagnostics)
+    assert any("exceeds declared capacity" in note for note in sample.diagnostics)
