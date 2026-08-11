@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -161,6 +162,12 @@ def _device_id_of(trace: Trace) -> int:
     return trace.events[0].device_id if trace.events else 0
 
 
+def _artifact_stem(value: str) -> str:
+    """Return a portable filename stem without changing the report identifier."""
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+    return stem or "trace"
+
+
 def analyze_paths(
     paths: list[str | Path],
     *,
@@ -256,7 +263,9 @@ def analyze_paths(
                 if keep_traces is not None:
                     keep_dir = Path(keep_traces)
                     keep_dir.mkdir(parents=True, exist_ok=True)
-                    tpath = keep_dir / f"{internal_id}_{tr.run_id}.jsonl"
+                    tpath = keep_dir / (
+                        f"{_artifact_stem(internal_id)}_{_artifact_stem(tr.run_id)}.jsonl"
+                    )
                     write_trace_jsonl(tpath, tr)
                     eng_bits.append(render_headroom_md(headroom))
 

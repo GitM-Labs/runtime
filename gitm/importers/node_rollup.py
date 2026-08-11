@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from gitm._timing import require_positive_duration
 from gitm.optimizer.metrics import _merge_intervals
 from gitm.tracer.schema import Trace
 
@@ -149,7 +150,9 @@ def device_comm_stats(trace: Trace) -> DeviceCommStats:
     kernels = [e for e in trace.events if getattr(e, "kind", None) == "kernel"]
     # Prefer the device_id on events; fall back to 0.
     dev = kernels[0].device_id if kernels else 0
-    wall = max(trace.duration_ns, 1)
+    wall = require_positive_duration(
+        float(trace.duration_ns), context=f"device {dev} communication rollup"
+    )
     comm = [(k.start_ns, k.end_ns) for k in kernels if is_comm_kernel(k.name)]
     non_comm = [(k.start_ns, k.end_ns) for k in kernels if not is_comm_kernel(k.name)]
     busy_ns = _interval_len([(k.start_ns, k.end_ns) for k in kernels])
@@ -210,8 +213,8 @@ def build_node_rollup(
         comm_stats.append(cs)
         if cs.comm_ns > 0:
             any_comm = True
-        weight_sum += max(wall_s, 0.0)
-        weighted_ceiling += ceiling * max(wall_s, 0.0)
+        weight_sum += wall_s
+        weighted_ceiling += ceiling * wall_s
 
     busies = list(device_busy.values())
     skew = (max(busies) - min(busies)) if busies else 0.0
@@ -219,7 +222,7 @@ def build_node_rollup(
     n_devices = len(device_busy)
     multi = multi_device_file or n_devices > 1
     comm_inconclusive = multi and not any_comm
-    node_ceiling = (weighted_ceiling / weight_sum) if weight_sum > 0 else 0.0
+    node_ceiling = weighted_ceiling / weight_sum
     mean_exposed = (
         sum(c.exposed_comm_share_of_wall for c in comm_stats) / len(comm_stats)
         if comm_stats

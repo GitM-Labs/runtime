@@ -125,6 +125,13 @@ def test_device_comm_no_comm_kernels():
     assert cs.comm_share_of_busy == 0.0
 
 
+@pytest.mark.parametrize("duration", [0, -1])
+def test_device_comm_refuses_nonpositive_wall_time(duration: int):
+    tr = _trace([], duration=duration)
+    with pytest.raises(RuntimeError, match="communication rollup timing unavailable"):
+        device_comm_stats(tr)
+
+
 # ── rollup skew / collective flags ───────────────────────────────────────────
 
 
@@ -162,6 +169,12 @@ def test_rollup_weighted_ceiling():
     )
     # (0.10*100 + 0.40*300) / 400 = (10+120)/400 = 0.325
     assert r.node_ceiling_distance == pytest.approx(0.325)
+
+
+def test_rollup_refuses_nonpositive_device_wall_time():
+    invalid = _trace([], duration=0)
+    with pytest.raises(RuntimeError, match="communication rollup timing unavailable"):
+        build_node_rollup([(invalid, 0.0, 0.4)], multi_device_file=False)
 
 
 def test_rollup_comm_inconclusive():

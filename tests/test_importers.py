@@ -447,7 +447,7 @@ def test_golden_customer_report(tmp_path):
 
     if os.environ.get("GITM_UPDATE_GOLDEN") == "1":
         golden.write_text(md)
-    assert md == golden.read_text(), (
+    assert md == golden.read_text(encoding="utf-8"), (
         "customer report drifted from golden — set GITM_UPDATE_GOLDEN=1 if intentional"
     )
 
