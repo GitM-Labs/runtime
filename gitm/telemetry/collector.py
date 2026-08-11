@@ -34,10 +34,17 @@ class Collector:
 
     def __init__(self, cfg: CollectorConfig) -> None:
         self._cfg = cfg
-        self._backends: list[Backend] = cfg.backends if cfg.backends is not None else discover_backends()
         self.diagnostics: list[str] = []
         self._diagnostic_keys: set[str] = set()
-        if not self._backends:
+        discovery_diagnostics: list[str] = []
+        self._backends: list[Backend] = (
+            cfg.backends
+            if cfg.backends is not None
+            else discover_backends(diagnostics=discovery_diagnostics)
+        )
+        for i, diagnostic in enumerate(discovery_diagnostics):
+            self._record_failure(f"backend-discovery:{i}", diagnostic)
+        if not self._backends and not discovery_diagnostics:
             self._record_failure("backend-discovery", "no live GPU telemetry backend found")
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None

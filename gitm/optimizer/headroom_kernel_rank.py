@@ -187,7 +187,12 @@ def live_gpu_headroom():
     """One-shot live snapshot via the telemetry backend (no running workload required)."""
     from gitm.telemetry.backends import discover_backends
 
-    backends = discover_backends()
+    discovery_diagnostics: list[str] = []
+    backends = discover_backends(diagnostics=discovery_diagnostics)
+    for diagnostic in discovery_diagnostics:
+        warnings.warn(
+            f"live GPU headroom degraded: {diagnostic}", RuntimeWarning, stacklevel=2
+        )
     if not backends:
         warnings.warn(
             "live GPU headroom unavailable: no telemetry backend found",
@@ -196,21 +201,32 @@ def live_gpu_headroom():
         )
     out = []
     for b in backends:
-        for idx in range(b.device_count()):
-            s = b.sample(idx)
-            for diagnostic in s.diagnostics:
+        try:
+            for idx in range(b.device_count()):
+                s = b.sample(idx)
+                for diagnostic in s.diagnostics:
+                    warnings.warn(
+                        f"live GPU headroom degraded: {diagnostic}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                out.append({
+                    "gpu_index": idx,
+                    "util_pct": s.util_pct,
+                    "mem_used_bytes": s.mem_used_bytes,
+                    "mem_total_bytes": s.mem_total_bytes,
+                    "power_w": s.power_w,
+                    "sm_clock_mhz": s.sm_clock_mhz,
+                    "throttle": s.throttle_reasons.name if s.throttle_reasons else "NONE",
+                })
+        finally:
+            try:
+                b.close()
+            except Exception as exc:
                 warnings.warn(
-                    f"live GPU headroom degraded: {diagnostic}",
+                    f"live GPU headroom degraded: backend close failed "
+                    f"({type(exc).__name__}: {exc})",
                     RuntimeWarning,
                     stacklevel=2,
                 )
-            out.append({
-                "gpu_index": idx,
-                "util_pct": s.util_pct,
-                "mem_used_bytes": s.mem_used_bytes,
-                "mem_total_bytes": s.mem_total_bytes,
-                "power_w": s.power_w,
-                "sm_clock_mhz": s.sm_clock_mhz,
-                "throttle": s.throttle_reasons.name if s.throttle_reasons else "NONE",
-            })
     return out

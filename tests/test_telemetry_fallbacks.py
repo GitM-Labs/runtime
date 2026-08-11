@@ -9,6 +9,99 @@ from gitm.telemetry.collector import Collector, CollectorConfig
 from gitm.telemetry.schema import Sample
 
 
+def test_discovery_surfaces_unexpected_vendor_failure_and_closes_partial_backend(monkeypatch):
+    import gitm.telemetry.backends.amd as amd
+    import gitm.telemetry.backends.nvidia as nvidia
+    from gitm.telemetry.backends.discover import discover_backends
+
+    closed = []
+
+    class BrokenCount:
+        def device_count(self):
+            raise RuntimeError("NVML count failed")
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(nvidia, "NvidiaBackend", BrokenCount)
+    monkeypatch.setattr(
+        amd, "AmdBackend", lambda: (_ for _ in ()).throw(ImportError("optional ROCm absent"))
+    )
+    diagnostics = []
+
+    assert discover_backends(diagnostics=diagnostics) == []
+    assert closed == [True]
+    assert any("nvidia" in d and "NVML count failed" in d for d in diagnostics)
+    assert not any("optional ROCm absent" in d for d in diagnostics)
+
+
+def test_collector_carries_discovery_diagnostics(monkeypatch):
+    monkeypatch.setattr(
+        "gitm.telemetry.collector.discover_backends",
+        lambda *, diagnostics: diagnostics.append("nvidia discovery failed: denied") or [],
+    )
+
+    with pytest.warns(RuntimeWarning, match="nvidia discovery failed"):
+        collector = Collector(CollectorConfig())
+
+    assert any("nvidia discovery failed" in d for d in collector.diagnostics)
+
+
+def test_doctor_reports_discovery_diagnostics_and_closes_backend(monkeypatch):
+    from gitm.doctor import doctor
+
+    closed = []
+
+    class Backend:
+        vendor = "nvidia"
+
+        def device_count(self):
+            return 1
+
+        def close(self):
+            closed.append(True)
+
+    def discover(*, diagnostics):
+        diagnostics.append("amd discovery failed: broken runtime")
+        return [Backend()]
+
+    monkeypatch.setattr("gitm.telemetry.backends.discover_backends", discover)
+    report = doctor()
+
+    assert report["telemetry_diagnostics"] == ["amd discovery failed: broken runtime"]
+    assert report["telemetry_backends"] == [{"vendor": "nvidia", "device_count": 1}]
+    assert closed == [True]
+
+
+def test_live_headroom_warns_discovery_diagnostic_and_closes_backend(monkeypatch):
+    from gitm.optimizer.headroom_kernel_rank import live_gpu_headroom
+
+    closed = []
+
+    class Backend:
+        def device_count(self):
+            return 1
+
+        def sample(self, _index):
+            return Sample(
+                ts_ns=1, node="n", gpu_uuid="g", gpu_index=0, vendor="nvidia"
+            )
+
+        def close(self):
+            closed.append(True)
+
+    def discover(*, diagnostics):
+        diagnostics.append("amd discovery failed: broken runtime")
+        return [Backend()]
+
+    monkeypatch.setattr("gitm.telemetry.backends.discover_backends", discover)
+    with pytest.warns(RuntimeWarning, match="amd discovery failed"):
+        rows = live_gpu_headroom()
+
+    assert len(rows) == 1
+    assert closed == [True]
+
+
 class _BrokenBackend:
     def device_count(self):
         return 1
