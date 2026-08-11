@@ -71,6 +71,30 @@ def test_refuses_nonpositive_trace_duration():
         compute_metrics(trace, PEAK)
 
 
+@pytest.mark.parametrize(
+    ("start_ns", "end_ns"),
+    [(-1, 10), (20, 10), (50, 250 * US)],
+)
+def test_invalid_kernel_window_refuses_clamped_busy_fraction(start_ns, end_ns):
+    trace = _trace()
+    bad = trace.events[0].model_copy(update={"start_ns": start_ns, "end_ns": end_ns})
+    trace = trace.model_copy(update={"events": [bad, *trace.events[1:]]})
+
+    with pytest.raises(RuntimeError, match="kernel timing.*outside trace window"):
+        compute_metrics(trace, PEAK)
+
+
+def test_zero_duration_kernel_is_warned_not_counted_as_busy():
+    trace = _trace()
+    pad = trace.events[0].model_copy(update={"start_ns": 200 * US, "end_ns": 200 * US})
+    trace = trace.model_copy(update={"events": [*trace.events, pad]})
+
+    with pytest.warns(RuntimeWarning, match="zero-duration kernel"):
+        result = compute_metrics(trace, PEAK)
+
+    assert result.busy_fraction == pytest.approx(0.5)
+
+
 def test_refuses_unpriced_memory_bandwidth():
     peak = HardwarePeak(name="UNKNOWN", peak_flops=1e14, peak_bw_bytes_s=0.0)
     with pytest.raises(RuntimeError, match="peak bandwidth must be positive"):

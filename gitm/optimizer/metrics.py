@@ -23,6 +23,7 @@ busy" (high HFU) vs "the GPU is doing useful work" (high MFU) separable.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
@@ -173,7 +174,30 @@ def compute_metrics(
     wall_s = require_positive_duration(
         trace.duration_ns / 1e9, context=f"{trace.workload_id} utilization metrics"
     )
+    invalid_kernels = [
+        k
+        for k in kernels
+        if k.start_ns < 0 or k.end_ns < k.start_ns or k.end_ns > trace.duration_ns
+    ]
+    if invalid_kernels:
+        raise RuntimeError(
+            f"{trace.workload_id} utilization kernel timing is outside trace window for "
+            f"{len(invalid_kernels)}/{len(kernels)} kernel(s); refusing to clamp busy time"
+        )
+    zero_duration = sum(k.end_ns == k.start_ns for k in kernels)
+    if zero_duration:
+        warnings.warn(
+            f"{trace.workload_id} utilization ignored {zero_duration}/{len(kernels)} "
+            "zero-duration kernel(s)",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     busy_fraction = _merged_busy_ns(kernels) / trace.duration_ns
+    if not 0.0 <= busy_fraction <= 1.0:
+        raise RuntimeError(
+            f"{trace.workload_id} utilization busy fraction is contradictory: "
+            f"{busy_fraction!r}"
+        )
     gaps = _idle_gaps(kernels, trace.duration_ns)
     stall_breakdown = _classify_stalls(gaps, memcpys, syncs, trace.duration_ns)
 
@@ -205,7 +229,7 @@ def compute_metrics(
         n_kernels=len(kernels),
         wall_s=wall_s,
         busy_fraction=busy_fraction,
-        stall_fraction=max(0.0, 1.0 - busy_fraction),
+        stall_fraction=1.0 - busy_fraction,
         stall_breakdown=stall_breakdown,
         achieved_flops_per_s=achieved_flops,
         achieved_bw_bytes_s=achieved_bw,
