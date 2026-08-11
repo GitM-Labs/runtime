@@ -47,6 +47,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -424,7 +425,13 @@ def served_model_name(base: str, fallback: str) -> str:
         with urllib.request.urlopen(base + "/v1/models", timeout=10) as r:
             data = json.loads(r.read())
         return data["data"][0]["id"]
-    except Exception:
+    except Exception as exc:
+        warnings.warn(
+            f"served-model discovery failed at {base}/v1/models; using configured "
+            f"fallback {fallback!r} ({type(exc).__name__}: {exc})",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return fallback
 
 

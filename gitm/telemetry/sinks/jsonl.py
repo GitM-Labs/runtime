@@ -26,8 +26,7 @@ class JsonlSink:
 
     def close(self) -> None:
         with self._lock:
-            try:
-                self._fh.flush()
-                self._fh.close()
-            except Exception:
-                pass
+            # Let the collector record and warn on finalization failures. Swallowing
+            # one here makes a truncated telemetry artifact look complete.
+            self._fh.flush()
+            self._fh.close()

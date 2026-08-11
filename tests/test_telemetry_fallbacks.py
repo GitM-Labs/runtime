@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -64,3 +65,34 @@ def test_collector_surfaces_partial_sample_field_failure():
         collector.stop()
 
     assert any("clock throttle reasons unavailable" in d for d in collector.diagnostics)
+
+
+class _BrokenClose:
+    def flush(self):
+        raise OSError("disk full")
+
+    def close(self):
+        raise AssertionError("flush failure should propagate first")
+
+
+def test_jsonl_sink_close_propagates_for_collector_diagnostic():
+    from gitm.telemetry.sinks.jsonl import JsonlSink
+
+    sink = JsonlSink.__new__(JsonlSink)
+    sink._lock = threading.Lock()
+    sink._fh = _BrokenClose()
+
+    with pytest.raises(OSError, match="disk full"):
+        sink.close()
+
+
+def test_otlp_sink_close_propagates_for_collector_diagnostic():
+    from gitm.telemetry.sinks.otlp import OtlpSink
+
+    sink = OtlpSink.__new__(OtlpSink)
+    sink._provider = type(
+        "BrokenProvider", (), {"shutdown": lambda self: (_ for _ in ()).throw(RuntimeError("export"))}
+    )()
+
+    with pytest.raises(RuntimeError, match="export"):
+        sink.close()

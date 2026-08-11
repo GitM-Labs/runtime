@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import threading
+import warnings
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -102,6 +103,34 @@ def test_unreachable_server_returns_none_not_a_fake_record():
     # first token would silently drop out of the percentiles as "unmeasurable" rather
     # than being counted as the failure it is.
     assert sc.one_request("http://127.0.0.1:1", "m", "p", 4, True, 0.5) is None
+
+
+def test_served_model_name_warns_when_endpoint_falls_back(monkeypatch):
+    def fail(*_args, **_kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(sc.urllib.request, "urlopen", fail)
+
+    with pytest.warns(RuntimeWarning, match="served-model discovery failed"):
+        assert sc.served_model_name("http://server", "configured-model") == "configured-model"
+
+
+def test_served_model_name_uses_endpoint_without_warning(monkeypatch):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"data": [{"id": "served-alias"}]}'
+
+    monkeypatch.setattr(sc.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
+
+    with warnings.catch_warnings(record=True) as caught:
+        assert sc.served_model_name("http://server", "configured-model") == "served-alias"
+    assert not caught
 
 
 def test_records_feed_the_existing_summary(sse_server):

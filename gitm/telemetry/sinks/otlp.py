@@ -48,7 +48,6 @@ class OtlpSink:
             self._temp.set(sample.temp_c, attributes=attrs)
 
     def close(self) -> None:
-        try:
-            self._provider.shutdown()
-        except Exception:
-            pass
+        # Collector.stop owns the fail-open boundary and turns this into a named
+        # diagnostic. Hiding it here would make dropped final exports invisible.
+        self._provider.shutdown()
