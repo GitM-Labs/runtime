@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import math
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -75,7 +76,15 @@ def apply_intervention(
     blocks the apply). Pass one only where the applicator mutates a real target;
     a dry-run leaves it ``None`` so the trail stays free of no-op entries.
     """
-    snapshot = applicator.snapshot()
+    try:
+        snapshot = applicator.snapshot()
+    except Exception as exc:
+        return ApplyResult(
+            False,
+            rolled_back=False,
+            measured_delta=None,
+            error=f"baseline snapshot failed; intervention not applied: {exc}",
+        )
 
     # Step 2: apply. A bad value (validation error) rolls straight back.
     try:
@@ -319,7 +328,9 @@ class LiveEngineApplicator:
         self._restart_mode = restart_mode
         self._getter = getter or get_knob
         self._setter = setter or set_knob
-        self._reps = max(1, reps)
+        if isinstance(reps, bool) or not isinstance(reps, int) or reps <= 0:
+            raise ValueError(f"A/B repetition count must be a positive integer, got {reps!r}")
+        self._reps = reps
         # force_restart is kept for custom deployments that still classify a
         # knob as scheduling but want to measure it through the restart path.
         self._force_restart = force_restart
@@ -339,7 +350,13 @@ class LiveEngineApplicator:
         stdev is 0.0 for a single rep → the noise band is 0 and keep falls back to
         ``delta > 0``, i.e. reps=1 behaves exactly as before reps were added.
         """
-        samples = [self._tps(self.engine) for _ in range(self._reps)]
+        samples = [float(self._tps(self.engine)) for _ in range(self._reps)]
+        invalid = [sample for sample in samples if not math.isfinite(sample) or sample <= 0.0]
+        if invalid:
+            raise ValueError(
+                "decode throughput samples must be finite and positive; "
+                f"observed {invalid!r}"
+            )
         mean = sum(samples) / len(samples)
         if len(samples) < 2:
             return mean, 0.0

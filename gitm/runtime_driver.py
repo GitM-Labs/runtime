@@ -81,8 +81,12 @@ def _free_gpu_pool():
         import cupy
 
         cupy.get_default_memory_pool().free_all_blocks()
-    except Exception:
-        pass
+    except Exception as exc:
+        warnings.warn(
+            f"GPU memory-pool cleanup unavailable: {type(exc).__name__}: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def _stream_hft(stage: Path, seed: int, shards_per_batch: int, max_shards: int | None):

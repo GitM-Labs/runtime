@@ -261,6 +261,25 @@ def test_restart_apply_rolls_back_to_original_engine_on_regression():
     assert app.engine is e0  # original engine restored
 
 
+@pytest.mark.parametrize("sample", [0.0, -1.0, float("nan"), float("inf")])
+def test_live_engine_ab_refuses_invalid_throughput_samples(sample):
+    engine = _TpsEngine(sample)
+    app = LiveEngineApplicator(engine, throughput_fn=_tps_of)
+
+    result = apply_intervention(_spec("max_num_seqs", 64), app)
+
+    assert not result.rolled_back
+    assert not result.applied
+    assert "finite and positive" in result.error
+    assert app.last_result is None
+
+
+@pytest.mark.parametrize("reps", [0, -1, 1.5, True])
+def test_live_engine_ab_refuses_invalid_repetition_counts(reps):
+    with pytest.raises(ValueError, match="repetition count must be a positive integer"):
+        LiveEngineApplicator(_TpsEngine(100.0), throughput_fn=_tps_of, reps=reps)
+
+
 
 def test_serial_restart_releases_baseline_before_building_candidate():
     class Engine(_TpsEngine):

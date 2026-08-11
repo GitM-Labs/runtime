@@ -688,8 +688,12 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
             if callable(obj):
                 try:
                     obj()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    warnings.warn(
+                        f"vLLM engine shutdown path {path!r} failed: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                 break
 
         try:
@@ -700,22 +704,36 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
 
             destroy_model_parallel()
             destroy_distributed_environment()
-        except Exception:
-            pass
+        except Exception as exc:
+            warnings.warn(
+                f"vLLM distributed-state cleanup failed: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         try:
             import torch.distributed as dist
 
             if dist.is_available() and dist.is_initialized():
                 dist.destroy_process_group()
-        except Exception:
-            pass
+        except Exception as exc:
+            warnings.warn(
+                f"torch distributed process-group cleanup failed: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         for attr in ("llm_engine", "engine"):
+            if not hasattr(engine, attr):
+                continue
             try:
                 delattr(engine, attr)
-            except Exception:
-                pass
+            except Exception as exc:
+                warnings.warn(
+                    f"vLLM engine reference cleanup for {attr!r} failed: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         try:
             import gc
@@ -726,8 +744,12 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
-        except Exception:
-            pass
+        except Exception as exc:
+            warnings.warn(
+                f"GPU cleanup after vLLM shutdown failed: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def _activate_engine(engine: Any) -> None:
         engine_ref["engine"] = engine
