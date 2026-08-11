@@ -371,6 +371,7 @@ def test_vllm_loop_surfaces_residual_coverage(tmp_path: Path, monkeypatch):
     """Unclassified work must be visible in both the JSON and human report."""
     import json
 
+    import gitm.planner.context as planner_context
     import gitm.scheduler.loop as loop
 
     @contextmanager
@@ -384,6 +385,7 @@ def test_vllm_loop_surfaces_residual_coverage(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(loop, "capture", fake_capture)
     monkeypatch.setattr(loop, "sync_device", lambda: None)
     monkeypatch.setenv("GITM_GPU_SKU", "NVIDIA B200")
+    monkeypatch.setattr(planner_context, "_query_nvml", lambda: ("NVIDIA B200", None))
 
     from gitm import optimize
 
@@ -401,6 +403,7 @@ def test_vllm_loop_surfaces_residual_coverage(tmp_path: Path, monkeypatch):
     assert payload["coverage"]["warnings"]
     assert "## Runtime diagnostics" in result["report_md"]
     assert "matched to the predicted graph" in result["report_md"]
+    assert "GPU count was unavailable" in result["report_md"]
 
 
 def test_vllm_loop_without_model_does_not_run_autoresearch_on_default_graph(

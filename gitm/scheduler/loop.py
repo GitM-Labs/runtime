@@ -707,6 +707,10 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # Llama/A100 default prediction.
     pctx = build_planner_context(cfg.engine, workload=workload)
     graph_resolution = _execution_graph(cfg.engine, pctx, sched_summary)
+    if pctx.num_gpus_is_fallback:
+        graph_resolution.diagnostics.append(
+            "GPU count was unavailable; using 1 for intervention applicability only"
+        )
     graph_resolution.diagnostics.extend(sched_summary.diagnostics)
     if not graph_resolution.ok:
         (run_dir / "prediction_refusal.json").write_text(

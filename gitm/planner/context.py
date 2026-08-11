@@ -120,6 +120,7 @@ class PlannerContext:
     peak: HardwarePeak | None
     sku: str | None
     num_gpus: int
+    num_gpus_is_fallback: bool = False
 
 
 def _query_nvml() -> tuple[str | None, int | None]:
@@ -221,13 +222,23 @@ def build_planner_context(
 
     ``GITM_GPU_SKU`` overrides NVML (useful in CI / on a box without pynvml).
     """
+    if num_gpus is not None and num_gpus <= 0:
+        raise ValueError(f"num_gpus must be positive when supplied, got {num_gpus}")
     env_sku = os.environ.get("GITM_GPU_SKU")
     # Only touch NVML if something it provides is actually missing.
     nvml_name = nvml_count = None
     if env_sku is None or num_gpus is None:
         nvml_name, nvml_count = _query_nvml()
     sku = env_sku or nvml_name
-    n = num_gpus or nvml_count or 1
+    if num_gpus is not None:
+        n = num_gpus
+        num_gpus_is_fallback = False
+    elif nvml_count is not None and nvml_count > 0:
+        n = nvml_count
+        num_gpus_is_fallback = False
+    else:
+        n = 1
+        num_gpus_is_fallback = True
     peak = peak_for_sku(sku)
     dtype = _engine_dtype(engine)
     kv_len = _engine_kv_len(engine)
@@ -241,4 +252,10 @@ def build_planner_context(
         has_collective=n > 1,
         has_interconnect=n > 1,  # refined later by NVLink/IB probe
     )
-    return PlannerContext(gate=gate, peak=peak, sku=sku, num_gpus=n)
+    return PlannerContext(
+        gate=gate,
+        peak=peak,
+        sku=sku,
+        num_gpus=n,
+        num_gpus_is_fallback=num_gpus_is_fallback,
+    )

@@ -465,6 +465,8 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
             f"GPU SKU {planner_ctx.sku or 'unknown'!r} is not in the hardware catalogue; "
             f"pricing uses fallback {hw.name!r}"
         )
+    if planner_ctx.num_gpus_is_fallback:
+        warnings.append("GPU count was unavailable; recording a fallback count of 1")
     if g.has_unpriced_nodes:
         missing = []
         if g.has_unpriced_compute:
@@ -488,6 +490,8 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
         "hardware": planner_ctx.sku,
         "hardware_pricing": hw.name,
         "hardware_is_fallback": planner_ctx.peak is None,
+        "num_gpus": planner_ctx.num_gpus,
+        "num_gpus_is_fallback": planner_ctx.num_gpus_is_fallback,
         "sharding": {"tp": sh.tp, "ep": sh.ep, "dp": sh.dp},
         "dtypes": {
             "weight": spec.weight_dtype,

@@ -81,6 +81,27 @@ def test_build_planner_context_sku_override(monkeypatch):
     assert pctx.gate.workload == "vllm-decode"
     assert pctx.gate.hardware == "NVIDIA A100-SXM4-80GB"
     assert pctx.gate.dtype is None  # no engine attached
+    assert pctx.num_gpus_is_fallback is False
+
+
+def test_build_planner_context_flags_unknown_gpu_count(monkeypatch):
+    import gitm.planner.context as context
+
+    monkeypatch.setenv("GITM_GPU_SKU", "NVIDIA B200")
+    monkeypatch.setattr(context, "_query_nvml", lambda: ("NVIDIA B200", None))
+
+    pctx = context.build_planner_context()
+
+    assert pctx.num_gpus == 1
+    assert pctx.num_gpus_is_fallback is True
+
+
+@pytest.mark.parametrize("count", [0, -1])
+def test_build_planner_context_refuses_invalid_explicit_gpu_count(count):
+    from gitm.planner.context import build_planner_context
+
+    with pytest.raises(ValueError, match="num_gpus must be positive"):
+        build_planner_context(num_gpus=count)
 
 
 def test_unknown_sku_yields_no_peak(monkeypatch):

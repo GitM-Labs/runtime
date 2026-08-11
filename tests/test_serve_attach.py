@@ -292,13 +292,20 @@ def test_predicted_graph_surfaces_resolved_warnings_and_bytes_fallback(
     monkeypatch.setattr(
         planner_context,
         "build_planner_context",
-        lambda: SimpleNamespace(peak=peak_for_sku("NVIDIA B200"), sku="NVIDIA B200"),
+        lambda: SimpleNamespace(
+            peak=peak_for_sku("NVIDIA B200"),
+            sku="NVIDIA B200",
+            num_gpus=1,
+            num_gpus_is_fallback=True,
+        ),
     )
 
     att._emit_predicted_graph(discover.Target(pid=1, cmdline=[]), tmp_path)
 
     payload = json.loads((tmp_path / "predicted_moe_graph.json").read_text())
     assert payload["has_fallback_bytes"] is True
+    assert payload["num_gpus_is_fallback"] is True
+    assert any("GPU count was unavailable" in warning for warning in payload["warnings"])
     assert any(node["bytes_are_fallback"] for node in payload["nodes"])
     assert payload["warnings"]
     stdout = capsys.readouterr().out
@@ -340,12 +347,19 @@ def test_predicted_graph_known_dtypes_leave_bytes_fallback_clean(tmp_path, monke
     monkeypatch.setattr(
         planner_context,
         "build_planner_context",
-        lambda: SimpleNamespace(peak=peak_for_sku("NVIDIA B200"), sku="NVIDIA B200"),
+        lambda: SimpleNamespace(
+            peak=peak_for_sku("NVIDIA B200"),
+            sku="NVIDIA B200",
+            num_gpus=1,
+            num_gpus_is_fallback=False,
+        ),
     )
 
     att._emit_predicted_graph(discover.Target(pid=1, cmdline=[]), tmp_path)
     payload = json.loads((tmp_path / "predicted_moe_graph.json").read_text())
     assert payload["has_fallback_bytes"] is False
+    assert payload["num_gpus_is_fallback"] is False
+    assert not any("GPU count was unavailable" in warning for warning in payload["warnings"])
     assert not any(node["bytes_are_fallback"] for node in payload["nodes"])
 
 
