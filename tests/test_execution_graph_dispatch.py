@@ -30,9 +30,20 @@ def _moe_cfg(**over) -> dict:
         "num_attention_heads": 1,
         "num_key_value_heads": 1,
         "head_dim": 64,
+        "qk_rope_head_dim": 16,
+        "q_lora_rank": 16,
+        "o_lora_rank": 16,
+        "o_groups": 1,
+        "vocab_size": 128,
         "n_routed_experts": 4,
+        "n_shared_experts": 0,
         "num_experts_per_tok": 1,
         "moe_intermediate_size": 32,
+        "index_n_heads": 1,
+        "index_head_dim": 16,
+        "index_topk": 32,
+        "sliding_window": 16,
+        "compress_ratios": [0, 4],
         "expert_dtype": "fp4",
         "quantization_config": {"quant_method": "fp8"},
         "torch_dtype": "bfloat16",
@@ -67,6 +78,16 @@ def test_partial_sparse_config_is_refused_not_sent_to_dense_graph():
 
     assert not resolved.ok and resolved.graph is None
     assert "experts per token" in resolved.refusal_reason
+
+
+def test_zero_expert_count_is_refused_not_priced_as_dense():
+    resolved = _execution_graph(
+        _engine(_moe_cfg(n_routed_experts=0)), _pctx(), sched=None
+    )
+
+    assert not resolved.ok and resolved.graph is None
+    assert "routed expert count" in resolved.refusal_reason
+    assert "positive" in resolved.refusal_reason
 
 
 def test_missing_live_model_refuses_instead_of_defaulting_to_llama():

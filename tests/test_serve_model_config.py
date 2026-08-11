@@ -29,9 +29,23 @@ def _deepseek_cfg(**over) -> dict:
         "model_type": "deepseek_v4",
         "num_hidden_layers": 4,
         "hidden_size": 4096,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 1,
+        "head_dim": 512,
+        "qk_rope_head_dim": 64,
+        "q_lora_rank": 1024,
+        "o_lora_rank": 1024,
+        "o_groups": 8,
+        "vocab_size": 129280,
         "n_routed_experts": 256,
+        "n_shared_experts": 1,
         "num_experts_per_tok": 6,
         "moe_intermediate_size": 2048,
+        "index_n_heads": 64,
+        "index_head_dim": 128,
+        "index_topk": 512,
+        "sliding_window": 128,
+        "compress_ratios": [0, 0, 4, 128],
         "quantization_config": {"quant_method": "fp8"},
         "expert_dtype": "fp4",
         "torch_dtype": "bfloat16",
@@ -96,14 +110,16 @@ def test_sparse_candidate_with_partial_expert_shape_is_not_misread_as_dense():
     assert not mc.is_sparse_moe_config({"model_type": "llama"})
 
 
-def test_mixtral_aliases_are_recognized_not_rejected():
+def test_mixtral_aliases_are_recognized_but_unsupported_shape_is_refused():
     mixtral = {
         "model_type": "mixtral",
         "num_local_experts": 8,
         "num_experts_per_tok": 2,
         "intermediate_size": 14336,
     }
-    assert mc.validate_moe_config(mixtral) == []
+    missing = mc.validate_moe_config(mixtral)
+    assert any("compress_ratios" in item for item in missing)
+    assert any("hidden_size" in item for item in missing)
     norm = mc.normalize_moe_config(mixtral)
     assert norm["n_routed_experts"] == 8
     assert norm["moe_intermediate_size"] == 14336
@@ -115,6 +131,16 @@ def test_missing_topk_is_refused_and_names_the_key():
     cfg = {"num_local_experts": 8, "intermediate_size": 14336}
     missing = mc.validate_moe_config(cfg)
     assert any("experts per token" in m for m in missing)
+
+
+def test_nonpositive_expert_shape_is_refused_instead_of_priced_as_dense():
+    missing = mc.validate_moe_config(_deepseek_cfg(n_routed_experts=0))
+    assert any("routed expert count" in item and "positive" in item for item in missing)
+
+
+def test_short_compression_schedule_is_refused_instead_of_reusing_last_ratio():
+    missing = mc.validate_moe_config(_deepseek_cfg(compress_ratios=[0, 4]))
+    assert any("compress_ratios" in item and "4 layers" in item for item in missing)
 
 
 def test_unpriceable_quant_method_is_refused_not_defaulted():

@@ -235,16 +235,77 @@ def validate_moe_config(cfg: dict[str, Any]) -> list[str]:
     supported config would carry.
     """
     missing: list[str] = []
-    if _first_present(cfg, _EXPERT_COUNT_ALIASES) is None:
-        missing.append(" | ".join(_EXPERT_COUNT_ALIASES) + " (routed expert count)")
-    if _first_present(cfg, _EXPERT_TOPK_ALIASES) is None:
-        missing.append(" | ".join(_EXPERT_TOPK_ALIASES) + " (experts per token)")
-    if _first_present(cfg, _EXPERT_INTER_ALIASES) is None:
-        missing.append(" | ".join(_EXPERT_INTER_ALIASES) + " (expert intermediate size)")
+
+    def positive_alias(keys: tuple[str, ...], label: str) -> int | None:
+        value = _first_present(cfg, keys)
+        joined = " | ".join(keys)
+        if value is None:
+            missing.append(f"{joined} ({label})")
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            missing.append(f"{joined} ({label}) must be a positive integer, got {value!r}")
+            return None
+        return value
+
+    n_experts = positive_alias(_EXPERT_COUNT_ALIASES, "routed expert count")
+    top_k = positive_alias(_EXPERT_TOPK_ALIASES, "experts per token")
+    positive_alias(_EXPERT_INTER_ALIASES, "expert intermediate size")
+    if n_experts is not None and top_k is not None and top_k > n_experts:
+        missing.append(
+            f"experts per token {top_k} exceeds routed expert count {n_experts}"
+        )
+
+    # The sparse graph is a V4-shaped attention model, not a generic MoE graph.
+    # Every field below changes a node's compute/bytes; defaulting any of them to
+    # V4 values would fabricate a plausible graph for a partial or foreign model.
+    for key in (
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "q_lora_rank",
+        "o_lora_rank",
+        "o_groups",
+        "vocab_size",
+        "index_n_heads",
+        "index_head_dim",
+        "index_topk",
+        "sliding_window",
+    ):
+        value = cfg.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            missing.append(f"{key} must be a declared positive integer, got {value!r}")
+    qk_rope = cfg.get("qk_rope_head_dim")
+    if isinstance(qk_rope, bool) or not isinstance(qk_rope, int) or qk_rope < 0:
+        missing.append(
+            f"qk_rope_head_dim must be a declared non-negative integer, got {qk_rope!r}"
+        )
+    shared = cfg.get("n_shared_experts")
+    if isinstance(shared, bool) or not isinstance(shared, int) or shared < 0:
+        missing.append(
+            f"n_shared_experts must be a declared non-negative integer, got {shared!r}"
+        )
+    if cfg.get("torch_dtype") is None:
+        missing.append("torch_dtype must be declared; activation width cannot be guessed")
+
+    n_layers = cfg.get("num_hidden_layers")
+    ratios = cfg.get("compress_ratios")
+    if not isinstance(ratios, (list, tuple)):
+        missing.append("compress_ratios must be declared for the sparse-attention graph")
+    elif isinstance(n_layers, int) and n_layers > 0 and len(ratios) < n_layers:
+        missing.append(
+            f"compress_ratios has {len(ratios)} entries; need at least {n_layers} for {n_layers} layers"
+        )
+    elif any(isinstance(r, bool) or not isinstance(r, int) or r < 0 for r in ratios):
+        missing.append("compress_ratios must contain non-negative integers")
 
     # Quantisation: a *declared* method must be one the roofline can price. No
     # ``quantization_config`` is fine — that is an unquantised (bf16) checkpoint.
     q = cfg.get("quantization_config") or {}
+    if not isinstance(q, dict):
+        missing.append("quantization_config must be an object when declared")
+        q = {}
     method = q.get("quant_method")
     if method is not None and str(method).lower() not in KNOWN_DTYPES:
         missing.append(

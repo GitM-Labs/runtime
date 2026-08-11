@@ -13,7 +13,14 @@ from __future__ import annotations
 import pytest
 
 from gitm.planner.graph import predict_graph
-from gitm.planner.roofline import BatchConfig, HardwareSpec, ModelSpec, distinct_experts
+from gitm.planner.roofline import (
+    BatchConfig,
+    HardwareSpec,
+    ModelSpec,
+    ShardingConfig,
+    distinct_experts,
+    roofline,
+)
 
 # Qwen3.6-35B-A3B-FP8 shaped: narrow hidden, many narrow experts, one shared
 # expert, fp8 weights with bf16 activations.
@@ -106,10 +113,41 @@ def test_moe_spec_properties():
     assert MOE.shared_intermediate == 768  # falls back to the routed width
 
 
-def test_num_experts_without_top_k_stays_dense():
-    """Half-configured is dense, not a mixture — no silent guessing."""
-    assert not ModelSpec(num_experts=256).is_moe
-    assert not ModelSpec(experts_per_token=8).is_moe
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"num_experts": 256},
+        {"experts_per_token": 8},
+        {"num_experts": 4, "experts_per_token": 8},
+        {"weight_dtype_bytes": 0},
+        {"moe_layer_step": 0},
+        {"full_attn_layer_step": 0},
+    ],
+)
+def test_model_spec_refuses_values_that_were_silently_clamped_or_defaulted(kwargs):
+    with pytest.raises(ValueError):
+        ModelSpec(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: BatchConfig(batch=0),
+        lambda: BatchConfig(speculative_tokens=-1),
+        lambda: BatchConfig(acceptance_rate=1.1),
+        lambda: ShardingConfig(tp=0),
+        lambda: ShardingConfig(ep_imbalance=0.5),
+    ],
+)
+def test_decode_and_sharding_specs_refuse_invalid_fallback_inputs(factory):
+    with pytest.raises(ValueError):
+        factory()
+
+
+@pytest.mark.parametrize("flops, bytes_moved", [(-1.0, 1.0), (1.0, -1.0), (float("nan"), 1.0)])
+def test_roofline_refuses_invalid_work_terms(flops, bytes_moved):
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        roofline("bad", flops, bytes_moved, H100)
 
 
 # --- graph: dense back-compat -------------------------------------------------

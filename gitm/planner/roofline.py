@@ -19,6 +19,7 @@ surfaces as ``peak_is_fallback`` rather than as a confident wrong number.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 # Bytes of HBM traffic per stored weight, including the quantisation scales that
@@ -143,6 +144,36 @@ class ModelSpec:
     #: 1 = every layer is full attention, i.e. a conventional transformer.
     full_attn_layer_step: int = 1
 
+    def __post_init__(self) -> None:
+        for name in ("hidden", "n_layers", "n_heads", "num_kv_heads", "head_dim", "dtype_bytes", "vocab"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        for name in ("moe_layer_step", "full_attn_layer_step"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        for name in ("num_experts", "experts_per_token", "shared_experts", "first_dense_layers"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+        if (self.num_experts == 0) != (self.experts_per_token == 0):
+            raise ValueError("num_experts and experts_per_token must both be zero or both positive")
+        if self.experts_per_token > self.num_experts:
+            raise ValueError("experts_per_token cannot exceed num_experts")
+        if self.first_dense_layers > self.n_layers:
+            raise ValueError("first_dense_layers cannot exceed n_layers")
+        for name in ("moe_intermediate", "shared_expert_intermediate", "weight_dtype_bytes"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer when supplied, got {value!r}")
+        if not isinstance(self.intermediate, int) or isinstance(self.intermediate, bool):
+            raise ValueError(f"intermediate must be an integer, got {self.intermediate!r}")
+        if self.intermediate < 0 or (self.n_moe_layers < self.n_layers and self.intermediate == 0):
+            raise ValueError("intermediate must be positive when any dense FFN layer is present")
+
     @property
     def is_moe(self) -> bool:
         """True when *any* layer's FFN should be modeled as a mixture of experts."""
@@ -159,8 +190,7 @@ class ModelSpec:
         """
         if not self.is_moe or layer < self.first_dense_layers:
             return False
-        step = max(self.moe_layer_step, 1)
-        return (layer - self.first_dense_layers) % step == 0
+        return (layer - self.first_dense_layers) % self.moe_layer_step == 0
 
     @property
     def n_moe_layers(self) -> int:
@@ -184,8 +214,7 @@ class ModelSpec:
         magnitude, and it is why a hybrid model can serve long contexts with only
         a few percent of KV-cache utilisation.
         """
-        step = max(self.full_attn_layer_step, 1)
-        return layer % step == 0
+        return layer % self.full_attn_layer_step == 0
 
     @property
     def n_full_attention_layers(self) -> int:
@@ -195,7 +224,7 @@ class ModelSpec:
     @property
     def is_hybrid_attention(self) -> bool:
         """True when some layers use linear/recurrent attention instead of KV."""
-        return max(self.full_attn_layer_step, 1) > 1
+        return self.full_attn_layer_step > 1
 
     @property
     def linear_attn_state_elems(self) -> int:
@@ -215,17 +244,21 @@ class ModelSpec:
     @property
     def w_bytes(self) -> int:
         """Bytes per weight element (falls back to the activation dtype)."""
-        return self.weight_dtype_bytes or self.dtype_bytes
+        return self.weight_dtype_bytes if self.weight_dtype_bytes is not None else self.dtype_bytes
 
     @property
     def expert_intermediate(self) -> int:
         """Per-routed-expert FFN width (falls back to the dense width)."""
-        return self.moe_intermediate or self.intermediate
+        return self.moe_intermediate if self.moe_intermediate is not None else self.intermediate
 
     @property
     def shared_intermediate(self) -> int:
         """Per-shared-expert FFN width (falls back to the routed width)."""
-        return self.shared_expert_intermediate or self.expert_intermediate
+        return (
+            self.shared_expert_intermediate
+            if self.shared_expert_intermediate is not None
+            else self.expert_intermediate
+        )
 
     # --- parameter accounting -------------------------------------------------
     # The "35B-A3B" naming convention: total parameters vs the ones a single
@@ -396,6 +429,30 @@ class SparseMoEModelSpec:
     kv_dtype: str = "fp8"  # KV cache and index keys
     act_dtype: str = "bf16"  # activations between ops
 
+    def __post_init__(self) -> None:
+        positive = (
+            "hidden", "n_layers", "n_heads", "num_kv_heads", "head_dim",
+            "q_lora_rank", "o_lora_rank", "o_groups", "vocab", "n_routed_experts",
+            "num_experts_per_tok", "moe_intermediate_size", "index_n_heads",
+            "index_head_dim", "index_topk",
+        )
+        for name in positive:
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        for name in ("qk_rope_head_dim", "n_shared_experts", "sliding_window", "num_nextn_predict_layers", "dspark_markov_rank"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+        if self.num_experts_per_tok > self.n_routed_experts:
+            raise ValueError("num_experts_per_tok cannot exceed n_routed_experts")
+        if any(not isinstance(r, int) or isinstance(r, bool) or r < 0 for r in self.compress_ratios):
+            raise ValueError("compress_ratios must contain non-negative integers")
+        if any(r == 0 for r in self.compress_ratios) and self.sliding_window <= 0:
+            raise ValueError("sliding_window must be positive when a compression ratio is 0")
+        if any(layer < 0 or layer >= self.n_layers for layer in self.dspark_layer_ids):
+            raise ValueError("dspark_layer_ids must refer to real transformer layers")
+
     def compress_ratio(self, layer: int) -> int:
         """KV compression ratio for ``layer`` (0/1 == uncompressed)."""
         if not self.compress_ratios:
@@ -454,6 +511,14 @@ class ShardingConfig:
     dp: int = 1
     ep_imbalance: float = 1.0
 
+    def __post_init__(self) -> None:
+        for name in ("tp", "ep", "dp"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        if not math.isfinite(self.ep_imbalance) or self.ep_imbalance < 1.0:
+            raise ValueError("ep_imbalance must be finite and at least 1.0")
+
     @property
     def expert_shards(self) -> int:
         """Ranks the expert weights are divided across."""
@@ -477,10 +542,20 @@ class BatchConfig:
     speculative_tokens: int = 0
     acceptance_rate: float = 0.0
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.batch, int) or isinstance(self.batch, bool) or self.batch <= 0:
+            raise ValueError(f"batch must be a positive integer, got {self.batch!r}")
+        for name in ("prompt_len", "kv_cache_len", "speculative_tokens"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+        if not math.isfinite(self.acceptance_rate) or not 0.0 <= self.acceptance_rate <= 1.0:
+            raise ValueError("acceptance_rate must be finite and in [0, 1]")
+
     @property
     def positions_per_step(self) -> int:
         """Sequence positions the model actually computes in one step."""
-        return self.batch * (1 + max(0, self.speculative_tokens))
+        return self.batch * (1 + self.speculative_tokens)
 
     @property
     def tokens_per_step(self) -> float:
@@ -489,7 +564,7 @@ class BatchConfig:
         Always at least ``batch``: the non-speculative token is verified, not
         drafted, so it is never rejected.
         """
-        return self.batch * (1.0 + max(0, self.speculative_tokens) * self.acceptance_rate)
+        return self.batch * (1.0 + self.speculative_tokens * self.acceptance_rate)
 
 
 @dataclass(frozen=True)
@@ -580,6 +655,11 @@ def roofline(
     bytes_are_fallback: bool = False,
 ) -> RooflinePrediction:
     """Compute the roofline prediction for a single op."""
+    if not math.isfinite(flops) or flops < 0 or not math.isfinite(bytes_moved) or bytes_moved < 0:
+        raise ValueError(
+            f"roofline work terms must be finite and non-negative, got "
+            f"flops={flops!r}, bytes_moved={bytes_moved!r}"
+        )
     peak_flops, peak_dtype = resolve_peak(hw, dtype)
     compute_is_unpriced = flops > 0 and peak_flops <= 0
     memory_is_unpriced = bytes_moved > 0 and hw.peak_mem_bw_bytes_per_s <= 0
