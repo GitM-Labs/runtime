@@ -626,7 +626,8 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     serving_summary = summarize_requests(req_records) if req_records else None
     # Collective-communication causes from the same trace — ranked beside the
     # scheduler causes below. Empty when the trace holds no collective kernels.
-    coll_causes = collective_causes(worst_device_comm(trace))
+    coll_stats = worst_device_comm(trace)
+    coll_causes = collective_causes(coll_stats)
     if sched_stats.samples or sched_summary.diagnostics or serving_summary is not None:
         (run_dir / "scheduler_stats.json").write_text(
             json.dumps(
@@ -744,7 +745,11 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # missing/partial live config or unknown SKU refuses graph-based claims and
     # falls through to an honest measurement report; it never becomes a plausible
     # Llama/A100 default prediction.
-    pctx = build_planner_context(cfg.engine, workload=workload)
+    pctx = build_planner_context(
+        cfg.engine,
+        workload=workload,
+        has_collective=coll_stats is not None and coll_stats.comm_ns > 0,
+    )
     graph_resolution = _execution_graph(cfg.engine, pctx, sched_summary)
     if pctx.num_gpus_is_fallback:
         graph_resolution.diagnostics.append(

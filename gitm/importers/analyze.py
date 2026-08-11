@@ -303,7 +303,9 @@ def analyze_paths(
                 hardware=resolved_sku,
                 num_gpus=max(len(device_analyses), 1),
                 has_collective=rollup.has_collective,
-                has_interconnect=rollup.has_collective,  # best-effort: collectives imply interconnect
+                # A collective proves communication occurred, not that its
+                # transport was NVLink/IB rather than PCIe or shared memory.
+                has_interconnect=None,
             )
 
             primary = device_analyses[0]

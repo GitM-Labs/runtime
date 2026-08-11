@@ -217,6 +217,8 @@ def build_planner_context(
     *,
     workload: str = "vllm-decode",
     num_gpus: int | None = None,
+    has_collective: bool = False,
+    has_interconnect: bool | None = None,
 ) -> PlannerContext:
     """Assemble the gate context + hardware peaks for this run.
 
@@ -249,8 +251,10 @@ def build_planner_context(
         hardware=sku,
         kv_cache_len=kv_len,
         num_gpus=n,
-        has_collective=n > 1,
-        has_interconnect=n > 1,  # refined later by NVLink/IB probe
+        # A device count proves neither fact. Callers may pass trace/probe-backed
+        # evidence; otherwise both remain unavailable/false.
+        has_collective=has_collective,
+        has_interconnect=has_interconnect,
     )
     return PlannerContext(
         gate=gate,

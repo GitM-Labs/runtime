@@ -96,6 +96,18 @@ def test_build_planner_context_flags_unknown_gpu_count(monkeypatch):
     assert pctx.num_gpus_is_fallback is True
 
 
+def test_multi_gpu_count_does_not_fabricate_collective_or_interconnect(monkeypatch):
+    import gitm.planner.context as context
+
+    monkeypatch.setattr(context, "_query_nvml", lambda: ("NVIDIA A100-SXM4-80GB", 4))
+
+    pctx = context.build_planner_context()
+
+    assert pctx.num_gpus == 4
+    assert pctx.gate.has_collective is False
+    assert pctx.gate.has_interconnect is None
+
+
 @pytest.mark.parametrize("count", [0, -1])
 def test_build_planner_context_refuses_invalid_explicit_gpu_count(count):
     from gitm.planner.context import build_planner_context

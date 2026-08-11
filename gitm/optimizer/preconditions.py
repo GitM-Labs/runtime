@@ -15,7 +15,7 @@ class GateContext:
     kv_cache_len: int | None = None
     num_gpus: int = 1
     has_collective: bool = False
-    has_interconnect: bool = False
+    has_interconnect: bool | None = None
 
 
 def applicable(spec: InterventionSpec, ctx: GateContext) -> tuple[bool, str]:
@@ -60,7 +60,8 @@ def applicable(spec: InterventionSpec, ctx: GateContext) -> tuple[bool, str]:
         return False, f"num_gpus {ctx.num_gpus} < min {min_gpus}"
     if getattr(app, "requires_collective", False) and not ctx.has_collective:
         return False, "requires a collective (multi-GPU) but run is single-GPU/no-collective"
-    if getattr(app, "requires_interconnect", False) and not ctx.has_interconnect:
-        return False, "requires interconnect (NVLink/IB) but none reported"
+    if getattr(app, "requires_interconnect", False) and ctx.has_interconnect is not True:
+        state = "topology is unknown" if ctx.has_interconnect is None else "none was reported"
+        return False, f"requires interconnect (NVLink/IB) but {state}"
 
     return True, ""
