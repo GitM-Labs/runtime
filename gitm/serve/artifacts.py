@@ -102,13 +102,15 @@ def write_capture_artifacts(
             "source": trace.source,
             "device_count": trace.device_count,
             "events": len(trace.events),
-            "kernels": len(kernels),
+            "kernel_records": len(kernels),
+            "kernels": breakdown.n_kernels,
+            "invalid_kernel_durations": breakdown.n_invalid_duration,
             "duration_ns": trace.duration_ns,
         },
     }
     (out_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2))
 
-    if not kernels:
+    if breakdown.n_kernels == 0:
         status = "no_kernels"
     elif not had_traffic:
         status = "no_traffic"
@@ -119,7 +121,7 @@ def write_capture_artifacts(
         out_dir=out_dir,
         trace_path=trace_path,
         n_events=len(trace.events),
-        n_kernels=len(kernels),
+        n_kernels=breakdown.n_kernels,
         status=status,
         breakdown=breakdown,
         warnings=warnings,

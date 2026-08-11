@@ -454,6 +454,19 @@ def test_empty_trace_and_idle_window_are_different_failures(tmp_path):
     assert _write(tmp_path / "c", [_FakeKernel()], had_traffic=True).status == "ok"
 
 
+def test_zero_duration_kernel_records_do_not_make_capture_successful(tmp_path):
+    result = _write(
+        tmp_path / "zero-duration",
+        [_FakeKernel(start_ns=10, end_ns=10)],
+        had_traffic=True,
+    )
+
+    assert result.status == "no_kernels"
+    assert result.n_kernels == 0
+    assert result.breakdown.n_invalid_duration == 1
+    assert any("non-positive duration" in warning for warning in result.warnings)
+
+
 def test_both_paths_write_the_same_artifact_set(tmp_path):
     """A driven benchmark and a production observation of the same server are only
     comparable if they leave the same files behind."""
