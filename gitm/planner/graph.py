@@ -120,16 +120,25 @@ class Graph:
         return sum(n.prediction.t_pred_s for n in self.nodes)
 
     @property
-    def has_unpriced_collectives(self) -> bool:
-        """True if a collective moves bytes but predicts zero time.
+    def has_unpriced_nodes(self) -> bool:
+        """True if any node moves bytes but predicts zero time.
 
-        Happens when the SKU has no interconnect bandwidth in the catalogue. The
-        node is still in the graph — it just costs nothing, which would quietly
-        credit a sharded deployment with a free all-to-all. Louder to ask than to
-        discover it in a report.
+        This is the general trust net: any missing bandwidth denominator can make
+        real work look free, whether or not the node is a collective.
         """
         return any(
             n.prediction.bytes > 0 and n.prediction.t_pred_s == 0.0 for n in self.nodes
+        )
+
+    @property
+    def has_unpriced_collectives(self) -> bool:
+        """True if a collective moves bytes but predicts zero time."""
+        collective_ops = {"moe_all_to_all", "tp_all_reduce"}
+        return any(
+            n.op in collective_ops
+            and n.prediction.bytes > 0
+            and n.prediction.t_pred_s == 0.0
+            for n in self.nodes
         )
 
     @property
@@ -149,6 +158,11 @@ class Graph:
         width are independent inputs, and decode is commonly memory-bound.
         """
         return any(n.prediction.bytes_are_fallback for n in self.nodes)
+
+    @property
+    def hardware_is_fallback(self) -> bool:
+        """True when the graph uses substituted rather than detected SKU peaks."""
+        return self.hw.is_fallback
 
 
 def predict_graph(

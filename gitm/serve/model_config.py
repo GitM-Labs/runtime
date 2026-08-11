@@ -209,6 +209,22 @@ def _first_present(cfg: dict[str, Any], keys: tuple[str, ...]) -> Any:
     return None
 
 
+def is_sparse_moe_config(cfg: dict[str, Any]) -> bool:
+    """True when any routed-expert shape field makes this a sparse candidate.
+
+    This deliberately recognizes partial configs. A config that declares an
+    expert count but omits top-k must reach :func:`validate_moe_config` and be
+    refused, never fall through to the dense graph because it was incomplete.
+    """
+    # ``intermediate_size`` is also the standard dense-MLP field, so only the
+    # explicitly MoE spelling is a sparse signal on that axis.
+    return (
+        _first_present(cfg, _EXPERT_COUNT_ALIASES) is not None
+        or _first_present(cfg, _EXPERT_TOPK_ALIASES) is not None
+        or cfg.get("moe_intermediate_size") is not None
+    )
+
+
 def validate_moe_config(cfg: dict[str, Any]) -> list[str]:
     """Dominant-term fields this config fails to declare usably. Empty == usable.
 
@@ -238,6 +254,19 @@ def validate_moe_config(cfg: dict[str, Any]) -> list[str]:
     expert_dtype = cfg.get("expert_dtype")
     if expert_dtype is not None and str(expert_dtype).lower() not in KNOWN_DTYPES:
         missing.append(f"expert_dtype={expert_dtype!r} (not priceable)")
+    return missing
+
+
+def validate_priceable_dtypes(spec: SparseMoEModelSpec) -> list[str]:
+    """Final resolved dtypes that would make byte-width pricing fall back."""
+    missing: list[str] = []
+    for field_name in ("weight_dtype", "expert_dtype", "kv_dtype", "act_dtype"):
+        value = getattr(spec, field_name)
+        if str(value).lower() not in KNOWN_DTYPES:
+            missing.append(
+                f"{field_name}={value!r} (not priceable; known: "
+                f"{', '.join(sorted(KNOWN_DTYPES))})"
+            )
     return missing
 
 
@@ -272,6 +301,7 @@ class LiveSpec:
     source_path: Path
     model_ref: str
     applied_overrides: dict[str, Any] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
     ok: bool = True
 
 
@@ -310,6 +340,7 @@ def live_moe_spec(
     supplied (tests). Returns :class:`LiveSpec` on success or :class:`LiveSpecError`
     with the reason — never a defaulted spec, so a report can only ever show a
     prediction against the model that is genuinely loaded.
+
     """
     model_ref = model_ref_from_cmdline(target.cmdline)
     if not model_ref:
@@ -359,10 +390,38 @@ def live_moe_spec(
 
         spec = replace(spec, **spec_changes)
 
+    unpriceable = validate_priceable_dtypes(spec)
+    if unpriceable:
+        return LiveSpecError(
+            reason=(
+                f"{model_ref!r} at {cfg_path} resolves to dtypes this planner cannot "
+                "price without substituting bf16 byte widths."
+            ),
+            model_ref=model_ref,
+            missing_keys=unpriceable,
+        )
+
     sharding = ShardingConfig(
         tp=overrides.get("tp", 1), ep=overrides.get("ep", 1), dp=overrides.get("dp", 1)
     )
     batch = BatchConfig(kv_cache_len=overrides.get("max_model_len", default_kv_cache_len))
+    warnings: list[str] = []
+    if cfg.get("expert_dtype") is None:
+        warnings.append(
+            "expert_dtype absent; inherited "
+            f"weight_dtype={spec.weight_dtype!r} for routed and shared expert weights"
+        )
+    warnings.append("decode batch was not observed; using batch=1 single-sequence floor")
+    if "max_model_len" not in overrides:
+        warnings.append(
+            f"KV cache length was not declared on the launch command; using "
+            f"kv_cache_len={default_kv_cache_len}"
+        )
+    if overrides.get("ep_enabled") and overrides.get("dp", 1) > 1:
+        warnings.append(
+            "expert parallelism with data_parallel_size>1 is approximated over the "
+            "tensor-parallel group"
+        )
 
     return LiveSpec(
         spec=spec,
@@ -371,4 +430,5 @@ def live_moe_spec(
         source_path=cfg_path,
         model_ref=model_ref,
         applied_overrides=overrides,
+        warnings=warnings,
     )

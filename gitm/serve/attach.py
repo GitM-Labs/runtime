@@ -424,6 +424,7 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
     prints the named-key refusal and writes nothing — a defaulted DeepSeek prediction
     next to a real trace would be read as a measurement, which is the one outcome the
     gate exists to prevent. Never raises into the capture path.
+
     """
     from gitm.serve.model_config import LiveSpec, live_moe_spec
 
@@ -442,14 +443,36 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
     from gitm.planner.context import build_planner_context, hardware_spec_for
     from gitm.planner.moe_graph import predict_moe_graph
 
-    hw = hardware_spec_for(build_planner_context().peak)
+    planner_ctx = build_planner_context()
+    hw = hardware_spec_for(planner_ctx.peak)
     g = predict_moe_graph(resolved.spec, hw, resolved.batch, resolved.sharding)
     sh, spec = resolved.sharding, resolved.spec
+    warnings = list(resolved.warnings)
+    if planner_ctx.peak is None:
+        warnings.append(
+            f"GPU SKU {planner_ctx.sku or 'unknown'!r} is not in the hardware catalogue; "
+            f"pricing uses fallback {hw.name!r}"
+        )
+    if g.has_unpriced_nodes:
+        warnings.append(
+            "byte-moving nodes are unpriced (a required bandwidth is absent from the catalogue)"
+        )
+    if g.has_fallback_peaks:
+        warnings.append("priced against fallback compute peaks; the ceiling is low")
+    if g.has_fallback_bytes:
+        warnings.append(
+            "byte widths include an unknown-dtype bf16 fallback; the memory floor is approximate"
+        )
+    n_estimated = sum(1 for n in g.nodes if n.prediction.estimated)
+    if n_estimated:
+        warnings.append(f"{n_estimated} predicted node(s) use documented estimated cost models")
 
     payload = {
         "model_ref": resolved.model_ref,
         "config_source": str(resolved.source_path),
-        "hardware": hw.name,
+        "hardware": planner_ctx.sku,
+        "hardware_pricing": hw.name,
+        "hardware_is_fallback": planner_ctx.peak is None,
         "sharding": {"tp": sh.tp, "ep": sh.ep, "dp": sh.dp},
         "dtypes": {
             "weight": spec.weight_dtype,
@@ -461,7 +484,10 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
         "applied_overrides": resolved.applied_overrides,
         "total_pred_s": g.total_pred_s,
         "has_unpriced_collectives": g.has_unpriced_collectives,
+        "has_unpriced_nodes": g.has_unpriced_nodes,
         "has_fallback_peaks": g.has_fallback_peaks,
+        "has_fallback_bytes": g.has_fallback_bytes,
+        "warnings": warnings,
         "nodes": [
             {
                 "op": n.op,
@@ -472,6 +498,7 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
                 "flops": n.prediction.flops,
                 "bytes": n.prediction.bytes,
                 "estimated": n.prediction.estimated,
+                "bytes_are_fallback": n.prediction.bytes_are_fallback,
             }
             for n in g.nodes
         ],
@@ -484,10 +511,8 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
         f"(TP={sh.tp} EP={sh.ep} DP={sh.dp}, "
         f"w={spec.weight_dtype}/e={spec.expert_dtype}/kv={spec.kv_dtype})"
     )
-    if g.has_unpriced_collectives:
-        print("    - collectives are unpriced (SKU has no interconnect bandwidth in the catalogue)")
-    if g.has_fallback_peaks:
-        print("    - priced against fallback peaks — the ceiling is low in a known direction")
+    for warning in warnings:
+        print(f"    - {warning}")
 
 
 def describe_targets(proc: Path = discover.PROC) -> list[dict]:

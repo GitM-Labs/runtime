@@ -170,6 +170,7 @@ def hardware_spec_for(peak: HardwarePeak | None) -> HardwareSpec:
     quant = quant_peaks_for_sku(peak.name)
     return HardwareSpec(
         name=peak.name,
+        is_fallback=False,
         peak_flops_fp16_per_s=peak.peak_flops,
         peak_flops_bf16_per_s=peak.peak_flops,
         peak_flops_fp8_per_s=quant.get("fp8", 0.0),

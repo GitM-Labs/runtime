@@ -68,6 +68,10 @@ class HardwareSpec:
     """
 
     name: str = "A100-SXM4-80GB"
+    # True when these catalogue numbers were substituted because the runtime did
+    # not identify a priceable SKU. Direct ``HardwareSpec()`` construction is the
+    # same documented A100 fallback; catalogue-backed builders set this false.
+    is_fallback: bool = True
     peak_flops_fp16_per_s: float = 312e12
     peak_flops_bf16_per_s: float = 312e12
     peak_flops_fp32_per_s: float = 19.5e12

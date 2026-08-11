@@ -54,8 +54,16 @@ from gitm.optimizer.vllm_knobs import (
     unmet_prerequisite,
 )
 from gitm.planner.context import build_planner_context, hardware_spec_for
-from gitm.planner.graph import predict_graph
+from gitm.planner.graph import Graph, predict_graph
+from gitm.planner.moe_graph import predict_moe_graph, spec_from_hf_config
+from gitm.planner.roofline import BatchConfig, ModelSpec, ShardingConfig
 from gitm.safety.audit import AuditLog, _write_report
+from gitm.serve.model_config import (
+    is_sparse_moe_config,
+    normalize_moe_config,
+    validate_moe_config,
+    validate_priceable_dtypes,
+)
 from gitm.tracer.capture import capture
 from gitm.tracer.vllm_stats import sample_scheduler_stats, summarize_requests
 from gitm.workloads import WorkloadRunner, get_factory, sync_device
@@ -265,6 +273,234 @@ def _batch_config_from_stats(sched: Any):
     if running is None or running < 1:
         return None
     return BatchConfig(batch=max(int(round(float(running))), 1))
+
+
+@dataclass
+class ExecutionGraphResolution:
+    """A trustworthy loop graph, or the named reason graph-based claims refuse."""
+
+    graph: Graph | None
+    diagnostics: list[str]
+    refusal_reason: str = ""
+    model_source: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.graph is not None and not self.refusal_reason
+
+
+def _engine_hf_config(engine: Any) -> tuple[Any | None, str]:
+    if engine is None:
+        return None, "no live engine was supplied"
+    for path in (
+        "llm_engine.model_config.hf_config",
+        "llm_engine.vllm_config.model_config.hf_config",
+        "model_config.hf_config",
+    ):
+        obj: Any = engine
+        for attr in path.split("."):
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if obj is not None:
+            return obj, path
+    return None, "the live engine exposes no HuggingFace config"
+
+
+def _config_dict(hf: Any) -> tuple[dict[str, Any] | None, str]:
+    try:
+        if isinstance(hf, dict):
+            return dict(hf), ""
+        to_dict = getattr(hf, "to_dict", None)
+        raw = to_dict() if callable(to_dict) else vars(hf)
+        if not isinstance(raw, dict):
+            return None, f"config conversion returned {type(raw).__name__}, not dict"
+        return dict(raw), ""
+    except Exception as exc:
+        # Fail open at the runtime boundary, but preserve the parser failure as
+        # the refusal reason instead of turning it into a default model.
+        return None, f"config conversion failed ({type(exc).__name__}: {exc})"
+
+
+def _engine_value(engine: Any, paths: tuple[str, ...]) -> Any:
+    for path in paths:
+        obj: Any = engine
+        for attr in path.split("."):
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if obj is not None:
+            return obj
+    return None
+
+
+def _loop_batch(engine: Any, pctx: Any, sched: Any) -> tuple[BatchConfig, list[str]]:
+    diagnostics: list[str] = []
+    observed = _batch_config_from_stats(sched)
+    batch = observed.batch if observed is not None else 1
+    if observed is None:
+        diagnostics.append("decode concurrency was not observed; using batch=1")
+
+    kv_len = getattr(getattr(pctx, "gate", None), "kv_cache_len", None)
+    if not isinstance(kv_len, int) or kv_len <= 0:
+        kv_len = 4096
+        diagnostics.append("KV cache length was not exposed; using kv_cache_len=4096")
+
+    speculative = _engine_value(
+        engine,
+        (
+            "speculative_config.num_speculative_tokens",
+            "vllm_config.speculative_config.num_speculative_tokens",
+        ),
+    )
+    speculative_tokens = int(speculative) if isinstance(speculative, int) and speculative > 0 else 0
+    return BatchConfig(
+        batch=batch,
+        kv_cache_len=kv_len,
+        speculative_tokens=speculative_tokens,
+    ), diagnostics
+
+
+def _loop_sharding(engine: Any) -> tuple[ShardingConfig, list[str]]:
+    tp = _engine_value(
+        engine,
+        ("parallel_config.tensor_parallel_size", "vllm_config.parallel_config.tensor_parallel_size"),
+    )
+    dp = _engine_value(
+        engine,
+        ("parallel_config.data_parallel_size", "vllm_config.parallel_config.data_parallel_size"),
+    )
+    ep = _engine_value(
+        engine,
+        ("parallel_config.enable_expert_parallel", "vllm_config.parallel_config.enable_expert_parallel"),
+    )
+    if not isinstance(tp, int) or tp < 1:
+        return ShardingConfig(), [
+            "sharding topology was not exposed; using whole-model tp=1 ep=1 dp=1"
+        ]
+    dp_i = dp if isinstance(dp, int) and dp > 0 else 1
+    return ShardingConfig(tp=tp, ep=tp if bool(ep) else 1, dp=dp_i), []
+
+
+def _dense_spec_from_config(cfg: dict[str, Any]) -> tuple[ModelSpec | None, str]:
+    required = (
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "intermediate_size",
+        "vocab_size",
+    )
+    missing = [key for key in required if cfg.get(key) is None]
+    if missing:
+        return None, "dense model config is missing answer-deciding fields: " + ", ".join(missing)
+    try:
+        hidden = int(cfg["hidden_size"])
+        n_heads = int(cfg["num_attention_heads"])
+        n_kv = int(cfg.get("num_key_value_heads", n_heads) or n_heads)
+        head_dim = int(cfg.get("head_dim", 0) or (hidden // n_heads))
+        act = str(cfg.get("torch_dtype", "bf16")).lower()
+        dtype_bytes = 4 if act in ("fp32", "float32") else 2
+        quant = cfg.get("quantization_config") or {}
+        method = quant.get("quant_method") if isinstance(quant, dict) else None
+        if method is not None and str(method).lower() not in _QUANT_WEIGHT_BYTES:
+            return None, f"dense quantization method {method!r} is not priceable"
+        return ModelSpec(
+            name=str(cfg.get("_name_or_path") or cfg.get("model_type") or "live-dense"),
+            hidden=hidden,
+            n_layers=int(cfg["num_hidden_layers"]),
+            n_heads=n_heads,
+            num_kv_heads=n_kv,
+            head_dim=head_dim,
+            intermediate=int(cfg["intermediate_size"]),
+            dtype_bytes=dtype_bytes,
+            weight_dtype_bytes=_QUANT_WEIGHT_BYTES.get(str(method).lower()) if method else None,
+            vocab=int(cfg["vocab_size"]),
+        ), ""
+    except (TypeError, ValueError, ZeroDivisionError) as exc:
+        return None, f"dense model config could not be parsed ({type(exc).__name__}: {exc})"
+
+
+def _execution_graph(engine: Any, pctx: Any, sched: Any) -> ExecutionGraphResolution:
+    """Resolve the live engine to the matching graph, or refuse namedly."""
+    hf, source = _engine_hf_config(engine)
+    if hf is None:
+        return ExecutionGraphResolution(None, [], source)
+    cfg, error = _config_dict(hf)
+    if cfg is None:
+        return ExecutionGraphResolution(None, [], error)
+
+    if getattr(pctx, "peak", None) is None:
+        sku = getattr(pctx, "sku", None) or "unknown"
+        return ExecutionGraphResolution(
+            None,
+            [],
+            f"GPU SKU {sku!r} is not in the hardware catalogue; refusing A100 substitution",
+        )
+    hw = hardware_spec_for(pctx.peak)
+    batch, diagnostics = _loop_batch(engine, pctx, sched)
+
+    if is_sparse_moe_config(cfg):
+        invalid = validate_moe_config(cfg)
+        if invalid:
+            return ExecutionGraphResolution(
+                None,
+                diagnostics,
+                "sparse-MoE config cannot be priced without guessing: " + "; ".join(invalid),
+            )
+        try:
+            spec = spec_from_hf_config(normalize_moe_config(cfg), name=str(cfg.get("_name_or_path") or "live-moe"))
+        except (TypeError, ValueError, ZeroDivisionError) as exc:
+            return ExecutionGraphResolution(
+                None,
+                diagnostics,
+                f"sparse-MoE config could not be parsed ({type(exc).__name__}: {exc})",
+            )
+        act_dtype = getattr(getattr(pctx, "gate", None), "dtype", None)
+        kv_dtype = _engine_value(
+            engine,
+            ("cache_config.cache_dtype", "cache_config.kv_cache_dtype", "vllm_config.cache_config.cache_dtype"),
+        )
+        changes: dict[str, Any] = {}
+        if act_dtype:
+            changes["act_dtype"] = str(act_dtype).lower()
+        if kv_dtype:
+            changes["kv_dtype"] = str(kv_dtype).lower().replace("fp8_e4m3", "fp8")
+        else:
+            diagnostics.append("KV cache dtype was not exposed; using planner default kv_dtype='fp8'")
+        if cfg.get("expert_dtype") is None:
+            diagnostics.append(
+                f"expert_dtype absent; inherited weight_dtype={spec.weight_dtype!r} for expert bytes"
+            )
+        if changes:
+            from dataclasses import replace
+
+            spec = replace(spec, **changes)
+        unpriceable = validate_priceable_dtypes(spec)
+        if unpriceable:
+            return ExecutionGraphResolution(None, diagnostics, "; ".join(unpriceable))
+        sharding, sharding_diagnostics = _loop_sharding(engine)
+        diagnostics.extend(sharding_diagnostics)
+        graph = predict_moe_graph(spec, hw, batch, sharding)
+    else:
+        spec, error = _dense_spec_from_config(cfg)
+        if spec is None:
+            return ExecutionGraphResolution(None, diagnostics, error)
+        graph = predict_graph(model=spec, hw=hw, batch=batch)
+
+    if graph.has_fallback_peaks:
+        diagnostics.append("one or more nodes use fallback compute peaks")
+    if graph.has_fallback_bytes:
+        diagnostics.append("one or more nodes use fallback byte widths")
+    if graph.has_unpriced_nodes:
+        diagnostics.append("one or more byte-moving nodes have no priceable bandwidth")
+    n_estimated = sum(1 for node in graph.nodes if node.prediction.estimated)
+    if n_estimated:
+        diagnostics.append(f"{n_estimated} predicted node(s) use estimated cost models")
+    return ExecutionGraphResolution(
+        graph,
+        diagnostics,
+        model_source="live_hf_config",
+    )
 
 
 def _read_int_aliases(hf: Any, table: dict[str, tuple[str, ...]]) -> dict[str, Any]:
@@ -543,31 +779,76 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             trace_path=trace_path,
         )
 
-    # Predict against the model that ACTUALLY ran (read from the live engine),
-    # not the Llama-2-7B default — otherwise residuals/deviation score the real
-    # kernels against the wrong graph. Falls back to the default graph when there
-    # is no engine or its config can't be read (CPU boxes, tests, dry-run).
-    #
-    # Same for hardware: predict_graph's own default is A100-SXM4-80GB peaks,
-    # which silently over-predicts on anything weaker (T4/L4/...) and
-    # produces a run-level kernel-time residual that saturates the report's
-    # +/-100% clamp on every claim. pctx is built here (moved up from Phase 3)
-    # so its NVML-detected SKU peak feeds the graph before residuals are ever
-    # computed against it.
+    # Resolve model, hardware, serving batch, and sharding as one trust gate. A
+    # missing/partial live config or unknown SKU refuses graph-based claims and
+    # falls through to an honest measurement report; it never becomes a plausible
+    # Llama/A100 default prediction.
     pctx = build_planner_context(cfg.engine, workload=workload)
-    _spec = _model_spec_from_engine(cfg.engine)
-    _hw = hardware_spec_for(pctx.peak)
-    # Batch matters for the same reason the model does — and more so on a
-    # mixture, where weight traffic follows the *distinct* experts a batch
-    # activates: distinct(1)=top_k but distinct(16) is an order of magnitude
-    # larger, so predicting a batch-16 step at the batch-1 default understates
-    # expert traffic ~12x. Read the real concurrency off the sampled scheduler
-    # rather than defaulting.
-    _batch = _batch_config_from_stats(sched_summary)
-    graph = predict_graph(model=_spec, hw=_hw, batch=_batch)
+    graph_resolution = _execution_graph(cfg.engine, pctx, sched_summary)
+    if not graph_resolution.ok:
+        (run_dir / "prediction_refusal.json").write_text(
+            json.dumps(
+                {
+                    "reason": graph_resolution.refusal_reason,
+                    "diagnostics": graph_resolution.diagnostics,
+                    "hardware": pctx.sku,
+                },
+                indent=2,
+            )
+        )
+        return _measurement_result(
+            run_dir=run_dir,
+            run_id=run_id,
+            workload=workload,
+            trace=trace,
+            qual=qual,
+            started_ns=started_ns,
+            trace_path=trace_path,
+            diagnostic=(
+                "Prediction gate refused graph-based optimization claims: "
+                f"{graph_resolution.refusal_reason}"
+            ),
+            runtime_diagnostics=graph_resolution.diagnostics,
+            status="prediction_refused",
+        )
+    graph = graph_resolution.graph
+    assert graph is not None
     (run_dir / "predicted_graph.json").write_text(
         json.dumps(
-            {"nodes": len(graph.nodes), "total_pred_s": graph.total_pred_s, "hardware": _hw.name},
+            {
+                "model": graph.model.name,
+                "model_source": graph_resolution.model_source,
+                "nodes": len(graph.nodes),
+                "total_pred_s": graph.total_pred_s,
+                "hardware": pctx.sku,
+                "hardware_pricing": graph.hw.name,
+                "hardware_is_fallback": graph.hardware_is_fallback,
+                "batch": {
+                    "batch": graph.batch.batch,
+                    "kv_cache_len": graph.batch.kv_cache_len,
+                    "speculative_tokens": graph.batch.speculative_tokens,
+                },
+                "sharding": {
+                    "tp": graph.sharding.tp,
+                    "ep": graph.sharding.ep,
+                    "dp": graph.sharding.dp,
+                },
+                "has_unpriced_collectives": graph.has_unpriced_collectives,
+                "has_unpriced_nodes": graph.has_unpriced_nodes,
+                "has_fallback_peaks": graph.has_fallback_peaks,
+                "has_fallback_bytes": graph.has_fallback_bytes,
+                "diagnostics": graph_resolution.diagnostics,
+                "predictions": [
+                    {
+                        "op": node.op,
+                        "layer": node.layer,
+                        "estimated": node.prediction.estimated,
+                        "peak_is_fallback": node.prediction.peak_is_fallback,
+                        "bytes_are_fallback": node.prediction.bytes_are_fallback,
+                    }
+                    for node in graph.nodes
+                ],
+            },
             indent=2,
         )
     )
@@ -896,7 +1177,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         claims=claims,
         provenance=provenance,
         qualification_diagnostic=qual.diagnostic,
-        runtime_diagnostics=res.coverage_warnings,
+        runtime_diagnostics=graph_resolution.diagnostics + res.coverage_warnings,
         summary=(
             f"vLLM decode on {pctx.sku or 'unknown SKU'}: {len(claims)} candidate(s) "
             f"evaluated, {len(rolled_back)} rolled back. {sched_note}"
@@ -921,6 +1202,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         "n_autoresearch": len(ar_run.results),
         "scheduler_stats": asdict(sched_summary) if sched_stats.samples else None,
         "residual_coverage": coverage,
+        "prediction_diagnostics": graph_resolution.diagnostics,
         "report_path": str(run_dir / "report.md"),
     }
     return {"summary": summary, "report_md": report_md, "run_dir": str(run_dir)}
@@ -935,6 +1217,9 @@ def _measurement_result(
     qual: Any,
     started_ns: int,
     trace_path: Path,
+    diagnostic: str | None = None,
+    runtime_diagnostics: list[str] | None = None,
+    status: str = "ok",
 ) -> dict[str, Any]:
     """Honest measurement report for a workload with no intervention library.
 
@@ -972,10 +1257,11 @@ def _measurement_result(
     report_md = write_report(
         claims=claims,
         provenance=provenance,
-        qualification_diagnostic=(
+        qualification_diagnostic=diagnostic or (
             "Measurement-only run: the runtime observed the workload and reports "
             "its real kernels. No intervention library applies to this workload."
         ),
+        runtime_diagnostics=runtime_diagnostics,
         summary=measurement_summary(workload, result),
     )
     _write_report(run_dir, report_md)
@@ -983,7 +1269,7 @@ def _measurement_result(
     summary = {
         "run_id": run_id,
         "workload": workload,
-        "status": "ok",
+        "status": status,
         "mode": "measurement",
         "fingerprint": qual.fingerprint,
         "commit": False,
@@ -992,6 +1278,8 @@ def _measurement_result(
         "n_claims": 0,
         "n_rolled_back": 0,
         "n_rejected": 0,
+        "prediction_refusal": diagnostic,
+        "runtime_diagnostics": runtime_diagnostics or [],
         "report_path": str(run_dir / "report.md"),
     }
     return {"summary": summary, "report_md": report_md, "run_dir": str(run_dir)}

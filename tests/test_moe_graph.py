@@ -21,6 +21,7 @@ import pytest
 
 from gitm.optimizer.deviation import classify_op
 from gitm.planner.context import hardware_spec_for, peak_for_sku
+from gitm.planner.graph import Graph, PredictedNode
 from gitm.planner.moe_graph import (
     effective_kv_tokens,
     index_candidates,
@@ -35,6 +36,7 @@ from gitm.planner.roofline import (
     HardwareSpec,
     ShardingConfig,
     resolve_peak,
+    roofline,
     weight_bytes,
     weight_bytes_is_fallback,
 )
@@ -246,6 +248,12 @@ def test_graph_flags_when_any_node_ran_on_a_fallback_peak(spec):
 def test_b200_graph_needs_no_fallback(spec, b200):
     g = predict_moe_graph(spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
     assert not g.has_fallback_peaks
+    assert not g.hardware_is_fallback
+
+
+def test_default_hardware_graph_flags_catalogue_fallback(spec):
+    g = predict_moe_graph(spec, HardwareSpec(), BatchConfig(batch=1, kv_cache_len=1024))
+    assert g.hardware_is_fallback
 
 
 def test_fp4_weight_bytes_include_the_block_scales():
@@ -553,12 +561,23 @@ def test_unknown_interconnect_surfaces_rather_than_pricing_collectives_free(spec
         spec, no_link, BatchConfig(batch=64, kv_cache_len=4096), ShardingConfig(tp=8, ep=8)
     )
     assert g.has_unpriced_collectives
+    assert g.has_unpriced_nodes
 
 
 def test_priced_interconnect_is_not_flagged(spec, b200):
     g = predict_moe_graph(
         spec, b200, BatchConfig(batch=64, kv_cache_len=4096), ShardingConfig(tp=8, ep=8)
     )
+    assert not g.has_unpriced_collectives
+    assert not g.has_unpriced_nodes
+
+
+def test_general_unpriced_node_net_is_not_collective_specific(spec):
+    hw = HardwareSpec(peak_mem_bw_bytes_per_s=0.0)
+    node = PredictedNode("memory_only", None, roofline("memory_only", 0.0, 1024.0, hw))
+    g = Graph(model=spec, hw=hw, batch=BatchConfig(), nodes=[node])
+
+    assert g.has_unpriced_nodes
     assert not g.has_unpriced_collectives
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -215,6 +216,33 @@ def _fake_capture_with_kernels(prefix: str):
     return fake_capture
 
 
+def _priceable_moe_engine():
+    cfg = SimpleNamespace(
+        model_type="deepseek_v4",
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=64,
+        n_routed_experts=4,
+        num_experts_per_tok=1,
+        moe_intermediate_size=32,
+        expert_dtype="fp4",
+        quantization_config={"quant_method": "fp8"},
+        torch_dtype="bfloat16",
+        vocab_size=128,
+    )
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=cfg, dtype="bf16", max_model_len=4096),
+        cache_config=SimpleNamespace(max_model_len=4096, cache_dtype="fp8"),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+            enable_expert_parallel=False,
+        ),
+    )
+
+
 def test_non_vllm_workload_emits_measurement_not_vllm_claims(tmp_path: Path, monkeypatch):
     """HFT (no intervention library) must report real kernels, never vLLM knobs."""
     import gitm.scheduler.loop as loop
@@ -243,13 +271,39 @@ def test_vllm_workload_still_uses_intervention_path(tmp_path: Path, monkeypatch)
 
     monkeypatch.setattr(loop, "capture", _fake_capture_with_kernels("paged_attention"))
     monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setenv("GITM_GPU_SKU", "NVIDIA B200")
+
+    from gitm import optimize
+
+    result = optimize(
+        _priceable_moe_engine(),
+        workload="vllm-decode",
+        budget="1s",
+        scratch=str(tmp_path),
+        workload_runner=lambda: {},
+    )
+    assert result["summary"]["mode"] == "intervention"
+
+
+def test_vllm_without_live_model_refuses_prediction_claims(tmp_path: Path, monkeypatch):
+    import gitm.scheduler.loop as loop
+
+    monkeypatch.setattr(loop, "capture", _fake_capture_with_kernels("paged_attention"))
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setenv("GITM_GPU_SKU", "NVIDIA B200")
 
     from gitm import optimize
 
     result = optimize(
         workload="vllm-decode", budget="1s", scratch=str(tmp_path), workload_runner=lambda: {}
     )
-    assert result["summary"]["mode"] == "intervention"
+
+    assert result["summary"]["status"] == "prediction_refused"
+    assert result["summary"]["mode"] == "measurement"
+    assert result["summary"]["n_claims"] == 0
+    assert "no live engine" in result["report_md"]
+    refusal = Path(result["run_dir"]) / "prediction_refusal.json"
+    assert refusal.exists() and "no live engine" in refusal.read_text()
 
 
 def test_vllm_loop_surfaces_residual_coverage(tmp_path: Path, monkeypatch):
@@ -268,10 +322,12 @@ def test_vllm_loop_surfaces_residual_coverage(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(loop, "capture", fake_capture)
     monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setenv("GITM_GPU_SKU", "NVIDIA B200")
 
     from gitm import optimize
 
     result = optimize(
+        _priceable_moe_engine(),
         workload="vllm-decode",
         budget="1s",
         scratch=str(tmp_path),
@@ -286,7 +342,9 @@ def test_vllm_loop_surfaces_residual_coverage(tmp_path: Path, monkeypatch):
     assert "matched to the predicted graph" in result["report_md"]
 
 
-def test_vllm_loop_runs_autoresearch(tmp_path: Path, monkeypatch):
+def test_vllm_loop_without_model_does_not_run_autoresearch_on_default_graph(
+    tmp_path: Path, monkeypatch
+):
     """The vllm path runs agentic autoresearch: it classifies the bottleneck via
     trace telemetry (the serialized same-stream "paged_attention" kernels are
     also roofline-predicted memory-bound at batch=1, so classification is
@@ -309,16 +367,13 @@ def test_vllm_loop_runs_autoresearch(tmp_path: Path, monkeypatch):
         workload="vllm-decode", budget="30s", scratch=str(tmp_path), workload_runner=lambda: {}
     )
     s = result["summary"]
-    assert s["bottleneck_class"] == "memory_bound"
-    assert s["n_autoresearch"] == 0
+    assert s["status"] == "prediction_refused"
+    assert s["n_claims"] == 0
+    assert "bottleneck_class" not in s
 
-    ar_json = (Path(result["run_dir"]) / "autoresearch.json").read_text(encoding="utf-8")
-    # Denylisted knobs with unchecked prerequisites must never surface, regardless
-    # of which bottleneck class the run classifies as.
-    assert "max_num_partial_prefills=" not in ar_json
-    assert "long_prefill_token_threshold=" not in ar_json
-
-    # Dry-run (no live engine) mutates nothing, so no safety trail is written.
+    # The prediction gate fires before candidate ranking/autoresearch, so neither
+    # artifact can imply that a default graph supported an optimization.
+    assert not (Path(result["run_dir"]) / "autoresearch.json").exists()
     assert not (Path(result["run_dir"]) / "audit.jsonl").exists()
 
 

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -219,6 +221,101 @@ def test_base_url_prefers_explicit_then_flag_then_cmdline():
         att._base_url_for(target, att.AttachOptions(base_url="http://127.0.0.1:1234/"))
         == "http://127.0.0.1:1234"
     )
+
+
+def test_predicted_graph_surfaces_resolved_warnings_and_bytes_fallback(
+    tmp_path, monkeypatch, capsys
+):
+    from gitm.planner.context import peak_for_sku
+    from gitm.planner.moe_graph import spec_from_hf_config
+    from gitm.planner.roofline import BatchConfig, ShardingConfig
+    from gitm.serve import model_config as mc
+
+    cfg = {
+        "model_type": "deepseek_v4",
+        "hidden_size": 64,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "head_dim": 64,
+        "n_routed_experts": 2,
+        "num_experts_per_tok": 1,
+        "moe_intermediate_size": 32,
+        "expert_dtype": "fp4",
+        "quantization_config": {"quant_method": "fp8"},
+        "torch_dtype": "bfloat16",
+    }
+    spec = replace(spec_from_hf_config(cfg), expert_dtype="future_fp3")
+    resolved = mc.LiveSpec(
+        spec=spec,
+        sharding=ShardingConfig(),
+        batch=BatchConfig(batch=1, kv_cache_len=128),
+        source_path=tmp_path / "config.json",
+        model_ref="org/model",
+        warnings=["decode batch was not observed; using batch=1 single-sequence floor"],
+    )
+    monkeypatch.setattr(mc, "live_moe_spec", lambda _target, **_kwargs: resolved)
+
+    import gitm.planner.context as planner_context
+
+    monkeypatch.setattr(
+        planner_context,
+        "build_planner_context",
+        lambda: SimpleNamespace(peak=peak_for_sku("NVIDIA B200"), sku="NVIDIA B200"),
+    )
+
+    att._emit_predicted_graph(discover.Target(pid=1, cmdline=[]), tmp_path)
+
+    payload = json.loads((tmp_path / "predicted_moe_graph.json").read_text())
+    assert payload["has_fallback_bytes"] is True
+    assert any(node["bytes_are_fallback"] for node in payload["nodes"])
+    assert payload["warnings"]
+    stdout = capsys.readouterr().out
+    assert "single-sequence floor" in stdout
+    assert "unknown-dtype bf16 fallback" in stdout
+
+
+def test_predicted_graph_known_dtypes_leave_bytes_fallback_clean(tmp_path, monkeypatch):
+    from gitm.planner.context import peak_for_sku
+    from gitm.planner.moe_graph import spec_from_hf_config
+    from gitm.planner.roofline import BatchConfig, ShardingConfig
+    from gitm.serve import model_config as mc
+
+    cfg = {
+        "model_type": "deepseek_v4",
+        "hidden_size": 64,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "head_dim": 64,
+        "n_routed_experts": 2,
+        "num_experts_per_tok": 1,
+        "moe_intermediate_size": 32,
+        "expert_dtype": "fp4",
+        "quantization_config": {"quant_method": "fp8"},
+        "torch_dtype": "bfloat16",
+    }
+    resolved = mc.LiveSpec(
+        spec=spec_from_hf_config(cfg),
+        sharding=ShardingConfig(),
+        batch=BatchConfig(batch=1, kv_cache_len=128),
+        source_path=tmp_path / "config.json",
+        model_ref="org/model",
+    )
+    monkeypatch.setattr(mc, "live_moe_spec", lambda _target, **_kwargs: resolved)
+
+    import gitm.planner.context as planner_context
+
+    monkeypatch.setattr(
+        planner_context,
+        "build_planner_context",
+        lambda: SimpleNamespace(peak=peak_for_sku("NVIDIA B200"), sku="NVIDIA B200"),
+    )
+
+    att._emit_predicted_graph(discover.Target(pid=1, cmdline=[]), tmp_path)
+    payload = json.loads((tmp_path / "predicted_moe_graph.json").read_text())
+    assert payload["has_fallback_bytes"] is False
+    assert not any(node["bytes_are_fallback"] for node in payload["nodes"])
 
 
 # --- preflight ---------------------------------------------------------------
