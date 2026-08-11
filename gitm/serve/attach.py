@@ -480,6 +480,10 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
         warnings.append(
             "byte widths include an unknown-dtype bf16 fallback; the memory floor is approximate"
         )
+    if g.resident_weight_bytes_is_lower_bound:
+        warnings.append(
+            "resident weight footprint is a lower bound because DSpark parameter shapes are private"
+        )
     n_estimated = sum(1 for n in g.nodes if n.prediction.estimated)
     if n_estimated:
         warnings.append(f"{n_estimated} predicted node(s) use documented estimated cost models")
@@ -502,6 +506,8 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
         "batch": {"batch": resolved.batch.batch, "kv_cache_len": resolved.batch.kv_cache_len},
         "applied_overrides": resolved.applied_overrides,
         "total_pred_s": g.total_pred_s,
+        "resident_weight_bytes_per_rank": g.resident_weight_bytes_per_rank,
+        "resident_weight_bytes_is_lower_bound": g.resident_weight_bytes_is_lower_bound,
         "has_unpriced_collectives": g.has_unpriced_collectives,
         "has_unpriced_nodes": g.has_unpriced_nodes,
         "has_unpriced_compute": g.has_unpriced_compute,

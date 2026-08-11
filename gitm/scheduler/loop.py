@@ -740,6 +740,10 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         )
     graph = graph_resolution.graph
     assert graph is not None
+    if graph.resident_weight_bytes_is_lower_bound:
+        graph_resolution.diagnostics.append(
+            "resident weight footprint is a lower bound because DSpark parameter shapes are private"
+        )
     (run_dir / "predicted_graph.json").write_text(
         json.dumps(
             {
@@ -747,6 +751,10 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 "model_source": graph_resolution.model_source,
                 "nodes": len(graph.nodes),
                 "total_pred_s": graph.total_pred_s,
+                "resident_weight_bytes_per_rank": graph.resident_weight_bytes_per_rank,
+                "resident_weight_bytes_is_lower_bound": (
+                    graph.resident_weight_bytes_is_lower_bound
+                ),
                 "hardware": pctx.sku,
                 "hardware_pricing": graph.hw.name,
                 "hardware_is_fallback": graph.hardware_is_fallback,

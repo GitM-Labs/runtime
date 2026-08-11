@@ -637,6 +637,12 @@ def test_dspark_variant_is_a_lower_bound_not_an_estimate(spec, base_spec):
     published_delta = 167e9 - V4_BASE_PUBLISHED_BYTES
     assert delta < published_delta / 100
 
+    g = predict_moe_graph(spec, HardwareSpec(), BatchConfig(), ShardingConfig(tp=8))
+    assert g.resident_weight_bytes_per_rank == pytest.approx(
+        model_weight_bytes(spec, ShardingConfig(tp=8))
+    )
+    assert g.resident_weight_bytes_is_lower_bound is True
+
 
 def test_base_checkpoint_has_no_dspark_nodes(base_spec, b200):
     """No dspark keys in the config means no dspark work in the graph.
@@ -647,6 +653,8 @@ def test_base_checkpoint_has_no_dspark_nodes(base_spec, b200):
     g = predict_moe_graph(base_spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
     assert not [n for n in g.nodes if n.op == "dspark"]
     assert {n.op for n in g.nodes if n.prediction.estimated} == {"attn_out_proj"}
+    assert g.resident_weight_bytes_per_rank == pytest.approx(model_weight_bytes(base_spec))
+    assert g.resident_weight_bytes_is_lower_bound is False
 
 
 def test_both_checkpoint_variants_yield_identical_per_layer_ratios(spec, base_spec):

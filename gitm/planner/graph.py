@@ -168,6 +168,25 @@ class Graph:
         """True when the graph uses substituted rather than detected SKU peaks."""
         return self.hw.is_fallback
 
+    @property
+    def resident_weight_bytes_per_rank(self) -> float | None:
+        """Sparse-model resident weight footprint for this graph's rank.
+
+        Dense v0 does not yet enumerate a complete resident footprint, so it
+        returns ``None`` rather than repurposing per-step traffic as capacity.
+        """
+        if not isinstance(self.model, SparseMoEModelSpec):
+            return None
+        # Local import avoids the graph <-> sparse graph construction cycle.
+        from gitm.planner.moe_graph import model_weight_bytes
+
+        return model_weight_bytes(self.model, self.sharding)
+
+    @property
+    def resident_weight_bytes_is_lower_bound(self) -> bool:
+        """True when private DSpark shapes make the footprint a known lower bound."""
+        return isinstance(self.model, SparseMoEModelSpec) and bool(self.model.dspark_layer_ids)
+
 
 def predict_graph(
     model: ModelSpec | None = None,

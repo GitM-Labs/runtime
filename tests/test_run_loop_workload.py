@@ -397,10 +397,13 @@ def test_vllm_loop_surfaces_residual_coverage(tmp_path: Path, monkeypatch):
         workload_runner=lambda: {},
     )
     payload = json.loads((Path(result["run_dir"]) / "residuals.json").read_text())
+    predicted = json.loads((Path(result["run_dir"]) / "predicted_graph.json").read_text())
 
     assert payload["coverage"]["total_kernels"] == 2
     assert payload["coverage"]["matched_kernels"] == 1
     assert payload["coverage"]["warnings"]
+    assert predicted["resident_weight_bytes_per_rank"] > 0
+    assert predicted["resident_weight_bytes_is_lower_bound"] is False
     assert "## Runtime diagnostics" in result["report_md"]
     assert "matched to the predicted graph" in result["report_md"]
     assert "GPU count was unavailable" in result["report_md"]
