@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from gitm.agents.policy import Policy, select_interventions
 from gitm.kernels.spec import Applicability, InterventionSpec, SafetyGate
 from gitm.optimizer.preconditions import GateContext
@@ -37,6 +39,12 @@ def test_without_ctx_no_applicability_filtering():
     ranked = select_interventions(_trace(), lib, Policy(), top_n=5)
     # No ctx -> gate skipped; only safety prefilter applies (none here).
     assert ranked[0].rejected_reason is None
+
+
+@pytest.mark.parametrize("top_n", [0, -1, True, 1.5])
+def test_policy_refuses_invalid_candidate_limit(top_n):
+    with pytest.raises(ValueError, match="top_n"):
+        select_interventions(_trace(), [], Policy(), top_n=top_n)
 
 
 def test_load_library_filters_by_workload(tmp_path):

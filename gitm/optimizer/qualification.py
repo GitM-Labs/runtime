@@ -81,6 +81,18 @@ def qualify(trace: Trace, target_floor: float = 0.15) -> QualificationResult:
             diagnostic="No kernels in trace — capture failed or workload did not run.",
         )
 
+    invalid_durations = [k for k in kernels if k.end_ns <= k.start_ns]
+    if invalid_durations:
+        return QualificationResult(
+            commit=False,
+            floor=target_floor,
+            fingerprint=fp,
+            diagnostic=(
+                f"Qualification evidence contains {len(invalid_durations)}/{len(kernels)} "
+                "kernel(s) with non-positive duration; refusing the floor commitment."
+            ),
+        )
+
     # Heuristic: if the top-10 kernels by time account for >95% of duration,
     # the workload is likely already well-shaped. Real gate uses the residual
     # distribution after the deviation monitor.

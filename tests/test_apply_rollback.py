@@ -219,6 +219,18 @@ def test_apply_refuses_nonfinite_keep_threshold(threshold):
         )
 
 
+@pytest.mark.parametrize("delta", [float("nan"), float("inf"), float("-inf")])
+def test_apply_rolls_back_nonfinite_measurement(delta):
+    cfg = {"block_size": 8}
+    app = DictApplicator(cfg, measure_fn=lambda _spec: delta)
+
+    result = apply_intervention(_spec(), app)
+
+    assert result.rolled_back and not result.applied
+    assert "finite" in result.error
+    assert cfg["block_size"] == 8
+
+
 # --- library now carries the 21 curated levers ------------------------------
 
 

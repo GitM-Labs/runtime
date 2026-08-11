@@ -79,6 +79,16 @@ def test_zero_duration_kernel_does_not_bypass_no_data_guard(tmp_path, monkeypatc
     assert "positive-duration" in result["report_md"]
 
 
+def test_qualification_direct_caller_refuses_invalid_kernel_durations():
+    from gitm.optimizer.qualification import qualify
+
+    trace = make_trace(events=[make_kernel("broken", start_ns=20, end_ns=10)])
+    result = qualify(trace)
+
+    assert result.commit is False
+    assert "non-positive duration" in result.diagnostic
+
+
 _UNSET = object()  # identity sentinel — a real workload_id could legitimately be any string
 
 

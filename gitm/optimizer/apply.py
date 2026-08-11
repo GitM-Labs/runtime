@@ -109,6 +109,16 @@ def apply_intervention(
         return ApplyResult(False, rolled_back=True, measured_delta=None,
                            error=f"measure failed, restored: {exc}")
 
+    if delta is not None and (
+        isinstance(delta, bool)
+        or not isinstance(delta, int | float)
+        or not math.isfinite(float(delta))
+    ):
+        applicator.restore(snapshot)
+        error = f"measurement delta must be finite, got {delta!r}; intervention restored"
+        _audit(audit, "revert", spec, cause=error, knobs=_knob_values(spec))
+        return ApplyResult(False, rolled_back=True, measured_delta=None, error=error)
+
     # Step 4: keep-or-rollback on the regression threshold.
     if delta is None:
         warnings.warn(
