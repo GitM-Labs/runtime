@@ -78,6 +78,7 @@ def write_report(
     provenance: Provenance,
     *,
     qualification_diagnostic: str = "",
+    runtime_diagnostics: list[str] | None = None,
     summary: str | None = None,
 ) -> str:
     """Render the provenance report as markdown."""
@@ -91,6 +92,7 @@ def write_report(
         "claims": claims,
         "provenance": provenance,
         "qualification_diagnostic": qualification_diagnostic,
+        "runtime_diagnostics": runtime_diagnostics or [],
         "summary": summary or _default_summary(claims),
         "now_ns": time.time_ns(),
     }

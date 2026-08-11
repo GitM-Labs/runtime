@@ -84,6 +84,49 @@ def test_residuals_skip_unmodeled_kernels():
     trace = _trace([_kernel("triton_rms_norm_kernel", 0, 100)])
     res = residuals(trace, predict_graph())
     assert res.per_kernel == []
+    assert res.total_kernels == 1
+    assert res.classified_kernels == 0
+    assert res.matched_kernels == 0
+    assert res.classification_coverage == 0.0
+    assert res.match_coverage == 0.0
+    assert res.coverage_warnings
+
+
+def test_residual_coverage_distinguishes_unclassified_from_graph_miss():
+    from gitm.optimizer.monitor import residuals
+    from gitm.planner.graph import predict_graph
+
+    # FlashAttention classifies and matches; NCCL classifies but a whole-model
+    # dense graph has no collective node; RMSNorm does not classify at all.
+    trace = _trace(
+        [
+            _kernel("flash_attn_kernel", 0, 700),
+            _kernel("ncclDevKernel_AllReduce", 700, 900),
+            _kernel("triton_rms_norm_kernel", 900, 1000),
+        ]
+    )
+    res = residuals(trace, predict_graph())
+
+    assert (res.total_kernels, res.classified_kernels, res.matched_kernels) == (3, 2, 1)
+    assert res.classification_coverage == pytest.approx(2 / 3)
+    assert res.match_coverage == pytest.approx(1 / 3)
+    assert res.classified_time_coverage == pytest.approx(0.9)
+    assert res.matched_time_coverage == pytest.approx(0.7)
+    assert any("classified" in warning for warning in res.coverage_warnings)
+    assert any("matched" in warning for warning in res.coverage_warnings)
+
+
+def test_fully_matched_residual_coverage_is_clean():
+    from gitm.optimizer.monitor import residuals
+    from gitm.planner.graph import predict_graph
+
+    res = residuals(_trace([_kernel("flash_attn_kernel", 0, 100)]), predict_graph())
+
+    assert res.classification_coverage == 1.0
+    assert res.match_coverage == 1.0
+    assert res.classified_time_coverage == 1.0
+    assert res.matched_time_coverage == 1.0
+    assert res.coverage_warnings == []
 
 
 # --- multi-basis filter ------------------------------------------------------

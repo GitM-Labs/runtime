@@ -252,6 +252,40 @@ def test_vllm_workload_still_uses_intervention_path(tmp_path: Path, monkeypatch)
     assert result["summary"]["mode"] == "intervention"
 
 
+def test_vllm_loop_surfaces_residual_coverage(tmp_path: Path, monkeypatch):
+    """Unclassified work must be visible in both the JSON and human report."""
+    import json
+
+    import gitm.scheduler.loop as loop
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [
+            make_kernel("flash_attn_kernel", start_ns=0, end_ns=900),
+            make_kernel("triton_rms_norm_kernel", start_ns=900, end_ns=1000),
+        ]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    from gitm import optimize
+
+    result = optimize(
+        workload="vllm-decode",
+        budget="1s",
+        scratch=str(tmp_path),
+        workload_runner=lambda: {},
+    )
+    payload = json.loads((Path(result["run_dir"]) / "residuals.json").read_text())
+
+    assert payload["coverage"]["total_kernels"] == 2
+    assert payload["coverage"]["matched_kernels"] == 1
+    assert payload["coverage"]["warnings"]
+    assert "## Runtime diagnostics" in result["report_md"]
+    assert "matched to the predicted graph" in result["report_md"]
+
+
 def test_vllm_loop_runs_autoresearch(tmp_path: Path, monkeypatch):
     """The vllm path runs agentic autoresearch: it classifies the bottleneck via
     trace telemetry (the serialized same-stream "paged_attention" kernels are

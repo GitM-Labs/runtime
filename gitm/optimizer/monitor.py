@@ -52,6 +52,54 @@ class Residuals:
 
     per_kernel: list[KernelResidual] = field(default_factory=list)
     serialized_concurrency_fraction: float = 0.0
+    total_kernels: int = 0
+    classified_kernels: int = 0
+    matched_kernels: int = 0
+    total_kernel_time_ns: int = 0
+    classified_kernel_time_ns: int = 0
+    matched_kernel_time_ns: int = 0
+
+    @staticmethod
+    def _ratio(part: int, whole: int) -> float:
+        return part / whole if whole > 0 else 0.0
+
+    @property
+    def classification_coverage(self) -> float:
+        return self._ratio(self.classified_kernels, self.total_kernels)
+
+    @property
+    def match_coverage(self) -> float:
+        return self._ratio(self.matched_kernels, self.total_kernels)
+
+    @property
+    def classified_time_coverage(self) -> float:
+        return self._ratio(self.classified_kernel_time_ns, self.total_kernel_time_ns)
+
+    @property
+    def matched_time_coverage(self) -> float:
+        return self._ratio(self.matched_kernel_time_ns, self.total_kernel_time_ns)
+
+    @property
+    def coverage_warnings(self) -> list[str]:
+        """Human-facing notes for work excluded from residual conclusions."""
+        if self.total_kernels == 0:
+            return ["residual coverage unavailable: trace contains no kernels"]
+        warnings: list[str] = []
+        if self.classified_kernels < self.total_kernels:
+            warnings.append(
+                "residual coverage: classified "
+                f"{self.classification_coverage:.1%} of launches and "
+                f"{self.classified_time_coverage:.1%} of kernel time "
+                f"({self.classified_kernels}/{self.total_kernels} kernels)"
+            )
+        if self.matched_kernels < self.total_kernels:
+            warnings.append(
+                "residual coverage: matched to the predicted graph "
+                f"{self.match_coverage:.1%} of launches and "
+                f"{self.matched_time_coverage:.1%} of kernel time "
+                f"({self.matched_kernels}/{self.total_kernels} kernels)"
+            )
+        return warnings
 
 
 def _class_key(pn: PredictedNode) -> tuple[float, float]:
@@ -119,7 +167,11 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
     obs = trace.kernels()
     pred = graph.nodes
 
-    res = Residuals()
+    durations = [max(ok.end_ns - ok.start_ns, 0) for ok in obs]
+    res = Residuals(
+        total_kernels=len(obs),
+        total_kernel_time_ns=sum(durations),
+    )
     by_op_layer: dict[tuple[str, int], PredictedNode] = {}
     classes: dict[str, dict[tuple[float, float], PredictedNode]] = {}
     for pn in pred:
@@ -127,13 +179,17 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
             by_op_layer.setdefault((pn.op, pn.layer), pn)
         classes.setdefault(pn.op, {}).setdefault(_class_key(pn), pn)
 
-    for ok in obs:
+    for ok, duration_ns in zip(obs, durations, strict=True):
         op = ok.range_op or classify_op(ok.name)
         if op is None:
             continue
+        res.classified_kernels += 1
+        res.classified_kernel_time_ns += duration_ns
         cls = list(classes.get(op, {}).values())
         if not cls:
             continue
+        res.matched_kernels += 1
+        res.matched_kernel_time_ns += duration_ns
 
         t_obs = max((ok.end_ns - ok.start_ns) / 1e9, 1e-12)
         b_obs = (

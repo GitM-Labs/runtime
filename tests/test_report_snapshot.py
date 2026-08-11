@@ -168,3 +168,18 @@ def test_non_finite_residual_is_refused(raw):
             predicted_delta=0.01,
             measured_delta=None,
         )
+
+
+def test_runtime_diagnostics_are_printed_when_present():
+    rendered = write_report(
+        [],
+        _fixed_provenance(),
+        runtime_diagnostics=["residual coverage: matched 40.0% of kernel time"],
+    )
+
+    assert "## Runtime diagnostics" in rendered
+    assert "matched 40.0% of kernel time" in rendered
+
+
+def test_runtime_diagnostics_section_is_absent_when_clean():
+    assert "## Runtime diagnostics" not in write_report([], _fixed_provenance())

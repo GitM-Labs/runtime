@@ -577,6 +577,16 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     violations = check_invariants(res)  # multi-basis confirmed
     hypotheses = attribute(res, graph)  # Granger
     dr_hypotheses = attribute_dr(res, graph)  # doubly-robust, corroborating
+    coverage = {
+        "total_kernels": res.total_kernels,
+        "classified_kernels": res.classified_kernels,
+        "matched_kernels": res.matched_kernels,
+        "classification_coverage": res.classification_coverage,
+        "match_coverage": res.match_coverage,
+        "classified_time_coverage": res.classified_time_coverage,
+        "matched_time_coverage": res.matched_time_coverage,
+        "warnings": res.coverage_warnings,
+    }
 
     (run_dir / "violations.json").write_text(
         json.dumps(
@@ -599,6 +609,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 "n_kernel_residuals": len(res.per_kernel),
                 "n_violations": len(violations),
                 "serialized_concurrency_fraction": res.serialized_concurrency_fraction,
+                "coverage": coverage,
                 "top_hypotheses_granger": [
                     {"cause": h.cause_op, "effect": h.effect_op, "p_value": h.p_value}
                     for h in hypotheses.top(5)
@@ -885,6 +896,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         claims=claims,
         provenance=provenance,
         qualification_diagnostic=qual.diagnostic,
+        runtime_diagnostics=res.coverage_warnings,
         summary=(
             f"vLLM decode on {pctx.sku or 'unknown SKU'}: {len(claims)} candidate(s) "
             f"evaluated, {len(rolled_back)} rolled back. {sched_note}"
@@ -908,6 +920,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         "bottleneck_class": ar_run.bottleneck_class,
         "n_autoresearch": len(ar_run.results),
         "scheduler_stats": asdict(sched_summary) if sched_stats.samples else None,
+        "residual_coverage": coverage,
         "report_path": str(run_dir / "report.md"),
     }
     return {"summary": summary, "report_md": report_md, "run_dir": str(run_dir)}

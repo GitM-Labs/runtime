@@ -13,6 +13,14 @@
 
 > **Qualification gate diagnostic.** {{ qualification_diagnostic }}
 {%- endif %}
+{%- if runtime_diagnostics %}
+
+## Runtime diagnostics
+
+{% for diagnostic in runtime_diagnostics -%}
+- {{ diagnostic }}
+{% endfor %}
+{%- endif %}
 
 ## Claims
 
