@@ -106,6 +106,25 @@ def test_autorevert_fires_on_regression():
     assert d.should_revert and d.relative_delta == pytest.approx(-0.1)
 
 
+@pytest.mark.parametrize("baseline", [float("nan"), float("inf"), 0.0, -1.0, True])
+def test_autorevert_refuses_invalid_baseline(baseline):
+    with pytest.raises(ValueError, match="baseline"):
+        AutoRevert(baseline=baseline)
+
+
+@pytest.mark.parametrize("tolerance", [float("nan"), float("inf"), -0.01, True])
+def test_autorevert_refuses_invalid_tolerance(tolerance):
+    with pytest.raises(ValueError, match="tolerance"):
+        AutoRevert(baseline=100.0, tolerance=tolerance)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), True])
+def test_autorevert_refuses_invalid_observation(value):
+    ar = AutoRevert(baseline=100.0)
+    with pytest.raises(ValueError, match="observation"):
+        ar.observe(value)
+
+
 # --------- gated rollout -------------------------------------------------------
 def test_rollout_shadow_then_manual_promote(tmp_path: Path):
     log = AuditLog(tmp_path / "audit.jsonl")

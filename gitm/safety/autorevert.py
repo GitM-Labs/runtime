@@ -9,6 +9,7 @@ noisy sample can't trip it.
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass
 
@@ -23,16 +24,34 @@ class AutoRevertDecision:
 
 class AutoRevert:
     def __init__(self, baseline: float, *, tolerance: float = 0.0, window: int = 5) -> None:
-        if baseline <= 0:
-            raise ValueError(f"baseline must be > 0, got {baseline}")
-        if window < 1:
-            raise ValueError(f"window must be >= 1, got {window}")
-        self.baseline = baseline
-        self.tolerance = tolerance  # allowed fractional drop before reverting
+        if (
+            isinstance(baseline, bool)
+            or not isinstance(baseline, int | float)
+            or not math.isfinite(float(baseline))
+            or baseline <= 0
+        ):
+            raise ValueError(f"baseline must be finite and > 0, got {baseline!r}")
+        if (
+            isinstance(tolerance, bool)
+            or not isinstance(tolerance, int | float)
+            or not math.isfinite(float(tolerance))
+            or tolerance < 0
+        ):
+            raise ValueError(f"tolerance must be finite and non-negative, got {tolerance!r}")
+        if isinstance(window, bool) or not isinstance(window, int) or window < 1:
+            raise ValueError(f"window must be a positive integer, got {window!r}")
+        self.baseline = float(baseline)
+        self.tolerance = float(tolerance)  # allowed fractional drop before reverting
         self._w: deque[float] = deque(maxlen=window)
 
     def observe(self, value: float) -> AutoRevertDecision:
-        self._w.append(value)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError(f"observation must be a finite number, got {value!r}")
+        self._w.append(float(value))
         if len(self._w) < self._w.maxlen:
             return AutoRevertDecision(False, "warming up (need a full window)")
         mean = sum(self._w) / len(self._w)
