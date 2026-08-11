@@ -28,6 +28,7 @@ that cannot tell it was traced.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import urllib.parse
@@ -68,6 +69,27 @@ class AttachOptions:
     metrics_interval: float = 1.0
     dry_run: bool = False
     proc: Path = discover.PROC
+
+    def __post_init__(self) -> None:
+        for name in ("duration_s", "request_timeout", "metrics_interval"):
+            value = getattr(self, name)
+            if not isinstance(value, int | float) or isinstance(value, bool):
+                raise ValueError(f"{name} must be a finite positive number, got {value!r}")
+            if not math.isfinite(float(value)) or value <= 0:
+                raise ValueError(f"{name} must be a finite positive number, got {value!r}")
+        if isinstance(self.requests, bool) or not isinstance(self.requests, int) or self.requests < 0:
+            raise ValueError(f"requests must be a non-negative integer, got {self.requests!r}")
+        for name in ("concurrency", "input_tokens", "output_tokens"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        for name, value in (("pid", self.pid), ("port", self.port)):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        if self.port is not None and self.port > 65535:
+            raise ValueError(f"port must be at most 65535, got {self.port!r}")
 
     @property
     def mode(self) -> str:

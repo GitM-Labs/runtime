@@ -22,6 +22,30 @@ from gitm.serve import attach as att
 from gitm.serve import discover
 from gitm.tracer import injection
 
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("duration_s", 0.0, "duration_s"),
+        ("duration_s", float("nan"), "duration_s"),
+        ("requests", -1, "requests"),
+        ("concurrency", 0, "concurrency"),
+        ("input_tokens", 0, "input_tokens"),
+        ("output_tokens", -1, "output_tokens"),
+        ("request_timeout", float("inf"), "request_timeout"),
+        ("metrics_interval", 0.0, "metrics_interval"),
+        ("port", 70000, "port"),
+    ],
+)
+def test_attach_options_refuse_invalid_window_inputs(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        att.AttachOptions(**{field: value})
+
+
+def test_attach_options_accept_normal_observe_and_drive_windows():
+    assert att.AttachOptions().mode == "observe"
+    assert att.AttachOptions(requests=1, concurrency=1).mode == "drive"
+
 LIB = str(injection.lib_path())
 
 
