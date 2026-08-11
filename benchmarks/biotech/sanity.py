@@ -27,6 +27,7 @@ from benchmarks.biotech.harness import (
     load_openfold_runner,
     select_proteins,
 )
+from gitm._timing import require_positive_duration
 
 
 def _fmt(result: dict) -> str:
@@ -85,7 +86,13 @@ def main(argv: list[str] | None = None) -> int:
     warm = runner.predict(target, msa)
     print(f"  WARM  {_fmt(warm)}")
 
-    speedup = cold["_t_total_s"] / max(warm["_t_total_s"], 1e-9)
+    cold_s = require_positive_duration(
+        float(cold["_t_total_s"]), context="OpenFold cold sanity pass"
+    )
+    warm_s = require_positive_duration(
+        float(warm["_t_total_s"]), context="OpenFold warm sanity pass"
+    )
+    speedup = cold_s / warm_s
     print(f"cold/warm total speedup: {speedup:.2f}x  (kernel cache + allocator warm-up)")
     if abs(cold["plddt"] - warm["plddt"]) > 1.0:
         print(
