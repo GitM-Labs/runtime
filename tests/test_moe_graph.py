@@ -578,7 +578,19 @@ def test_general_unpriced_node_net_is_not_collective_specific(spec):
     g = Graph(model=spec, hw=hw, batch=BatchConfig(), nodes=[node])
 
     assert g.has_unpriced_nodes
+    assert g.has_unpriced_memory
+    assert not g.has_unpriced_compute
     assert not g.has_unpriced_collectives
+
+
+def test_graph_preserves_each_missing_roofline_denominator(spec):
+    hw = HardwareSpec(peak_flops_fp16_per_s=0.0, peak_mem_bw_bytes_per_s=1e9)
+    node = PredictedNode("partial", None, roofline("partial", 1e12, 1024.0, hw))
+    g = Graph(model=spec, hw=hw, batch=BatchConfig(), nodes=[node])
+
+    assert g.has_unpriced_nodes
+    assert g.has_unpriced_compute
+    assert not g.has_unpriced_memory
 
 
 def test_expert_imbalance_only_applies_under_expert_parallelism(spec, b200):

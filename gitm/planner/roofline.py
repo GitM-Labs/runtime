@@ -512,6 +512,11 @@ class RooflinePrediction:
     # inferred from ``dtype``: a node's compute dtype and its activation, weight,
     # or KV-cache byte contributors may differ.
     bytes_are_fallback: bool = False
+    # Zero catalogue rates retain fail-open arithmetic, but positive work must
+    # never look free. Keep the missing denominator even if the sibling term
+    # still produces a nonzero prediction.
+    compute_is_unpriced: bool = False
+    memory_is_unpriced: bool = False
 
     @property
     def peak_is_fallback(self) -> bool:
@@ -573,6 +578,8 @@ def roofline(
 ) -> RooflinePrediction:
     """Compute the roofline prediction for a single op."""
     peak_flops, peak_dtype = resolve_peak(hw, dtype)
+    compute_is_unpriced = flops > 0 and peak_flops <= 0
+    memory_is_unpriced = bytes_moved > 0 and hw.peak_mem_bw_bytes_per_s <= 0
     t_c = flops / peak_flops if peak_flops > 0 else 0.0
     t_m = bytes_moved / hw.peak_mem_bw_bytes_per_s if hw.peak_mem_bw_bytes_per_s > 0 else 0.0
     bound = "compute" if t_c >= t_m else "memory"
@@ -589,4 +596,6 @@ def roofline(
         peak_flops_per_s=peak_flops,
         estimated=estimated,
         bytes_are_fallback=bytes_are_fallback,
+        compute_is_unpriced=compute_is_unpriced,
+        memory_is_unpriced=memory_is_unpriced,
     )

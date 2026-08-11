@@ -111,3 +111,14 @@ def test_roofline_zero_peak_rates_dont_divide_by_zero():
     assert pred.t_compute_s == 0.0
     assert pred.t_memory_s == 0.0
     assert pred.t_pred_s == 0.0
+    assert pred.compute_is_unpriced
+    assert pred.memory_is_unpriced
+
+
+def test_nonzero_memory_time_does_not_hide_missing_compute_rate():
+    hw = HardwareSpec(peak_flops_fp16_per_s=0.0, peak_mem_bw_bytes_per_s=1e9)
+    pred = roofline("partial", flops=1e12, bytes_moved=1e6, hw=hw)
+
+    assert pred.t_pred_s > 0.0
+    assert pred.compute_is_unpriced
+    assert not pred.memory_is_unpriced

@@ -121,23 +121,27 @@ class Graph:
 
     @property
     def has_unpriced_nodes(self) -> bool:
-        """True if any node moves bytes but predicts zero time.
+        """True when a positive compute or byte term lacks its denominator.
 
-        This is the general trust net: any missing bandwidth denominator can make
-        real work look free, whether or not the node is a collective.
+        A priced memory term must not hide missing compute throughput (or vice
+        versa), so this cannot be inferred from total predicted time alone.
         """
-        return any(
-            n.prediction.bytes > 0 and n.prediction.t_pred_s == 0.0 for n in self.nodes
-        )
+        return self.has_unpriced_compute or self.has_unpriced_memory
+
+    @property
+    def has_unpriced_compute(self) -> bool:
+        return any(n.prediction.compute_is_unpriced for n in self.nodes)
+
+    @property
+    def has_unpriced_memory(self) -> bool:
+        return any(n.prediction.memory_is_unpriced for n in self.nodes)
 
     @property
     def has_unpriced_collectives(self) -> bool:
         """True if a collective moves bytes but predicts zero time."""
         collective_ops = {"moe_all_to_all", "tp_all_reduce"}
         return any(
-            n.op in collective_ops
-            and n.prediction.bytes > 0
-            and n.prediction.t_pred_s == 0.0
+            n.op in collective_ops and n.prediction.memory_is_unpriced
             for n in self.nodes
         )
 
