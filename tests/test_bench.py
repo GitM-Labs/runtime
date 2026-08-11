@@ -313,6 +313,74 @@ def test_profile_marks_failed_workload_command(tmp_path):
     assert not bundle.complete
 
 
+def test_profile_launches_pyspy_and_records_its_artifact(monkeypatch, tmp_path):
+    from gitm.bench import profile
+
+    calls = []
+
+    class Proc:
+        def __init__(self, argv, **_kwargs):
+            self.argv = argv
+            self.pid = 4321
+            self.returncode = None
+            calls.append(argv)
+            if argv[0] == "py-spy":
+                output = Path(argv[argv.index("--output") + 1])
+                output.write_text("<svg/>")
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+        def terminate(self):
+            self.returncode = -15
+
+    monkeypatch.setattr(profile.subprocess, "Popen", Proc)
+    bundle = profile.run_profile(
+        _hft_config(),
+        ["workload"],
+        tmp_path,
+        host_capture_s=1,
+        tools=profile.ProfilerTools(nsys=None, rocprof=None, py_spy="py-spy", sar=None),
+    )
+
+    pyspy = next(call for call in calls if call[0] == "py-spy")
+    assert pyspy[pyspy.index("--pid") + 1] == "4321"
+    assert "--subprocesses" in pyspy
+    assert bundle.host_pyspy == tmp_path / "host_flamegraph.svg"
+    assert bundle.host_pyspy.exists()
+    assert not any("py-spy" in item for item in bundle.missing)
+
+
+def test_profile_surfaces_failed_pyspy_capture(monkeypatch, tmp_path):
+    from gitm.bench import profile
+
+    class Proc:
+        def __init__(self, argv, **_kwargs):
+            self.argv = argv
+            self.pid = 4321
+            self.returncode = None
+
+        def wait(self, timeout=None):
+            self.returncode = 9 if self.argv[0] == "py-spy" else 0
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+    monkeypatch.setattr(profile.subprocess, "Popen", Proc)
+    bundle = profile.run_profile(
+        _hft_config(),
+        ["workload"],
+        tmp_path,
+        host_capture_s=1,
+        tools=profile.ProfilerTools(nsys=None, rocprof=None, py_spy="py-spy", sar=None),
+    )
+
+    assert any("py-spy capture failed (exit 9)" in item for item in bundle.missing)
+    assert not bundle.complete
+
+
 def test_breakdown_refuses_to_clamp_overlapping_timings():
     from gitm.bench.profile import PhaseTiming, build_breakdown
 
