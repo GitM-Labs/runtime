@@ -46,7 +46,6 @@ class SchedulerSample:
     num_unfinished: int | None = None  # total in-flight requests
     preemptions_cumulative: int | None = None  # running total of preemptions
     gpu_cache_usage: float | None = None  # KV-cache blocks used / total, 0..1
-    cpu_cache_usage: float | None = None
     batch_occupancy: float | None = None  # num_running / max_num_seqs, 0..1
     diagnostics: list[str] = field(default_factory=list)
 

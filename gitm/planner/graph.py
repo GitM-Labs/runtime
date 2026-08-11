@@ -99,9 +99,6 @@ class PredictedNode:
     op: str
     layer: int | None
     prediction: RooflinePrediction
-    # Streams the planner expects to run on — used by the stream-concurrency
-    # invariant.
-    expected_stream_id: int = 0
 
 
 @dataclass
