@@ -91,6 +91,22 @@ def test_require_compatible_is_silent_when_the_stack_fits(host):
     cuda_env.require_compatible()  # must not raise
 
 
+def test_require_compatible_warns_when_build_versions_are_unverified(host):
+    host(driver=(13, 0), torch=None, vllm=None)
+
+    with pytest.warns(RuntimeWarning, match="PyTorch CUDA build.*vLLM CUDA build"):
+        cuda_env.require_compatible()
+
+
+def test_diagnostic_cli_does_not_claim_ok_for_unverified_builds(host, capsys):
+    host(driver=(13, 0), torch=None, vllm=None)
+
+    assert cuda_env.main([]) == 2
+    output = capsys.readouterr().out
+    assert "UNVERIFIED" in output
+    assert "OK" not in output
+
+
 @pytest.mark.parametrize(
     ("driver", "expected"),
     [

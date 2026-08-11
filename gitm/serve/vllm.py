@@ -253,11 +253,7 @@ def check_driver_stack() -> list[Check]:
     problems = cuda_env.check()
     if problems:
         return [Check("cuda-stack", "fail", "\n".join(str(p) for p in problems))]
-    unverified = []
-    if cuda_env.torch_cuda() is None:
-        unverified.append("PyTorch CUDA build")
-    if cuda_env.vllm_cuda_major() is None:
-        unverified.append("vLLM CUDA build")
+    unverified = cuda_env.unverified_cuda_components()
     if unverified:
         return [
             Check(
