@@ -69,6 +69,18 @@ def analyse(trace, sku: str, *, hardware_assumed: bool = False):
 
     kernels = trace.kernels()
     breakdown = summarize_kernels(kernels, window_ns=trace.duration_ns)
+    if breakdown.n_kernels == 0:
+        return {
+            "breakdown": breakdown,
+            "peak": None,
+            "sku_known": False,
+            "hardware_assumed": hardware_assumed,
+            "metrics": None,
+            "headroom": None,
+            "roi": [],
+            "comm": None,
+            "causes": [],
+        }
 
     peak, sku_known = _resolve_peak(sku)
     metrics = compute_metrics(trace, peak)

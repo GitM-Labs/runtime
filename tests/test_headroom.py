@@ -55,3 +55,22 @@ def test_render_contains_key_lines():
     md = render_headroom_md(r)
     assert "Blind headroom — vllm-decode on NVIDIA H100" in md
     assert "Ceiling distance" in md
+    assert "Caveats:" in md
+    assert "HFU is unavailable" in md
+
+
+@pytest.mark.parametrize("floor", [0.0, float("nan"), float("inf")])
+def test_invalid_predicted_floor_is_refused(floor):
+    trace = _trace(wall_us=200)
+    metrics = compute_metrics(trace, PEAK)
+
+    with pytest.raises(ValueError, match="predicted floor must be finite and positive"):
+        build_headroom(trace, predicted_floor_s=floor, metrics=metrics, workload="vllm-decode")
+
+
+def test_floor_above_observation_is_refused_instead_of_already_optimized():
+    trace = _trace(wall_us=200)
+    metrics = compute_metrics(trace, PEAK)
+
+    with pytest.raises(ValueError, match="exceeds observed wall"):
+        build_headroom(trace, predicted_floor_s=201e-6, metrics=metrics, workload="vllm-decode")

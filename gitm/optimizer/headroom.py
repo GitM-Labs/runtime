@@ -16,6 +16,7 @@ metrics → one report-ready object.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Literal
 
@@ -82,10 +83,21 @@ def build_headroom(
 ) -> HeadroomReport:
     """Assemble the headroom report from the trace, planner floor, and metrics."""
     observed_s = trace.duration_ns / 1e9
-    if observed_s > 0 and predicted_floor_s > 0:
-        ceiling_distance = max(0.0, (observed_s - predicted_floor_s) / observed_s)
-    else:
-        ceiling_distance = 0.0
+    if not math.isfinite(observed_s) or observed_s <= 0.0:
+        raise ValueError(f"observed trace duration must be finite and positive, got {observed_s!r}")
+    if not math.isfinite(predicted_floor_s) or predicted_floor_s <= 0.0:
+        raise ValueError(
+            f"predicted floor must be finite and positive, got {predicted_floor_s!r}"
+        )
+    if predicted_floor_s > observed_s:
+        raise ValueError(
+            f"predicted floor {predicted_floor_s!r}s exceeds observed wall {observed_s!r}s"
+        )
+    if not math.isfinite(optimized_threshold) or not 0.0 <= optimized_threshold <= 1.0:
+        raise ValueError(
+            f"optimized threshold must be finite and in [0, 1], got {optimized_threshold!r}"
+        )
+    ceiling_distance = (observed_s - predicted_floor_s) / observed_s
     already_optimized = ceiling_distance < optimized_threshold
 
     # Split the recoverable distance across stall classes. Idle is the GPU-idle
@@ -150,5 +162,16 @@ def render_headroom_md(r: HeadroomReport) -> str:
     if r.already_optimized:
         lines.append("")
         lines.append("> Flagged already-optimized — no headroom to bill.")
+    if r.indicative_mem_compute_split or r.caveats:
+        lines.extend(["", "Caveats:"])
+        for caveat in r.caveats:
+            lines.append(f"  - {caveat}")
+        if r.indicative_mem_compute_split and not any(
+            "indicative" in caveat.lower() for caveat in r.caveats
+        ):
+            lines.append(
+                "  - Memory/compute split is indicative because HFU is unavailable; "
+                "it uses available MBU signal and a 50/50 split when both signals are weak."
+            )
     return "\n".join(lines) + "\n"
 
