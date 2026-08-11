@@ -1025,7 +1025,10 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
 
     # Phase 4b - agentic autoresearch through the catalog gate/rollback path.
     if time.time_ns() - started_ns < int(budget_s * 1e9):
-        proposer = FallbackProposer(EngineArgsProposer(), TableProposer())
+        proposer = FallbackProposer(
+            EngineArgsProposer(gpu_count=pctx.num_gpus),
+            TableProposer(),
+        )
 
         def _unenactable(spec: Any) -> str | None:
             if (

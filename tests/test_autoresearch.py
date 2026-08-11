@@ -768,6 +768,32 @@ def test_visible_gpu_count_is_a_positive_int() -> None:
     assert isinstance(n, int) and n >= 1
 
 
+def test_visible_gpu_count_warns_when_torch_reports_no_gpus(monkeypatch) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 0)))
+    with pytest.warns(RuntimeWarning, match="GPU-count detection reported 0"):
+        assert _visible_gpu_count() == 1
+
+
+def test_visible_gpu_count_keeps_observed_multi_gpu_count_clean(monkeypatch) -> None:
+    import sys
+    import warnings
+    from types import SimpleNamespace
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 4)))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert _visible_gpu_count() == 4
+
+
+@pytest.mark.parametrize("count", [0, -1])
+def test_knobs_from_engine_args_refuses_invalid_explicit_gpu_count(count) -> None:
+    with pytest.raises(ValueError, match="gpu_count must be positive"):
+        _knobs_from_engine_args(_FakeEngineArgs, gpu_count=count)
+
+
 def test_vllm_knob_source_gpu_count_override_is_accepted_offline() -> None:
     # vLLM isn't importable in CI, so the offline fallback catalog is returned
     # regardless of gpu_count — this just proves the parameter doesn't crash

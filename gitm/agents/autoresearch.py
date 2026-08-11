@@ -558,8 +558,23 @@ def _visible_gpu_count() -> int:
     try:
         import torch
 
-        return torch.cuda.device_count() or 1
-    except Exception:
+        count = int(torch.cuda.device_count())
+        if count > 0:
+            return count
+        warnings.warn(
+            f"GPU-count detection reported {count}; autoresearch is using 1 and "
+            "may omit multi-GPU candidates",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return 1
+    except Exception as exc:
+        warnings.warn(
+            "GPU-count detection failed; autoresearch is using 1 and may omit "
+            f"multi-GPU candidates ({type(exc).__name__}: {exc})",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return 1
 
 
@@ -645,6 +660,8 @@ def _knobs_from_engine_args(
     """
     import dataclasses
 
+    if gpu_count is not None and gpu_count <= 0:
+        raise ValueError(f"gpu_count must be positive when supplied, got {gpu_count}")
     gpus = _visible_gpu_count() if gpu_count is None else gpu_count
     domains = _argparse_domains(engine_args_cls)
     knobs: list[Knob] = []
