@@ -94,6 +94,7 @@ def test_chunk_count_is_the_fallback_when_usage_is_absent(sse_server):
     rec = sc.one_request(base, "m", "p", max_tokens=4, ignore_eos=True, timeout_s=30)
 
     assert rec is not None and rec.n_output_tokens == 3
+    assert rec.token_count_source == "chunks"
 
 
 def test_unreachable_server_returns_none_not_a_fake_record():

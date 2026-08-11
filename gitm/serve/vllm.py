@@ -544,6 +544,7 @@ def one_request(base: str, model: str, prompt: str, max_tokens: int,
     # usage is authoritative; the chunk count is the fallback when a build doesn't
     # emit it, and it undercounts whenever a chunk carries several tokens.
     rec.n_output_tokens = usage_tokens if usage_tokens is not None else chunks
+    rec.token_count_source = "usage" if usage_tokens is not None else "chunks"
     return rec
 
 
@@ -759,8 +760,11 @@ def launch_and_capture(args, serve_argv: list[str] | None = None):
 
     print(f"\n==> {len(records)} ok / {failures} failed in {wall:.1f}s")
     if summary.ttft_p50_s is not None:
+        tpot = f"{summary.tpot_p50_s * 1e3:.1f} ms" if summary.tpot_p50_s is not None else "n/a"
         print(f"    TTFT p50/p95 {summary.ttft_p50_s * 1e3:.0f}/{summary.ttft_p95_s * 1e3:.0f} ms"
-              f"   TPOT p50 {(summary.tpot_p50_s or 0) * 1e3:.1f} ms")
+              f"   TPOT p50 {tpot}")
+    for warning in summary.warnings:
+        print(f"    WARN: {warning}")
     print_result(result)
 
     if result.status == "no_kernels":

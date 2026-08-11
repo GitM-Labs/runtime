@@ -89,6 +89,14 @@ class RequestRecord:
     first_token_wall_s: float | None = None
     finished_wall_s: float | None = None
     n_output_tokens: int = 0
+    # ``authoritative`` means usage metadata or engine token_ids; ``chunks`` is
+    # the SSE-event fallback (one event can carry multiple tokens); ``unknown``
+    # means no trustworthy denominator exists.
+    token_count_source: str = "unknown"
+
+    @property
+    def token_count_authoritative(self) -> bool:
+        return self.token_count_source in {"usage", "engine"}
 
     @property
     def ttft_s(self) -> float | None:
@@ -106,9 +114,21 @@ class RequestRecord:
         inter-token interval at all and yields ``None`` rather than a number
         derived from a zero-length gap.
         """
+        if not self.token_count_authoritative:
+            return None
         if self.first_token_wall_s is None or self.finished_wall_s is None:
             return None
         if self.n_output_tokens < 2:
+            return None
+        span = max(self.finished_wall_s - self.first_token_wall_s, 0.0)
+        return span / (self.n_output_tokens - 1)
+
+    @property
+    def estimated_tpot_s(self) -> float | None:
+        """Chunk-count TPOT estimate, never admitted to SLO goodput."""
+        if self.token_count_source != "chunks" or self.n_output_tokens < 2:
+            return None
+        if self.first_token_wall_s is None or self.finished_wall_s is None:
             return None
         span = max(self.finished_wall_s - self.first_token_wall_s, 0.0)
         return span / (self.n_output_tokens - 1)
@@ -124,8 +144,14 @@ class RequestRecord:
         ttft = self.ttft_s
         if ttft is None or ttft > ttft_slo_s:
             return False
+        if not self.token_count_authoritative:
+            return False
+        if self.n_output_tokens == 1:
+            return True
+        if self.n_output_tokens < 1:
+            return False
         tpot = self.tpot_s
-        return tpot is None or tpot <= tpot_slo_s
+        return tpot is not None and tpot <= tpot_slo_s
 
 
 @dataclass
@@ -141,17 +167,20 @@ class ServingSummary:
     n_requests: int
     n_ttft: int
     n_tpot: int
+    n_tpot_estimated: int
     ttft_p50_s: float | None
     ttft_p95_s: float | None
     ttft_p99_s: float | None
     tpot_p50_s: float | None
     tpot_p95_s: float | None
     tpot_p99_s: float | None
+    tpot_estimated_p50_s: float | None
     n_met_slo: int
     goodput_rps: float | None  # SLO-meeting requests per second over the window
     window_s: float | None
     ttft_slo_s: float
     tpot_slo_s: float
+    warnings: list[str]
 
 
 def _percentile(vals: list[float], q: float) -> float | None:
@@ -182,6 +211,7 @@ def request_records_from_outputs(outputs: Any) -> list[RequestRecord]:
         if outs:
             try:
                 rec.n_output_tokens = len(outs[0].token_ids)
+                rec.token_count_source = "engine"
             except (AttributeError, TypeError, IndexError):
                 pass
         metrics = getattr(o, "metrics", None)
@@ -212,6 +242,7 @@ def summarize_requests(
     """
     ttfts = [t for t in (r.ttft_s for r in records) if t is not None]
     tpots = [t for t in (r.tpot_s for r in records) if t is not None]
+    estimated_tpots = [t for t in (r.estimated_tpot_s for r in records) if t is not None]
     met = [r for r in records if r.meets_slo(ttft_slo_s, tpot_slo_s)]
 
     arrivals = [r.arrival_wall_s for r in records if r.arrival_wall_s is not None]
@@ -223,21 +254,36 @@ def summarize_requests(
     # has no meaningful rate — report the count, not a division by ~0.
     goodput = (len(met) / window_s) if window_s else None
 
+    warnings: list[str] = []
+    if estimated_tpots:
+        warnings.append(
+            f"TPOT coverage: {len(estimated_tpots)} request(s) use SSE chunk-count estimates; "
+            "excluded from authoritative TPOT percentiles and SLO goodput"
+        )
+    missing_counts = sum(1 for r in records if r.token_count_source == "unknown")
+    if missing_counts:
+        warnings.append(
+            f"TPOT coverage: {missing_counts} request(s) have no authoritative output-token count"
+        )
+
     return ServingSummary(
         n_requests=len(records),
         n_ttft=len(ttfts),
         n_tpot=len(tpots),
+        n_tpot_estimated=len(estimated_tpots),
         ttft_p50_s=_percentile(ttfts, 0.50),
         ttft_p95_s=_percentile(ttfts, 0.95),
         ttft_p99_s=_percentile(ttfts, 0.99),
         tpot_p50_s=_percentile(tpots, 0.50),
         tpot_p95_s=_percentile(tpots, 0.95),
         tpot_p99_s=_percentile(tpots, 0.99),
+        tpot_estimated_p50_s=_percentile(estimated_tpots, 0.50),
         n_met_slo=len(met),
         goodput_rps=goodput,
         window_s=window_s,
         ttft_slo_s=ttft_slo_s,
         tpot_slo_s=tpot_slo_s,
+        warnings=warnings,
     )
 
 
