@@ -143,11 +143,12 @@ def test_torch_json_and_gz():
 
 
 def test_torch_array_form_and_missing_grid():
-    ts, _ = import_torch_trace(FIXTURES / "torch_trace_array.json")
+    ts, stats = import_torch_trace(FIXTURES / "torch_trace_array.json")
     t = ts[0]
     assert t.kernels()
     # grid defaults to 1 when absent
     assert all(k.grid_x >= 1 and k.block_x >= 1 for k in t.kernels())
+    assert any("grid dimensions" in warning for warning in stats.warnings)
 
 
 def test_torch_us_to_ns_conversion():
