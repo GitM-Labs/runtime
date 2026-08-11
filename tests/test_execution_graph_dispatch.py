@@ -52,6 +52,20 @@ def _moe_cfg(**over) -> dict:
     return cfg
 
 
+def _dense_cfg(**over) -> dict:
+    cfg = {
+        "model_type": "opt",
+        "hidden_size": 768,
+        "num_hidden_layers": 12,
+        "num_attention_heads": 12,
+        "intermediate_size": 3072,
+        "vocab_size": 50272,
+        "torch_dtype": "bf16",
+    }
+    cfg.update(over)
+    return cfg
+
+
 def test_sparse_engine_dispatches_to_sparse_graph():
     resolved = _execution_graph(_engine(_moe_cfg()), _pctx(), sched=None)
 
@@ -126,3 +140,11 @@ def test_accepted_batch_and_kv_defaults_are_diagnostics():
     assert resolved.graph.batch.kv_cache_len == 4096
     assert any("batch=1" in note for note in resolved.diagnostics)
     assert any("kv_cache_len=4096" in note for note in resolved.diagnostics)
+
+
+def test_dense_mha_and_head_dimension_derivations_are_diagnostics():
+    resolved = _execution_graph(_engine(_dense_cfg()), _pctx(), sched=None)
+
+    assert resolved.ok
+    assert any("num_key_value_heads" in note and "MHA" in note for note in resolved.diagnostics)
+    assert any("head_dim" in note and "derived" in note for note in resolved.diagnostics)

@@ -59,6 +59,25 @@ def test_unknown_dense_dtype_refuses_instead_of_becoming_bf16():
     assert "not priceable" in error
 
 
+def test_missing_dense_dtype_refuses_instead_of_becoming_bf16():
+    cfg = dict(_OPT_125M)
+    del cfg["torch_dtype"]
+
+    spec, error = _dense_spec_from_config(cfg)
+
+    assert spec is None
+    assert "torch_dtype" in error
+
+
+def test_malformed_dense_quantization_config_refuses():
+    spec, error = _dense_spec_from_config(
+        {**_OPT_125M, "quantization_config": ["fp8"]}
+    )
+
+    assert spec is None
+    assert "quantization_config" in error
+
+
 def test_dense_parser_preserves_fp32_compute_dtype():
     spec, error = _dense_spec_from_config({**_OPT_125M, "torch_dtype": "float32"})
 

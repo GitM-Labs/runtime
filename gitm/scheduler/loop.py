@@ -341,6 +341,7 @@ def _dense_spec_from_config(cfg: dict[str, Any]) -> tuple[ModelSpec | None, str]
         "num_attention_heads",
         "intermediate_size",
         "vocab_size",
+        "torch_dtype",
     )
     missing = [key for key in required if cfg.get(key) is None]
     if missing:
@@ -361,7 +362,9 @@ def _dense_spec_from_config(cfg: dict[str, Any]) -> tuple[ModelSpec | None, str]
             return None, f"dense activation dtype {act!r} is not priceable"
         dtype_bytes = int(weight_bytes(act))
         quant = cfg.get("quantization_config") or {}
-        method = quant.get("quant_method") if isinstance(quant, dict) else None
+        if not isinstance(quant, dict):
+            return None, "dense quantization_config must be an object when declared"
+        method = quant.get("quant_method")
         if method is not None and str(method).lower() not in _QUANT_WEIGHT_BYTES:
             return None, f"dense quantization method {method!r} is not priceable"
         full_attn_layer_step = 1
@@ -452,6 +455,15 @@ def _execution_graph(engine: Any, pctx: Any, sched: Any) -> ExecutionGraphResolu
         diagnostics.extend(sharding_diagnostics)
         graph = predict_moe_graph(spec, hw, batch, sharding)
     else:
+        if cfg.get("num_key_value_heads") is None:
+            diagnostics.append(
+                "dense num_key_value_heads was not declared; assuming standard MHA "
+                "with one KV head per query head"
+            )
+        if cfg.get("head_dim") is None:
+            diagnostics.append(
+                "dense head_dim was not declared; derived hidden_size / num_attention_heads"
+            )
         spec, error = _dense_spec_from_config(cfg)
         if spec is None:
             return ExecutionGraphResolution(None, diagnostics, error)
