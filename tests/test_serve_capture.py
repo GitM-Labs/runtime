@@ -366,3 +366,31 @@ def test_preflight_fails_closed_without_a_gpu():
     start a server that cannot possibly work."""
     dev = sc.Devices(indices=[], count=0, source="nvidia-smi unavailable")
     assert sc.check_gpus(2, dev)[0].status == "fail"
+
+
+def test_driver_stack_does_not_pass_when_build_versions_are_unreadable(monkeypatch):
+    from gitm import cuda_env
+
+    monkeypatch.setattr(cuda_env, "driver_cuda", lambda: (13, 0))
+    monkeypatch.setattr(cuda_env, "stack_for", lambda _driver: object())
+    monkeypatch.setattr(cuda_env, "check", lambda: [])
+    monkeypatch.setattr(cuda_env, "torch_cuda", lambda: None)
+    monkeypatch.setattr(cuda_env, "vllm_cuda_major", lambda: None)
+
+    check = sc.check_driver_stack()[0]
+
+    assert check.status == "warn"
+    assert "PyTorch CUDA build" in check.detail
+    assert "vLLM CUDA build" in check.detail
+
+
+def test_driver_stack_pass_requires_observed_build_versions(monkeypatch):
+    from gitm import cuda_env
+
+    monkeypatch.setattr(cuda_env, "driver_cuda", lambda: (13, 0))
+    monkeypatch.setattr(cuda_env, "stack_for", lambda _driver: object())
+    monkeypatch.setattr(cuda_env, "check", lambda: [])
+    monkeypatch.setattr(cuda_env, "torch_cuda", lambda: (13, 0))
+    monkeypatch.setattr(cuda_env, "vllm_cuda_major", lambda: 13)
+
+    assert sc.check_driver_stack()[0].status == "pass"

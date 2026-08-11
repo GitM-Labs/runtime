@@ -253,6 +253,21 @@ def check_driver_stack() -> list[Check]:
     problems = cuda_env.check()
     if problems:
         return [Check("cuda-stack", "fail", "\n".join(str(p) for p in problems))]
+    unverified = []
+    if cuda_env.torch_cuda() is None:
+        unverified.append("PyTorch CUDA build")
+    if cuda_env.vllm_cuda_major() is None:
+        unverified.append("vLLM CUDA build")
+    if unverified:
+        return [
+            Check(
+                "cuda-stack",
+                "warn",
+                f"driver CUDA {driver[0]}.{driver[1]} detected, but "
+                f"{' and '.join(unverified)} could not be verified; "
+                "stack compatibility is unknown",
+            )
+        ]
     return [Check("cuda-stack", "pass", f"driver CUDA {driver[0]}.{driver[1]}, stack consistent")]
 
 
