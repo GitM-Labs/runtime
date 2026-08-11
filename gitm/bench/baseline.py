@@ -146,6 +146,10 @@ def aggregate(runs: list[BaselineRun], config: BenchConfig) -> BaselineSummary:
             provenance_issues.append(f"seed {run.seed}: GPU identity unavailable ({run.gpu_name!r})")
         if run.device_count < 1:
             provenance_issues.append(f"seed {run.seed}: no GPU devices reported")
+        if run.started_at_ns <= 0:
+            provenance_issues.append(f"seed {run.seed}: start timestamp unavailable")
+        if run.ended_at_ns <= run.started_at_ns:
+            provenance_issues.append(f"seed {run.seed}: end timestamp does not follow start")
         provenance_issues.extend(f"seed {run.seed}: {note}" for note in run.provenance_warnings)
     gates.append(
         GateResult(

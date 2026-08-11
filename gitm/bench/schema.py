@@ -93,7 +93,7 @@ class BenchConfig(BaseModel):
     seeds: list[int] = Field(min_length=1)
     spread_tolerance: float = Field(default=0.02, gt=0.0, le=1.0)
     gpu_active_ceiling: float = Field(default=0.85, gt=0.0, le=1.0)
-    baseline_target: float | None = None
+    baseline_target: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
     target_direction: TargetDirection = "ge"
     dataset: DatasetRef
     work_unit: WorkUnit
@@ -122,7 +122,7 @@ class StallPhase(BaseModel):
     data_stall: float = Field(ge=0.0, le=1.0)
     sync: float = Field(ge=0.0, le=1.0)
     gpu_active: float = Field(ge=0.0, le=1.0)
-    throughput: float | None = None  # in the benchmark's metric units
+    throughput: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
     wall_clock_s: float = Field(ge=0.0)
 
 
@@ -140,8 +140,8 @@ class BaselineRun(BaseModel):
     seed: int
     vendor: Vendor
     metric: str
-    metric_value: float
-    warm_window_s: int
+    metric_value: float = Field(gt=0.0, allow_inf_nan=False)
+    warm_window_s: int = Field(gt=0)
 
     # Provenance: a baseline is only reproducible if these are pinned.
     git_sha: str

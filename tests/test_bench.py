@@ -127,6 +127,8 @@ def _run(seed: int, value: float, gpu: float = 0.7) -> object:
         manifest_sha256="manifest123",
         gpu_name="A100",
         device_count=1,
+        started_at_ns=1,
+        ended_at_ns=2,
         stall_breakdown=[
             StallPhase(phase="all", cpu=0.03, data_stall=max(0.0, 1 - gpu - 0.03 - 0.05),
                        sync=0.05, gpu_active=gpu, throughput=value, wall_clock_s=60.0)
@@ -199,6 +201,39 @@ def test_baseline_refuses_cpu_or_unpinned_runs():
     assert not gate.passed
     assert "GPU identity unavailable" in gate.detail
     assert "manifest digest unavailable" in gate.detail
+
+
+def test_baseline_refuses_missing_or_reversed_timing_provenance():
+    from gitm.bench.baseline import aggregate
+
+    runs = [_run(42, 26e6), _run(43, 26e6), _run(44, 26e6)]
+    runs[0].started_at_ns = 0
+    runs[1].ended_at_ns = runs[1].started_at_ns
+
+    summary = aggregate(runs, _hft_config())
+
+    gate = next(g for g in summary.gates if g.name == "provenance")
+    assert not gate.passed
+    assert "start timestamp unavailable" in gate.detail
+    assert "end timestamp does not follow start" in gate.detail
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+def test_baseline_run_refuses_unusable_metric_values(value):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        _run(42, value)
+
+
+@pytest.mark.parametrize("target", [0.0, -1.0, float("nan"), float("inf")])
+def test_bench_config_refuses_unusable_baseline_target(target):
+    from pydantic import ValidationError
+
+    cfg = _hft_config().model_dump()
+    cfg["baseline_target"] = target
+    with pytest.raises(ValidationError):
+        type(_hft_config()).model_validate(cfg)
 
 
 def test_baseline_fails_on_too_few_runs_and_below_target():
