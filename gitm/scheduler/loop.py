@@ -1311,13 +1311,25 @@ def _specialized_claim_basis(
     if not math.isfinite(measured_delta):
         diagnostics.append("intervention A/B speedup is non-finite; no claim emitted")
         return None, None, diagnostics
-    if mres.n_kernels > mres.n_invalid_duration:
+    if mres.serialized_fraction is not None:
         return ("stream_concurrency", float(mres.serialized_fraction)), measured_delta, diagnostics
+    if mres.n_kernels > mres.n_invalid_duration:
+        diagnostics.append(
+            "no adjacent cross-stream CUPTI kernel pairs; claim residual uses the "
+            "measured A/B throughput delta instead of fabricated concurrency evidence"
+        )
+        return ("throughput_delta", measured_delta), measured_delta, diagnostics
     diagnostics.append(
         "no positive-duration CUPTI kernels; claim residual uses the measured A/B "
         "throughput delta instead of a fabricated stream-concurrency value"
     )
     return ("throughput_delta", measured_delta), measured_delta, diagnostics
+
+
+def _serialized_evidence(mres: Any) -> str:
+    if mres.serialized_fraction is None:
+        return "serialized-concurrency unavailable (no adjacent cross-stream pairs)"
+    return f"serialized-concurrency={mres.serialized_fraction:.3f}"
 
 
 def _hft_intervention_result(
@@ -1374,13 +1386,10 @@ def _hft_intervention_result(
     if top:
         evidence = (
             f"top hypothesis: {top[0].cause_op[:30]} → {top[0].effect_op[:30]} "
-            f"(p={top[0].p_value:.3g}); serialized-concurrency={mres.serialized_fraction:.3f}"
+            f"(p={top[0].p_value:.3g}); {_serialized_evidence(mres)}"
         )
     elif mres.n_kernels:
-        evidence = (
-            f"serialized-concurrency={mres.serialized_fraction:.3f} over "
-            f"{mres.n_kernels} kernels"
-        )
+        evidence = f"{_serialized_evidence(mres)} over {mres.n_kernels} kernels"
     else:
         evidence = (
             "no CUPTI trace captured on this box; intervention proven by the "
@@ -1446,8 +1455,7 @@ def _hft_intervention_result(
         runtime_diagnostics=runtime_diagnostics,
         summary=(
             f"HFT intervention {spec.name!r}: {verdict}. "
-            f"{mres.n_kernels:,} kernels observed, serialized-concurrency="
-            f"{mres.serialized_fraction:.3f}."
+            f"{mres.n_kernels:,} kernels observed, {_serialized_evidence(mres)}."
         ),
     )
     _write_report(run_dir, report_md)
@@ -1516,13 +1524,10 @@ def _openfold_intervention_result(
     if top:
         evidence = (
             f"top hypothesis: {top[0].cause_op[:30]} → {top[0].effect_op[:30]} "
-            f"(p={top[0].p_value:.3g}); serialized-concurrency={mres.serialized_fraction:.3f}"
+            f"(p={top[0].p_value:.3g}); {_serialized_evidence(mres)}"
         )
     elif mres.n_kernels:
-        evidence = (
-            f"serialized-concurrency={mres.serialized_fraction:.3f} over "
-            f"{mres.n_kernels} kernels"
-        )
+        evidence = f"{_serialized_evidence(mres)} over {mres.n_kernels} kernels"
     else:
         evidence = (
             "no CUPTI trace captured on this box; intervention proven by the "
@@ -1591,8 +1596,7 @@ def _openfold_intervention_result(
         runtime_diagnostics=runtime_diagnostics,
         summary=(
             f"AF2 intervention {spec.name!r}: {verdict}. "
-            f"{mres.n_kernels:,} kernels observed, serialized-concurrency="
-            f"{mres.serialized_fraction:.3f}."
+            f"{mres.n_kernels:,} kernels observed, {_serialized_evidence(mres)}."
         ),
     )
     _write_report(run_dir, report_md)
@@ -1663,13 +1667,10 @@ def _edge_intervention_result(
     if top:
         evidence = (
             f"top hypothesis: {top[0].cause_op[:30]} → {top[0].effect_op[:30]} "
-            f"(p={top[0].p_value:.3g}); serialized-concurrency={mres.serialized_fraction:.3f}"
+            f"(p={top[0].p_value:.3g}); {_serialized_evidence(mres)}"
         )
     elif mres.n_kernels:
-        evidence = (
-            f"serialized-concurrency={mres.serialized_fraction:.3f} over "
-            f"{mres.n_kernels} kernels"
-        )
+        evidence = f"{_serialized_evidence(mres)} over {mres.n_kernels} kernels"
     else:
         evidence = (
             "no CUPTI trace captured on this box; intervention proven by the "
@@ -1736,8 +1737,7 @@ def _edge_intervention_result(
         runtime_diagnostics=runtime_diagnostics,
         summary=(
             f"edge intervention {spec.name!r}: {verdict}. "
-            f"{mres.n_kernels:,} kernels observed, serialized-concurrency="
-            f"{mres.serialized_fraction:.3f}."
+            f"{mres.n_kernels:,} kernels observed, {_serialized_evidence(mres)}."
         ),
     )
     _write_report(run_dir, report_md)

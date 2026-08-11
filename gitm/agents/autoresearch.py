@@ -148,11 +148,15 @@ def classify_bottleneck(trace: Trace, residuals: Residuals | None = None) -> str
     gpu_op_ns = kernel_ns + memcpy_ns
     memcpy_frac = memcpy_ns / gpu_op_ns if gpu_op_ns else 0.0
 
-    sc_score = sc / _SC_THRESHOLD
+    sc_score = sc / _SC_THRESHOLD if sc is not None else None
     mem_score = memcpy_frac / _MEMCPY_THRESHOLD
     roofline_frac = _roofline_memory_fraction(residuals)
     if roofline_frac is not None:
         mem_score = max(mem_score, roofline_frac / _MEMCPY_THRESHOLD)
+    if mem_score >= 1.0 and (sc_score is None or mem_score > sc_score):
+        return MEMORY_BOUND
+    if sc_score is None:
+        return UNCLASSIFIED
     if max(sc_score, mem_score) < 1.0:
         return COMPUTE_BOUND
     return IDLE_STALL if sc_score >= mem_score else MEMORY_BOUND  # ties favor idle_stall

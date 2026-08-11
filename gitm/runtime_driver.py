@@ -398,8 +398,9 @@ def main(argv: list[str] | None = None) -> int:
     violations = measured.violations
     top_hyps = measured.top_hypotheses
     sc = measured.serialized_fraction
+    sc_text = f"{sc:.3f}" if sc is not None else "unavailable"
     print(
-        f"serialized_concurrency_fraction = {sc:.3f}  |  "
+        f"serialized_concurrency_fraction = {sc_text}  |  "
         f"violations multi-basis={len(violations)}"
     )
     print(f"attribution families (>= 16 samples): {measured.families}")

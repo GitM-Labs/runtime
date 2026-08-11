@@ -52,7 +52,7 @@ class Residuals:
     """Residuals against predicted graph. Per-kernel + per-stream-set."""
 
     per_kernel: list[KernelResidual] = field(default_factory=list)
-    serialized_concurrency_fraction: float = 0.0
+    serialized_concurrency_fraction: float | None = None
     total_kernels: int = 0
     classified_kernels: int = 0
     matched_kernels: int = 0
@@ -99,6 +99,11 @@ class Residuals:
                 "residual coverage: excluded "
                 f"{self.unpriced_prediction_kernels} matched kernel(s) because "
                 "their predicted duration is non-positive or non-finite"
+            )
+        if self.serialized_concurrency_fraction is None:
+            warnings.append(
+                "stream-concurrency coverage unavailable: trace has no adjacent "
+                "cross-stream kernel pairs"
             )
         if self.classified_kernels < self.total_kernels:
             warnings.append(
@@ -260,25 +265,28 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
     return res
 
 
-def _serialized_fraction(obs: list[KernelEvent]) -> float:
-    """Fraction of adjacent kernel pairs that executed serialized.
+def _serialized_fraction(obs: list[KernelEvent]) -> float | None:
+    """Fraction of observed cross-stream opportunities that did not overlap.
 
-    Sort observed kernels by start time; a consecutive pair is *serialized* when
-    the later kernel starts after the earlier one ends (no temporal overlap)
-    while sharing a stream — concurrency a well-tuned pipeline would have
-    achieved was lost. 0.0 = fully overlapped, 1.0 = fully sequential. Computed
-    from the real trace (stream IDs + ns timestamps), not assumed.
+    Sort kernels by start time and inspect adjacent pairs assigned to different
+    streams. Such a pair is evidence that the runtime intended independent
+    scheduling; it is serialized when the later kernel starts after the earlier
+    one ends. Same-stream ordering is mandatory and therefore says nothing about
+    lost concurrency. ``None`` means the trace exposed no cross-stream
+    opportunity, not a clean zero.
     """
     if len(obs) < 2:
-        return 0.0
+        return None
     s = sorted(obs, key=lambda k: k.start_ns)
     pairs = serialized = 0
     for a, b in zip(s, s[1:], strict=False):
+        if a.stream_id == b.stream_id:
+            continue
         pairs += 1
         overlapped = b.start_ns < a.end_ns
-        if not overlapped and a.stream_id == b.stream_id:
+        if not overlapped:
             serialized += 1
-    return serialized / pairs if pairs else 0.0
+    return serialized / pairs if pairs else None
 
 
 def check_invariants(
@@ -344,6 +352,7 @@ def check_invariants(
 
     if (
         inv_sc is not None
+        and residuals_.serialized_concurrency_fraction is not None
         and residuals_.serialized_concurrency_fraction > inv_sc.band_width * 0.5
     ):
         out.append(

@@ -121,7 +121,12 @@ def _fake_capture_with(entered, prefix="cutlass_sm90_gemm"):
     def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
         entered["capture"] = True
         kernels = [
-            make_kernel(f"{prefix}_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 90 + (i % 9))
+            make_kernel(
+                f"{prefix}_{i % 4}",
+                start_ns=i * 100,
+                end_ns=i * 100 + 90 + (i % 9),
+                stream_id=i % 2,
+            )
             for i in range(80)
         ]
         yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")

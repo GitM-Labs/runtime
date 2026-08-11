@@ -67,7 +67,8 @@ def main() -> int:
 
     # Real stream-concurrency computed from the trace stream IDs.
     sc = _serialized_fraction(kernels)
-    print(f"serialized_concurrency_fraction (REAL): {sc:.3f}")
+    sc_text = f"{sc:.3f}" if sc is not None else "unavailable (no cross-stream pairs)"
+    print(f"serialized_concurrency_fraction (REAL): {sc_text}")
 
     # Residual per kernel = deviation from that kernel name's median duration.
     by_name: dict[str, list[int]] = {}

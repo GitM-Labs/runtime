@@ -70,12 +70,21 @@ def test_proposed_knobs_are_disjoint_from_catalog() -> None:
 
 
 def test_classify_idle_stall_from_serialized_kernels() -> None:
-    # Back-to-back kernels on one stream, no overlap ⇒ serialized concurrency = 1.
+    # Back-to-back kernels on alternating streams expose independent scheduling
+    # opportunities that failed to overlap.
+    events = [
+        make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90, stream_id=i % 2)
+        for i in range(6)
+    ]
+    assert classify_bottleneck(make_trace(events=events)) == "idle_stall"
+
+
+def test_classify_single_stream_is_unclassified_without_overlap_opportunity() -> None:
     events = [
         make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90, stream_id=0)
         for i in range(6)
     ]
-    assert classify_bottleneck(make_trace(events=events)) == "idle_stall"
+    assert classify_bottleneck(make_trace(events=events)) == ar.UNCLASSIFIED
 
 
 def test_classify_memory_bound_from_memcpy_heavy_trace() -> None:
@@ -220,7 +229,7 @@ def test_unknown_class_yields_no_results() -> None:
 
 def test_autoresearch_end_to_end_classifies_and_runs() -> None:
     events = [
-        make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90, stream_id=0)
+        make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90, stream_id=i % 2)
         for i in range(6)
     ]
     config: dict = {}
@@ -566,7 +575,8 @@ def test_fallback_proposer_uses_table_only_when_primary_is_empty() -> None:
 
 def test_autoresearch_end_to_end_with_engineargs_proposer() -> None:
     events = [
-        make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90, stream_id=0) for i in range(6)
+        make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90, stream_id=i % 2)
+        for i in range(6)
     ]  # serialized → idle_stall
     proposer = EngineArgsProposer(
         knobs=[Knob("max_num_partial_prefills", "int", default=1)], catalog_knobs=set()
@@ -832,7 +842,8 @@ def test_classify_always_returns_a_known_class() -> None:
     traces = [
         make_trace(events=[]),  # empty → compute default
         make_trace(events=[
-            make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90) for i in range(6)
+            make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90, stream_id=i % 2)
+            for i in range(6)
         ]),  # serialized → idle
         make_trace(events=[make_kernel("k", start_ns=0, end_ns=1000)]
                    + [make_memcpy(start_ns=i * 10, end_ns=i * 10 + 5) for i in range(4)]),

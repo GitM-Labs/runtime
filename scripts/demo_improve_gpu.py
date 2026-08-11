@@ -29,11 +29,11 @@ from pathlib import Path
 from gitm._timing import require_positive_duration
 
 
-def _serialized(trace) -> float:
+def _serialized(trace) -> float | None:
     from gitm.optimizer.monitor import _serialized_fraction
 
     kernels = [e for e in trace.events if e.kind == "kernel"]
-    return _serialized_fraction(kernels) if kernels else 0.0
+    return _serialized_fraction(kernels) if kernels else None
 
 
 def _mean_util(path: Path) -> float | None:
@@ -133,14 +133,20 @@ def main(argv=None) -> int:
     # --- 1. OBSERVE -----------------------------------------------------------
     before_res, before = _run_observed(serial, "before", args.outdir)
     util_s = f"{before['util_pct']:.0f}%" if before["util_pct"] is not None else "n/a"
+    serialized_s = (
+        f"{before['serialized']:.3f}" if before["serialized"] is not None else "unavailable"
+    )
     print("1. OBSERVE (serial baseline under the runtime):")
     print("     why: run the work once, untouched, to measure how much of the GPU it actually uses.")
     print(f"     wall-clock {before['elapsed_s'] * 1e3:.2f} ms | util {util_s} | "
-          f"serialized {before['serialized']:.3f} | {before['n_kernels']} kernels\n")
+          f"serialized {serialized_s} | {before['n_kernels']} kernels\n")
 
     # --- 2. DECIDE ------------------------------------------------------------
     if before["util_pct"] is None:
         print("     telemetry unavailable — refusing an idle-GPU claim and intervention decision.")
+        return 1
+    if before["serialized"] is None:
+        print("     cross-stream evidence unavailable — refusing a concurrency intervention decision.")
         return 1
     idle = before["util_pct"] < 85.0
     serial_heavy = before["serialized"] > 0.5
@@ -173,15 +179,25 @@ def main(argv=None) -> int:
         return 1
 
     util_a = f"{after['util_pct']:.0f}%" if after["util_pct"] is not None else "n/a"
+    serialized_a = (
+        f"{after['serialized']:.3f}" if after["serialized"] is not None else "unavailable"
+    )
     speedup = before["elapsed_s"] / after["elapsed_s"]
     print()
     print("                     BEFORE (serial)     AFTER (parallel)")
     print(f"     wall-clock      {before['elapsed_s'] * 1e3:>10.2f} ms    {after['elapsed_s'] * 1e3:>10.2f} ms")
     print(f"     throughput      {K / before['elapsed_s']:>10.0f} mm/s  {K / after['elapsed_s']:>10.0f} mm/s")
     print(f"     GPU util        {util_s:>12}      {util_a:>12}")
-    print(f"     serialized      {before['serialized']:>12.3f}      {after['serialized']:>12.3f}")
-    print(f"\n  >>> runtime-driven improvement: {speedup:.2f}x faster, "
-          f"serialization {before['serialized']:.2f} -> {after['serialized']:.2f}  (correctness-gated)")
+    print(f"     serialized      {serialized_s:>12}      {serialized_a:>12}")
+    serialization_delta = (
+        f", serialization {before['serialized']:.2f} -> {after['serialized']:.2f}"
+        if after["serialized"] is not None
+        else ", post-change serialization unavailable"
+    )
+    print(
+        f"\n  >>> runtime-driven improvement: {speedup:.2f}x faster{serialization_delta} "
+        " (correctness-gated)"
+    )
     return 0
 
 

@@ -31,9 +31,17 @@ def _trace(events):
 def test_serialized_fraction_sequential_vs_overlapped():
     from gitm.optimizer.monitor import _serialized_fraction
 
-    # back-to-back on one stream -> fully serialized
+    # Back-to-back work on one stream is mandatory ordering, not evidence that
+    # independent work failed to overlap.
     seq = [_kernel("k", i * 100, i * 100 + 100, stream=7) for i in range(6)]
-    assert _serialized_fraction(seq) == pytest.approx(1.0)
+    assert _serialized_fraction(seq) is None
+
+    # Different streams establish an overlap opportunity; back-to-back execution
+    # means every observed opportunity serialized.
+    cross_stream_seq = [
+        _kernel("k", i * 100, i * 100 + 100, stream=i % 2) for i in range(6)
+    ]
+    assert _serialized_fraction(cross_stream_seq) == pytest.approx(1.0)
 
     # heavily overlapping on different streams -> not serialized
     over = [_kernel("k", 0, 1000, stream=s) for s in range(6)]
@@ -46,7 +54,8 @@ def test_residuals_compute_real_concurrency():
 
     trace = _trace([_kernel("k", i * 100, i * 100 + 100) for i in range(8)])
     res = residuals(trace, predict_graph())
-    assert res.serialized_concurrency_fraction == pytest.approx(1.0)  # all sequential, one stream
+    assert res.serialized_concurrency_fraction is None
+    assert any("cross-stream" in note for note in res.coverage_warnings)
 
 
 # --- op-identity matching (was ordinal `for i in range(min(len(obs), len(pred)))`) --
@@ -120,7 +129,15 @@ def test_fully_matched_residual_coverage_is_clean():
     from gitm.optimizer.monitor import residuals
     from gitm.planner.graph import predict_graph
 
-    res = residuals(_trace([_kernel("flash_attn_kernel", 0, 100)]), predict_graph())
+    res = residuals(
+        _trace(
+            [
+                _kernel("flash_attn_kernel", 0, 100, stream=0),
+                _kernel("flash_attn_kernel", 0, 100, stream=1),
+            ]
+        ),
+        predict_graph(),
+    )
 
     assert res.classification_coverage == 1.0
     assert res.match_coverage == 1.0
@@ -238,7 +255,40 @@ def test_measure_trace_excludes_zero_duration_kernels_with_diagnostic():
     assert result.n_kernels == 3
     assert result.n_invalid_duration == 1
     assert any("excluded 1/3" in note for note in result.diagnostics)
+    assert result.serialized_fraction is None
+    assert any("cross-stream" in note for note in result.diagnostics)
     assert all(v.node_op != "bad" for v in result.violations)
+
+
+def test_measurement_summary_names_unavailable_concurrency():
+    from gitm.optimizer.measure import measure_trace, measurement_summary
+
+    result = measure_trace(
+        _trace([_kernel("same", i * 100, i * 100 + 50, stream=0) for i in range(3)])
+    )
+
+    assert "serialized-concurrency=unavailable" in measurement_summary("demo", result)
+    assert not any(v.invariant == "stream_concurrency" for v in result.violations)
+
+
+def test_specialized_claim_uses_throughput_when_concurrency_is_unavailable():
+    from types import SimpleNamespace
+
+    from gitm.scheduler.loop import _specialized_claim_basis
+
+    basis, delta, diagnostics = _specialized_claim_basis(
+        SimpleNamespace(
+            n_kernels=3,
+            n_invalid_duration=0,
+            serialized_fraction=None,
+            diagnostics=["stream-concurrency coverage unavailable"],
+        ),
+        SimpleNamespace(speedup=1.25),
+    )
+
+    assert basis == ("throughput_delta", pytest.approx(0.25))
+    assert delta == pytest.approx(0.25)
+    assert any("no adjacent cross-stream" in note for note in diagnostics)
 
 
 def test_residuals_exclude_zero_duration_kernels_with_diagnostic():
