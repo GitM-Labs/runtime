@@ -227,7 +227,7 @@ def test_unpriceable_command_line_dtype_is_refused_after_overrides(tmp_path):
     assert any("kv_dtype='future_kv3'" in item for item in r.missing_keys)
 
 
-def test_accepted_default_substitutions_are_named_on_live_spec(tmp_path):
+def test_missing_expert_dtype_refuses_dominant_term_prediction(tmp_path):
     ckpt = tmp_path / "ckpt"
     cfg = _deepseek_cfg()
     cfg.pop("expert_dtype")
@@ -235,10 +235,8 @@ def test_accepted_default_substitutions_are_named_on_live_spec(tmp_path):
 
     r = mc.live_moe_spec(_target(["vllm", "serve", str(ckpt)]), environ={})
 
-    assert isinstance(r, mc.LiveSpec)
-    assert any("expert_dtype absent" in warning for warning in r.warnings)
-    assert any("batch=1" in warning for warning in r.warnings)
-    assert any("kv_cache_len=4096" in warning for warning in r.warnings)
+    assert isinstance(r, mc.LiveSpecError)
+    assert any("expert_dtype must be declared" in key for key in r.missing_keys)
 
 
 def test_live_moe_spec_refuses_when_no_config_found(tmp_path):

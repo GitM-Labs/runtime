@@ -76,6 +76,8 @@ def apply_intervention(
     blocks the apply). Pass one only where the applicator mutates a real target;
     a dry-run leaves it ``None`` so the trail stays free of no-op entries.
     """
+    if not math.isfinite(min_keep_delta):
+        raise ValueError(f"min_keep_delta must be finite, got {min_keep_delta!r}")
     try:
         snapshot = applicator.snapshot()
     except Exception as exc:

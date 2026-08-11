@@ -8,6 +8,7 @@ off this gate — it must be honest.
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass
 
 from gitm.tracer.schema import Trace
@@ -57,6 +58,10 @@ def qualify(trace: Trace, target_floor: float = 0.15) -> QualificationResult:
     Imported profiler traces (``nsys-import`` / ``torch-import``) never commit:
     the 15% floor and refund clause require a gitm-captured run.
     """
+    if not math.isfinite(target_floor) or not 0.0 < target_floor <= 1.0:
+        raise ValueError(
+            f"target floor must be finite and in (0, 1], got {target_floor!r}"
+        )
     fp = fingerprint(trace)
     source = getattr(trace, "source", "cupti") or "cupti"
     if source in _IMPORT_SOURCES:

@@ -211,6 +211,14 @@ def test_apply_from_file_with_config(tmp_path):
     assert yaml.safe_load(target.read_text())["block_size"] == 16
 
 
+@pytest.mark.parametrize("threshold", [float("nan"), float("inf"), float("-inf")])
+def test_apply_refuses_nonfinite_keep_threshold(threshold):
+    with pytest.raises(ValueError, match="min_keep_delta"):
+        apply_intervention(
+            _spec(), DictApplicator({"block_size": 8}), min_keep_delta=threshold
+        )
+
+
 # --- library now carries the 21 curated levers ------------------------------
 
 

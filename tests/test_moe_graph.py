@@ -95,6 +95,25 @@ def base_spec():
     return spec_from_hf_config(V4_BASE_CONFIG, name="DeepSeek-V4-Flash")
 
 
+@pytest.mark.parametrize(
+    "missing_key",
+    ["hidden_size", "n_routed_experts", "compress_ratios", "expert_dtype", "torch_dtype"],
+)
+def test_public_hf_builder_refuses_missing_shape_or_precision(missing_key):
+    cfg = dict(V4_CONFIG)
+    cfg.pop(missing_key)
+
+    with pytest.raises(ValueError, match=missing_key):
+        spec_from_hf_config(cfg)
+
+
+def test_public_hf_builder_accepts_complete_declared_config():
+    parsed = spec_from_hf_config(V4_CONFIG)
+
+    assert parsed.hidden == V4_CONFIG["hidden_size"]
+    assert parsed.expert_dtype == V4_CONFIG["expert_dtype"]
+
+
 @pytest.fixture
 def b200():
     return hardware_spec_for(peak_for_sku("NVIDIA B200"))

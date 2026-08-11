@@ -313,7 +313,11 @@ def validate_moe_config(cfg: dict[str, Any]) -> list[str]:
             f"(not priceable; known: {', '.join(sorted(KNOWN_DTYPES))})"
         )
     expert_dtype = cfg.get("expert_dtype")
-    if expert_dtype is not None and str(expert_dtype).lower() not in KNOWN_DTYPES:
+    if expert_dtype is None:
+        missing.append(
+            "expert_dtype must be declared; routed and shared expert byte width cannot be guessed"
+        )
+    elif str(expert_dtype).lower() not in KNOWN_DTYPES:
         missing.append(f"expert_dtype={expert_dtype!r} (not priceable)")
     return missing
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -214,8 +215,12 @@ def _parser() -> argparse.ArgumentParser:
 def _parse_target(s: str) -> float:
     s = s.strip()
     if s.endswith("%"):
-        return float(s[:-1]) / 100.0
-    return float(s)
+        target = float(s[:-1]) / 100.0
+    else:
+        target = float(s)
+    if not math.isfinite(target) or not 0.0 < target <= 1.0:
+        raise ValueError(f"target floor must be finite and in (0, 1], got {s!r}")
+    return target
 
 
 _HFT_WORKLOADS = {"hft", "hft-lob"}
@@ -352,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
             args.intervention, config=args.config, min_keep_delta=args.min_keep_delta
         )
         print(json.dumps(result, indent=2))
-        return 0
+        return 0 if result.get("applied") and not result.get("rolled_back") else 3
 
     if args.cmd == "attach":
         from gitm.deploy import attach_job

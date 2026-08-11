@@ -104,7 +104,10 @@ def _parse_budget_s(budget: str) -> float:
     if not m:
         raise ValueError(f"unparseable budget: {budget!r} (use 24h, 90m, 3600s, 1d)")
     value, unit = float(m.group(1)), m.group(2)
-    return value * {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}[unit]
+    seconds = value * {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}[unit]
+    if seconds <= 0.0:
+        raise ValueError(f"budget must be positive, got {budget!r}")
+    return seconds
 
 def _engine_throughput_fn(engine: Any, runner: Any) -> Any:
     """Resolve a decode-throughput probe for the live A/B.

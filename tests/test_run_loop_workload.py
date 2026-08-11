@@ -20,6 +20,22 @@ from .conftest import make_kernel, make_trace
 EMPTY_DIGEST = "4f53cda18c2baa0c"
 
 
+@pytest.mark.parametrize("budget", ["0s", "0.0h"])
+def test_loop_refuses_nonpositive_budget(budget, tmp_path):
+    from gitm import optimize
+
+    with pytest.raises(ValueError, match="budget must be positive"):
+        optimize(workload="custom", budget=budget, scratch=str(tmp_path))
+
+
+@pytest.mark.parametrize("target", [0.0, -0.1, 1.01, float("nan"), float("inf")])
+def test_loop_refuses_invalid_target_floor(target, tmp_path):
+    from gitm import optimize
+
+    with pytest.raises(ValueError, match="target floor"):
+        optimize(workload="custom", budget="1s", target=target, scratch=str(tmp_path))
+
+
 def test_no_data_guard_does_not_fabricate_claims(tmp_path: Path):
     """No GPU/shim and no registered runner → honest no-data, zero claims."""
     from gitm import optimize
@@ -460,6 +476,44 @@ def test_cli_run_returns_nonzero_on_no_data(tmp_path: Path, capsys):
 
     rc = main(["run", "--workload", "vllm-decode", "--budget", "1s", "--scratch", str(tmp_path)])
     assert rc == 3
+
+
+@pytest.mark.parametrize("target", ["nan", "inf", "0%", "101%"])
+def test_cli_run_rejects_invalid_target_before_optimization(target, monkeypatch):
+    import gitm
+    from gitm.cli import main
+
+    called = False
+
+    def fake_optimize(**_kwargs):
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr(gitm, "optimize", fake_optimize)
+    with pytest.raises(ValueError, match="target floor"):
+        main(["run", "--workload", "vllm-decode", "--target", target])
+    assert called is False
+
+
+def test_cli_apply_returns_nonzero_when_nothing_was_applied(tmp_path, capsys):
+    import json
+
+    import yaml
+
+    from gitm.cli import main
+    from gitm.kernels.spec import InterventionSpec
+
+    spec = InterventionSpec(
+        name="noop", summary="test", knob="block_size", value=16,
+        expected_delta_lo=0.0, expected_delta_mean=0.1, expected_delta_hi=0.2,
+        source="https://example.test",
+    )
+    path = tmp_path / "intervention.yaml"
+    path.write_text(yaml.safe_dump(json.loads(spec.model_dump_json())), encoding="utf-8")
+
+    assert main(["apply", "--intervention", str(path)]) == 3
+    assert "no target config" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(

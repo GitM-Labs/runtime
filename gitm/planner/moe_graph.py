@@ -75,6 +75,84 @@ from gitm.planner.roofline import (
     weight_bytes_is_fallback,
 )
 
+_REQUIRED_POSITIVE_CONFIG_FIELDS = (
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "q_lora_rank",
+    "o_lora_rank",
+    "o_groups",
+    "vocab_size",
+    "n_routed_experts",
+    "num_experts_per_tok",
+    "moe_intermediate_size",
+    "index_n_heads",
+    "index_head_dim",
+    "index_topk",
+    "sliding_window",
+)
+
+
+def validate_sparse_moe_config(cfg: dict[str, Any]) -> list[str]:
+    """Return canonical sparse-graph fields that cannot be used without guessing.
+
+    Serve and scheduler boundaries provide richer source/alias diagnostics. This
+    planner-side defense ensures a direct public-builder call cannot turn a
+    partial foreign config into a plausible DeepSeek-V4 graph from defaults.
+    """
+    errors: list[str] = []
+    for key in _REQUIRED_POSITIVE_CONFIG_FIELDS:
+        value = cfg.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"{key} must be a declared positive integer, got {value!r}")
+
+    for key in ("qk_rope_head_dim", "n_shared_experts"):
+        value = cfg.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            errors.append(f"{key} must be a declared non-negative integer, got {value!r}")
+
+    n_experts = cfg.get("n_routed_experts")
+    top_k = cfg.get("num_experts_per_tok")
+    if (
+        isinstance(n_experts, int)
+        and not isinstance(n_experts, bool)
+        and isinstance(top_k, int)
+        and not isinstance(top_k, bool)
+        and top_k > n_experts
+    ):
+        errors.append(
+            f"num_experts_per_tok={top_k} exceeds n_routed_experts={n_experts}"
+        )
+
+    n_layers = cfg.get("num_hidden_layers")
+    ratios = cfg.get("compress_ratios")
+    if not isinstance(ratios, (list, tuple)):
+        errors.append("compress_ratios must be declared for the sparse-attention graph")
+    elif isinstance(n_layers, int) and n_layers > 0 and len(ratios) < n_layers:
+        errors.append(
+            f"compress_ratios has {len(ratios)} entries; need at least {n_layers}"
+        )
+    elif any(isinstance(r, bool) or not isinstance(r, int) or r < 0 for r in ratios):
+        errors.append("compress_ratios must contain non-negative integers")
+
+    q = cfg.get("quantization_config")
+    if q is not None and not isinstance(q, dict):
+        errors.append("quantization_config must be an object when declared")
+    elif isinstance(q, dict):
+        method = q.get("quant_method")
+        if method is not None and weight_bytes_is_fallback(str(method).lower()):
+            errors.append(f"quantization_config.quant_method={method!r} is not priceable")
+
+    for key in ("expert_dtype", "torch_dtype"):
+        value = cfg.get(key)
+        if value is None:
+            errors.append(f"{key} must be declared; byte width cannot be guessed")
+        elif weight_bytes_is_fallback(str(value).lower().replace("bfloat16", "bf16")):
+            errors.append(f"{key}={value!r} is not priceable")
+    return errors
+
 
 def effective_kv_tokens(spec: SparseMoEModelSpec, layer: int, kv_len: int) -> int:
     """KV positions the attention *core* reads for ``layer`` at ``kv_len`` context.
@@ -549,6 +627,10 @@ def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None) -> Spar
     ``num_hidden_layers`` entries index real layers, so the tail is dropped
     rather than silently shifting every layer's ratio.
     """
+    errors = validate_sparse_moe_config(cfg)
+    if errors:
+        raise ValueError("sparse-MoE config is not predictable: " + "; ".join(errors))
+
     q = cfg.get("quantization_config") or {}
     weight_dtype = str(q.get("quant_method", "bf16")).lower()
     n_layers = int(cfg.get("num_hidden_layers", 43))
