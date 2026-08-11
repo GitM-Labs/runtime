@@ -323,6 +323,7 @@ def attach_and_capture(opts: AttachOptions) -> tuple[int, CaptureResult | None]:
     server_window = metrics.window_from_snapshots(
         before, after, window_s=wall, samples=samples
     )
+    server_window.notes.extend(sampler.diagnostics)
 
     # Server-side truth is the summary for observe mode, where no client exists. In
     # drive mode both are kept: when the client's view and the server's histograms
@@ -382,27 +383,8 @@ def attach_and_capture(opts: AttachOptions) -> tuple[int, CaptureResult | None]:
     print(f"\n==> window closed after {wall:.1f}s — server left running (PID {target.pid})")
     if opts.mode == "drive":
         print(f"    client: {len(records)} ok / {failures} failed")
-    if server_window.requests_finished is not None:
-        print(
-            f"    server: {server_window.requests_finished:.0f} requests, "
-            f"{(server_window.generation_tokens or 0):.0f} output tokens"
-            + (
-                f", {server_window.output_tokens_per_s:.0f} tok/s"
-                if server_window.output_tokens_per_s
-                else ""
-            )
-        )
-        if server_window.ttft_mean_s is not None:
-            print(
-                f"    server TTFT mean {server_window.ttft_mean_s * 1e3:.0f} ms   "
-                f"TPOT mean {(server_window.tpot_mean_s or 0) * 1e3:.1f} ms"
-            )
-        if server_window.running_p50 is not None and server_window.waiting_p50 is not None:
-            print(
-                f"    queue depth p50/p95 running "
-                f"{server_window.running_p50:.0f}/{server_window.running_p95:.0f}, "
-                f"waiting {server_window.waiting_p50:.0f}/{server_window.waiting_p95:.0f}"
-            )
+    for line in _server_metric_lines(server_window):
+        print(line)
     print_result(result)
     for note in server_window.notes:
         print("  - " + note)
@@ -414,6 +396,36 @@ def attach_and_capture(opts: AttachOptions) -> tuple[int, CaptureResult | None]:
         # should not be reported as a pass by automation.
         return 1, result
     return 0, result
+
+
+def _server_metric_lines(window: metrics.ServerWindow) -> list[str]:
+    """Human summary that preserves missing server metrics as unknown."""
+    if window.requests_finished is None:
+        return []
+    generation = (
+        f"{window.generation_tokens:.0f} output tokens"
+        if window.generation_tokens is not None
+        else "output-token count unavailable"
+    )
+    lines = [
+        f"    server: {window.requests_finished:.0f} requests, {generation}"
+        + (f", {window.output_tokens_per_s:.0f} tok/s" if window.output_tokens_per_s else "")
+    ]
+    if window.ttft_mean_s is not None:
+        tpot = (
+            f"{window.tpot_mean_s * 1e3:.1f} ms"
+            if window.tpot_mean_s is not None
+            else "unavailable"
+        )
+        lines.append(
+            f"    server TTFT mean {window.ttft_mean_s * 1e3:.0f} ms   TPOT mean {tpot}"
+        )
+    if window.running_p50 is not None and window.waiting_p50 is not None:
+        lines.append(
+            f"    queue depth p50/p95 running {window.running_p50:.0f}/{window.running_p95:.0f}, "
+            f"waiting {window.waiting_p50:.0f}/{window.waiting_p95:.0f}"
+        )
+    return lines
 
 
 def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:

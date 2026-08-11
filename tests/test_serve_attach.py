@@ -223,6 +223,37 @@ def test_base_url_prefers_explicit_then_flag_then_cmdline():
     )
 
 
+def test_server_metric_lines_surface_missing_token_and_tpot_values():
+    from gitm.serve.metrics import ServerWindow
+
+    lines = att._server_metric_lines(
+        ServerWindow(requests_finished=3, generation_tokens=None, ttft_mean_s=0.012)
+    )
+
+    assert "output-token count unavailable" in lines[0]
+    assert "TPOT mean unavailable" in lines[1]
+    assert "0 output tokens" not in "\n".join(lines)
+
+
+def test_server_metric_lines_render_measured_values_without_caveats():
+    from gitm.serve.metrics import ServerWindow
+
+    lines = att._server_metric_lines(
+        ServerWindow(
+            requests_finished=3,
+            generation_tokens=24,
+            output_tokens_per_s=12,
+            ttft_mean_s=0.012,
+            tpot_mean_s=0.0035,
+        )
+    )
+
+    assert lines == [
+        "    server: 3 requests, 24 output tokens, 12 tok/s",
+        "    server TTFT mean 12 ms   TPOT mean 3.5 ms",
+    ]
+
+
 def test_predicted_graph_surfaces_resolved_warnings_and_bytes_fallback(
     tmp_path, monkeypatch, capsys
 ):
