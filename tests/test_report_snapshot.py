@@ -170,6 +170,24 @@ def test_non_finite_residual_is_refused(raw):
         )
 
 
+@pytest.mark.parametrize("field", ["predicted_delta", "measured_delta"])
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_non_finite_claim_deltas_are_refused(field, value):
+    kwargs = {
+        "summary": "model gap",
+        "residual_invariant": "kernel_time",
+        "residual_value": 0.1,
+        "causal_evidence": "trace",
+        "intervention_name": "candidate",
+        "predicted_delta": 0.01,
+        "measured_delta": 0.02,
+    }
+    kwargs[field] = value
+
+    with pytest.raises(ValueError, match=f"{field} must be finite"):
+        Claim(**kwargs)
+
+
 def test_runtime_diagnostics_are_printed_when_present():
     rendered = write_report(
         [],

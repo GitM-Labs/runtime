@@ -34,6 +34,10 @@ class Claim:
     def __post_init__(self) -> None:
         if not math.isfinite(self.residual_value):
             raise ValueError("residual_value must be finite")
+        if not math.isfinite(self.predicted_delta):
+            raise ValueError("predicted_delta must be finite")
+        if self.measured_delta is not None and not math.isfinite(self.measured_delta):
+            raise ValueError("measured_delta must be finite when present")
 
     @property
     def residual_display_value(self) -> float:
@@ -103,7 +107,7 @@ def _default_summary(claims: list[Claim]) -> str:
     verified = [c for c in claims if c.measured_delta is not None and not c.rolled_back]
     if not verified:
         return "No claims verified within budget. See diagnostic below."
-    total = sum(c.measured_delta or 0.0 for c in verified)
+    total = sum(c.measured_delta for c in verified if c.measured_delta is not None)
     return f"{len(verified)} verified claims, aggregate measured delta {total:+.1%}."
 
 
