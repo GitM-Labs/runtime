@@ -327,3 +327,20 @@ def test_replay_validation_within_tolerance():
     assert result.passed
     assert result.mean_abs_rel_err <= 0.20
     assert result.frac_within_tol > 0.7
+
+
+def test_replay_validation_refuses_zero_truth_instead_of_reporting_zero_error(monkeypatch):
+    from gitm.optimizer import replay_validation as rv
+
+    monkeypatch.setattr(rv, "_ground_truth_delta", lambda *_args, **_kwargs: 0.0)
+
+    with pytest.raises(RuntimeError, match="ground truth must be finite and positive"):
+        rv.validate(n=1)
+
+
+@pytest.mark.parametrize("n", [0, -1])
+def test_replay_validation_refuses_empty_injection_sets(n):
+    from gitm.optimizer.replay_validation import validate
+
+    with pytest.raises(ValueError, match="injection count must be positive"):
+        validate(n=n)
