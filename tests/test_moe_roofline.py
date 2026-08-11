@@ -84,6 +84,20 @@ def test_dense_spec_is_not_moe_and_falls_back():
     assert m.expert_intermediate == m.intermediate
 
 
+def test_dense_graph_uses_configured_compute_dtype_for_peak_selection():
+    hw = HardwareSpec(
+        peak_flops_fp16_per_s=100.0,
+        peak_flops_fp32_per_s=10.0,
+        peak_mem_bw_bytes_per_s=1e30,
+    )
+
+    graph = predict_graph(ModelSpec(n_layers=1, compute_dtype="fp32"), hw)
+
+    assert graph.nodes
+    assert all(node.prediction.dtype == "fp32" for node in graph.nodes)
+    assert all(node.prediction.peak_dtype == "fp32" for node in graph.nodes)
+
+
 def test_moe_spec_properties():
     assert MOE.is_moe
     assert MOE.top_k == 8

@@ -57,3 +57,12 @@ def test_unknown_dense_dtype_refuses_instead_of_becoming_bf16():
     spec, error = _dense_spec_from_config({**_OPT_125M, "torch_dtype": "mystery4"})
     assert spec is None
     assert "not priceable" in error
+
+
+def test_dense_parser_preserves_fp32_compute_dtype():
+    spec, error = _dense_spec_from_config({**_OPT_125M, "torch_dtype": "float32"})
+
+    assert error == ""
+    assert spec is not None
+    assert spec.compute_dtype == "fp32"
+    assert spec.dtype_bytes == 4

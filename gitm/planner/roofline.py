@@ -106,6 +106,9 @@ class ModelSpec:
     num_kv_heads: int = 32  # < n_heads when GQA
     head_dim: int = 128
     intermediate: int = 11008
+    #: Compute dtype used to choose the tensor-core ceiling. Width alone cannot
+    #: distinguish bf16/fp16/fp32, so this must travel separately.
+    compute_dtype: str = "fp16"
     dtype_bytes: int = 2  # fp16 / bf16 — activations
     vocab: int = 32000
 

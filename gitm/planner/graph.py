@@ -197,7 +197,11 @@ def predict_graph(
         flops = 2 * b * h * qkv_out
         bytes_moved = dt * (b * h + h * qkv_out + b * qkv_out)
         g.nodes.append(
-            PredictedNode("qkv_proj", layer, roofline("qkv_proj", flops, bytes_moved, hw))
+            PredictedNode(
+                "qkv_proj",
+                layer,
+                roofline("qkv_proj", flops, bytes_moved, hw, dtype=model.compute_dtype),
+            )
         )
 
         # Attention scores + softmax + value. Full-attention layers re-read a KV
@@ -219,7 +223,9 @@ def predict_graph(
             PredictedNode(
                 "attn_score_value",
                 layer,
-                roofline("attn_score_value", attn_flops, kv_bytes, hw),
+                roofline(
+                    "attn_score_value", attn_flops, kv_bytes, hw, dtype=model.compute_dtype
+                ),
             )
         )
 
@@ -227,7 +233,11 @@ def predict_graph(
         flops = 2 * b * h * h
         bytes_moved = dt * (b * h + h * h + b * h)
         g.nodes.append(
-            PredictedNode("attn_out_proj", layer, roofline("attn_out_proj", flops, bytes_moved, hw))
+            PredictedNode(
+                "attn_out_proj",
+                layer,
+                roofline("attn_out_proj", flops, bytes_moved, hw, dtype=model.compute_dtype),
+            )
         )
 
         # MLP gate+up / down. On an MoE model these two ops carry the expert
@@ -238,18 +248,36 @@ def predict_graph(
         )
         g.nodes.append(
             PredictedNode(
-                "mlp_gate_up", layer, roofline("mlp_gate_up", gate_up_flops, gate_up_bytes, hw)
+                "mlp_gate_up",
+                layer,
+                roofline(
+                    "mlp_gate_up",
+                    gate_up_flops,
+                    gate_up_bytes,
+                    hw,
+                    dtype=model.compute_dtype,
+                ),
             )
         )
         g.nodes.append(
-            PredictedNode("mlp_down", layer, roofline("mlp_down", down_flops, down_bytes, hw))
+            PredictedNode(
+                "mlp_down",
+                layer,
+                roofline(
+                    "mlp_down", down_flops, down_bytes, hw, dtype=model.compute_dtype
+                ),
+            )
         )
 
     # Final vocab projection
     flops = 2 * b * h * model.vocab
     bytes_moved = dt * (b * h + h * model.vocab + b * model.vocab)
     g.nodes.append(
-        PredictedNode("lm_head", None, roofline("lm_head", flops, bytes_moved, hw))
+        PredictedNode(
+            "lm_head",
+            None,
+            roofline("lm_head", flops, bytes_moved, hw, dtype=model.compute_dtype),
+        )
     )
 
     return g

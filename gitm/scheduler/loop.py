@@ -377,6 +377,7 @@ def _dense_spec_from_config(cfg: dict[str, Any]) -> tuple[ModelSpec | None, str]
             num_kv_heads=n_kv,
             head_dim=head_dim,
             intermediate=int(cfg["intermediate_size"]),
+            compute_dtype=act,
             dtype_bytes=dtype_bytes,
             weight_dtype_bytes=_QUANT_WEIGHT_BYTES.get(str(method).lower()) if method else None,
             vocab=int(cfg["vocab_size"]),
