@@ -27,6 +27,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from gitm._timing import require_positive_duration, require_positive_work
 from gitm.kernels.spec import Applicability, InterventionSpec, SafetyGate
 
 # A run_mode runs N frames in a given mode and returns a per-frame summary dict:
@@ -145,7 +146,9 @@ def optimize_edge(
             sync()
             best = min(best, time.perf_counter() - t0)
         n = max(int(summary.get("n_frames", 0)), 0)
-        return summary, n / max(best, 1e-9)
+        require_positive_work(n, context=f"edge A/B {mode}")
+        best = require_positive_duration(best, context=f"edge A/B {mode}")
+        return summary, n / best
 
     base_summary, base_eps = _timed(baseline_mode)
     cand_summary, cand_eps = _timed(candidate_mode)

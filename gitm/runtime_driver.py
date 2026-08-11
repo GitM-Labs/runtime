@@ -28,8 +28,11 @@ import argparse
 import json
 import os
 import time
+import warnings
 from contextlib import closing
 from pathlib import Path
+
+from gitm._timing import require_positive_duration
 
 
 def _sync():
@@ -37,8 +40,13 @@ def _sync():
         import cupy
 
         cupy.cuda.runtime.deviceSynchronize()
-    except Exception:
-        pass
+    except Exception as exc:
+        warnings.warn(
+            f"CuPy device synchronization unavailable; trace completeness is not "
+            f"guaranteed ({type(exc).__name__}: {exc})",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def _load_hft(stage: Path, seed: int, max_events: int | None):
@@ -340,7 +348,9 @@ def main(argv: list[str] | None = None) -> int:
         t0 = time.perf_counter()
         summary = work()
         _sync()
-        elapsed = max(time.perf_counter() - t0, 1e-9)
+        elapsed = require_positive_duration(
+            time.perf_counter() - t0, context=f"{args.workload} runtime driver"
+        )
     if tele:
         tele.stop()
         telemetry_diagnostics.extend(tele.diagnostics)

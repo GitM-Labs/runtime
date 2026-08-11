@@ -25,6 +25,8 @@ import json
 import time
 from pathlib import Path
 
+from gitm._timing import require_positive_duration
+
 
 def _serialized(trace) -> float:
     from gitm.optimizer.monitor import _serialized_fraction
@@ -71,7 +73,9 @@ def _run_observed(fn, label: str, outdir: Path) -> tuple[object, dict]:
         t0 = time.perf_counter()
         result = fn()
         cupy.cuda.runtime.deviceSynchronize()
-        elapsed = max(time.perf_counter() - t0, 1e-9)
+        elapsed = require_positive_duration(
+            time.perf_counter() - t0, context=f"demo observation {label}"
+        )
     if tele:
         tele.stop()
 

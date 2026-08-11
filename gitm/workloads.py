@@ -29,9 +29,12 @@ from __future__ import annotations
 
 import os
 import socket
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from gitm._timing import require_positive_duration
 
 if TYPE_CHECKING:
     from gitm.scheduler.loop import LoopConfig
@@ -134,8 +137,13 @@ def _free_gpu_pool() -> None:
         import cupy
 
         cupy.get_default_memory_pool().free_all_blocks()
-    except Exception:
-        pass
+    except Exception as exc:
+        warnings.warn(
+            f"GPU memory-pool cleanup unavailable; streaming may retain cached blocks "
+            f"({type(exc).__name__}: {exc})",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def _hft_batches_factory(stage: Path, seed: int, dflib, shards_per_batch: int,
@@ -193,6 +201,12 @@ def _ensure_hft_data(stage: Path, seed: int) -> None:
 
     events = int(os.environ.get("GITM_BENCH_EVENTS", "200000"))
     out = stage / f"hft_smoke_seed{seed}"
+    warnings.warn(
+        f"no staged HFT dataset found; generating {events:,}-event smoke data at {out}. "
+        "This is synthetic smoke coverage, not a publishable baseline dataset.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
     generate(
         GenConfig(events=events, seed=seed, events_per_file=min(events, 100_000)),
         out,
@@ -392,7 +406,9 @@ def _nuscenes_factory(cfg: LoopConfig) -> WorkloadRunner:
         t0 = time.perf_counter()
         for idx in run_indices:
             total_dets += unit.run(idx).n_detections
-        elapsed = max(time.perf_counter() - t0, 1e-9)
+        elapsed = require_positive_duration(
+            time.perf_counter() - t0, context="nuScenes workload"
+        )
         return {
             "frames": len(run_indices),
             "detections": total_dets,
@@ -440,7 +456,9 @@ def _kitti_factory(cfg: LoopConfig) -> WorkloadRunner:
         t0 = time.perf_counter()
         for p in run_paths:
             total_dets += unit.run(p).n_detections
-        elapsed = max(time.perf_counter() - t0, 1e-9)
+        elapsed = require_positive_duration(
+            time.perf_counter() - t0, context="KITTI workload"
+        )
         return {
             "frames": len(run_paths),
             "detections": total_dets,
@@ -760,7 +778,10 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         outs = eng.generate(prompts, params)
         toks = sum(len(o.outputs[0].token_ids) for o in outs)
         sync_device()
-        return toks / max(time.perf_counter() - t0, 1e-9)
+        elapsed = require_positive_duration(
+            time.perf_counter() - t0, context="vLLM throughput probe"
+        )
+        return toks / elapsed
 
     def _restart(_old_engine: Any, knob_values: dict[str, Any]) -> Any:
         """Rebuild a fresh vLLM engine with one or more structural knobs changed.
@@ -883,17 +904,31 @@ def set_decode_run_defaults() -> dict[str, str]:
 def sync_device() -> None:
     """Block until queued GPU work completes, so all kernels land in the trace
     before capture stops. Best-effort — a no-op without CuPy/torch."""
+    cupy_error: Exception | None = None
     try:
         import cupy
 
         cupy.cuda.runtime.deviceSynchronize()
         return
-    except Exception:
-        pass
+    except Exception as exc:
+        cupy_error = exc
     try:
         import torch
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-    except Exception:
-        pass
+            return
+    except Exception as exc:
+        warnings.warn(
+            f"GPU device synchronization failed; trace completeness is not guaranteed "
+            f"(CuPy: {type(cupy_error).__name__ if cupy_error else 'unavailable'}; "
+            f"torch: {type(exc).__name__}: {exc})",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+    warnings.warn(
+        "GPU device synchronization unavailable; trace completeness is not guaranteed",
+        RuntimeWarning,
+        stacklevel=2,
+    )

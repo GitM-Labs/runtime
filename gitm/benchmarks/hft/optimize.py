@@ -25,6 +25,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+from gitm._timing import require_positive_duration, require_positive_work
 from gitm.benchmarks.hft.harness import microprice, run_pipeline, vwap_1s
 from gitm.kernels.spec import Applicability, InterventionSpec, SafetyGate
 
@@ -117,7 +118,9 @@ def optimize_hft(df, dflib, *, reps: int = 3, sync=None) -> ABResult:
             summary = fn(df, dflib)
             sync()
             best = min(best, time.perf_counter() - t0)
-        return summary, summary["events"] / max(best, 1e-9)
+        best = require_positive_duration(best, context=f"HFT A/B {fn.__name__}")
+        events = require_positive_work(summary["events"], context=f"HFT A/B {fn.__name__}")
+        return summary, events / best
 
     base_summary, base_eps = _timed(run_pipeline)
     cand_summary, cand_eps = _timed(run_pipeline_fast)
@@ -198,8 +201,12 @@ def optimize_hft_streaming(batches, dflib, *, sync=None, on_batch=None) -> ABRes
     if n_batches == 0:
         raise ValueError("optimize_hft_streaming: no batches to process (empty iterable)")
 
-    base_eps = base_events / max(base_t, 1e-9)
-    cand_eps = cand_events / max(cand_t, 1e-9)
+    require_positive_work(base_events, context="HFT streaming baseline")
+    require_positive_work(cand_events, context="HFT streaming candidate")
+    base_t = require_positive_duration(base_t, context="HFT streaming baseline")
+    cand_t = require_positive_duration(cand_t, context="HFT streaming candidate")
+    base_eps = base_events / base_t
+    cand_eps = cand_events / cand_t
     speedup = cand_eps / base_eps if base_eps else 0.0
     kept = "candidate" if (identical and cand_eps > base_eps) else "baseline"
     # Per-pipeline count aggregates (kept separate so a divergent run never reports

@@ -20,7 +20,8 @@ def test_ensure_hft_data_generates_then_reuses(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("GITM_BENCH_EVENTS", "2000")
     stage = tmp_path / "stage"
 
-    _ensure_hft_data(stage, 42)
+    with pytest.warns(RuntimeWarning, match="synthetic smoke coverage"):
+        _ensure_hft_data(stage, 42)
     seed_dir = stage / "hft_smoke_seed42"
     shards = sorted(seed_dir.glob("part-*.parquet"))
     assert shards, "smoke data should have been generated"
