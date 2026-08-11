@@ -149,6 +149,10 @@ def _parser() -> argparse.ArgumentParser:
     _add_capture(sub)
 
     sub.add_parser("doctor", help="Probe environment, GPUs, and data locations.")
+    sub.add_parser(
+        "gpu-headroom",
+        help="Print a one-shot live GPU utilization and memory snapshot.",
+    )
 
     plan_kitti = sub.add_parser(
         "plan-kitti", help="Render the PointPillars execution graph for a known GPU SKU."
@@ -381,6 +385,13 @@ def main(argv: list[str] | None = None) -> int:
         report = doctor()
         print(json.dumps(report, indent=2))
         return 0
+
+    if args.cmd == "gpu-headroom":
+        from gitm.optimizer.headroom_kernel_rank import live_gpu_headroom
+
+        rows = live_gpu_headroom()
+        print(json.dumps(rows, indent=2))
+        return 0 if rows else 3
 
     if args.cmd == "plan-kitti":
         from gitm.planner.context import hardware_spec_for, peak_for_sku

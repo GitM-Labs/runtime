@@ -116,3 +116,28 @@ def test_doctor_returns_jsonable():
     json.dumps(info)
     assert info["gitm_version"]
     assert "telemetry_backends" in info
+
+
+def test_gpu_headroom_cli_surfaces_live_snapshot(monkeypatch, capsys):
+    from gitm.cli import main
+
+    monkeypatch.setattr(
+        "gitm.optimizer.headroom_kernel_rank.live_gpu_headroom",
+        lambda: [{"gpu_index": 0, "util_pct": 42.0}],
+    )
+
+    assert main(["gpu-headroom"]) == 0
+    assert json.loads(capsys.readouterr().out) == [
+        {"gpu_index": 0, "util_pct": 42.0}
+    ]
+
+
+def test_gpu_headroom_cli_fails_when_snapshot_is_unavailable(monkeypatch, capsys):
+    from gitm.cli import main
+
+    monkeypatch.setattr(
+        "gitm.optimizer.headroom_kernel_rank.live_gpu_headroom", lambda: []
+    )
+
+    assert main(["gpu-headroom"]) == 3
+    assert json.loads(capsys.readouterr().out) == []
