@@ -34,6 +34,7 @@ from gitm.planner.moe_graph import (
 from gitm.planner.roofline import (
     BatchConfig,
     HardwareSpec,
+    ModelSpec,
     ShardingConfig,
     resolve_peak,
     roofline,
@@ -711,6 +712,10 @@ def test_kv_footprint_splits_growing_from_fixed(spec):
 
     # The two window layers are real, bounded, and paid once per sequence.
     assert fixed == 2 * spec.sliding_window * spec.kv_latent_dim * weight_bytes(spec.kv_dtype)
+
+    graph = predict_moe_graph(spec, HardwareSpec(), BatchConfig())
+    assert graph.kv_bytes_per_token_per_sequence == pytest.approx(per_token)
+    assert graph.kv_fixed_bytes_per_sequence == pytest.approx(fixed)
     # In magnitude the fixed term is tiny — worth ~40 tokens of context, so it
     # never drives a sizing decision. What mattered was excluding these layers
     # from the *rate*, which is a 37% error on every sequence at every length.
@@ -719,6 +724,12 @@ def test_kv_footprint_splits_growing_from_fixed(spec):
         spec.kv_dtype
     )
     assert naive == pytest.approx(1.37 * per_token, rel=0.02)
+
+
+def test_dense_graph_does_not_invent_sparse_kv_footprint():
+    graph = Graph(model=ModelSpec(), hw=HardwareSpec(), batch=BatchConfig())
+    assert graph.kv_bytes_per_token_per_sequence is None
+    assert graph.kv_fixed_bytes_per_sequence is None
 
 
 def test_b300_headroom_admits_a_full_replica_where_b200_is_marginal(spec):

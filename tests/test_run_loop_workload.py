@@ -440,6 +440,8 @@ def test_vllm_loop_surfaces_residual_coverage(tmp_path: Path, monkeypatch):
     assert payload["coverage"]["warnings"]
     assert predicted["resident_weight_bytes_per_rank"] > 0
     assert predicted["resident_weight_bytes_is_lower_bound"] is False
+    assert predicted["kv_bytes_per_token_per_sequence"] > 0
+    assert predicted["kv_fixed_bytes_per_sequence"] > 0
     assert "## Runtime diagnostics" in result["report_md"]
     assert "matched to the predicted graph" in result["report_md"]
     assert "GPU count was unavailable" in result["report_md"]

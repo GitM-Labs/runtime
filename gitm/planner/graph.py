@@ -190,6 +190,24 @@ class Graph:
         """True when private DSpark shapes make the footprint a known lower bound."""
         return isinstance(self.model, SparseMoEModelSpec) and bool(self.model.dspark_layer_ids)
 
+    @property
+    def kv_bytes_per_token_per_sequence(self) -> float | None:
+        """Sparse KV footprint that grows with each context token and sequence."""
+        if not isinstance(self.model, SparseMoEModelSpec):
+            return None
+        from gitm.planner.moe_graph import kv_bytes_per_token
+
+        return kv_bytes_per_token(self.model)
+
+    @property
+    def kv_fixed_bytes_per_sequence(self) -> float | None:
+        """Sparse sliding-window KV footprint paid once for each sequence."""
+        if not isinstance(self.model, SparseMoEModelSpec):
+            return None
+        from gitm.planner.moe_graph import kv_fixed_bytes_per_sequence
+
+        return kv_fixed_bytes_per_sequence(self.model)
+
 
 def predict_graph(
     model: ModelSpec | None = None,

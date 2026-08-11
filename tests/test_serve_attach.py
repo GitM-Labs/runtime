@@ -341,6 +341,8 @@ def test_predicted_graph_surfaces_resolved_warnings_and_bytes_fallback(
     assert payload["has_fallback_bytes"] is True
     assert payload["resident_weight_bytes_per_rank"] > 0
     assert payload["resident_weight_bytes_is_lower_bound"] is False
+    assert payload["kv_bytes_per_token_per_sequence"] == 0.0
+    assert payload["kv_fixed_bytes_per_sequence"] > 0
     assert payload["num_gpus_is_fallback"] is True
     assert any("GPU count was unavailable" in warning for warning in payload["warnings"])
     assert any(node["bytes_are_fallback"] for node in payload["nodes"])
@@ -408,6 +410,8 @@ def test_predicted_graph_known_dtypes_leave_bytes_fallback_clean(tmp_path, monke
     assert payload["has_fallback_bytes"] is False
     assert payload["resident_weight_bytes_per_rank"] > 0
     assert payload["resident_weight_bytes_is_lower_bound"] is False
+    assert payload["kv_bytes_per_token_per_sequence"] == 0.0
+    assert payload["kv_fixed_bytes_per_sequence"] > 0
     assert payload["num_gpus_is_fallback"] is False
     assert not any("GPU count was unavailable" in warning for warning in payload["warnings"])
     assert not any(node["bytes_are_fallback"] for node in payload["nodes"])

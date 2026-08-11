@@ -530,6 +530,8 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
         "total_pred_s": g.total_pred_s,
         "resident_weight_bytes_per_rank": g.resident_weight_bytes_per_rank,
         "resident_weight_bytes_is_lower_bound": g.resident_weight_bytes_is_lower_bound,
+        "kv_bytes_per_token_per_sequence": g.kv_bytes_per_token_per_sequence,
+        "kv_fixed_bytes_per_sequence": g.kv_fixed_bytes_per_sequence,
         "has_unpriced_collectives": g.has_unpriced_collectives,
         "has_unpriced_nodes": g.has_unpriced_nodes,
         "has_unpriced_compute": g.has_unpriced_compute,

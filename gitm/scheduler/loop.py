@@ -794,6 +794,8 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 "resident_weight_bytes_is_lower_bound": (
                     graph.resident_weight_bytes_is_lower_bound
                 ),
+                "kv_bytes_per_token_per_sequence": graph.kv_bytes_per_token_per_sequence,
+                "kv_fixed_bytes_per_sequence": graph.kv_fixed_bytes_per_sequence,
                 "hardware": pctx.sku,
                 "hardware_pricing": graph.hw.name,
                 "hardware_is_fallback": graph.hardware_is_fallback,
