@@ -48,3 +48,22 @@ def test_v1_engine_without_stats_is_none():
         )
     )
     assert read_scheduler_stats(empty) is None
+
+
+def test_v1_scheduler_read_failure_is_diagnostic():
+    class BrokenScheduler:
+        def make_stats(self):
+            raise RuntimeError("v1 stats moved")
+
+    engine = SimpleNamespace(
+        engine_core=SimpleNamespace(scheduler=BrokenScheduler())
+    )
+
+    sample = read_scheduler_stats(engine)
+
+    assert sample is not None
+    assert sample.num_running is None
+    assert any(
+        "make_stats failed" in note and "v1 stats moved" in note
+        for note in sample.diagnostics
+    )

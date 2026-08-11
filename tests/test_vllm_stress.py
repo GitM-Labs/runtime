@@ -136,6 +136,44 @@ def test_read_scheduler_stats_partial_engine():
     assert s.num_running is None and s.batch_occupancy is None
 
 
+def test_scheduler_sampler_surfaces_unrecognized_engine_shape():
+    sampler = SchedulerStatsSampler(object(), interval_s=1.0)
+
+    with pytest.warns(RuntimeWarning, match="no recognized scheduler fields"):
+        sampler.start()
+        sampler.stop()
+
+    assert any(
+        "no recognized scheduler fields" in note
+        for note in sampler.summary().diagnostics
+    )
+
+
+def test_read_scheduler_stats_surfaces_field_probe_failures():
+    class BlockManager:
+        num_total_gpu_blocks = 8
+
+        def get_num_free_gpu_blocks(self):
+            raise RuntimeError("cache probe broke")
+
+    class Scheduler:
+        running = [object()]
+        block_manager = BlockManager()
+
+    class Engine:
+        scheduler = Scheduler()
+
+        def get_num_unfinished_requests(self):
+            raise RuntimeError("unfinished probe broke")
+
+    sample = read_scheduler_stats(Engine())
+
+    assert sample is not None
+    assert sample.num_running == 1
+    assert any("cache usage probe failed" in note for note in sample.diagnostics)
+    assert any("unfinished-request probe failed" in note for note in sample.diagnostics)
+
+
 def test_summarize_single_sample():
     s = read_scheduler_stats(
         type("E", (), {"scheduler": [type("S", (), {"running": [0, 1], "waiting": [], "swapped": []})()],

@@ -48,6 +48,7 @@ class SchedulerSample:
     gpu_cache_usage: float | None = None  # KV-cache blocks used / total, 0..1
     cpu_cache_usage: float | None = None
     batch_occupancy: float | None = None  # num_running / max_num_seqs, 0..1
+    diagnostics: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -369,7 +370,9 @@ def _schedulers(engine: Any) -> list[Any]:
     return list(sched) if isinstance(sched, list | tuple) else [sched]
 
 
-def _v1_scheduler_stats(scheduler: Any) -> dict[str, Any]:
+def _v1_scheduler_stats(
+    scheduler: Any, diagnostics: list[str] | None = None
+) -> dict[str, Any]:
     """vLLM V1 stats via ``scheduler.make_stats()`` — V1 doesn't keep the V0
     running/waiting deques in the same shape, but exposes a stats object with
     ``num_running_reqs`` / ``num_waiting_reqs`` / ``kv_cache_usage``. Best-effort;
@@ -381,7 +384,11 @@ def _v1_scheduler_stats(scheduler: Any) -> dict[str, Any]:
         return {}
     try:
         stats = make()
-    except Exception:
+    except Exception as exc:
+        if diagnostics is not None:
+            diagnostics.append(
+                f"vLLM V1 scheduler make_stats failed: {type(exc).__name__}: {exc}"
+            )
         return {}
     if stats is None:
         return {}
@@ -443,7 +450,7 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
             saw_any = True
 
         # KV-cache usage off the first scheduler's block manager (best-effort, V0).
-        usage = _gpu_cache_usage(schedulers[0])
+        usage = _gpu_cache_usage(schedulers[0], sample.diagnostics)
         if usage is not None:
             sample.gpu_cache_usage = usage
             saw_any = True
@@ -451,7 +458,7 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
         # vLLM V1: fill running / waiting / cache from the scheduler's stat object
         # where the VO deques weren't exposed (they read empty on V1)
         for sch in schedulers:
-            for field_name, val in _v1_scheduler_stats(sch).items():
+            for field_name, val in _v1_scheduler_stats(sch, sample.diagnostics).items():
                 if getattr(sample, field_name) is None:
                     setattr(sample, field_name, val)
                     saw_any = True
@@ -467,8 +474,10 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
         try:
             sample.num_unfinished = int(getter())
             saw_any = True
-        except Exception:
-            pass
+        except Exception as exc:
+            sample.diagnostics.append(
+                f"unfinished-request probe failed: {type(exc).__name__}: {exc}"
+            )
 
     if sample.num_running is not None:
         max_seqs = _max_num_seqs(engine)
@@ -480,10 +489,12 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
             capacity = max_seqs * max(len(schedulers), 1)
             sample.batch_occupancy = min(1.0, sample.num_running / capacity)
 
-    return sample if saw_any else None
+    return sample if saw_any or sample.diagnostics else None
 
 
-def _gpu_cache_usage(scheduler: Any) -> float | None:
+def _gpu_cache_usage(
+    scheduler: Any, diagnostics: list[str] | None = None
+) -> float | None:
     """KV-cache block occupancy (0..1) off a scheduler's block manager, if exposed."""
     bm = getattr(scheduler, "block_manager", None)
     if bm is None:
@@ -494,7 +505,11 @@ def _gpu_cache_usage(scheduler: Any) -> float | None:
     if callable(free_fn) and isinstance(total, int) and total > 0:
         try:
             return max(0.0, 1.0 - free_fn() / total)
-        except Exception:
+        except Exception as exc:
+            if diagnostics is not None:
+                diagnostics.append(
+                    f"KV-cache usage probe failed: {type(exc).__name__}: {exc}"
+                )
             return None
     return None
 
@@ -543,7 +558,12 @@ class SchedulerStatsSampler:
         try:
             s0 = read_scheduler_stats(self.engine, t_ns=0)
             if s0 is not None:
+                self._surface_sample_diagnostics(s0)
                 self.samples.append(s0)
+            else:
+                self._record_failure(
+                    "unavailable", "engine exposes no recognized scheduler fields"
+                )
         except Exception as exc:
             self._record_failure("initial-read", f"scheduler stats read failed: {exc}")
         self._stop.clear()
@@ -555,7 +575,12 @@ class SchedulerStatsSampler:
             try:
                 s = read_scheduler_stats(self.engine, t_ns=time.perf_counter_ns() - self._t0_ns)
                 if s is not None:
+                    self._surface_sample_diagnostics(s)
                     self.samples.append(s)
+                else:
+                    self._record_failure(
+                        "unavailable", "engine exposes no recognized scheduler fields"
+                    )
             except Exception as exc:
                 self._record_failure("background-read", f"scheduler stats read failed: {exc}")
             self._stop.wait(self.interval_s)
@@ -577,12 +602,20 @@ class SchedulerStatsSampler:
         self.diagnostics.append(message)
         warnings.warn(message, RuntimeWarning, stacklevel=2)
 
+    def _surface_sample_diagnostics(self, sample: SchedulerSample) -> None:
+        for message in sample.diagnostics:
+            self._record_failure(f"field:{message.split(':', 1)[0]}", message)
+
     def summary(self) -> SchedulerStatsSummary:
         # Snapshot first: stop() joins with a timeout, so in the pathological case
         # where the daemon thread is still alive, summarize must iterate a stable
         # copy rather than a list being appended to concurrently.
         result = summarize(list(self.samples), t0_wall_ns=self._t0_wall_ns)
-        result.diagnostics.extend(self.diagnostics)
+        if self.diagnostics:
+            # The sampler versions field diagnostics with stable deduplication keys
+            # and a user-facing prefix. Direct ``summarize`` callers still receive
+            # the raw per-sample diagnostics, while this boundary emits one copy.
+            result.diagnostics = list(self.diagnostics)
         return result
 
     def to_records(self) -> list[dict[str, Any]]:
@@ -612,6 +645,7 @@ def summarize(
     swapped = _vals("num_swapped")
     duration_s = max(samples[-1].t_ns - samples[0].t_ns, 0) / 1e9
 
+    diagnostics = list(dict.fromkeys(note for sample in samples for note in sample.diagnostics))
     return SchedulerStatsSummary(
         n_samples=len(samples),
         duration_s=duration_s,
@@ -626,6 +660,7 @@ def summarize(
         peak_gpu_cache_usage=max(cache) if cache else None,
         peak_swapped=int(max(swapped)) if swapped else None,
         t0_wall_ns=t0_wall_ns,
+        diagnostics=diagnostics,
     )
 
 
