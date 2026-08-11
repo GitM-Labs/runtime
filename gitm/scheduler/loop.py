@@ -752,13 +752,13 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 trace_path=trace_path,
             )
 
-    # Guard: if the tracer captured nothing (no GPU/shim, or the workload never
-    # ran), do NOT proceed to attribution + emit claims — that fabricates a
-    # result from an empty trace. Report no-data honestly instead.
-    if trace.vendor == "none" or not trace.kernels():
-        diagnostic = runner_error or qual.diagnostic or (
-            "Tracer captured no GPU kernels. Either no GPU/CUPTI shim is present, "
-            "or the workload did not run under the runtime."
+    # Guard: a kernel launch with no positive duration is not measurement
+    # coverage. Do not classify it or emit claims from a fabricated denominator.
+    valid_kernels = [k for k in trace.kernels() if k.end_ns > k.start_ns]
+    if trace.vendor == "none" or not valid_kernels:
+        diagnostic = runner_error or (
+            "Tracer captured no positive-duration GPU kernels. Either no GPU/CUPTI "
+            "shim is present, the workload did not run, or kernel timestamps are invalid."
         )
         return _no_data_result(
             run_dir=run_dir,
@@ -1799,8 +1799,8 @@ def _no_data_result(
 ) -> dict[str, Any]:
     """Write an honest no-data report and return its summary (status=no_data).
 
-    Used when the trace has no kernels — a misconfigured box or a workload that
-    never ran. We emit zero claims rather than fabricating results from nothing.
+    Used when the trace has no positive-duration kernels — a misconfigured box,
+    a workload that never ran, or invalid timestamps. We emit zero claims.
     """
     provenance = build_provenance(
         workload_id=workload,
@@ -1813,7 +1813,7 @@ def _no_data_result(
         claims=[],
         provenance=provenance,
         qualification_diagnostic=diagnostic,
-        summary="NO DATA — tracer captured no GPU kernels; nothing was measured.",
+        summary="NO DATA — tracer captured no positive-duration GPU kernels; nothing was measured.",
     )
     _write_report(run_dir, report_md)
 
