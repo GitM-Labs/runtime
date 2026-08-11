@@ -58,16 +58,20 @@ def test_roofline_a100_compute_bound_reference():
     assert pred.t_pred_s == pytest.approx(expected_t_compute, rel=1e-9)
 
 
-# ── dtype selection: fp16/bf16 share peak; fp32 takes the slower path ───────
+# ── dtype selection: each declared hardware ceiling is honored ──────────────
 
 
-def test_roofline_dtype_selects_fp16_peak_for_bf16():
-    hw = HardwareSpec()
+def test_roofline_dtype_selects_the_explicit_bf16_peak():
+    hw = HardwareSpec(
+        peak_flops_fp16_per_s=100e12,
+        peak_flops_bf16_per_s=200e12,
+    )
     fp16 = roofline("op", flops=1e12, bytes_moved=0, hw=hw, dtype="fp16")
     bf16 = roofline("op", flops=1e12, bytes_moved=0, hw=hw, dtype="bf16")
-    assert fp16.t_compute_s == pytest.approx(bf16.t_compute_s, rel=1e-12)
-    # Both must pick the fp16 peak (312e12), not the fp32 peak (19.5e12).
-    assert fp16.t_compute_s == pytest.approx(1e12 / 312e12, rel=1e-9)
+    assert fp16.t_compute_s == pytest.approx(1e12 / 100e12, rel=1e-9)
+    assert bf16.t_compute_s == pytest.approx(1e12 / 200e12, rel=1e-9)
+    assert bf16.peak_dtype == "bf16"
+    assert not bf16.peak_is_fallback
 
 
 def test_roofline_dtype_fp32_uses_slower_peak():

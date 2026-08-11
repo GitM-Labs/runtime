@@ -6,9 +6,6 @@ For each op we compute:
     t_memory  = bytes / peak_mem_bw
     t_pred    = max(t_compute, t_memory)
 
-with a vendor-specific efficiency band ``(eff_lo, eff_hi)``: a kernel within
-that band is "as expected". Residuals outside the band drive attribution.
-
 **The peak must match the op's dtype.** A checkpoint that runs fp8 linears and
 fp4 experts priced against a bf16 peak understates its own ceiling by 2-4x, and
 an understated ceiling reads as recoverable headroom that isn't there — the one
@@ -83,8 +80,6 @@ class HardwareSpec:
     # ``0.0`` means unknown, which makes a sharded graph refuse to guess rather
     # than predict a free all-to-all.
     interconnect_bw_bytes_per_s: float = 0.0
-    eff_lo: float = 0.55
-    eff_hi: float = 0.95
 
 
 @dataclass(frozen=True)
@@ -534,7 +529,6 @@ class BatchConfig:
     """Decode batch shape — prompt length already paid; we predict per-step."""
 
     batch: int = 1
-    prompt_len: int = 128
     kv_cache_len: int = 128  # tokens already in KV-cache when decode starts
     # Multi-token prediction: draft positions proposed per step, and the fraction
     # the verifier keeps. A step costs the drafted work regardless; only accepted
@@ -545,7 +539,7 @@ class BatchConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.batch, int) or isinstance(self.batch, bool) or self.batch <= 0:
             raise ValueError(f"batch must be a positive integer, got {self.batch!r}")
-        for name in ("prompt_len", "kv_cache_len", "speculative_tokens"):
+        for name in ("kv_cache_len", "speculative_tokens"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
@@ -609,7 +603,9 @@ class RooflinePrediction:
 
 def _canon_dtype(dtype: str) -> str:
     d = dtype.lower()
-    if d in ("bf16", "float16", "fp16", "half"):
+    if d in ("bf16", "bfloat16"):
+        return "bf16"
+    if d in ("float16", "fp16", "half"):
         return "fp16"
     if d in ("fp4", "mxfp4", "nvfp4"):
         return "fp4"
@@ -631,6 +627,8 @@ def resolve_peak(hw: HardwareSpec, dtype: str) -> tuple[float, str]:
     d = _canon_dtype(dtype)
     if d == "fp32":
         return hw.peak_flops_fp32_per_s, "fp32"
+    if d == "bf16":
+        return hw.peak_flops_bf16_per_s, "bf16"
     if d == "fp4":
         if hw.peak_flops_fp4_per_s > 0:
             return hw.peak_flops_fp4_per_s, "fp4"
