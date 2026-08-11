@@ -161,16 +161,21 @@ def run_profile(
     if not tools.py_spy:
         bundle.missing.append("py-spy")
 
-    subprocess.run(argv, check=False)
+    completed = subprocess.run(argv, check=False)
+    if completed.returncode != 0:
+        bundle.missing.append(f"workload command failed (exit {completed.returncode})")
 
     for hp in host_procs:
         try:
             hp.wait(timeout=host_capture_s + 5)
         except subprocess.TimeoutExpired:
             hp.terminate()
+            bundle.missing.append("host sampler timed out")
 
     if config.vendor == "nvidia" and tools.nsys and bundle.gpu_report:
         bundle.gpu_csv = _export_nsys_csv(tools.nsys, bundle.gpu_report, out_dir)
+        if bundle.gpu_csv is None:
+            bundle.missing.append("nsys GPU CSV export")
 
     return bundle
 
@@ -284,14 +289,21 @@ def build_breakdown(phases: list[PhaseTiming]) -> list[StallPhase]:
         gpu = p.gpu_busy_s / wall
         sync = p.sync_s / wall
         cpu = p.cpu_s / wall
-        data_stall = max(0.0, 1.0 - gpu - sync - cpu)
+        components = {"gpu_busy_s": gpu, "sync_s": sync, "cpu_s": cpu}
+        invalid = {name: value for name, value in components.items() if value < 0 or value > 1}
+        if invalid or gpu + sync + cpu > 1.0 + 1e-9:
+            raise ValueError(
+                f"phase {p.phase!r} has contradictory/overlapping timing attribution: "
+                f"gpu={gpu:.3f}, sync={sync:.3f}, cpu={cpu:.3f}; refusing to clamp"
+            )
+        data_stall = 1.0 - gpu - sync - cpu
         out.append(
             StallPhase(
                 phase=p.phase,
-                cpu=min(1.0, cpu),
-                data_stall=min(1.0, data_stall),
-                sync=min(1.0, sync),
-                gpu_active=min(1.0, gpu),
+                cpu=cpu,
+                data_stall=data_stall,
+                sync=sync,
+                gpu_active=gpu,
                 throughput=p.throughput,
                 wall_clock_s=wall,
             )

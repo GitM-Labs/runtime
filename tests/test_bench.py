@@ -262,6 +262,31 @@ def test_wrap_command_marks_missing_profiler():
     assert "nsys" in bundle.missing
 
 
+def test_profile_marks_failed_workload_command(tmp_path):
+    import sys
+
+    from gitm.bench.profile import ProfilerTools, run_profile
+
+    bundle = run_profile(
+        _hft_config(),
+        [sys.executable, "-c", "raise SystemExit(7)"],
+        tmp_path,
+        tools=ProfilerTools(nsys=None, rocprof=None, py_spy=None, sar=None),
+    )
+
+    assert any("exit 7" in item for item in bundle.missing)
+    assert not bundle.complete
+
+
+def test_breakdown_refuses_to_clamp_overlapping_timings():
+    from gitm.bench.profile import PhaseTiming, build_breakdown
+
+    with pytest.raises(ValueError, match="refusing to clamp"):
+        build_breakdown(
+            [PhaseTiming("overlap", wall_clock_s=1.0, gpu_busy_s=0.8, cpu_s=0.4)]
+        )
+
+
 # --- edge manifest ----------------------------------------------------------
 
 

@@ -67,3 +67,14 @@ def test_missing_library_refuses_with_named_path(tmp_path):
     missing = tmp_path / "missing.yaml"
     with pytest.raises(FileNotFoundError, match="candidate coverage is unavailable"):
         load_library(missing)
+
+
+def test_empty_library_refuses_instead_of_looking_like_no_applicable_levers(tmp_path):
+    import pytest
+
+    from gitm.kernels.library import load_library
+
+    empty = tmp_path / "empty.yaml"
+    empty.write_text("interventions: []\n")
+    with pytest.raises(ValueError, match="candidate coverage is unavailable"):
+        load_library(empty)

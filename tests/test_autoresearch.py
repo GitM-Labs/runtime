@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import gitm.agents.autoresearch as ar
 from gitm.agents.autoresearch import (
     AutoresearchRun,
@@ -106,8 +108,11 @@ def test_classify_compute_bound_when_overlapped_and_no_memcpy() -> None:
     assert classify_bottleneck(make_trace(events=events)) == "compute_bound"
 
 
-def test_classify_empty_trace_defaults_to_compute() -> None:
-    assert classify_bottleneck(make_trace(events=[])) == "compute_bound"
+def test_classify_empty_or_invalid_trace_is_unclassified() -> None:
+    assert classify_bottleneck(make_trace(events=[])) == ar.UNCLASSIFIED
+    assert classify_bottleneck(
+        make_trace(events=[make_kernel("zero", start_ns=10, end_ns=10)])
+    ) == ar.UNCLASSIFIED
 
 
 # --- classify_bottleneck: roofline-weighted memory signal ---------------------
@@ -615,9 +620,13 @@ def test_engineargs_proposer_is_a_vllm_bound_generative_proposer() -> None:
     assert specs and all(s.applicability.workloads == ["vllm-decode"] for s in specs)
 
 
-def test_vllm_knob_source_yields_offline_fallback_without_vllm() -> None:
+def test_vllm_knob_source_warns_when_using_offline_fallback(monkeypatch) -> None:
     # vLLM isn't importable in CI → the source yields the frozen fallback catalog.
-    knobs = VLLMKnobSource().knobs()
+    import sys
+
+    monkeypatch.setitem(sys.modules, "vllm", None)
+    with pytest.warns(RuntimeWarning, match="frozen fallback knob catalog"):
+        knobs = VLLMKnobSource().knobs()
     assert knobs and all(isinstance(k, Knob) for k in knobs)
     names = {k.name for k in knobs}
     assert "cpu_offload_gb" in names
@@ -722,7 +731,8 @@ def test_argparse_domains_empty_when_no_cli_builder() -> None:
     class _Bare:
         pass
 
-    assert _argparse_domains(_Bare) == {}
+    with pytest.warns(RuntimeWarning, match="CLI-domain introspection unavailable"):
+        assert _argparse_domains(_Bare) == {}
 
 
 # --- hardware-applicability: skip multi-GPU knobs on a single-GPU box --------

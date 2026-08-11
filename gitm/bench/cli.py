@@ -145,6 +145,12 @@ def _cmd_edge_manifest(args) -> int:
     n_nusc = sum(1 for r in rows if r.source == "nuscenes")
     n_kitti = sum(1 for r in rows if r.source == "kitti")
     print(f"wrote {args.out}: {len(rows)} keyframes ({n_nusc} nuScenes, {n_kitti} KITTI)")
+    if not rows:
+        print(
+            "ERROR: no dataset keyframes were discovered; empty manifest is not usable",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -187,7 +193,7 @@ def _cmd_profile(args) -> int:
             f"detected: {ProfilerTools.detect()}",
             file=sys.stderr,
         )
-    return 0
+    return 0 if bundle.complete else 1
 
 
 def _cmd_baseline(args) -> int:

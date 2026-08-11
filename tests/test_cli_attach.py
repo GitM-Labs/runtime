@@ -35,3 +35,15 @@ def test_main_attach_returns_zero_on_plan(capsys):
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert out["job_id"] == "j" and out["status"] == "planned"
+
+
+def test_live_pid_is_not_falsely_reported_attached(monkeypatch):
+    import gitm.deploy.attach as attach
+
+    monkeypatch.setattr(attach, "_pid_is_live", lambda _pid: True)
+
+    plan = attach_job("job-live", pid=4321, dry_run=False)
+
+    assert plan["status"] == "unsupported"
+    assert "not implemented" in plan["reason"]
+    assert "no telemetry shim was installed" in plan["reason"]
