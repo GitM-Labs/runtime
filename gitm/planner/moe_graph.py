@@ -72,6 +72,7 @@ from gitm.planner.roofline import (
     distinct_experts,
     roofline,
     weight_bytes,
+    weight_bytes_is_fallback,
 )
 
 
@@ -259,12 +260,36 @@ def _emit_layer(
     ww = weight_bytes(spec.weight_dtype)
     ew = weight_bytes(spec.expert_dtype)
     kw = weight_bytes(spec.kv_dtype)
+    af = weight_bytes_is_fallback(spec.act_dtype)
+    wf = weight_bytes_is_fallback(spec.weight_dtype)
+    ef = weight_bytes_is_fallback(spec.expert_dtype)
+    kf = weight_bytes_is_fallback(spec.kv_dtype)
     wd, ed = spec.weight_dtype, spec.expert_dtype
 
-    def add(op: str, flops: float, byts: float, dtype: str, *, estimated: bool = False) -> None:
+    def add(
+        op: str,
+        flops: float,
+        byts: float,
+        dtype: str,
+        *,
+        byte_fallback: bool,
+        estimated: bool = False,
+    ) -> None:
         name = f"{prefix}{op}"
         g.nodes.append(
-            PredictedNode(name, layer, roofline(name, flops, byts, hw, dtype, estimated=estimated))
+            PredictedNode(
+                name,
+                layer,
+                roofline(
+                    name,
+                    flops,
+                    byts,
+                    hw,
+                    dtype,
+                    estimated=estimated,
+                    bytes_are_fallback=byte_fallback,
+                ),
+            )
         )
 
     tp = max(1, sh.tp)
@@ -276,14 +301,15 @@ def _emit_layer(
     # head. Every rank pays for them in full, so TP's speedup on attention is
     # strictly less than ``tp``.
     f, b = _linear(positions, h, spec.q_lora_rank, aw, ww)
-    add("attn_q_a", f, b, wd)
+    add("attn_q_a", f, b, wd, byte_fallback=af or wf)
 
     f, b = _linear(positions, spec.q_lora_rank, spec.n_heads * spec.q_head_dim // tp, aw, ww)
-    add("attn_q_b", f, b, wd)
+    add("attn_q_b", f, b, wd, byte_fallback=af or wf)
 
     # KV down-projection, plus the cache write for the positions just computed.
     f, b = _linear(positions, h, spec.kv_latent_dim, aw, ww)
-    add("attn_kv_a", f, b + positions * spec.kv_latent_dim * kw, wd)
+    add("attn_kv_a", f, b + positions * spec.kv_latent_dim * kw, wd,
+        byte_fallback=af or wf or kf)
 
     # ── indexer: project the query, then scan the compressed candidate set ───
     # Sliding-window layers have no indexer — a fixed recent window needs no
@@ -293,7 +319,7 @@ def _emit_layer(
     cand = index_candidates(spec, layer, kv_len)
     if cand > 0:
         f, b = _linear(positions, h, spec.index_n_heads * spec.index_head_dim // tp, aw, ww)
-        add("attn_index_proj", f, b, wd)
+        add("attn_index_proj", f, b, wd, byte_fallback=af or wf)
 
         add(
             "attn_index_score",
@@ -302,6 +328,7 @@ def _emit_layer(
             # position, and replicated across TP ranks alongside the KV latent.
             sequences * cand * spec.index_head_dim * kw,
             wd,
+            byte_fallback=kf,
         )
 
     # ── attention core over the selected positions ──────────────────────────
@@ -322,6 +349,7 @@ def _emit_layer(
         # waiting to happen if the graph divided here.
         sequences * t_eff * spec.kv_latent_dim * kw,
         wd,
+        byte_fallback=kf,
     )
 
     # Output projection, grouped and low-rank. ``o_groups`` partitions the head
@@ -333,13 +361,14 @@ def _emit_layer(
     f_b, b_b = _linear(positions, spec.o_lora_rank, h, aw, ww)
     # Named to match the dense graph's output projection: it is the same op in
     # the same place, so residuals for it stay comparable across model families.
-    add("attn_out_proj", f_a + f_b, b_a + b_b, wd, estimated=True)
+    add("attn_out_proj", f_a + f_b, b_a + b_b, wd,
+        byte_fallback=af or wf, estimated=True)
 
     # ── mixture of experts ──────────────────────────────────────────────────
     # Routing is replicated: every rank scores every expert so it knows what to
     # keep and what to ship.
     f, b = _linear(positions, h, spec.n_routed_experts, aw, ww)
-    add("moe_router", f, b, wd)
+    add("moe_router", f, b, wd, byte_fallback=af or wf)
 
     inter = spec.moe_intermediate_size
     # gate + up + down == three h x inter matrices per expert.
@@ -353,6 +382,7 @@ def _emit_layer(
             per_expert_weights * spec.n_shared_experts * ew / tp
             + aw * (positions * h * 2 + positions * inter * 2 * spec.n_shared_experts / tp),
             ed,
+            byte_fallback=ef or af,
         )
 
     # Shared with the dense MoE roofline — one owner for the union term. Note the
@@ -374,6 +404,7 @@ def _emit_layer(
         per_expert_weights * distinct * ew * skew / es
         + aw * (positions * h * 2 + positions * inter * 2 * spec.num_experts_per_tok / es),
         ed,
+        byte_fallback=ef or af,
     )
 
     # ── low-rank state update on the tail layers ────────────────────────────
@@ -384,7 +415,8 @@ def _emit_layer(
         # Coarse: a down-up low-rank pair. The published shape isn't public, so
         # this establishes an order of magnitude and flags itself as an estimate
         # rather than sitting silently in the total.
-        add("dspark", f_d + f_u, b_d + b_u, wd, estimated=True)
+        add("dspark", f_d + f_u, b_d + b_u, wd,
+            byte_fallback=af or wf, estimated=True)
 
     # ── cross-rank traffic ──────────────────────────────────────────────────
     # Priced against the interconnect, not HBM, by swapping the bandwidth term.
@@ -400,7 +432,15 @@ def _emit_layer(
             g.nodes.append(
                 PredictedNode(
                     name, layer,
-                    roofline(name, 0.0, byts, link, spec.act_dtype, estimated=True),
+                    roofline(
+                        name,
+                        0.0,
+                        byts,
+                        link,
+                        spec.act_dtype,
+                        estimated=True,
+                        bytes_are_fallback=af,
+                    ),
                 )
             )
 
@@ -476,7 +516,21 @@ def predict_moe_graph(
     ww = weight_bytes(spec.weight_dtype)
     f, b = _linear(positions, spec.hidden, spec.vocab // max(1, sh.tp), aw, ww)
     g.nodes.append(
-        PredictedNode("lm_head", None, roofline("lm_head", f, b, hw, spec.weight_dtype))
+        PredictedNode(
+            "lm_head",
+            None,
+            roofline(
+                "lm_head",
+                f,
+                b,
+                hw,
+                spec.weight_dtype,
+                bytes_are_fallback=(
+                    weight_bytes_is_fallback(spec.act_dtype)
+                    or weight_bytes_is_fallback(spec.weight_dtype)
+                ),
+            ),
+        )
     )
 
     return g

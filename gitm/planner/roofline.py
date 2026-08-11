@@ -49,6 +49,11 @@ def weight_bytes(dtype: str) -> float:
     return _WEIGHT_BYTES.get(dtype.lower(), 2.0)
 
 
+def weight_bytes_is_fallback(dtype: str) -> bool:
+    """Whether :func:`weight_bytes` substitutes bf16 for an unknown dtype."""
+    return dtype.lower() not in _WEIGHT_BYTES
+
+
 @dataclass(frozen=True)
 class HardwareSpec:
     """Peak achievable rates for a target GPU.
@@ -498,6 +503,11 @@ class RooflinePrediction:
     # derivation from published shapes — carried through to the report so an
     # estimate is never read as a measurement.
     estimated: bool = False
+    # Set when any dtype contributing to ``bytes`` was unknown and therefore
+    # priced at :func:`weight_bytes`'s fail-open bf16 width. This cannot be
+    # inferred from ``dtype``: a node's compute dtype and its activation, weight,
+    # or KV-cache byte contributors may differ.
+    bytes_are_fallback: bool = False
 
     @property
     def peak_is_fallback(self) -> bool:
@@ -555,6 +565,7 @@ def roofline(
     dtype: str = "fp16",
     *,
     estimated: bool = False,
+    bytes_are_fallback: bool = False,
 ) -> RooflinePrediction:
     """Compute the roofline prediction for a single op."""
     peak_flops, peak_dtype = resolve_peak(hw, dtype)
@@ -573,4 +584,5 @@ def roofline(
         peak_dtype=peak_dtype,
         peak_flops_per_s=peak_flops,
         estimated=estimated,
+        bytes_are_fallback=bytes_are_fallback,
     )

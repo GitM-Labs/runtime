@@ -15,6 +15,8 @@ headroom report would then bill against.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from gitm.optimizer.deviation import classify_op
@@ -34,6 +36,7 @@ from gitm.planner.roofline import (
     ShardingConfig,
     resolve_peak,
     weight_bytes,
+    weight_bytes_is_fallback,
 )
 
 # The shape of DeepSeek-V4-Flash-0731, trimmed to the keys the planner reads.
@@ -254,6 +257,37 @@ def test_fp4_weight_bytes_include_the_block_scales():
     assert weight_bytes("fp4") == pytest.approx(0.5 + 1 / 32)
     assert weight_bytes("fp8") > 1.0  # block scales ride along
     assert weight_bytes("bf16") == 2.0
+
+
+def test_unknown_weight_dtype_is_fail_open_but_explicitly_flagged(spec, b200):
+    """The bf16 byte-width fallback must ride with the memory term it changes."""
+    unknown = replace(spec, expert_dtype="future_fp3")
+    g = predict_moe_graph(unknown, b200, BatchConfig(batch=1, kv_cache_len=1024))
+
+    assert weight_bytes("future_fp3") == weight_bytes("bf16")
+    assert weight_bytes_is_fallback("future_fp3")
+    assert g.has_fallback_bytes
+    assert {
+        n.op for n in g.nodes if n.prediction.bytes_are_fallback
+    } == {"moe_shared", "moe_routed"}
+
+
+def test_known_weight_dtypes_leave_bytes_fallback_clean(spec, b200):
+    g = predict_moe_graph(spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
+
+    assert not weight_bytes_is_fallback("fp4")
+    assert not g.has_fallback_bytes
+    assert not any(n.prediction.bytes_are_fallback for n in g.nodes)
+
+
+def test_mixed_byte_node_flags_unknown_kv_dtype(spec, b200):
+    """A node is flagged when any byte contributor is unknown, not just compute dtype."""
+    unknown = replace(spec, kv_dtype="future_kv3")
+    g = predict_moe_graph(unknown, b200, BatchConfig(batch=1, kv_cache_len=1024))
+
+    flagged = {n.op for n in g.nodes if n.prediction.bytes_are_fallback}
+    assert {"attn_kv_a", "attn_score_value"} <= flagged
+    assert "moe_router" not in flagged
 
 
 # ── config parsing ──────────────────────────────────────────────────────────

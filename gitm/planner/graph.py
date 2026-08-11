@@ -141,6 +141,15 @@ class Graph:
         """
         return any(n.prediction.peak_is_fallback for n in self.nodes)
 
+    @property
+    def has_fallback_bytes(self) -> bool:
+        """True if any node substituted bf16 for an unknown byte-width dtype.
+
+        Kept separate from :attr:`has_fallback_peaks`: compute peak and byte
+        width are independent inputs, and decode is commonly memory-bound.
+        """
+        return any(n.prediction.bytes_are_fallback for n in self.nodes)
+
 
 def predict_graph(
     model: ModelSpec | None = None,
