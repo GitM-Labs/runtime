@@ -159,6 +159,26 @@ def test_capture_falls_back_to_noop_trace(tmp_path, monkeypatch):
     assert header["device_count"] == 0
 
 
+@pytest.mark.parametrize(
+    "counter, message",
+    [
+        (lambda: 0, "reported 0 devices"),
+        (lambda: (_ for _ in ()).throw(RuntimeError("driver denied")), "driver denied"),
+    ],
+)
+def test_capture_warns_when_active_backend_device_count_is_unavailable(counter, message):
+    import importlib
+    from types import SimpleNamespace
+
+    capture_mod = importlib.import_module("gitm.tracer.capture")
+    backend = SimpleNamespace(device_count=counter)
+
+    with pytest.warns(RuntimeWarning, match=message):
+        count = capture_mod._device_count(backend, injected=False)
+
+    assert count == 0
+
+
 # --- full backend wiring via a fake shim ------------------------------------
 
 
