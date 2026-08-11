@@ -86,6 +86,15 @@ def test_summary_keys_by_the_observed_kernels_op():
     assert summary["kept_ops"] == {"attn_score_value": 1, "<unmodeled>": 1}
 
 
+def test_zero_duration_kernel_is_kept_as_a_departure():
+    g = predict_graph()
+    tr = _trace([_k("flash_attn_kernel", 0.0)])
+
+    dev = deviating_kernel_indices(tr, g)
+
+    assert dev.kept_indices == [0]
+
+
 def test_range_identity_classifies_a_bare_gemm_that_name_matching_cannot():
     """The dominant real-world gap: bare cuBLAS/cutlass GEMMs carry no
     projection tag in their name (test_classify_op_matches_real_vllm_kernel_names

@@ -65,6 +65,18 @@ def test_rejects_bad_recompute_fraction():
         compute_metrics(_trace(), PEAK, recompute_fraction=1.0)
 
 
+def test_refuses_nonpositive_trace_duration():
+    trace = _trace().model_copy(update={"duration_ns": 0})
+    with pytest.raises(RuntimeError, match="utilization metrics timing unavailable"):
+        compute_metrics(trace, PEAK)
+
+
+def test_refuses_unpriced_memory_bandwidth():
+    peak = HardwarePeak(name="UNKNOWN", peak_flops=1e14, peak_bw_bytes_s=0.0)
+    with pytest.raises(RuntimeError, match="peak bandwidth must be positive"):
+        compute_metrics(_trace(), peak)
+
+
 def test_stall_breakdown_transfer_and_idle():
     # _trace() gaps: [50,100]us and [150,200]us; the memcpy [60,65]us sits in the
     # first gap -> 5us transfer-bound, the remaining 95us of idle is a long stall.

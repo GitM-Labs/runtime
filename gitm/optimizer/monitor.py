@@ -9,6 +9,7 @@ invariants so attribution doesn't need per-invariant logic.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -58,6 +59,8 @@ class Residuals:
     total_kernel_time_ns: int = 0
     classified_kernel_time_ns: int = 0
     matched_kernel_time_ns: int = 0
+    invalid_duration_kernels: int = 0
+    unpriced_prediction_kernels: int = 0
 
     @staticmethod
     def _ratio(part: int, whole: int) -> float:
@@ -85,6 +88,18 @@ class Residuals:
         if self.total_kernels == 0:
             return ["residual coverage unavailable: trace contains no kernels"]
         warnings: list[str] = []
+        if self.invalid_duration_kernels:
+            warnings.append(
+                "residual coverage: excluded "
+                f"{self.invalid_duration_kernels}/{self.total_kernels} kernel(s) "
+                "with non-positive timestamps"
+            )
+        if self.unpriced_prediction_kernels:
+            warnings.append(
+                "residual coverage: excluded "
+                f"{self.unpriced_prediction_kernels} matched kernel(s) because "
+                "their predicted duration is non-positive or non-finite"
+            )
         if self.classified_kernels < self.total_kernels:
             warnings.append(
                 "residual coverage: classified "
@@ -167,10 +182,11 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
     obs = trace.kernels()
     pred = graph.nodes
 
-    durations = [max(ok.end_ns - ok.start_ns, 0) for ok in obs]
+    durations = [ok.end_ns - ok.start_ns for ok in obs]
     res = Residuals(
         total_kernels=len(obs),
-        total_kernel_time_ns=sum(durations),
+        total_kernel_time_ns=sum(d for d in durations if d > 0),
+        invalid_duration_kernels=sum(d <= 0 for d in durations),
     )
     by_op_layer: dict[tuple[str, int], PredictedNode] = {}
     classes: dict[str, dict[tuple[float, float], PredictedNode]] = {}
@@ -180,6 +196,8 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
         classes.setdefault(pn.op, {}).setdefault(_class_key(pn), pn)
 
     for ok, duration_ns in zip(obs, durations, strict=True):
+        if duration_ns <= 0:
+            continue
         op = ok.range_op or classify_op(ok.name)
         if op is None:
             continue
@@ -191,7 +209,7 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
         res.matched_kernels += 1
         res.matched_kernel_time_ns += duration_ns
 
-        t_obs = max((ok.end_ns - ok.start_ns) / 1e9, 1e-12)
+        t_obs = duration_ns / 1e9
         b_obs = (
             ok.bytes_read + ok.bytes_written
             if ok.bytes_read is not None and ok.bytes_written is not None
@@ -205,7 +223,10 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
             pn = cls[0]
 
         if pn is not None:
-            t_pred = max(pn.prediction.t_pred_s, 1e-12)
+            t_pred = pn.prediction.t_pred_s
+            if not math.isfinite(t_pred) or t_pred <= 0.0:
+                res.unpriced_prediction_kernels += 1
+                continue
             r_kt = (t_obs - t_pred) / t_pred
             r_mt = (
                 (b_obs - pn.prediction.bytes) / pn.prediction.bytes
@@ -214,7 +235,10 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
             )
             layer, bound = ok.range_layer, pn.prediction.bound
         else:
-            ts = sorted(max(c.prediction.t_pred_s, 1e-12) for c in cls)
+            ts = sorted(c.prediction.t_pred_s for c in cls)
+            if any(not math.isfinite(t) or t <= 0.0 for t in ts):
+                res.unpriced_prediction_kernels += 1
+                continue
             r_kt = _interval_residual(t_obs, ts[0], ts[-1])
             bs = sorted(c.prediction.bytes for c in cls if c.prediction.bytes > 0)
             r_mt = _interval_residual(b_obs, bs[0], bs[-1]) if b_obs is not None and bs else None

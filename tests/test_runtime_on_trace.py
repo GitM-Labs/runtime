@@ -241,6 +241,24 @@ def test_measure_trace_excludes_zero_duration_kernels_with_diagnostic():
     assert all(v.node_op != "bad" for v in result.violations)
 
 
+def test_residuals_exclude_zero_duration_kernels_with_diagnostic():
+    from gitm.optimizer.monitor import residuals
+    from gitm.planner.graph import predict_graph
+
+    trace = _trace(
+        [
+            _kernel("flash_attn_kernel", start=10, end=10),
+            _kernel("flash_attn_kernel", start=20, end=30),
+        ]
+    )
+
+    result = residuals(trace, predict_graph())
+
+    assert result.invalid_duration_kernels == 1
+    assert len(result.per_kernel) == 1
+    assert any("non-positive timestamps" in note for note in result.coverage_warnings)
+
+
 def test_attribute_dr_ranks_pairs():
     from gitm.optimizer.dr import attribute_dr
     from gitm.optimizer.monitor import KernelResidual, Residuals

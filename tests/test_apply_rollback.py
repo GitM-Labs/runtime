@@ -45,10 +45,24 @@ def test_apply_keeps_on_positive_delta():
 
 def test_apply_only_when_no_measurement_keeps():
     cfg = {"block_size": 8}
-    res = apply_intervention(_spec(), DictApplicator(cfg))  # measure -> None
+    with pytest.warns(RuntimeWarning, match="applied without a measurement"):
+        res = apply_intervention(_spec(), DictApplicator(cfg))  # measure -> None
     assert res.applied and not res.rolled_back
     assert res.measured_delta is None
     assert cfg["block_size"] == 16
+
+
+def test_broken_apply_audit_sink_warns():
+    class BrokenAudit:
+        def record(self, *_args, **_kwargs):
+            raise OSError("disk full")
+
+    with pytest.warns(RuntimeWarning, match="safety audit failed"):
+        result = apply_intervention(
+            _spec(), DictApplicator({"block_size": 8}, measure_fn=lambda _s: 0.1), audit=BrokenAudit()
+        )
+
+    assert result.applied and not result.rolled_back
 
 
 # --- rollback case 1: bad value (apply raises) ------------------------------

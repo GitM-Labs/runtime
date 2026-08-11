@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,6 +99,13 @@ def apply_intervention(
                            error=f"measure failed, restored: {exc}")
 
     # Step 4: keep-or-rollback on the regression threshold.
+    if delta is None:
+        warnings.warn(
+            f"intervention {spec.name!r} was applied without a measurement; "
+            "the change is unverified",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     if delta is not None and delta < min_keep_delta:
         applicator.restore(snapshot)
         _audit(audit, "revert", spec, knobs=_knob_values(spec),
@@ -117,8 +125,12 @@ def _audit(
         return
     try:
         audit.record(event, spec.name, cause, **detail)
-    except Exception:
-        pass
+    except Exception as exc:
+        warnings.warn(
+            f"intervention safety audit failed for {event} {spec.name!r}: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def _knob_values(spec: Any) -> dict[str, Any]:
@@ -430,8 +442,10 @@ class LiveEngineApplicator:
         if callable(fn):
             try:
                 fn(engine)
-            except Exception:
-                pass
+            except Exception as exc:
+                warnings.warn(
+                    f"engine activation hook failed: {exc}", RuntimeWarning, stacklevel=2
+                )
 
     @staticmethod
     def _shutdown(engine: Any) -> None:
@@ -440,8 +454,10 @@ class LiveEngineApplicator:
         if callable(custom):
             try:
                 custom(engine)
-            except Exception:
-                pass
+            except Exception as exc:
+                warnings.warn(
+                    f"engine shutdown hook failed: {exc}", RuntimeWarning, stacklevel=2
+                )
 
         for path in ("shutdown", "llm_engine.shutdown", "engine.shutdown"):
             obj: Any = engine
@@ -452,8 +468,12 @@ class LiveEngineApplicator:
             if callable(obj):
                 try:
                     obj()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    warnings.warn(
+                        f"engine shutdown path {path!r} failed: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                 break
         try:
             gc.collect()
@@ -462,8 +482,12 @@ class LiveEngineApplicator:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
-        except Exception:
-            pass
+        except Exception as exc:
+            warnings.warn(
+                f"GPU cleanup after engine shutdown unavailable: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def measure(self, spec: InterventionSpec) -> float | None:
         baseline = self._baseline_tps if self._baseline_tps is not None else self._bench_stats()[0]

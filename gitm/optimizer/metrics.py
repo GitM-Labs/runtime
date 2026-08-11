@@ -26,6 +26,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
+from gitm._timing import require_positive_duration
 from gitm.tracer.schema import KernelEvent, Trace
 
 FlopsModel = Callable[[KernelEvent], float]
@@ -169,8 +170,10 @@ def compute_metrics(
     kernels = trace.kernels()
     memcpys = [e for e in trace.events if getattr(e, "kind", None) == "memcpy"]
     syncs = [e for e in trace.events if getattr(e, "kind", None) == "sync"]
-    wall_s = trace.duration_ns / 1e9
-    busy_fraction = (_merged_busy_ns(kernels) / trace.duration_ns) if trace.duration_ns else 0.0
+    wall_s = require_positive_duration(
+        trace.duration_ns / 1e9, context=f"{trace.workload_id} utilization metrics"
+    )
+    busy_fraction = _merged_busy_ns(kernels) / trace.duration_ns
     gaps = _idle_gaps(kernels, trace.duration_ns)
     stall_breakdown = _classify_stalls(gaps, memcpys, syncs, trace.duration_ns)
 
@@ -179,7 +182,11 @@ def compute_metrics(
     mfu: float | None = None
     if flops_model is not None:
         total_flops = sum(flops_model(k) for k in kernels)
-        achieved_flops = total_flops / wall_s if wall_s else 0.0
+        achieved_flops = total_flops / wall_s
+        if total_flops > 0 and peak.peak_flops <= 0:
+            raise RuntimeError(
+                f"{peak.name} compute utilization unavailable: peak FLOP/s must be positive"
+            )
         if peak.peak_flops > 0:
             hfu = achieved_flops / peak.peak_flops
             mfu = hfu * (1.0 - recompute_fraction)
@@ -187,8 +194,12 @@ def compute_metrics(
     bytes_moved = sum(e.bytes for e in memcpys)
     for k in kernels:
         bytes_moved += (k.bytes_read or 0) + (k.bytes_written or 0)
-    achieved_bw = bytes_moved / wall_s if wall_s else 0.0
-    mbu = achieved_bw / peak.peak_bw_bytes_s if peak.peak_bw_bytes_s > 0 else 0.0
+    achieved_bw = bytes_moved / wall_s
+    if peak.peak_bw_bytes_s <= 0:
+        raise RuntimeError(
+            f"{peak.name} memory utilization unavailable: peak bandwidth must be positive"
+        )
+    mbu = achieved_bw / peak.peak_bw_bytes_s
 
     return MetricsResult(
         n_kernels=len(kernels),
