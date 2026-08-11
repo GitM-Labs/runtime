@@ -381,6 +381,33 @@ def test_profile_surfaces_failed_pyspy_capture(monkeypatch, tmp_path):
     assert not bundle.complete
 
 
+def test_profile_cli_prints_every_bundle_artifact(monkeypatch, tmp_path, capsys):
+    from types import SimpleNamespace
+
+    from gitm.bench import cli
+    from gitm.bench.profile import ProfileBundle
+
+    bundle = ProfileBundle(
+        out_dir=tmp_path,
+        gpu_report=tmp_path / "gpu.nsys-rep",
+        gpu_csv=tmp_path / "gpu.csv",
+        host_pyspy=tmp_path / "host.svg",
+        host_sar=tmp_path / "host.log",
+    )
+    monkeypatch.setattr("gitm.bench.schema.BenchConfig.from_toml", lambda _path: object())
+    monkeypatch.setattr("gitm.bench.runner.build_command", lambda _cfg, _seed: ["workload"])
+    monkeypatch.setattr("gitm.bench.profile.run_profile", lambda *_args, **_kwargs: bundle)
+
+    rc = cli._cmd_profile(SimpleNamespace(config=tmp_path / "bench.toml", seed=1, out=tmp_path))
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["gpu_report"] == str(bundle.gpu_report)
+    assert payload["gpu_csv"] == str(bundle.gpu_csv)
+    assert payload["host_pyspy"] == str(bundle.host_pyspy)
+    assert payload["host_sar"] == str(bundle.host_sar)
+
+
 def test_breakdown_refuses_to_clamp_overlapping_timings():
     from gitm.bench.profile import PhaseTiming, build_breakdown
 

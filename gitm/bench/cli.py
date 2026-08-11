@@ -183,7 +183,10 @@ def _cmd_profile(args) -> int:
             "out_dir": str(bundle.out_dir),
             "complete": bundle.complete,
             "missing_tools": bundle.missing,
+            "gpu_report": str(bundle.gpu_report) if bundle.gpu_report else None,
             "gpu_csv": str(bundle.gpu_csv) if bundle.gpu_csv else None,
+            "host_pyspy": str(bundle.host_pyspy) if bundle.host_pyspy else None,
+            "host_sar": str(bundle.host_sar) if bundle.host_sar else None,
         },
         indent=2,
     ))
