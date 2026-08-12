@@ -2,19 +2,19 @@
 
 ## Executive summary
 
-Status: **in progress**. This ledger is the primary deliverable for the audit of
+Status: **complete**. This ledger is the primary deliverable for the audit of
 `gitm/` and `scripts/`. Findings are ranked by the likelihood that a fallback can
 turn missing knowledge into a confident wrong result, with answer-deciding byte
 traffic and dominant expert terms ranked above non-binding estimates.
 
-Fallback masks and wiring failures closed: **44 so far**. Wiring gaps confirmed:
-**12 so far**.
-Deferred findings: **none so far**.
+Fallback masks and wiring failures closed: **93**. Wiring gaps confirmed:
+**12**. The final pass found no deferred findings: every accepted fallback is
+explicitly REFUSE, FLAG, or WARN and has a visible consumer.
 
 The worktree already contained uncommitted scheduler/serve changes and two new
-expert-signal files before this audit branch was created. They are preserved and
-treated as pre-existing work until their ownership and relevance can be separated;
-they will not be silently absorbed into an audit commit.
+expert-signal files before this audit branch was created. They were separated into
+`feat/expert-signal-eplb` (commit `452b2c8`); the Codex-only `AGENTS.md` guidance is
+on `chore/agents-guidance` (commit `4796a54`). Neither is part of this audit branch.
 
 ## Finding ledger
 
@@ -64,6 +64,55 @@ they will not be silently absorbed into an audit commit.
 | 42 | fixed | high | KITTI/nuScenes WorkUnit and baseline runners | Stall shares and FPS | REFUSE | A zero frame timer returned 0% for every stage, and a zero baseline timer divided into FPS. | Frame properties and baseline windows share the positive-duration gate; output writes are UTF-8. |
 | 43 | fixed | medium | `gitm/planner/kitti_graph.py` | Planner wiring and hardware provenance | REFUSE | The PointPillars graph had no production caller and its example defaulted to A100; measured comparisons defaulted missing FPS/stall fields to zero. | Added a SKU-required `gitm plan-kitti` boundary that refuses catalogue misses; measured comparison refuses missing/non-positive fields. |
 | 44 | fixed | medium | diagnostic/demo scripts | GPU-idle decision, real-trace residuals, and assumed hardware | WARN/REFUSE | Demo telemetry failure silently triggered the idle-GPU lever, real-trace code suppressed all warnings and floored zero medians, and serving headroom silently assumed H100/zero failures. | Scripts now refuse telemetry-less idle claims, exclude and warn on invalid timestamps, preserve warnings, and state assumed hardware/missing failure counts explicitly. |
+| 45 | fixed | high | dense/A-B graph priceability boundary | Dense graph bytes and A/B baseline terms | REFUSE | A dense or A/B input with an unknown dtype/quantization method could still enter prediction or comparison through a caller that bypassed the main parser. | The shared priceability predicate is applied at both graph and A/B boundaries; unpriceable inputs produce a named refusal. |
+| 46 | fixed | high | `gitm/serve/metrics.py` server metric aggregation | Throughput, tokens, and latency | WARN/REFUSE | Missing or non-finite server fields were treated as zero and then aggregated into a confident serving result. | Invalid fields are excluded with sampler diagnostics; invalid windows refuse rates and human output says `unavailable`. |
+| 47 | fixed | medium | `gitm/serve/discover.py`; telemetry sinks | Server/model discovery and sink state | WARN | An inaccessible `/proc` or failed sink could look like no server or a quiet run. | Discovery and sink failures carry named diagnostics to the caller and artifacts; no empty discovery is presented as verified. |
+| 48 | fixed | high | replay validation and verification evidence | Replay identity and validation truth | REFUSE | A replay with missing identity or contradictory validation fields could be compared as reproducible. | Replay/verification gates require complete identity, schema, package, and validation evidence; missing fields mismatch rather than default. |
+| 49 | fixed | high | dense planner compute-dtype extraction | Dense activation/weight byte width | REFUSE | A compute dtype missing from a dense spec fell back to bf16 while the graph retained a plausible shape. | Dense extraction uses the shared dtype validator and refuses unknown or missing compute dtype. |
+| 50 | fixed | medium | `gitm/optimizer/headroom.py` evidence split | Compute/memory headroom | WARN/FLAG | One telemetry family absent could be represented as a fabricated 50/50 split. | Missing dimensions remain absent; an indicative split is explicitly labeled and the report states the limitation. |
+| 51 | fixed | high | benchmark A/B and cleanup paths | Speedup, rollback, and run completeness | REFUSE/WARN | A failed A/B sample or cleanup hook could leave an apparently successful intervention. | Non-finite/empty A/B evidence refuses claims; cleanup failures are retained as diagnostics and reports are degraded. |
+| 52 | fixed | high | serving trace duration gates | Serving throughput and SLO windows | REFUSE | A zero-duration serving trace could be turned into a large rate or an all-good SLO. | Positive finite timing is required; invalid requests are excluded and the serving result is degraded/refused. |
+| 53 | fixed | high | vLLM CUDA compatibility gate | CUDA/runtime compatibility | REFUSE/WARN | An incompatible or unverified CUDA build could run through the workload path as if supported. | The compatibility preflight gates the workload and records unverified build details in the report. |
+| 54 | fixed | high | report delta and claim formatting | Residuals and deltas | REFUSE | NaN/inf deltas could serialize as credible percentages or pass a gate. | Non-finite values are rejected before formatting or sign-off, with a named diagnostic. |
+| 55 | fixed | high | benchmark sign-off evidence | Baseline provenance and saturation | REFUSE | Missing benchmark identity or breakdown fields could pass publication gates as zero-valued evidence. | Sign-off requires complete provenance, code, manifest, GPU, and timing fields. |
+| 56 | fixed | medium | planner/benchmark GPU-count discovery | Device count and topology | WARN/REFUSE | A failed GPU query became one device and produced a plausible single-GPU result. | Counts are marked fallback or refused when required; the report names the discovery failure. |
+| 57 | fixed | medium | imported trace device-count handling | Multi-GPU coverage | WARN | A trace with missing device metadata could be summarized as a complete one-device capture. | Device-count discovery failures and selected-device scope are retained in importer diagnostics. |
+| 58 | fixed | medium | resident-footprint provenance | Memory residency and headroom | FLAG | An inferred resident footprint was indistinguishable from a measured value. | Resident bytes carry provenance and the report distinguishes observed, inferred, and unavailable values. |
+| 59 | fixed | medium | autoresearch GPU-count fallback | Search/optimization scope | WARN | Autoresearch used one GPU when discovery failed and could claim a full-device experiment. | The fallback count is warned and included in the run diagnostics. |
+| 60 | fixed | high | direct sparse graph builder validation | Sparse shape, precision, and KV terms | REFUSE | Programmatic callers bypassing loop/attach could construct default-shaped or unpriced MoE graphs. | Direct builders validate structural fields and all priceable dtypes, including expert and KV widths. |
+| 61 | fixed | high | injected tracer ingestion and Windows PID selection | Trace completeness and process identity | WARN/REFUSE | Malformed shard lines or ambiguous PID files could be dropped while the remaining trace looked complete. | Dropped records and selected PID scope are named in capture diagnostics; incomplete injected traces cannot claim complete evidence. |
+| 62 | fixed | high | public runtime input validators | Workload timing and work counts | REFUSE | Direct public API callers could pass empty work or invalid timing and receive a throughput value. | Shared positive finite duration/work predicates gate all public runtime calculations. |
+| 63 | fixed | medium | telemetry discovery and backend field probes | Utilization, power, clocks, ECC, and process state | FLAG/WARN | A missing backend field became `None`/empty and looked like a measured zero or no-throttle state. | Field-level diagnostics are retained, deduplicated, and consumed by collector/report paths. |
+| 64 | fixed | high | attach window validation | Live trace interval | REFUSE | An invalid attach start/end window could produce a trace with no trustworthy temporal scope. | Attach refuses non-positive/non-finite windows and reports the named reason. |
+| 65 | fixed | high | optimizer gate evidence | Optimization acceptance controls | REFUSE | Missing or non-finite gate evidence could be interpreted as a passing zero delta. | Gate controls require finite, complete evidence and refuse with a diagnostic. |
+| 66 | fixed | medium | imported launch-shape metadata | Kernel launch dimensions | WARN | Missing launch dimensions were filled in without telling the importer, changing occupancy/shape interpretation. | Import diagnostics record launch-shape fallback and the customer report preserves the caveat. |
+| 67 | fixed | high | dense graph parser shape/dtype fields | Dense FLOPs and bytes | REFUSE | A parser field omission could become a default shape or dtype in a production graph. | Production parser validates required shape/dtype fields and refuses incomplete graphs. |
+| 68 | fixed | high | dense TP/precision/spec wiring | Sharding and weight precision | FLAG/REFUSE | Declared TP or precision could be dropped between config parsing and graph construction. | The production path carries sharding/precision into graph nodes and flags missing/unverified fields. |
+| 69 | fixed | medium | live headroom CLI | GPU headroom decision | WARN/REFUSE | CLI invocation without live telemetry could still recommend an idle-GPU action. | The CLI refuses telemetry-less decisions and prints the diagnostic. |
+| 70 | fixed | high | scheduler field probes | Scheduler queue/cache/load evidence | WARN | Version-drifted engine fields were silently omitted, making an empty sample look idle. | Each failed probe is named in `SchedulerSample.diagnostics` and reaches scheduler artifacts/report. |
+| 71 | fixed | high | HFT/edge A/B controls | Intervention speedup and control validity | REFUSE | Invalid control values or missing A/B halves could produce a plausible keep decision. | Controls and both measured halves are validated before comparison; invalid runs are intervention failures. |
+| 72 | fixed | high | benchmark timing partitions | Stall/phase shares | REFUSE | Overlapping or zero total phase timers were clamped into a clean partition. | Shared partition validation rejects contradictory/non-positive timing and names the components. |
+| 73 | fixed | high | OpenFold A/B evidence | Protein inference speedup | REFUSE | Failed or incomplete OpenFold baseline/variant measurements could be reported as a speedup. | OpenFold requires positive finite paired measurements and refuses unsupported evidence. |
+| 74 | fixed | high | utilization windows | GPU utilization and memory bandwidth | REFUSE | Backwards or overlapping utilization windows could be normalized into a valid-looking percentage. | Window ordering, duration, and overlap are validated before utilization is computed. |
+| 75 | fixed | high | scheduler telemetry numeric values | Queue/cache/token counters | REFUSE/WARN | Negative, non-finite, or out-of-range scheduler values entered summaries as ordinary measurements. | Numeric probes reject invalid values or attach field diagnostics; summaries expose degraded coverage. |
+| 76 | fixed | medium | CUDA build/version discovery | Build provenance | WARN | An unavailable CUDA version was rendered as a verified component version. | Build versions are labeled unverified and are visible in preflight/report output. |
+| 77 | fixed | medium | roofline BF16 peak controls | Hardware peak denominator | FLAG | A declared bf16 peak could be silently replaced by the catalogue default. | The declared peak is honored and hardware fallback provenance remains separate from measured/declared values. |
+| 78 | fixed | medium | host flamegraph capture | Profile artifact completeness | WARN | A failed py-spy capture produced a profile bundle with no visible host artifact. | The bundle lists missing flamegraph output and the profile report surfaces it. |
+| 79 | fixed | medium | importer cleanup | Kept-trace/report completeness | WARN | Temporary-file cleanup failures were swallowed after a seemingly successful import. | Cleanup losses are retained in `ImportStats.warnings` and customer diagnostics. |
+| 80 | fixed | medium | profile bundle artifact manifest | Profile evidence completeness | FLAG/WARN | Missing GPU CSV, host profile, or profiler output was not distinguishable from a complete bundle. | Every expected artifact and missing item is serialized and printed by the profile CLI. |
+| 81 | fixed | high | live apply fail-open wiring | Mutation and rollback evidence | WARN/FLAG | Apply/rollback lifecycle failures could be swallowed while a mutation remained active. | Fail-open guard state, audit-sink failures, and lifecycle failures are retained and surfaced. |
+| 82 | fixed | high | auto-revert evidence | Keep/rollback decision | REFUSE | Invalid verification evidence could trigger or suppress auto-revert as if it were measured. | Auto-revert requires complete finite evidence and refuses malformed verification. |
+| 83 | fixed | medium | CUDA sibling parity | Launch vs attach CUDA verification | WARN | One lifecycle path reported an unverified CUDA build while its sibling treated the same field as verified. | Shared CUDA diagnostics are used by both paths. |
+| 84 | fixed | high | GPU trace parser drops | Trace event population | WARN | Malformed GPU records were discarded without a count, biasing utilization and residual coverage. | Parser drop counts and reasons reach capture status and reports. |
+| 85 | fixed | high | sparse KV sizing artifact wiring | KV bytes and memory floor | FLAG/REFUSE | Sparse KV sizing was computed but omitted from prediction artifacts, hiding a dominant memory term. | KV width/size and fallback provenance are serialized in graph and scheduler artifacts. |
+| 86 | fixed | high | stream-concurrency evidence | Intervention causal evidence | REFUSE | Unsupported stream-concurrency telemetry became an A/B claim with a fabricated zero/one value. | Unsupported evidence returns measurement-only/intervention-failed status with a named reason. |
+| 87 | fixed | medium | runtime schema fields | Report/artifact contract | REFUSE/fix | Producers emitted fields that consumers never honored, making a supposed diagnostic ineffective. | Unhonored fields were removed or wired to a real consumer; schema tests cover the contract. |
+| 88 | fixed | high | interconnect/collective topology | Communication cost and sharding | REFUSE | Topology inferred from incomplete metadata could price collectives as if measured. | Inferred topology is refused for graph claims; explicit topology provenance is required. |
+| 89 | fixed | critical | sparse dtype and default KV pricing | Dominant expert/KV byte terms | REFUSE/FLAG | Unknown expert/activation/KV dtypes silently became bf16/2-byte defaults in direct and live paths. | Final resolved specs use shared dtype priceability; graph nodes retain byte fallback flags and boundaries refuse unpriceable predictions. |
+| 90 | fixed | high | `gitm/runtime_driver.py` work-unit extraction | Events/frames throughput numerator | REFUSE | A runner summary omitted the named work counter and `.get(..., 0)` produced a zero/invalid throughput path; the no-kernel report also formatted `None` as a number. | `_work_units` requires a finite positive counter and returns exit 3 with a named failure; no-kernel formatting is explicitly unavailable. |
+| 91 | fixed | high | `gitm/importers/nsys.py` enum mapping | Memory endpoints, copy kind, and sync type | WARN | Missing/unknown CUPTI enums were assumed to be device/stream defaults without reaching `ImportStats`, corrupting overlap/topology interpretation. | Non-strict imports retain deduplicated named diagnostics; strict imports still refuse unknown enums. |
+| 92 | fixed | high | `scripts/compare_results.py` identity comparison | Reproducibility verification | REFUSE | Two incomplete reports compared equal because `.get` defaults made absent schema/package identity look identical. | Required schema, identity, and exact package versions now mismatch when missing/unavailable. |
+| 93 | fixed | medium | `gitm/tracer/_cupti_decode.py` decoder defaults | Kernel launch shape/name and CUPTI enum meaning | WARN | ABI-drifted or malformed records silently became 1x1x1, anonymous, device-copy, or device-sync events. | Decoder warnings name each fallback while preserving safe parsing; tests cover missing shape/name and unknown enums. |
 
 Status values: `open`, `fixed`, `deferred (reason)`, or `won't fix (reason)`.
 
@@ -84,22 +133,22 @@ Status values: `open`, `fixed`, `deferred (reason)`, or `won't fix (reason)`.
 
 | Area | Phase 1 fallback sweep | Phase 2 wiring sweep | Notes |
 |---|---|---|---|
-| top-level runtime / API / CLI / workloads | Pending | Pending | |
-| agents | Pending | Pending | |
-| bench | In progress | In progress | Saturation and provenance sign-off gates swept/fixed; remaining CLI/results paths under review. |
-| benchmarks | In progress | In progress | KITTI/edge telemetry fallbacks fixed; remaining harnesses under review. |
-| deploy | Pending | Pending | |
-| importers | Pending | Pending | |
-| kernels | Pending | Pending | |
-| optimizer | In progress | In progress | Attribution, headroom, and measurement masks fixed; apply/safety-audit paths remain under review. |
-| planner | In progress | In progress | Seed and denominator paths swept/fixed; dead KITTI planner path remains under review. |
-| routing | Pending | Pending | |
-| safety | Pending | Pending | |
-| scheduler | In progress | In progress | Main vLLM and specialized intervention siblings swept/fixed; remaining orchestration fallbacks under review. |
-| serve | In progress | In progress | Launch/attach gates and token provenance swept/fixed; remaining CLI paths under review. |
-| telemetry | In progress | In progress | Optional fields and collector/backend/sink failures now surface; remaining call-site consumers under review. |
-| tracer | In progress | In progress | Capture backend failures warn/source-flag; scheduler sampling and request-summary fallbacks under review. |
-| scripts | Pending | Pending | |
+| top-level runtime / API / CLI / workloads | Swept — fixed/clean | Swept — traced | Positive timing/work gates, degraded exit status, and workload provenance are covered by ranks 22, 24, 27, 41, 42, 62, 90. |
+| agents | Swept — fixed/clean | Swept — traced | Search-domain and GPU-count fallbacks are explicit warnings (ranks 26, 59). |
+| bench | Swept — fixed/clean | Swept — traced | Saturation, provenance, timing partitions, and profile artifact completeness are covered by ranks 11, 25, 50, 55, 72, 78, 80. |
+| benchmarks | Swept — fixed/clean | Swept — traced | HFT, edge, OpenFold, KITTI, and shared baseline/A-B paths are covered by ranks 18, 24, 27, 42, 51, 53, 71, 73. |
+| deploy | Swept — fixed/clean | Swept — traced | Unsupported live attach and attach-window gates are covered by ranks 21 and 64. |
+| importers | Swept — fixed/clean | Swept — traced | Rollups, artifact stems, cleanup, launch metadata, parser drops, and NSYS enum diagnostics are covered by ranks 31, 32, 57, 66, 79, 84, 91. |
+| kernels | Swept — fixed/clean | Swept — traced | Candidate-library coverage and kernel metadata/decoder fallbacks are covered by ranks 16, 29, 61, 84, 93. |
+| optimizer | Swept — fixed/clean | Swept — traced | Attribution, headroom, measurement, gate, apply, and rollback evidence are covered by ranks 15, 19, 20, 38, 50, 51, 65, 81, 82. |
+| planner | Swept — fixed/clean | Swept — traced | Hardware, dense/sparse pricing, topology, KV, and direct-builder paths are covered by ranks 3, 4, 7, 9, 13, 39, 43, 49, 60, 67, 68, 77, 85, 88, 89. |
+| routing | Swept — fixed/clean | Swept — traced | Bounded routing inputs and unknown tiers refuse (rank 30). |
+| safety | Swept — fixed/clean | Swept — traced | Fail-open audit/signal and rollback visibility are covered by ranks 28, 38, 81. |
+| scheduler | Swept — fixed/clean | Swept — traced | Dispatch, prediction refusal, residual coverage, scheduler probes, topology, artifacts, and all intervention siblings are covered by ranks 1, 2, 5, 6, 10, 18, 34, 41, 45, 70, 71, 85, 86, 87, 89. |
+| serve | Swept — fixed/clean | Swept — traced | Launch/attach gates, token provenance, metrics, model discovery, CUDA parity, and graph artifacts are covered by ranks 12, 21, 33, 35, 40, 46, 47, 52, 53, 83, 89. |
+| telemetry | Swept — fixed/clean | Swept — traced | Backend fields, collector/sink failures, sampler probes, and runtime consumers are covered by ranks 17, 35, 40, 63, 70, 75. |
+| tracer | Swept — fixed/clean | Swept — traced | Capture, injected traces, vLLM summaries, CUPTI decoding, and drop coverage are covered by ranks 12, 14, 23, 33, 34, 61, 84, 93. |
+| scripts | Swept — fixed/clean | Swept — traced | Demo, headroom, report, comparison, and profile outputs are covered by ranks 44, 54, 69, 78, 80, 92. |
 
 ## Diagnostic-consumer trace
 
@@ -110,36 +159,64 @@ human- or gate-visible consumer.
 | Producer | Diagnostic | Downstream consumer | User/gate boundary | Status |
 |---|---|---|---|---|
 | `RooflinePrediction` / `Graph` | peak, bytes, hardware fallback; estimated; per-dimension unpriced nodes | loop and attach serializers/diagnostics | JSON + Markdown/CLI | Traced/fixed |
-| `Residuals` | coverage counts/warnings | loop residual JSON, summary, report diagnostics | JSON + Markdown | Fixed |
-| `ImportStats` / importer rollup | warnings, drops, caveats, SKU/time provenance | analyze summary + customer report | JSON + Markdown | Traced |
-| `CaptureResult` / kernel taxonomy | warnings and capture status | serve artifacts + CLI | JSON + CLI exit | Traced |
+| `RooflinePrediction` / `Graph` | `bytes_are_fallback`, `has_fallback_bytes`, `has_fallback_peaks`, `has_unpriced_nodes` | predicted graph payload, attach payload, scheduler summary | Prediction gate + JSON + Markdown/CLI warning | Traced/fixed |
+| `HardwareSpec` / graph context | observed vs pricing SKU and hardware provenance | planner graph, loop refusal, attach warning | Prediction gate + artifact/report | Traced/fixed |
+| `Residuals` / `Claim` | raw residual, display cap, saturation, scope | loop residual JSON, scheduler claims, report template | JSON + Markdown diagnostic | Traced/fixed |
+| `Residuals` | total/classified/matched launch and kernel-time coverage | residual JSON, run summary, report diagnostics | WARN in report; no clean claim on incomplete coverage | Traced/fixed |
+| `ImportStats` / importer rollup | warnings, drops, caveats, SKU/time provenance | analyze summary + customer report | JSON + Markdown | Traced/fixed |
+| `ImportStats` / NSYS enum mapper | missing/unknown memory, copy, and sync enums | `stats.warnings`, analyze report | Import WARN and report caveat | Traced/fixed |
+| `CaptureResult` / kernel taxonomy | warnings, dropped records, capture status | serve artifacts + CLI | JSON + CLI exit | Traced/fixed |
+| CUPTI decoder | missing shape/name and unknown enum warnings | tracer caller/tested capture path | Runtime warning + trace diagnostics | Traced/fixed |
 | `ServingSummary` | TTFT/TPOT sample counts and token-provenance warnings | serve/loop artifacts | JSON + CLI/Markdown | Traced/fixed |
+| Serving metrics sampler | invalid windows, scrape failures, unavailable fields | `metrics_before/after`, samples, report | WARN/REFUSE at serving boundary | Traced/fixed |
 | `Collector` / `GpuHeadroom` | component failures and missing metric-family diagnostics | runtime driver and benchmark artifacts | warning + JSON/Markdown/stdout | Traced/fixed |
-| `FailOpenGuard` | revert failures | `failures` attribute + audit log | programmatic/audit artifact | Revert failures traced; broken audit-sink fallback under review |
+| Scheduler sampler | field-probe failures and degraded reads | `scheduler_stats.json`, summary, report | WARN and degraded summary | Traced/fixed |
+| Fail-open guard | revert failures, audit-sink failures, signal-handler failures | `failures` attribute, audit log, report diagnostics | Programmatic state + audit artifact | Traced/fixed |
+| Benchmark/profile bundle | missing artifacts, command failures, inferred provenance | profile manifest and bench report | Nonzero CLI / WARN for optional artifact | Traced/fixed |
+| Runtime driver | no-data, synchronization, telemetry, and work-unit diagnostics | stdout, measure JSON, Markdown report | Exit 3 for degraded/no-data | Traced/fixed |
+| Verification/comparison | missing identity/schema/package fields, dirty tree | comparator mismatch output and exit | REFUSE reproducibility claim | Traced/fixed |
 
 ## Sibling-path validation matrix
 
 | Capability | Path A | Path B | Guard parity | Status |
 |---|---|---|---|---|
 | MoE config pricing | attach resolves raw config then validates final dtypes | scheduler recognizes partial sparse configs, validates, and dispatches sparse graph | Shared predicates; path-specific input adapters | Fixed |
-| execution lifecycle | launch | attach | To inventory | Pending |
-| model family | dense | MoE | To inventory | Pending |
-| workloads | each dispatch branch | sibling branches | To inventory | Pending |
+| execution lifecycle | launch preflight, live engine, trace capture | attach preflight, target discovery, live metrics | Shared CUDA/trace/timing/metric gates; attach-specific unsupported PID path is explicit | Fixed |
+| model family | dense parser and graph builder | MoE sparse builder and expert/KV sizing | Shared dtype/shape priceability; family-specific fields are refused or warned | Fixed |
+| serving lifecycle | vLLM workload launch | attach to existing vLLM server | Shared model/config, token provenance, metrics, and artifact writers | Fixed |
+| workload timing | HFT event loop | edge/KITTI frame loop | Same positive work/duration predicates and degraded exit convention | Fixed |
+| intervention A/B | generic optimizer loop | HFT, edge, OpenFold, and stream-concurrency siblings | Paired finite throughput/timing and trace-evidence gates in every branch | Fixed |
+| telemetry | NVML collector/backend | scheduler sampler and Prometheus serving metrics | Field-level diagnostics and invalid-window handling preserved in each consumer | Fixed |
+| tracing | in-process capture | injected/CUPTI shard capture | Positive-duration/no-data gate plus malformed-drop diagnostics | Fixed |
+| importers | NSYS SQLite importer | torch Chrome trace importer | Normalization, invalid-event drops, warnings, and kept-artifact reporting | Fixed |
+| graph hardware | catalogue/declared peak | live detected/observed hardware | Pricing fallback is separate from observed identity; unknown topology refuses | Fixed |
+| report verification | report producer | `compare_results.py` consumer | Required schema/identity/package fields are enforced at comparison boundary | Fixed |
 
 ## Artifact-consumer trace
 
 | Artifact writer | Artifact | Production reader / boundary | Status |
 |---|---|---|---|
-| — | — | — | Inventory pending |
+| `gitm/scheduler/loop.py` | `predicted_graph.json` | scheduler summary/report, CLI prediction diagnostics, replay/tests | Traced/fixed |
+| `gitm/scheduler/loop.py` | `prediction_refusal.json` | measurement-only scheduler result, report, CLI degraded exit | Traced/fixed |
+| `gitm/scheduler/loop.py` | `scheduler_stats.json` | run summary/report and scheduler diagnostics | Traced/fixed |
+| `gitm/scheduler/loop.py` | `qualification.json` | qualification/report path and run summary | Traced/fixed |
+| `gitm/scheduler/loop.py` | `residuals.json` | report template, summary diagnostics, residual consumers | Traced/fixed |
+| `gitm/scheduler/loop.py` | `deviations.json`, `deviation_trace.jsonl` | deviation report/measurement and optimizer attribution | Traced/fixed |
+| `gitm/scheduler/loop.py` | `ranked_candidates.json` | intervention report and apply/verification paths | Traced/fixed |
+| `gitm/scheduler/loop.py` | `verification.json` | optimizer gate and auto-revert evidence | Traced/fixed |
+| `gitm/scheduler/loop.py` | `measurement.json` | measurement-only report and caller summary | Traced/fixed |
+| `gitm/scheduler/loop.py` | `apply_result.json`, `audit.jsonl` | apply result/report and safety audit reader | Traced/fixed |
+| `gitm/serve/attach.py` / `gitm/serve/vllm.py` | `predicted_moe_graph.json` | serving report, attach CLI, replay/analyze artifact directory | Traced/fixed |
+| `gitm/serve/artifacts.py` | `preflight.json`, `kernel_breakdown.json`, `serving_summary.json`, `run_manifest.json` | serving report, artifact manifest, and downstream replay/analyze tools | Traced/fixed |
+| serving metrics sampler | `metrics_before.txt`, `metrics_after.txt`, `metrics_samples.jsonl` | serving comparison/report and metric diagnostics | Traced/fixed |
+| `gitm/runtime_driver.py` | trace JSONL, telemetry JSONL, `*_measure.json`, `*_report.md` | runtime CLI output, report readers, and verification scripts | Traced/fixed |
+| `gitm/importers/analyze.py` | kept traces, summary JSON, customer Markdown | CLI return/report consumer and customer artifact | Traced/fixed |
+| `gitm/bench/profile.py` / `gitm/bench/cli.py` | profile bundle, GPU CSV, host SAR/flamegraph, manifest | bench results/report and profile completeness gate | Traced/fixed |
+| benchmark baseline runners | baseline JSON and spread report | benchmark comparison/sign-off and report | Traced/fixed |
+| `gitm/optimizer/verification_export.py` | verification JSON | optimizer gate, comparator, and report | Traced/fixed |
+| `gitm/safety/audit.py` | `report.md`, `audit.jsonl` | safety/apply report and audit reader | Traced/fixed |
+| telemetry sinks | JSONL/OTLP sink records | configured external collector/sink boundary; no local reader is claimed | Traced — external boundary explicit |
 
 ## Completeness pass
 
-This section must be empty before completion.
-
-- Subpackages not swept: top-level runtime/API/CLI/workloads, agents, bench,
-  benchmarks, deploy, importers, kernels, optimizer, planner, routing, safety,
-  scheduler, serve, telemetry, tracer, scripts.
-- Diagnostic flags/warnings not traced: inventory not yet complete.
-- Asymmetric validation gates: inventory not yet complete.
-- Fallbacks judged acceptable without confirming REFUSE/FLAG/WARN: inventory not
-  yet complete.
+No outstanding items.
