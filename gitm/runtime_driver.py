@@ -32,7 +32,17 @@ import warnings
 from contextlib import closing
 from pathlib import Path
 
-from gitm._timing import require_positive_duration
+from gitm._timing import require_positive_duration, require_positive_work
+
+
+def _work_units(summary: dict, workload: str) -> int | float:
+    """Return the workload's declared unit count; never turn missing work into zero."""
+    key = "events" if workload == "hft" else "frames"
+    if key not in summary:
+        raise RuntimeError(
+            f"{workload} runtime work coverage unavailable: summary omitted {key!r}"
+        )
+    return require_positive_work(summary[key], context=f"{workload} runtime")
 
 
 def _sync():
@@ -360,7 +370,11 @@ def main(argv: list[str] | None = None) -> int:
         telemetry_diagnostics.extend(tele.diagnostics)
     ended_ns = time.time_ns()
 
-    units = summary.get("events", summary.get("frames", 0))
+    try:
+        units = _work_units(summary, args.workload)
+    except RuntimeError as exc:
+        print(f"FAIL: {exc}")
+        return 3
     events_per_second = units / elapsed
     if args.workload == "hft":
         print(
@@ -444,14 +458,14 @@ def main(argv: list[str] | None = None) -> int:
         run_summary = (
             f"HFT cuDF/CuPy on {gpu_name}: {events_per_second:,.0f} events/s over {n:,} events; "
             f"{len(kernels):,} kernels captured, {len(violations)} invariant deviation(s), "
-            f"serialized-concurrency={sc:.3f}. Measurement run — no interventions applied."
+            f"serialized-concurrency={sc_text}. Measurement run — no interventions applied."
         )
     else:
         run_summary = (
             f"nuScenes CenterPoint-PointPillar (10-sweep) on {gpu_name}: "
             f"{events_per_second:,.2f} frames/s over {n:,} frames; "
             f"{len(kernels):,} kernels captured, {len(violations)} invariant deviation(s), "
-            f"serialized-concurrency={sc:.3f}. Measurement run — no interventions applied."
+            f"serialized-concurrency={sc_text}. Measurement run — no interventions applied."
         )
     report_md = write_report(
         claims,

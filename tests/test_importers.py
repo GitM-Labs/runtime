@@ -105,6 +105,27 @@ def test_nsys_sync_enum_branches():
     assert "device" in kinds
 
 
+def test_nsys_unknown_enums_are_retained_as_import_diagnostics(tmp_path):
+    src = FIXTURES / "nsys_2024_min.sqlite"
+    dst = tmp_path / "unknown-enums.sqlite"
+    dst.write_bytes(src.read_bytes())
+    conn = sqlite3.connect(dst)
+    conn.execute(
+        "UPDATE CUPTI_ACTIVITY_KIND_MEMCPY SET srcKind=NULL, dstKind=NULL, copyKind=999 "
+        "WHERE rowid=1"
+    )
+    conn.execute(
+        "UPDATE CUPTI_ACTIVITY_KIND_SYNCHRONIZATION SET syncType=999 WHERE rowid=1"
+    )
+    conn.commit()
+    conn.close()
+
+    _, stats = import_nsys(dst, device=0)
+
+    assert any("unknown CUPTI copyKind enum 999" in note for note in stats.warnings)
+    assert any("unknown CUPTI sync type enum 999" in note for note in stats.warnings)
+
+
 def test_nsys_multi_device_selection():
     # Default: all devices
     all_traces, stats = import_nsys(FIXTURES / "nsys_2024_min.sqlite")

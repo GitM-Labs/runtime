@@ -2,6 +2,29 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
+import pytest
+
+
+@pytest.mark.parametrize(
+    ("summary", "workload", "expected"),
+    [({"events": 10}, "hft", 10), ({"frames": 3}, "edge", 3)],
+)
+def test_work_units_require_the_named_positive_counter(summary, workload, expected):
+    from gitm.runtime_driver import _work_units
+
+    assert _work_units(summary, workload) == expected
+
+
+@pytest.mark.parametrize(
+    ("summary", "workload"),
+    [({}, "hft"), ({"frames": 0}, "edge"), ({"events": -1}, "hft")],
+)
+def test_work_units_refuse_missing_or_empty_coverage(summary, workload):
+    from gitm.runtime_driver import _work_units
+
+    with pytest.raises(RuntimeError, match="work coverage unavailable"):
+        _work_units(summary, workload)
+
 
 def test_runtime_driver_refuses_empty_trace_instead_of_printing_pass(tmp_path, monkeypatch, capsys):
     from gitm import runtime_driver

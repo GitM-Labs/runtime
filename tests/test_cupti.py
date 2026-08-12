@@ -51,6 +51,15 @@ def test_decode_kernel_anonymous_name():
     assert ev.name == "<anonymous>"
 
 
+def test_decode_kernel_warns_when_shape_or_name_is_missing():
+    from gitm.tracer._cupti_decode import decode_kernel
+
+    with pytest.warns(RuntimeWarning, match="kernel grid dimensions unavailable"):
+        decode_kernel(_kernel_rec(grid=None))
+    with pytest.warns(RuntimeWarning, match="kernel name unavailable"):
+        decode_kernel(_kernel_rec(name=None))
+
+
 # --- decode: memcpy copy-kind mapping ---------------------------------------
 
 
@@ -94,6 +103,21 @@ def test_decode_sync_types(sync_type, kind):
         "stream_id": 2, "correlation_id": 0,
     })
     assert ev.sync_kind == kind
+
+
+def test_decode_unknown_cupti_enums_warn_before_using_safe_endpoint_defaults():
+    from gitm.tracer._cupti_decode import decode_memcpy, decode_sync
+
+    memcpy = {
+        "kind": "memcpy", "copy_kind": 99, "bytes": 1,
+        "start_ns": 10, "end_ns": 20, "device_id": 0, "stream_id": 0,
+    }
+    with pytest.warns(RuntimeWarning, match="unknown CUPTI memcpy kind 99"):
+        decode_memcpy(memcpy)
+
+    sync = {"kind": "sync", "sync_type": 99, "start_ns": 10, "end_ns": 20}
+    with pytest.warns(RuntimeWarning, match="unknown CUPTI synchronization type 99"):
+        decode_sync(sync)
 
 
 # --- decode: batch ----------------------------------------------------------
