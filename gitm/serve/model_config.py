@@ -450,6 +450,10 @@ def live_moe_spec(
         spec_changes["kv_dtype"] = overrides["kv_dtype"]
     if "act_dtype" in overrides:
         spec_changes["act_dtype"] = overrides["act_dtype"]
+        if "kv_dtype" not in overrides:
+            # vLLM's absent --kv-cache-dtype means ``auto``: follow the resolved
+            # compute dtype, not a model-family-specific fp8 guess.
+            spec_changes["kv_dtype"] = overrides["act_dtype"]
     if spec_changes:
         from dataclasses import replace
 

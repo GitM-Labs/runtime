@@ -632,7 +632,11 @@ def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None) -> Spar
         raise ValueError("sparse-MoE config is not predictable: " + "; ".join(errors))
 
     q = cfg.get("quantization_config") or {}
-    weight_dtype = str(q.get("quant_method", "bf16")).lower()
+    act_dtype = str(cfg.get("torch_dtype", "bf16")).lower().replace("bfloat16", "bf16")
+    # An unquantized checkpoint stores weights at its declared model dtype. bf16
+    # is not a safe universal default: it halves fp32 bytes and changes the peak
+    # selected for fp16/bf16 on hardware whose rates differ.
+    weight_dtype = str(q.get("quant_method") or act_dtype).lower()
     n_layers = int(cfg.get("num_hidden_layers", 43))
     ratios = tuple(int(r) for r in (cfg.get("compress_ratios") or ())[:n_layers])
 
@@ -662,8 +666,9 @@ def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None) -> Spar
         dspark_markov_rank=int(cfg.get("dspark_markov_rank", 0)),
         weight_dtype=weight_dtype,
         expert_dtype=str(cfg.get("expert_dtype", weight_dtype)).lower(),
-        # vLLM serves this checkpoint with an fp8 KV cache; the config does not
-        # declare cache dtype, so it is a serving decision, not a model fact.
-        kv_dtype="fp8",
-        act_dtype=str(cfg.get("torch_dtype", "bf16")).lower().replace("bfloat16", "bf16"),
+        # No cache dtype lives in a model config. The serving default is ``auto``
+        # (follow the compute/model dtype); live callers replace this only when
+        # the engine or command line declares a different cache dtype.
+        kv_dtype=act_dtype,
+        act_dtype=act_dtype,
     )

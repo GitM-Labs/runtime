@@ -460,7 +460,12 @@ def _execution_graph(engine: Any, pctx: Any, sched: Any) -> ExecutionGraphResolu
         if kv_dtype:
             changes["kv_dtype"] = str(kv_dtype).lower().replace("fp8_e4m3", "fp8")
         else:
-            diagnostics.append("KV cache dtype was not exposed; using planner default kv_dtype='fp8'")
+            resolved_act = changes.get("act_dtype", spec.act_dtype)
+            changes["kv_dtype"] = resolved_act
+            diagnostics.append(
+                "KV cache dtype was not exposed; assuming vLLM default 'auto' follows "
+                f"activation dtype {resolved_act!r}"
+            )
         if cfg.get("expert_dtype") is None:
             diagnostics.append(
                 f"expert_dtype absent; inherited weight_dtype={spec.weight_dtype!r} for expert bytes"

@@ -328,6 +328,24 @@ def test_config_parse_keeps_expert_and_linear_dtypes_distinct(spec):
     assert spec.act_dtype == "bf16"
 
 
+def test_unquantized_config_uses_declared_model_dtype_for_weights_and_kv():
+    cfg = dict(V4_CONFIG)
+    cfg.pop("quantization_config")
+    cfg["torch_dtype"] = "float32"
+    cfg["expert_dtype"] = "fp32"
+
+    parsed = spec_from_hf_config(cfg)
+
+    assert parsed.weight_dtype == "fp32"
+    assert parsed.expert_dtype == "fp32"
+    assert parsed.act_dtype == "fp32"
+    assert parsed.kv_dtype == "fp32"
+
+
+def test_config_without_serving_override_does_not_invent_fp8_kv(spec):
+    assert spec.kv_dtype == spec.act_dtype == "bf16"
+
+
 def test_compress_ratios_truncate_to_layer_count(spec):
     """The config ships 46 ratios for 43 layers.
 
