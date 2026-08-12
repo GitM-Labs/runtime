@@ -37,6 +37,22 @@ _WEIGHT_BYTES: dict[str, float] = {
 _WEIGHT_BYTES["fp4"] = _WEIGHT_BYTES["mxfp4"]
 
 
+def _canon_dtype(dtype: str) -> str:
+    """Normalize framework/config aliases before pricing or fallback checks."""
+    d = str(dtype).lower().removeprefix("torch.")
+    if d in ("bf16", "bfloat16"):
+        return "bf16"
+    if d in ("float16", "fp16", "half"):
+        return "fp16"
+    if d in ("fp4", "mxfp4", "nvfp4"):
+        return "fp4"
+    if d in ("fp8", "e4m3", "e5m2"):
+        return "fp8"
+    if d in ("fp32", "float32", "tf32"):
+        return "fp32"
+    return d
+
+
 def weight_bytes(dtype: str) -> float:
     """Bytes moved per stored weight for ``dtype``, scales included.
 
@@ -44,12 +60,12 @@ def weight_bytes(dtype: str) -> float:
     since over-counting weight traffic predicts a *slower* floor and so cannot
     manufacture headroom.
     """
-    return _WEIGHT_BYTES.get(dtype.lower(), 2.0)
+    return _WEIGHT_BYTES.get(_canon_dtype(dtype), 2.0)
 
 
 def weight_bytes_is_fallback(dtype: str) -> bool:
     """Whether :func:`weight_bytes` substitutes bf16 for an unknown dtype."""
-    return dtype.lower() not in _WEIGHT_BYTES
+    return _canon_dtype(dtype) not in _WEIGHT_BYTES
 
 
 @dataclass(frozen=True)
@@ -599,21 +615,6 @@ class RooflinePrediction:
         report must not present it as a clean roofline.
         """
         return _canon_dtype(self.dtype) != self.peak_dtype
-
-
-def _canon_dtype(dtype: str) -> str:
-    d = dtype.lower()
-    if d in ("bf16", "bfloat16"):
-        return "bf16"
-    if d in ("float16", "fp16", "half"):
-        return "fp16"
-    if d in ("fp4", "mxfp4", "nvfp4"):
-        return "fp4"
-    if d in ("fp8", "e4m3", "e5m2"):
-        return "fp8"
-    if d in ("fp32", "float32", "tf32"):
-        return "fp32"
-    return d
 
 
 def resolve_peak(hw: HardwareSpec, dtype: str) -> tuple[float, str]:

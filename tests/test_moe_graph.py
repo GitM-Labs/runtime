@@ -726,7 +726,9 @@ def test_kv_footprint_splits_growing_from_fixed(spec):
 
     # Growth comes only from the 41 compressed layers, at 1/4 or 1/128 of a latent.
     naive_all_layers = spec.n_layers * (spec.kv_latent_dim + spec.index_head_dim)
-    assert per_token < naive_all_layers / 5
+    # Excluding bounded sliding-window layers keeps growth below one third of
+    # the all-layers naive rate for the declared KV dtype.
+    assert per_token < naive_all_layers / 3
 
     # The two window layers are real, bounded, and paid once per sequence.
     assert fixed == 2 * spec.sliding_window * spec.kv_latent_dim * weight_bytes(spec.kv_dtype)

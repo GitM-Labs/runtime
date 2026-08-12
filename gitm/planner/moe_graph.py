@@ -69,6 +69,7 @@ from gitm.planner.roofline import (
     HardwareSpec,
     ShardingConfig,
     SparseMoEModelSpec,
+    _canon_dtype,
     distinct_experts,
     roofline,
     weight_bytes,
@@ -142,14 +143,14 @@ def validate_sparse_moe_config(cfg: dict[str, Any]) -> list[str]:
         errors.append("quantization_config must be an object when declared")
     elif isinstance(q, dict):
         method = q.get("quant_method")
-        if method is not None and weight_bytes_is_fallback(str(method).lower()):
+        if method is not None and weight_bytes_is_fallback(str(method)):
             errors.append(f"quantization_config.quant_method={method!r} is not priceable")
 
     for key in ("expert_dtype", "torch_dtype"):
         value = cfg.get(key)
         if value is None:
             errors.append(f"{key} must be declared; byte width cannot be guessed")
-        elif weight_bytes_is_fallback(str(value).lower().replace("bfloat16", "bf16")):
+        elif weight_bytes_is_fallback(str(value)):
             errors.append(f"{key}={value!r} is not priceable")
     return errors
 
@@ -632,11 +633,11 @@ def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None) -> Spar
         raise ValueError("sparse-MoE config is not predictable: " + "; ".join(errors))
 
     q = cfg.get("quantization_config") or {}
-    act_dtype = str(cfg.get("torch_dtype", "bf16")).lower().replace("bfloat16", "bf16")
+    act_dtype = _canon_dtype(str(cfg.get("torch_dtype", "bf16")))
     # An unquantized checkpoint stores weights at its declared model dtype. bf16
     # is not a safe universal default: it halves fp32 bytes and changes the peak
     # selected for fp16/bf16 on hardware whose rates differ.
-    weight_dtype = str(q.get("quant_method") or act_dtype).lower()
+    weight_dtype = _canon_dtype(str(q.get("quant_method") or act_dtype))
     n_layers = int(cfg.get("num_hidden_layers", 43))
     ratios = tuple(int(r) for r in (cfg.get("compress_ratios") or ())[:n_layers])
 
@@ -665,7 +666,7 @@ def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None) -> Spar
         dspark_layer_ids=tuple(int(i) for i in (cfg.get("dspark_target_layer_ids") or ())),
         dspark_markov_rank=int(cfg.get("dspark_markov_rank", 0)),
         weight_dtype=weight_dtype,
-        expert_dtype=str(cfg.get("expert_dtype", weight_dtype)).lower(),
+        expert_dtype=_canon_dtype(str(cfg.get("expert_dtype", weight_dtype))),
         # No cache dtype lives in a model config. The serving default is ``auto``
         # (follow the compute/model dtype); live callers replace this only when
         # the engine or command line declares a different cache dtype.
