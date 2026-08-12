@@ -220,3 +220,22 @@ human- or gate-visible consumer.
 ## Completeness pass
 
 No outstanding items.
+
+## Verification and review readiness
+
+- Targeted tests for touched runtime/importer/CUPTI/comparison paths: **73 passed**;
+  targeted planner/routing tests after the final alias fix: **75 passed**.
+- Full repository run: **1067 passed, 1 skipped**, with only named runtime warnings
+  for optional GPU/vLLM/CUDA telemetry and intentional fallback demonstrations.
+  Importer fixtures were restored after the run; `git status --short` is clean.
+- Ruff passed on all touched modules and tests; `git diff --check` is clean.
+- The audit branch is `audit/graceful-fallbacks` and contains only audit fixes plus
+  this ledger. The clean expert-signal branch is `feat/expert-signal-eplb` from
+  `main` (`ca289d6`), containing the signal module and its tests; caller wiring is
+  intentionally the next feature step, not an audit change. The pre-existing
+  wiring snapshot remains preserved on `feat/expert-signal-eplb-stacked` (`452b2c8`)
+  for the maintainer to port or review.
+- Review recommendation: one audit PR is reviewable by theme because each commit
+  is a bounded REFUSE/FLAG/WARN fix and this ledger is the summary. Keep the
+  expert-signal work as a separate follow-up PR; do not open multiple audit PRs
+  without maintainer selection.
