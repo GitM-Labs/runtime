@@ -12,9 +12,11 @@ Fallback masks and wiring failures closed: **93**. Wiring gaps confirmed:
 explicitly REFUSE, FLAG, or WARN and has a visible consumer.
 
 The worktree already contained uncommitted scheduler/serve changes and two new
-expert-signal files before this audit branch was created. They were separated into
-`feat/expert-signal-eplb` (commit `452b2c8`); the Codex-only `AGENTS.md` guidance is
-on `chore/agents-guidance` (commit `4796a54`). Neither is part of this audit branch.
+expert-signal files before this audit branch was created. The clean signal module
+and tests are separated into `feat/expert-signal-eplb` (commit `ca289d6`), while
+the pre-existing wiring snapshot is preserved on `feat/expert-signal-eplb-stacked`
+(commit `452b2c8`). The Codex-only `AGENTS.md` guidance is on
+`chore/agents-guidance` (commit `4796a54`). None is part of this audit branch.
 
 ## Finding ledger
 
