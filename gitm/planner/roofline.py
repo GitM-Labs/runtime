@@ -73,6 +73,12 @@ class HardwareSpec:
     # ``0.0`` means unknown, which makes a sharded graph refuse to guess rather
     # than predict a free all-to-all.
     interconnect_bw_bytes_per_s: float = 0.0
+    # Wall time to issue one dependent kernel, for work whose cost is the *number
+    # of launches* rather than the arithmetic in them. ~2 us is a CUDA-graph
+    # replay figure; eager launch is nearer 5 us. Calibrate from a trace — an
+    # iteration count multiplied by a wrong constant is still the right shape,
+    # which is more than a pure roofline offers here.
+    kernel_launch_overhead_s: float = 2.0e-6
     eff_lo: float = 0.55
     eff_hi: float = 0.95
 
@@ -374,6 +380,20 @@ class SparseMoEModelSpec:
     # Multi-token prediction (speculative decoding head)
     num_nextn_predict_layers: int = 1
 
+    # Manifold-Constrained Hyper-Connections (paper §2.2). ``hc_width`` is n_hc,
+    # the factor the residual stream is widened by — 1 disables every mHC term.
+    # Two instances per transformer block (one around attention, one around the
+    # MoE), each projecting a flattened n_hc*d residual state down to the three
+    # small mappings A (1 x n_hc), B (n_hc x n_hc) and C (n_hc x 1), then
+    # projecting B onto the doubly-stochastic manifold by Sinkhorn-Knopp.
+    hc_width: int = 1
+    hc_sinkhorn_iters: int = 0
+    hc_blocks_per_layer: int = 2
+
+    # Leading layers that route to experts by a hash of the token id rather than
+    # a learned router (paper §2.1) — those layers run no router GEMM.
+    num_hash_layers: int = 0
+
     # Low-rank state update on a subset of layers (DeepSeek "DSpark").
     dspark_layer_ids: tuple[int, ...] = ()
     dspark_markov_rank: int = 256
@@ -391,6 +411,42 @@ class SparseMoEModelSpec:
         if layer < len(self.compress_ratios):
             return self.compress_ratios[layer]
         return self.compress_ratios[-1]
+
+    @property
+    def compression_levels(self) -> tuple[int, ...]:
+        """The distinct compression rates this checkpoint interleaves, ascending.
+
+        DeepSeek-V4 uses two: ``m`` for Compressed Sparse Attention and
+        ``m' >> m`` for Heavily Compressed Attention. Derived from the config
+        rather than hardcoded, so a checkpoint with different rates — or only
+        one — still classifies.
+        """
+        return tuple(sorted({r for r in self.compress_ratios if r > 1}))
+
+    def attention_kind(self, layer: int) -> str:
+        """``"swa"`` | ``"csa"`` | ``"hca"`` — which attention this layer runs.
+
+        The three differ in ways that change the cost model qualitatively, not
+        just numerically (paper §2.3):
+
+        * **swa** — uncompressed and windowed. Only the sliding-window branch.
+        * **csa** — compress by ``m``, then *sparse* attention: a lightning
+          indexer scores the compressed entries and keeps ``index_topk``. Read is
+          bounded, so it is flat in context once selection saturates.
+        * **hca** — compress by ``m' >> m`` and attend **densely** over every
+          compressed entry. No indexer. Read is ``kv_len / m'``, so unlike CSA it
+          *grows with context* — HCA trades a bigger compression rate for not
+          having to select.
+
+        The largest compression level is HCA; anything else compressed is CSA.
+        """
+        r = self.compress_ratio(layer)
+        if r == 0:
+            return "swa"
+        levels = self.compression_levels
+        if len(levels) >= 2 and r == levels[-1]:
+            return "hca"
+        return "csa"
 
     @property
     def q_head_dim(self) -> int:
@@ -488,7 +544,7 @@ class RooflinePrediction:
     t_compute_s: float
     t_memory_s: float
     t_pred_s: float
-    bound: str  # "compute" | "memory"
+    bound: str  # "compute" | "memory" | "launch"
     # Which dtype the op runs in, and which peak was actually available to price
     # it. They differ only on a catalogue miss; see ``peak_is_fallback``.
     dtype: str = "fp16"
@@ -498,6 +554,9 @@ class RooflinePrediction:
     # derivation from published shapes — carried through to the report so an
     # estimate is never read as a measurement.
     estimated: bool = False
+    #: Dependent kernel launches this op costs. Non-zero only for iterative work
+    #: that cannot be overlapped with itself; see ``bound == "launch"``.
+    serial_launches: int = 0
 
     @property
     def peak_is_fallback(self) -> bool:
@@ -555,22 +614,37 @@ def roofline(
     dtype: str = "fp16",
     *,
     estimated: bool = False,
+    serial_launches: int = 0,
 ) -> RooflinePrediction:
-    """Compute the roofline prediction for a single op."""
+    """Compute the roofline prediction for a single op.
+
+    ``serial_launches`` adds a third bound for work whose cost is the number of
+    *dependent* kernel launches rather than the arithmetic inside them. A
+    roofline cannot see this: 20 Sinkhorn iterations over a 4x4 matrix move a few
+    hundred bytes and do a few hundred FLOPs, so both classic terms round to
+    zero, while the wall time is 20 launches deep and cannot be overlapped
+    because each iteration consumes the previous one's output. Ignoring it does
+    not make the prediction slightly optimistic — it makes it absent.
+    """
     peak_flops, peak_dtype = resolve_peak(hw, dtype)
     t_c = flops / peak_flops if peak_flops > 0 else 0.0
     t_m = bytes_moved / hw.peak_mem_bw_bytes_per_s if hw.peak_mem_bw_bytes_per_s > 0 else 0.0
-    bound = "compute" if t_c >= t_m else "memory"
+    t_l = max(0, serial_launches) * hw.kernel_launch_overhead_s
+    t_pred = max(t_c, t_m, t_l)
+    bound = "launch" if t_l >= max(t_c, t_m) and t_l > 0 else (
+        "compute" if t_c >= t_m else "memory"
+    )
     return RooflinePrediction(
         op=op,
         flops=flops,
         bytes=bytes_moved,
         t_compute_s=t_c,
         t_memory_s=t_m,
-        t_pred_s=max(t_c, t_m),
+        t_pred_s=t_pred,
         bound=bound,
         dtype=dtype,
         peak_dtype=peak_dtype,
         peak_flops_per_s=peak_flops,
         estimated=estimated,
+        serial_launches=max(0, serial_launches),
     )
