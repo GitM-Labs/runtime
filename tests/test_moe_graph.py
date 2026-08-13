@@ -23,6 +23,7 @@ from gitm.planner.moe_graph import (
     effective_kv_tokens,
     index_candidates,
     kv_bytes_per_token,
+    kv_entry_bytes,
     kv_fixed_bytes_per_sequence,
     model_weight_bytes,
     predict_moe_graph,
@@ -60,6 +61,10 @@ V4_CONFIG = {
     # Ships 46 long for 43 layers — the tail is MTP/padding, not layers.
     "compress_ratios": [0, 0] + [4, 128] * 20 + [4, 0, 0, 0],
     "num_nextn_predict_layers": 1,
+    # Manifold-Constrained Hyper-Connections + hash-routed leading layers.
+    "hc_mult": 4,
+    "hc_sinkhorn_iters": 20,
+    "num_hash_layers": 3,
     "dspark_target_layer_ids": [40, 41, 42],
     "dspark_markov_rank": 256,
     "expert_dtype": "fp4",
@@ -141,17 +146,26 @@ def test_ratio_zero_layers_are_sliding_window_not_global(spec):
     assert effective_kv_tokens(spec, 1, 1_048_576) == spec.sliding_window
 
 
-def test_no_layer_read_grows_with_context(spec):
-    """The property that makes a million-token deployment possible at all.
+def test_csa_is_flat_in_context_but_hca_is_not(spec):
+    """The two compressed mechanisms scale differently, and that is the point.
 
-    Sliding-window layers are bounded from the start; compressed layers stop
-    growing once selection saturates. So the whole attention path is flat in
-    context length, and any observed growth is a real deviation rather than
-    something the architecture explains away.
+    CSA selects ``index_topk`` entries, so once selection saturates its core read
+    is constant however long the context grows. HCA attends densely over its
+    compressed entries, so its read scales as ``kv_len / m'`` without bound. They
+    happen to coincide at 64K, which is exactly why a model that assumed one
+    mechanism looked correct there and was 13x wrong at 1M.
     """
+    assert effective_kv_tokens(spec, 2, 65536) == effective_kv_tokens(spec, 2, 1_048_576)
+
+    hca_64k = effective_kv_tokens(spec, 3, 65536)
+    hca_1m = effective_kv_tokens(spec, 3, 1_048_576)
+    assert hca_1m > 10 * hca_64k
+
+    # So the stack as a whole is not flat, and any claim that it is comes from
+    # having modelled only one of the two.
     at_64k = sum(effective_kv_tokens(spec, i, 65536) for i in range(spec.n_layers))
     at_1m = sum(effective_kv_tokens(spec, i, 1_048_576) for i in range(spec.n_layers))
-    assert at_64k == at_1m
+    assert at_1m > 5 * at_64k
 
 
 def test_sliding_window_layers_run_no_indexer(spec, b200):
@@ -185,14 +199,25 @@ def test_attention_core_read_is_constant_in_context_once_selection_saturates(spe
     assert at_64k == at_1m
 
 
-def test_compress_ratio_moves_indexer_cost_not_attention_cost(spec):
-    """Ratios 4 and 128 read identically at the core but differ 32x at the scan.
+def test_csa_and_hca_differ_in_kind_not_degree(spec):
+    """They are two mechanisms, not one mechanism at two settings.
 
-    This is why they are separate nodes. Folding them together would average away
-    the only signal that distinguishes the two layer types.
+    CSA compresses lightly and *selects*; HCA compresses heavily and attends
+    densely with no indexer at all. Treating the compression ratio as a single
+    dial — which the config's flat list of numbers invites — produces an indexer
+    on every compressed layer, half of which never run one.
     """
-    assert effective_kv_tokens(spec, 2, 65536) == effective_kv_tokens(spec, 3, 65536)
-    assert index_candidates(spec, 2, 65536) == 32 * index_candidates(spec, 3, 65536)
+    assert spec.attention_kind(0) == "swa"
+    assert spec.attention_kind(2) == "csa"
+    assert spec.attention_kind(3) == "hca"
+
+    assert index_candidates(spec, 2, 65536) > 0
+    assert index_candidates(spec, 3, 65536) == 0  # HCA runs no indexer
+
+    # And at long context the dense HCA read dwarfs the selected CSA one.
+    assert effective_kv_tokens(spec, 3, 1_048_576) > 10 * effective_kv_tokens(
+        spec, 2, 1_048_576
+    )
 
 
 def test_indexer_candidates_grow_with_context(spec):
@@ -618,13 +643,13 @@ def test_kv_footprint_splits_growing_from_fixed(spec):
     assert per_token < naive_all_layers / 5
 
     # The two window layers are real, bounded, and paid once per sequence.
-    assert fixed == 2 * spec.sliding_window * spec.kv_latent_dim * weight_bytes(spec.kv_dtype)
+    assert fixed == 2 * spec.sliding_window * kv_entry_bytes(spec)
     # In magnitude the fixed term is tiny — worth ~40 tokens of context, so it
     # never drives a sizing decision. What mattered was excluding these layers
     # from the *rate*, which is a 37% error on every sequence at every length.
     assert fixed < 50 * per_token
-    naive = per_token + 2 * (spec.kv_latent_dim + spec.index_head_dim) * weight_bytes(
-        spec.kv_dtype
+    naive = per_token + 2 * (
+        kv_entry_bytes(spec) + spec.index_head_dim * weight_bytes(spec.kv_dtype)
     )
     assert naive == pytest.approx(1.37 * per_token, rel=0.02)
 
