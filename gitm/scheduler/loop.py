@@ -55,6 +55,11 @@ from gitm.optimizer.vllm_knobs import (
 )
 from gitm.planner.context import build_planner_context, hardware_spec_for
 from gitm.planner.graph import predict_graph
+from gitm.planner.moe_graph import (
+    is_sparse_moe_config,
+    predict_moe_graph,
+    spec_from_hf_config,
+)
 from gitm.safety.audit import AuditLog, _write_report
 from gitm.tracer.capture import capture
 from gitm.tracer.vllm_stats import sample_scheduler_stats, summarize_requests
@@ -160,20 +165,12 @@ class LoopConfig:
     workload_runner: WorkloadRunner | None = None
 
 
-def _model_spec_from_engine(engine: Any):
-    """Build a ``ModelSpec`` from a live vLLM engine's HF config, or ``None``.
-
-    ``predict_graph()`` with no model defaults to Llama-2-7B (32 layers). A run
-    of a *different* model (e.g. opt-125m, 12 layers) is then scored against the
-    wrong predicted graph, which makes residuals and deviation meaningless. When
-    the loop has the live engine, read the real architecture off its HF config so
-    the predicted graph matches the model that actually ran. Duck-typed across
-    vLLM version drift; any failure returns ``None`` and the caller falls back to
-    the default graph rather than crashing.
-    """
+def _hf_config_from_engine(engine: Any) -> Any:
+    """The live vLLM engine's HF config object, or ``None``. Duck-typed so it
+    survives vLLM version drift; the config is where both graph-selection and the
+    model shape are read from."""
     if engine is None:
         return None
-    hf: Any = None
     for path in (
         "llm_engine.model_config.hf_config",
         "llm_engine.vllm_config.model_config.hf_config",
@@ -185,8 +182,34 @@ def _model_spec_from_engine(engine: Any):
             if obj is None:
                 break
         if obj is not None:
-            hf = obj
-            break
+            return obj
+    return None
+
+
+def _hf_config_dict(hf: Any) -> dict[str, Any]:
+    """A plain dict of the HF config, with ``quantization_config`` flattened.
+
+    ``spec_from_hf_config`` reads the config as a dict and expects
+    ``quantization_config`` to be one too; a live config carries it as a nested
+    object, so normalise it here rather than teaching the dict-based builder about
+    vLLM's object shapes."""
+    raw = hf.to_dict() if hasattr(hf, "to_dict") else dict(vars(hf))
+    q = raw.get("quantization_config")
+    if q is not None and not isinstance(q, dict):
+        raw["quantization_config"] = q.to_dict() if hasattr(q, "to_dict") else dict(vars(q))
+    return raw
+
+
+def _model_spec_from_hf(hf: Any):
+    """Build a dense ``ModelSpec`` from an HF config object, or ``None``.
+
+    ``predict_graph()`` with no model defaults to Llama-2-7B (32 layers). A run
+    of a *different* model (e.g. opt-125m, 12 layers) is then scored against the
+    wrong predicted graph, which makes residuals and deviation meaningless — so
+    read the real architecture off the config. Duck-typed across vLLM version
+    drift; any failure returns ``None`` and the caller falls back to the default
+    graph rather than crashing.
+    """
     if hf is None:
         return None
     try:
@@ -209,6 +232,11 @@ def _model_spec_from_engine(engine: Any):
         )
     except Exception:
         return None
+
+
+def _model_spec_from_engine(engine: Any):
+    """Dense ``ModelSpec`` for a live engine's model — the config, then the spec."""
+    return _model_spec_from_hf(_hf_config_from_engine(engine))
 
 
 #: HF config field aliases per MoE family — the same quantity is spelled
@@ -315,6 +343,28 @@ def _moe_fields_from_hf(hf: Any) -> dict[str, Any]:
         if wb:
             out["weight_dtype_bytes"] = wb
     return out
+
+
+def _execution_graph(engine: Any, hw: Any, batch: Any):
+    """The predicted graph for the model that actually ran, and whether it is the
+    sparse-MoE one.
+
+    A DeepSeek-V4-class checkpoint gets :func:`predict_moe_graph` — mixed fp4/fp8
+    precision, compressed/selected attention, MTP — none of which the dense graph
+    can represent; everything else gets the dense graph, whose FFN already prices a
+    mixture (:func:`_moe_fields_from_hf`). Sharding stays whole-model so the MoE
+    prediction shares the dense path's comparison basis against the in-process
+    trace, rather than predicting one rank against an all-rank capture.
+    """
+    from gitm.planner.roofline import ShardingConfig
+
+    hf = _hf_config_from_engine(engine)
+    if hf is not None:
+        cfg = _hf_config_dict(hf)
+        if is_sparse_moe_config(cfg):
+            spec = spec_from_hf_config(cfg, name=str(cfg.get("model_type") or "sparse-moe"))
+            return predict_moe_graph(spec, hw, batch, ShardingConfig()), True
+    return predict_graph(model=_model_spec_from_hf(hf), hw=hw, batch=batch), False
 
 
 def _clamp_pct(value: float) -> float:
@@ -549,10 +599,11 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             trace_path=trace_path,
         )
 
-    # Predict against the model that ACTUALLY ran (read from the live engine),
-    # not the Llama-2-7B default — otherwise residuals/deviation score the real
-    # kernels against the wrong graph. Falls back to the default graph when there
-    # is no engine or its config can't be read (CPU boxes, tests, dry-run).
+    # Predict against the model that ACTUALLY ran (read from the live engine) with
+    # the graph its architecture needs — the sparse-MoE graph for a V4-class
+    # checkpoint, the dense graph otherwise (_execution_graph). Falls back to the
+    # default dense graph when there is no engine or its config can't be read (CPU
+    # boxes, tests, dry-run), so residuals never score kernels against Llama-2-7B.
     #
     # Same for hardware: predict_graph's own default is A100-SXM4-80GB peaks,
     # which silently over-predicts on anything weaker (T4/L4/...) and
@@ -561,7 +612,6 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # so its NVML-detected SKU peak feeds the graph before residuals are ever
     # computed against it.
     pctx = build_planner_context(cfg.engine, workload=workload)
-    _spec = _model_spec_from_engine(cfg.engine)
     _hw = hardware_spec_for(pctx.peak)
     # Batch matters for the same reason the model does — and more so on a
     # mixture, where weight traffic follows the *distinct* experts a batch
@@ -570,13 +620,22 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # expert traffic ~12x. Read the real concurrency off the sampled scheduler
     # rather than defaulting.
     _batch = _batch_config_from_stats(sched_summary)
-    graph = predict_graph(model=_spec, hw=_hw, batch=_batch)
-    (run_dir / "predicted_graph.json").write_text(
-        json.dumps(
-            {"nodes": len(graph.nodes), "total_pred_s": graph.total_pred_s, "hardware": _hw.name},
-            indent=2,
+    graph, is_moe = _execution_graph(cfg.engine, _hw, _batch)
+    _graph_summary: dict[str, Any] = {
+        "graph": "moe" if is_moe else "dense",
+        "nodes": len(graph.nodes),
+        "total_pred_s": graph.total_pred_s,
+        "hardware": _hw.name,
+    }
+    if is_moe:
+        m = graph.model
+        _graph_summary.update(
+            model=m.name,
+            sharding="whole-model",
+            dtypes={"weight": m.weight_dtype, "expert": m.expert_dtype, "kv": m.kv_dtype},
+            has_unpriced_collectives=graph.has_unpriced_collectives,
         )
-    )
+    (run_dir / "predicted_graph.json").write_text(json.dumps(_graph_summary, indent=2))
 
     # Phase 2 — residuals + attribution
     res = residuals(trace, graph)
