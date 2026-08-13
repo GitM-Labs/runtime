@@ -26,8 +26,20 @@ jobs:
       - name: Build package
         run: python -m build
 
+      # `release/v1` rather than a pinned tag, deliberately. The action bundles
+      # its own twine, and `verify-metadata` runs `twine check` before upload —
+      # so a pinned action ages into failure as build backends advance their
+      # core-metadata version, with nothing in this repo changing. v1.12.4 shipped
+      # twine 6.0.1 (metadata 2.4) and v0.1.12 failed on hatchling's 2.5:
+      #
+      #   InvalidDistribution: '2.5' is not a valid metadata version
+      #
+      # `[build-system] requires` is unpinned, so builds always take the newest
+      # hatchling. Pinning the backend instead would freeze it for a downstream
+      # tool's benefit; tracking the action is the side that should move.
+      #
+      # No API token needed — OIDC trusted publishing handles auth.
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@v1.12.4
-        # No API token needed — OIDC handles auth automatically
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
           verbose: true
