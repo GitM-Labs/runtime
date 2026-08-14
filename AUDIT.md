@@ -18,6 +18,25 @@ the pre-existing wiring snapshot is preserved on `feat/expert-signal-eplb-stacke
 (commit `452b2c8`). The Codex-only `AGENTS.md` guidance is on
 `chore/agents-guidance` (commit `4796a54`). None is part of this audit branch.
 
+## Changes in this PR
+
+This branch is an audit layer on top of the current runtime, not a planner
+rewrite. It first synchronizes with `origin/main` at `f63879b`, then preserves
+the upstream sparse-MoE architecture while making every fallback explicit at
+the boundary where it can affect a user-facing claim.
+
+| Theme | What changed | User-visible result |
+|---|---|---|
+| Graph prediction and MoE pricing | Added strict sparse-config and final-dtype priceability gates; retained upstream CSA/HCA, hash-routing, and live-config dispatch; separated compute, weight, activation, expert, and KV byte provenance. | Unknown or incomplete inputs refuse graph-based claims or become an explicitly measurement-only result; valid graphs retain their normal architecture-specific pricing. |
+| Fallback provenance | Added per-node and graph-level flags for fallback bytes, peaks, hardware, estimates, and unpriced dimensions. | Attach and scheduler JSON, summaries, reports, and CLI diagnostics identify exactly which denominator or byte width was substituted. |
+| Runtime evidence | Hardened timing, work-unit, telemetry, importer, CUPTI, benchmark, A/B, and cleanup paths against missing, non-finite, zero, or contradictory values. | A missing answer-driving field is refused; an optional degradation is named as a warning instead of being converted into a plausible number. |
+| Claims and residuals | Preserved raw residual magnitude, derived display capping/saturation, claim scope, and matched/total coverage. | Reports can show a capped percentage without hiding the underlying error or repeating one aggregate as if it were a node-level claim. |
+| Calibration and topology | Kept calibration opt-in, source-run aware, freshness-checked, and provenance-bearing; validated topology identity, shape, and later-trace requirements. | Calibration cannot silently self-apply to its source run or cross an incompatible workload/shape, and partial coverage is visible. |
+| Artifacts and verification | Traced diagnostics through `predicted_graph.json`, refusal/measurement artifacts, reports, and CLI status; added regression coverage for direct builders and live dispatch. | Every accepted fallback has a visible consumer, and no generated planner JSON is checked into the repository. |
+
+The merge synchronization is recorded in `2975a72`; the verification ledger was
+updated in `8f03430`, and the final CI lint compatibility fix is `0e7da1e`.
+
 ## Finding ledger
 
 | Rank | Status | Severity | Location | Distorted term / contract | Surfacing state | Failure scenario | Disposition |
