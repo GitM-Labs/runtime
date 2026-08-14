@@ -18,11 +18,14 @@ attributes the difference to a cause. The term itself is
 rather than reimplemented here — it is the same union, and two copies of it would
 drift.
 
-**Context length stops driving the attention core.** Compressed KV plus an indexer
-that keeps ``index_topk`` candidates means the attention core reads a bounded
-number of tokens no matter how long the sequence gets. What grows with context is
-the *indexer scan* — a different node, with a different bound, that the dense graph
-would have folded into attention and then blamed on the wrong kernel.
+**Attention is three mechanisms, not one.** Sliding-window layers read a fixed
+recent window. CSA layers compress by ``m`` and then *select* ``index_topk``
+entries with a lightning indexer, so their core read is bounded and flat in
+context while their indexer scan grows. HCA layers compress by ``m' >> m`` and
+attend *densely* with no indexer, so their read grows with context without bound
+and they dominate the attention cost at long sequence lengths. Folding these into
+one op — as a dense graph must — averages a 13x spread at 1M context and
+attributes deviation to whichever layer happened to be modelled.
 
 **Precision is per-tensor-class.** Experts run fp4, linears fp8, the KV cache fp8.
 The load-bearing half of this is *bytes*, not FLOPs: pricing fp4 expert weights at
@@ -77,75 +80,39 @@ from gitm.planner.roofline import (
 )
 
 _REQUIRED_POSITIVE_CONFIG_FIELDS = (
-    "hidden_size",
-    "num_hidden_layers",
-    "num_attention_heads",
-    "num_key_value_heads",
-    "head_dim",
-    "q_lora_rank",
-    "o_lora_rank",
-    "o_groups",
-    "vocab_size",
-    "n_routed_experts",
-    "num_experts_per_tok",
-    "moe_intermediate_size",
-    "index_n_heads",
-    "index_head_dim",
-    "index_topk",
-    "sliding_window",
+    "hidden_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
+    "head_dim", "q_lora_rank", "o_lora_rank", "o_groups", "vocab_size",
+    "n_routed_experts", "num_experts_per_tok", "moe_intermediate_size",
+    "index_n_heads", "index_head_dim", "index_topk", "sliding_window",
 )
 
 
 def validate_sparse_moe_config(cfg: dict[str, Any]) -> list[str]:
-    """Return canonical sparse-graph fields that cannot be used without guessing.
-
-    Serve and scheduler boundaries provide richer source/alias diagnostics. This
-    planner-side defense ensures a direct public-builder call cannot turn a
-    partial foreign config into a plausible DeepSeek-V4 graph from defaults.
-    """
+    """Return fields that cannot be omitted without inventing graph shape/bytes."""
     errors: list[str] = []
     for key in _REQUIRED_POSITIVE_CONFIG_FIELDS:
         value = cfg.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             errors.append(f"{key} must be a declared positive integer, got {value!r}")
-
     for key in ("qk_rope_head_dim", "n_shared_experts"):
         value = cfg.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             errors.append(f"{key} must be a declared non-negative integer, got {value!r}")
-
-    n_experts = cfg.get("n_routed_experts")
-    top_k = cfg.get("num_experts_per_tok")
-    if (
-        isinstance(n_experts, int)
-        and not isinstance(n_experts, bool)
-        and isinstance(top_k, int)
-        and not isinstance(top_k, bool)
-        and top_k > n_experts
-    ):
-        errors.append(
-            f"num_experts_per_tok={top_k} exceeds n_routed_experts={n_experts}"
-        )
-
-    n_layers = cfg.get("num_hidden_layers")
-    ratios = cfg.get("compress_ratios")
+    n_experts, top_k = cfg.get("n_routed_experts"), cfg.get("num_experts_per_tok")
+    if isinstance(n_experts, int) and not isinstance(n_experts, bool) and isinstance(top_k, int) and not isinstance(top_k, bool) and top_k > n_experts:
+        errors.append(f"num_experts_per_tok={top_k} exceeds n_routed_experts={n_experts}")
+    n_layers, ratios = cfg.get("num_hidden_layers"), cfg.get("compress_ratios")
     if not isinstance(ratios, (list, tuple)):
         errors.append("compress_ratios must be declared for the sparse-attention graph")
     elif isinstance(n_layers, int) and n_layers > 0 and len(ratios) < n_layers:
-        errors.append(
-            f"compress_ratios has {len(ratios)} entries; need at least {n_layers}"
-        )
+        errors.append(f"compress_ratios has {len(ratios)} entries; need at least {n_layers}")
     elif any(isinstance(r, bool) or not isinstance(r, int) or r < 0 for r in ratios):
         errors.append("compress_ratios must contain non-negative integers")
-
     q = cfg.get("quantization_config")
     if q is not None and not isinstance(q, dict):
         errors.append("quantization_config must be an object when declared")
-    elif isinstance(q, dict):
-        method = q.get("quant_method")
-        if method is not None and weight_bytes_is_fallback(str(method)):
-            errors.append(f"quantization_config.quant_method={method!r} is not priceable")
-
+    elif isinstance(q, dict) and q.get("quant_method") is not None and weight_bytes_is_fallback(str(q["quant_method"])):
+        errors.append(f"quantization_config.quant_method={q['quant_method']!r} is not priceable")
     for key in ("expert_dtype", "torch_dtype"):
         value = cfg.get(key)
         if value is None:
@@ -158,42 +125,53 @@ def validate_sparse_moe_config(cfg: dict[str, Any]) -> list[str]:
 def effective_kv_tokens(spec: SparseMoEModelSpec, layer: int, kv_len: int) -> int:
     """KV positions the attention *core* reads for ``layer`` at ``kv_len`` context.
 
-    Two layer kinds, and conflating them is the error this function exists to
-    avoid:
+    Three layer kinds (paper §2.3), and conflating any two of them is the error
+    this function exists to avoid:
 
-    **Ratio 0 — sliding-window attention.** The layer is *not* compressed, but it
-    is also not global: it reads at most ``sliding_window`` recent tokens. Reading
-    ``0`` as "uncompressed, therefore attends to everything" is the natural
-    mistake and it is wrong by ``kv_len / sliding_window`` — 512x at 64K, 8192x at
-    1M. It is also self-refuting: if any layer read the whole cache, a
-    million-token context could not be served at all, which is the headline
-    capability of the checkpoint.
+    **swa — ratio 0.** Not compressed, but not global either: at most
+    ``sliding_window`` recent tokens. Reading ``0`` as "uncompressed, therefore
+    attends to everything" is wrong by ``kv_len / sliding_window`` — 512x at 64K.
 
-    **Ratio > 1 — compressed and selected.** The layer keeps one entry per ``r``
-    tokens, an indexer scores those candidates and keeps at most ``index_topk``,
-    and the recent ``sliding_window`` tokens are read regardless.
+    **csa — the smaller compression rate.** One entry per ``m`` tokens, then a
+    lightning indexer scores those entries and keeps ``index_topk``. Bounded, so
+    **flat in context** once selection saturates.
+
+    **hca — the larger rate.** One entry per ``m' >> m`` tokens, attended
+    **densely** — no indexer, no selection. So its read is ``kv_len / m'`` and
+    **grows with context without bound**. HCA buys efficiency from the
+    compression rate alone; CSA buys it from selection. That is the whole point
+    of interleaving them, and it means the two cannot share a cost model.
 
     (Ratio 1 means genuinely uncompressed global attention. No layer of this
     checkpoint uses it; it is kept for other architectures.)
 
-    The consequence worth internalising: **no layer's read grows with context.**
-    Once ``kv_len / r`` exceeds ``index_topk``, the core's read is constant, and
-    the sliding-window layers were bounded from the start. A layer with ratio 128
-    and one with ratio 4 read the same number of tokens at 64K — they differ in
-    KV *storage* and in how much the indexer has to scan, not in what attention
-    itself costs. So a residual that scales with context belongs to the indexer
-    node, and blaming it on attention is the mistake this split prevents.
+    The consequence worth internalising: **HCA is what makes long context
+    expensive.** At 64K every layer reads 640 entries and the stack looks flat;
+    by 1M the HCA layers read 8,320 each and account for the great majority of
+    all attention traffic. A residual that scales with context therefore belongs
+    to HCA or to the CSA indexer — never to a CSA core, which is genuinely
+    constant.
     """
     if kv_len <= 0:
         return 0
-    r = spec.compress_ratio(layer)
-    if r == 0:
+    kind = spec.attention_kind(layer)
+    if kind == "swa":
+        # An uncompressed layer with no window is not a window layer — it is
+        # global attention, and it reads everything. Returning
+        # ``min(kv_len, 0) == 0`` there would say attention is free, which is
+        # the failure mode a config missing ``sliding_window`` walks straight
+        # into: a plausible total with a whole mechanism silently costed at zero.
+        if spec.sliding_window <= 0:
+            return kv_len
         return min(kv_len, spec.sliding_window)
-    if r == 1:
-        return kv_len
-    candidates = math.ceil(kv_len / r)
-    selected = min(spec.index_topk, candidates)
-    return min(kv_len, spec.sliding_window + selected)
+    r = max(1, spec.compress_ratio(layer))
+    compressed = math.ceil(kv_len / r)
+    if kind == "hca":
+        # Dense over every compressed entry — no selection, so this grows with
+        # context. HCA buys its efficiency from the compression rate alone.
+        return min(kv_len, spec.sliding_window + compressed)
+    # CSA: the indexer keeps at most index_topk of the compressed entries.
+    return min(kv_len, spec.sliding_window + min(spec.index_topk, compressed))
 
 
 def index_candidates(spec: SparseMoEModelSpec, layer: int, kv_len: int) -> int:
@@ -207,14 +185,9 @@ def index_candidates(spec: SparseMoEModelSpec, layer: int, kv_len: int) -> int:
     decides whether a million-token deployment is viable, and now the *only* term
     in the attention path that still grows with context.
     """
-    if kv_len <= 0:
+    if kv_len <= 0 or spec.attention_kind(layer) != "csa":
         return 0
-    r = spec.compress_ratio(layer)
-    if r == 0:
-        return 0
-    if r == 1:
-        return kv_len
-    return math.ceil(kv_len / r)
+    return math.ceil(kv_len / max(1, spec.compress_ratio(layer)))
 
 
 def model_weight_bytes(
@@ -283,7 +256,7 @@ def kv_bytes_per_token(spec: SparseMoEModelSpec) -> float:
         if r == 0:
             continue  # bounded buffer, not per-token growth
         # The latent, plus the indexer's key for the same (compressed) position.
-        total += (spec.kv_latent_dim + spec.index_head_dim) * kw / max(1, r)
+        total += (kv_entry_bytes(spec) + spec.index_head_dim * kw) / max(1, r)
     return total
 
 
@@ -298,9 +271,21 @@ def kv_fixed_bytes_per_sequence(spec: SparseMoEModelSpec) -> float:
     *rate* was wrong without it: counting these layers per-token inflated
     :func:`kv_bytes_per_token` by 37% at every context length.
     """
-    kw = weight_bytes(spec.kv_dtype)
     swa_layers = sum(1 for i in range(spec.n_layers) if spec.compress_ratio(i) == 0)
-    return swa_layers * spec.sliding_window * spec.kv_latent_dim * kw
+    return swa_layers * spec.sliding_window * kv_entry_bytes(spec)
+
+
+def kv_entry_bytes(spec: SparseMoEModelSpec) -> float:
+    """Bytes one cached KV entry occupies, across its mixed storage format.
+
+    Paper §2.3.4: the RoPE dimensions are kept in BF16 while the rest is FP8,
+    "reducing the KV cache size by nearly half compared with pure BF16". Pricing
+    the whole entry at FP8 understates it — on this checkpoint by 11%, since 64
+    of the 576 dimensions carry double width.
+    """
+    rope = spec.qk_rope_head_dim * spec.num_kv_heads
+    rest = spec.kv_latent_dim - rope
+    return rest * weight_bytes(spec.kv_dtype) + rope * weight_bytes("bf16")
 
 
 def _linear(rows: float, k: int, n: int, act_b: float, w_b: float) -> tuple[float, float]:
@@ -338,7 +323,6 @@ def _emit_layer(
     aw = weight_bytes(spec.act_dtype)
     ww = weight_bytes(spec.weight_dtype)
     ew = weight_bytes(spec.expert_dtype)
-    kw = weight_bytes(spec.kv_dtype)
     af = weight_bytes_is_fallback(spec.act_dtype)
     wf = weight_bytes_is_fallback(spec.weight_dtype)
     ef = weight_bytes_is_fallback(spec.expert_dtype)
@@ -346,26 +330,16 @@ def _emit_layer(
     wd, ed = spec.weight_dtype, spec.expert_dtype
 
     def add(
-        op: str,
-        flops: float,
-        byts: float,
-        dtype: str,
-        *,
-        byte_fallback: bool,
-        estimated: bool = False,
+        op: str, flops: float, byts: float, dtype: str,
+        *, byte_fallback: bool = False, estimated: bool = False, serial_launches: int = 0,
     ) -> None:
         name = f"{prefix}{op}"
         g.nodes.append(
             PredictedNode(
-                name,
-                layer,
+                name, layer,
                 roofline(
-                    name,
-                    flops,
-                    byts,
-                    hw,
-                    dtype,
-                    estimated=estimated,
+                    name, flops, byts, hw, dtype,
+                    estimated=estimated, serial_launches=serial_launches,
                     bytes_are_fallback=byte_fallback,
                 ),
             )
@@ -385,28 +359,59 @@ def _emit_layer(
     f, b = _linear(positions, spec.q_lora_rank, spec.n_heads * spec.q_head_dim // tp, aw, ww)
     add("attn_q_b", f, b, wd, byte_fallback=af or wf)
 
-    # KV down-projection, plus the cache write for the positions just computed.
-    f, b = _linear(positions, h, spec.kv_latent_dim, aw, ww)
-    add("attn_kv_a", f, b + positions * spec.kv_latent_dim * kw, wd,
-        byte_fallback=af or wf or kf)
+    # KV entries and their compression weights, plus the cache write for the
+    # positions just computed. CSA computes *two* KV series and two weight series
+    # (W^aKV, W^bKV, W^aZ, W^bZ) because its compression windows overlap; HCA
+    # computes one of each; a window layer caches raw entries and compresses
+    # nothing. Modelling one projection everywhere understates CSA 4x on this op.
+    kind = spec.attention_kind(layer)
+    n_kv_proj = {"csa": 4, "hca": 2}.get(kind, 1)
+    f, b = _linear(positions, h, spec.kv_latent_dim * n_kv_proj, aw, ww)
+    add("attn_kv_a", f, b + positions * kv_entry_bytes(spec), wd, byte_fallback=af or wf or kf)
+
+    if kind != "swa":
+        # The compressor itself: a row-softmax over the window's weights and the
+        # weighted sum that collapses it to one entry. One compressed entry per
+        # ``r`` tokens, so at decode this fires on a 1/r duty cycle.
+        r = max(1, spec.compress_ratio(layer))
+        window = 2 * r if kind == "csa" else r  # CSA windows overlap
+        add(
+            "attn_kv_compress",
+            3.0 * positions * window * spec.kv_latent_dim / r,
+            2.0 * positions * window * spec.kv_latent_dim * aw / r,
+            spec.act_dtype,
+            byte_fallback=af,
+        )
 
     # ── indexer: project the query, then scan the compressed candidate set ───
-    # Sliding-window layers have no indexer — a fixed recent window needs no
-    # selection — so they emit neither node. Emitting them anyway would put two
-    # kernels per such layer into the predicted graph that no kernel can ever
-    # align to, which reads downstream as "predicted work that never ran".
+    # Only CSA layers run one. Window layers need no selection, and HCA attends
+    # densely over its (far more aggressively compressed) entries — emitting an
+    # indexer for either would put kernels in the graph that never ran.
     cand = index_candidates(spec, layer, kv_len)
     if cand > 0:
-        f, b = _linear(positions, h, spec.index_n_heads * spec.index_head_dim // tp, aw, ww)
+        # The indexer query comes off the *same* latent as the attention query
+        # (paper eq. 13-14: both are c_t^Q @ W^UQ variants), so only the
+        # up-projection is charged here — the down-projection is attn_q_a.
+        #
+        # Not divided by ``tp``: vLLM builds the indexer's ``wq_b`` and
+        # ``weights_proj`` as ReplicatedLinear, so every rank runs the whole
+        # indexer. Sharding it here would predict a speedup the deployment does
+        # not get, and would under-predict this node by ``tp``.
+        f, b = _linear(
+            positions, spec.q_lora_rank, spec.index_n_heads * spec.index_head_dim, aw, ww
+        )
         add("attn_index_proj", f, b, wd, byte_fallback=af or wf)
 
         add(
             "attn_index_score",
-            2.0 * positions * (spec.index_n_heads // tp) * spec.index_head_dim * cand,
+            2.0 * positions * spec.index_n_heads * spec.index_head_dim * cand,
             # Index keys live in the cache: read once per sequence, not per
-            # position, and replicated across TP ranks alongside the KV latent.
-            sequences * cand * spec.index_head_dim * kw,
-            wd,
+            # position, and replicated across ranks alongside the KV latent.
+            # vLLM quantises this cache to uint8, so a byte per element — the
+            # FP4 in the paper (§2.3.4) is the *arithmetic* precision, which is
+            # why the dtype and the byte width disagree here.
+            sequences * cand * spec.index_head_dim * 1.0,
+            "fp4",
             byte_fallback=kf,
         )
 
@@ -426,9 +431,27 @@ def _emit_layer(
         # parallelism buys no KV bandwidth on this architecture — the opposite of
         # the intuition carried over from GQA models, and a lever-ranking error
         # waiting to happen if the graph divided here.
-        sequences * t_eff * spec.kv_latent_dim * kw,
+        sequences * t_eff * kv_entry_bytes(spec),
         wd,
         byte_fallback=kf,
+    )
+
+    # RMSNorm on every query head and on the single compressed KV head, plus
+    # partial RoPE on the last ``qk_rope_head_dim`` dimensions and the cache
+    # insert — one node because vLLM runs them as one kernel
+    # (``fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert``, and
+    # ``fused_q_kv_rmsnorm`` for the pair of norms). Emitting a node per
+    # mathematical step would put three predicted kernels where one runs, and
+    # nothing would align to two of them.
+    heads = spec.n_heads // tp
+    normed = positions * (heads * spec.q_head_dim + spec.kv_latent_dim)
+    roped = positions * (2 * heads + 1) * spec.qk_rope_head_dim
+    add(
+        "attn_qnorm_rope_insert",
+        3.0 * normed + 6.0 * roped,
+        2.0 * normed * aw + 2.0 * roped * aw,
+        spec.act_dtype,
+        byte_fallback=af,
     )
 
     # Output projection, grouped and low-rank. ``o_groups`` partitions the head
@@ -440,14 +463,53 @@ def _emit_layer(
     f_b, b_b = _linear(positions, spec.o_lora_rank, h, aw, ww)
     # Named to match the dense graph's output projection: it is the same op in
     # the same place, so residuals for it stay comparable across model families.
-    add("attn_out_proj", f_a + f_b, b_a + b_b, wd,
-        byte_fallback=af or wf, estimated=True)
+    add("attn_out_proj", f_a + f_b, b_a + b_b, wd, byte_fallback=af or wf, estimated=True)
+
+    # ── manifold-constrained hyper-connections ──────────────────────────────
+    # Two per block (around attention, around the MoE). The residual stream is
+    # n_hc times as wide as the hidden size, so the *activation* traffic here is
+    # the cost — the three generated mappings are tiny in weights but every one
+    # of them reads a flattened n_hc*d state.
+    if spec.hc_width > 1:
+        n_hc = spec.hc_width
+        wide = n_hc * h
+        # A (1 x n_hc), B (n_hc x n_hc) and C (n_hc x 1), all generated from the
+        # same normalised state, so one (wide -> 2*n_hc + n_hc**2) projection.
+        gen_out = 2 * n_hc + n_hc * n_hc
+        # One fused kernel per instance, not one per stage. vLLM's
+        # ``mhc_pre_big_fuse_tilelang`` folds the RMSNorm, the Sinkhorn-Knopp
+        # projection and the residual mixing together, so the 20 iterations run
+        # *inside* a single launch and cost arithmetic rather than launch depth.
+        #
+        # Worth stating because the unfused reading is not a small error: two
+        # dependent launches per iteration, twice per layer, would be ~3.5k
+        # serialised launches per step and would dominate a short-context step
+        # entirely. The iteration count is real; the launch depth is not.
+        iters = max(1, spec.hc_sinkhorn_iters)
+        for _ in range(max(1, spec.hc_blocks_per_layer)):
+            f_gen, b_gen = _linear(positions, wide, gen_out, aw, ww)
+            norm_bytes = 2.0 * positions * wide * aw
+            mix_flops = 2.0 * positions * n_hc * n_hc * h
+            mix_bytes = 2.0 * positions * wide * aw
+            # Sinkhorn arithmetic: alternating row/column normalisation of a
+            # per-token n_hc x n_hc matrix, `iters` times, register-resident.
+            sinkhorn_flops = 4.0 * positions * n_hc * n_hc * iters
+            add(
+                "mhc_mix",
+                f_gen + mix_flops + sinkhorn_flops,
+                b_gen + norm_bytes + mix_bytes,
+                wd,
+                byte_fallback=af or wf,
+                serial_launches=1,
+            )
 
     # ── mixture of experts ──────────────────────────────────────────────────
     # Routing is replicated: every rank scores every expert so it knows what to
-    # keep and what to ship.
-    f, b = _linear(positions, h, spec.n_routed_experts, aw, ww)
-    add("moe_router", f, b, wd, byte_fallback=af or wf)
+    # keep and what to ship. Hash-routed layers pick experts from the token id
+    # alone (paper §2.1), so they run no router GEMM at all.
+    if layer >= spec.num_hash_layers:
+        f, b = _linear(positions, h, spec.n_routed_experts, aw, ww)
+        add("moe_router", f, b, wd, byte_fallback=af or wf)
 
     inter = spec.moe_intermediate_size
     # gate + up + down == three h x inter matrices per expert.
@@ -461,7 +523,7 @@ def _emit_layer(
             per_expert_weights * spec.n_shared_experts * ew / tp
             + aw * (positions * h * 2 + positions * inter * 2 * spec.n_shared_experts / tp),
             ed,
-            byte_fallback=ef or af,
+            byte_fallback=af or ef,
         )
 
     # Shared with the dense MoE roofline — one owner for the union term. Note the
@@ -483,7 +545,7 @@ def _emit_layer(
         per_expert_weights * distinct * ew * skew / es
         + aw * (positions * h * 2 + positions * inter * 2 * spec.num_experts_per_tok / es),
         ed,
-        byte_fallback=ef or af,
+        byte_fallback=af or ef,
     )
 
     # ── low-rank state update on the tail layers ────────────────────────────
@@ -494,8 +556,7 @@ def _emit_layer(
         # Coarse: a down-up low-rank pair. The published shape isn't public, so
         # this establishes an order of magnitude and flags itself as an estimate
         # rather than sitting silently in the total.
-        add("dspark", f_d + f_u, b_d + b_u, wd,
-            byte_fallback=af or wf, estimated=True)
+        add("dspark", f_d + f_u, b_d + b_u, wd, byte_fallback=af or wf, estimated=True)
 
     # ── cross-rank traffic ──────────────────────────────────────────────────
     # Priced against the interconnect, not HBM, by swapping the bandwidth term.
@@ -511,15 +572,7 @@ def _emit_layer(
             g.nodes.append(
                 PredictedNode(
                     name, layer,
-                    roofline(
-                        name,
-                        0.0,
-                        byts,
-                        link,
-                        spec.act_dtype,
-                        estimated=True,
-                        bytes_are_fallback=af,
-                    ),
+                    roofline(name, 0.0, byts, link, spec.act_dtype, estimated=True, bytes_are_fallback=af),
                 )
             )
 
@@ -560,6 +613,22 @@ def predict_moe_graph(
     batch = batch or BatchConfig()
     sh = sharding or ShardingConfig()
 
+    # Refuse a sharding the model cannot actually take. Head counts are floor-
+    # divided throughout, so ``tp > n_heads`` silently yields zero heads per rank
+    # and prices the entire attention path at zero FLOPs — a cheap, confident,
+    # completely wrong graph. vLLM rejects this at construction; so does this.
+    if spec.n_heads % max(1, sh.tp) != 0:
+        raise ValueError(
+            f"tensor-parallel size {sh.tp} does not divide {spec.n_heads} attention "
+            "heads — every head-sharded op would floor to zero work"
+        )
+    if spec.qk_rope_head_dim > spec.head_dim:
+        raise ValueError(
+            f"qk_rope_head_dim ({spec.qk_rope_head_dim}) exceeds head_dim "
+            f"({spec.head_dim}) — the RoPE slice cannot be larger than the head "
+            "it is a slice of, and the KV-entry byte split goes negative"
+        )
+
     g = Graph(model=spec, hw=hw, batch=batch, sharding=sh)
     positions = batch.positions_per_step
     sequences = batch.batch
@@ -593,26 +662,33 @@ def predict_moe_graph(
     # Sharded along the vocabulary under TP.
     aw = weight_bytes(spec.act_dtype)
     ww = weight_bytes(spec.weight_dtype)
+    af = weight_bytes_is_fallback(spec.act_dtype)
+    wf = weight_bytes_is_fallback(spec.weight_dtype)
     f, b = _linear(positions, spec.hidden, spec.vocab // max(1, sh.tp), aw, ww)
     g.nodes.append(
         PredictedNode(
-            "lm_head",
-            None,
-            roofline(
-                "lm_head",
-                f,
-                b,
-                hw,
-                spec.weight_dtype,
-                bytes_are_fallback=(
-                    weight_bytes_is_fallback(spec.act_dtype)
-                    or weight_bytes_is_fallback(spec.weight_dtype)
-                ),
-            ),
+            "lm_head", None,
+            roofline("lm_head", f, b, hw, spec.weight_dtype,
+                     bytes_are_fallback=af or wf),
         )
     )
 
     return g
+
+
+def is_sparse_moe_config(cfg: dict[str, Any]) -> bool:
+    """True for the DeepSeek-V4-class checkpoints :func:`predict_moe_graph` models.
+
+    Routed experts alone are not the signal: a Mixtral declares those too but runs
+    standard attention, which this graph's compressed-KV latent and indexer nodes
+    would mis-price. The discriminator is the sparse-attention machinery — an index
+    top-k or a per-layer compression schedule — which only the DSA family carries.
+    A config without it belongs to the dense graph, whose FFN already prices a
+    mixture.
+    """
+    routed = cfg.get("n_routed_experts") and cfg.get("num_experts_per_tok")
+    sparse_attn = cfg.get("index_topk") or cfg.get("compress_ratios")
+    return bool(routed and sparse_attn)
 
 
 def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None) -> SparseMoEModelSpec:
@@ -633,43 +709,41 @@ def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None) -> Spar
         raise ValueError("sparse-MoE config is not predictable: " + "; ".join(errors))
 
     q = cfg.get("quantization_config") or {}
-    act_dtype = _canon_dtype(str(cfg.get("torch_dtype", "bf16")))
-    # An unquantized checkpoint stores weights at its declared model dtype. bf16
-    # is not a safe universal default: it halves fp32 bytes and changes the peak
-    # selected for fp16/bf16 on hardware whose rates differ.
+    act_dtype = _canon_dtype(str(cfg["torch_dtype"]))
     weight_dtype = _canon_dtype(str(q.get("quant_method") or act_dtype))
-    n_layers = int(cfg.get("num_hidden_layers", 43))
-    ratios = tuple(int(r) for r in (cfg.get("compress_ratios") or ())[:n_layers])
+    n_layers = int(cfg["num_hidden_layers"])
+    ratios = tuple(int(r) for r in cfg["compress_ratios"][:n_layers])
 
     return SparseMoEModelSpec(
         name=name or str(cfg.get("model_type", "sparse-moe")),
-        hidden=int(cfg.get("hidden_size", 4096)),
+        hidden=int(cfg["hidden_size"]),
         n_layers=n_layers,
-        n_heads=int(cfg.get("num_attention_heads", 64)),
-        num_kv_heads=int(cfg.get("num_key_value_heads", 1)),
-        head_dim=int(cfg.get("head_dim", 512)),
+        n_heads=int(cfg["num_attention_heads"]),
+        num_kv_heads=int(cfg["num_key_value_heads"]),
+        head_dim=int(cfg["head_dim"]),
         qk_rope_head_dim=int(cfg.get("qk_rope_head_dim", 64)),
-        q_lora_rank=int(cfg.get("q_lora_rank", 1024)),
-        o_lora_rank=int(cfg.get("o_lora_rank", 1024)),
-        o_groups=int(cfg.get("o_groups", 1)),
-        vocab=int(cfg.get("vocab_size", 129280)),
-        n_routed_experts=int(cfg.get("n_routed_experts", 256)),
-        n_shared_experts=int(cfg.get("n_shared_experts", 1)),
-        num_experts_per_tok=int(cfg.get("num_experts_per_tok", 6)),
-        moe_intermediate_size=int(cfg.get("moe_intermediate_size", 2048)),
-        index_n_heads=int(cfg.get("index_n_heads", 64)),
-        index_head_dim=int(cfg.get("index_head_dim", 128)),
-        index_topk=int(cfg.get("index_topk", 512)),
-        sliding_window=int(cfg.get("sliding_window", 0) or 0),
+        q_lora_rank=int(cfg["q_lora_rank"]),
+        o_lora_rank=int(cfg["o_lora_rank"]),
+        o_groups=int(cfg["o_groups"]),
+        vocab=int(cfg["vocab_size"]),
+        n_routed_experts=int(cfg["n_routed_experts"]),
+        n_shared_experts=int(cfg["n_shared_experts"]),
+        num_experts_per_tok=int(cfg["num_experts_per_tok"]),
+        moe_intermediate_size=int(cfg["moe_intermediate_size"]),
+        index_n_heads=int(cfg["index_n_heads"]),
+        index_head_dim=int(cfg["index_head_dim"]),
+        index_topk=int(cfg["index_topk"]),
+        sliding_window=int(cfg["sliding_window"]),
         compress_ratios=ratios,
         num_nextn_predict_layers=int(cfg.get("num_nextn_predict_layers", 0)),
+        # mHC: ``hc_mult`` is n_hc, the residual-stream widening factor.
+        hc_width=int(cfg.get("hc_mult", 1) or 1),
+        hc_sinkhorn_iters=int(cfg.get("hc_sinkhorn_iters", 0) or 0),
+        num_hash_layers=int(cfg.get("num_hash_layers", 0) or 0),
         dspark_layer_ids=tuple(int(i) for i in (cfg.get("dspark_target_layer_ids") or ())),
         dspark_markov_rank=int(cfg.get("dspark_markov_rank", 0)),
         weight_dtype=weight_dtype,
-        expert_dtype=_canon_dtype(str(cfg.get("expert_dtype", weight_dtype))),
-        # No cache dtype lives in a model config. The serving default is ``auto``
-        # (follow the compute/model dtype); live callers replace this only when
-        # the engine or command line declares a different cache dtype.
+        expert_dtype=_canon_dtype(str(cfg["expert_dtype"])),
         kv_dtype=act_dtype,
         act_dtype=act_dtype,
     )

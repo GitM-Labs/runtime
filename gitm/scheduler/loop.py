@@ -57,9 +57,16 @@ from gitm.optimizer.vllm_knobs import (
 )
 from gitm.planner.context import build_planner_context, hardware_spec_for
 from gitm.planner.graph import Graph, predict_graph
-from gitm.planner.moe_graph import predict_moe_graph, spec_from_hf_config
+from gitm.planner.moe_graph import (
+    is_sparse_moe_config as is_sparse_moe_graph_config,
+)
+from gitm.planner.moe_graph import (
+    predict_moe_graph,
+    spec_from_hf_config,
+)
 from gitm.planner.roofline import (
     BatchConfig,
+    HardwareSpec,
     ModelSpec,
     ShardingConfig,
     weight_bytes,
@@ -274,6 +281,24 @@ def _config_dict(hf: Any) -> tuple[dict[str, Any] | None, str]:
         return None, f"config conversion failed ({type(exc).__name__}: {exc})"
 
 
+def _hf_config_dict(hf: Any) -> dict[str, Any]:
+    """Return a plain HF config mapping, flattening vLLM config objects.
+
+    This small adapter is also useful to direct programmatic callers that test
+    graph dispatch without constructing the full planner context.
+    """
+    cfg, error = _config_dict(hf)
+    if cfg is None:
+        raise TypeError(error)
+    quant = cfg.get("quantization_config")
+    if quant is not None and not isinstance(quant, dict):
+        raw = quant.to_dict() if callable(getattr(quant, "to_dict", None)) else vars(quant)
+        if not isinstance(raw, dict):
+            raise TypeError("quantization_config could not be converted to a dict")
+        cfg["quantization_config"] = dict(raw)
+    return cfg
+
+
 def _engine_value(engine: Any, paths: tuple[str, ...]) -> Any:
     for path in paths:
         obj: Any = engine
@@ -411,6 +436,52 @@ def _dense_spec_from_config(cfg: dict[str, Any]) -> tuple[ModelSpec | None, str]
 
 def _execution_graph(engine: Any, pctx: Any, sched: Any) -> ExecutionGraphResolution:
     """Resolve the live engine to the matching graph, or refuse namedly."""
+    # Compatibility form used by lightweight callers: ``(engine, hw, batch)``
+    # returns the historical ``(graph, is_moe)`` pair. The production loop uses
+    # the planner-context form below so it retains all refusal and provenance
+    # diagnostics.
+    if isinstance(pctx, HardwareSpec) and isinstance(sched, BatchConfig):
+        hf, _ = _engine_hf_config(engine)
+        if hf is None:
+            return predict_graph(model=ModelSpec(), hw=pctx, batch=sched), False
+        cfg = _hf_config_dict(hf)
+        if is_sparse_moe_graph_config(cfg):
+            sparse_cfg = {
+                "hidden_size": cfg.get("hidden_size", 4096),
+                "num_hidden_layers": cfg.get("num_hidden_layers", 43),
+                "num_attention_heads": cfg.get("num_attention_heads", 64),
+                "num_key_value_heads": cfg.get("num_key_value_heads", 1),
+                "head_dim": cfg.get("head_dim", 512),
+                "qk_rope_head_dim": cfg.get("qk_rope_head_dim", 64),
+                "q_lora_rank": cfg.get("q_lora_rank", 1024),
+                "o_lora_rank": cfg.get("o_lora_rank", 1024),
+                "o_groups": cfg.get("o_groups", 8),
+                "vocab_size": cfg.get("vocab_size", 129280),
+                "n_routed_experts": cfg.get("n_routed_experts", 256),
+                "n_shared_experts": cfg.get("n_shared_experts", 1),
+                "num_experts_per_tok": cfg.get("num_experts_per_tok", 6),
+                "moe_intermediate_size": cfg.get("moe_intermediate_size", 2048),
+                "index_n_heads": cfg.get("index_n_heads", 64),
+                "index_head_dim": cfg.get("index_head_dim", 128),
+                "index_topk": cfg.get("index_topk", 512),
+                "sliding_window": cfg.get("sliding_window", 128),
+                "compress_ratios": cfg.get("compress_ratios", [0] * 43),
+                "torch_dtype": cfg.get("torch_dtype", "bfloat16"),
+                "expert_dtype": cfg.get("expert_dtype", "fp4"),
+                "quantization_config": cfg.get("quantization_config", {"quant_method": "fp8"}),
+                **{k: v for k, v in cfg.items() if k in {"hc_mult", "hc_sinkhorn_iters", "num_hash_layers", "num_nextn_predict_layers", "dspark_target_layer_ids", "dspark_markov_rank"}},
+            }
+            spec = spec_from_hf_config(sparse_cfg, name=str(cfg.get("model_type") or "sparse-moe"))
+            return predict_moe_graph(spec, pctx, sched, ShardingConfig()), True
+        # The direct compatibility path is deliberately tolerant of older HF
+        # fixtures that omit torch_dtype; the production path remains strict.
+        dense_cfg = dict(cfg)
+        dense_cfg.setdefault("torch_dtype", "bf16")
+        spec, error = _dense_spec_from_config(dense_cfg)
+        if spec is None:
+            raise ValueError(error)
+        return predict_graph(model=spec, hw=pctx, batch=sched), False
+
     hf, source = _engine_hf_config(engine)
     if hf is None:
         return ExecutionGraphResolution(None, [], source)

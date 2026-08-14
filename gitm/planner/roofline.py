@@ -96,6 +96,11 @@ class HardwareSpec:
     # ``0.0`` means unknown, which makes a sharded graph refuse to guess rather
     # than predict a free all-to-all.
     interconnect_bw_bytes_per_s: float = 0.0
+    # Wall time to issue one dependent kernel. This is a separate bound from
+    # FLOPs/bytes for fused iterative work whose launch depth is answer-deciding.
+    kernel_launch_overhead_s: float = 2.0e-6
+    eff_lo: float = 0.55
+    eff_hi: float = 0.95
 
 
 @dataclass(frozen=True)
@@ -430,6 +435,14 @@ class SparseMoEModelSpec:
     # Multi-token prediction (speculative decoding head)
     num_nextn_predict_layers: int = 1
 
+    # DeepSeek-V4 structural extensions. These are explicit so the graph can
+    # represent fused mHC/hash-routed layers instead of silently pricing dense
+    # substitutes.
+    hc_width: int = 1
+    hc_sinkhorn_iters: int = 0
+    hc_blocks_per_layer: int = 2
+    num_hash_layers: int = 0
+
     # Low-rank state update on a subset of layers (DeepSeek "DSpark").
     dspark_layer_ids: tuple[int, ...] = ()
     dspark_markov_rank: int = 256
@@ -443,15 +456,18 @@ class SparseMoEModelSpec:
     def __post_init__(self) -> None:
         positive = (
             "hidden", "n_layers", "n_heads", "num_kv_heads", "head_dim",
-            "q_lora_rank", "o_lora_rank", "o_groups", "vocab", "n_routed_experts",
-            "num_experts_per_tok", "moe_intermediate_size", "index_n_heads",
-            "index_head_dim", "index_topk",
+            "q_lora_rank", "o_lora_rank", "o_groups", "vocab", "moe_intermediate_size",
+            "index_n_heads", "index_head_dim",
         )
         for name in positive:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer, got {value!r}")
-        for name in ("qk_rope_head_dim", "n_shared_experts", "sliding_window", "num_nextn_predict_layers", "dspark_markov_rank"):
+        for name in (
+            "qk_rope_head_dim", "n_shared_experts", "sliding_window",
+            "num_nextn_predict_layers", "dspark_markov_rank", "hc_sinkhorn_iters",
+            "num_hash_layers", "n_routed_experts", "num_experts_per_tok", "index_topk",
+        ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
@@ -459,10 +475,14 @@ class SparseMoEModelSpec:
             raise ValueError("num_experts_per_tok cannot exceed n_routed_experts")
         if any(not isinstance(r, int) or isinstance(r, bool) or r < 0 for r in self.compress_ratios):
             raise ValueError("compress_ratios must contain non-negative integers")
-        if any(r == 0 for r in self.compress_ratios) and self.sliding_window <= 0:
-            raise ValueError("sliding_window must be positive when a compression ratio is 0")
+        if (self.n_routed_experts == 0) != (self.num_experts_per_tok == 0):
+            raise ValueError("n_routed_experts and num_experts_per_tok must both be zero or positive")
         if any(layer < 0 or layer >= self.n_layers for layer in self.dspark_layer_ids):
             raise ValueError("dspark_layer_ids must refer to real transformer layers")
+        for name in ("hc_width", "hc_blocks_per_layer"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
 
     def compress_ratio(self, layer: int) -> int:
         """KV compression ratio for ``layer`` (0/1 == uncompressed)."""
@@ -471,6 +491,20 @@ class SparseMoEModelSpec:
         if layer < len(self.compress_ratios):
             return self.compress_ratios[layer]
         return self.compress_ratios[-1]
+
+    @property
+    def compression_levels(self) -> tuple[int, ...]:
+        return tuple(sorted({r for r in self.compress_ratios if r > 1}))
+
+    def attention_kind(self, layer: int) -> str:
+        """Return the sparse-attention family for one layer."""
+        ratio = self.compress_ratio(layer)
+        if ratio == 0:
+            return "swa"
+        levels = self.compression_levels
+        if len(levels) >= 2 and ratio == levels[-1]:
+            return "hca"
+        return "csa"
 
     @property
     def q_head_dim(self) -> int:
@@ -585,7 +619,7 @@ class RooflinePrediction:
     t_compute_s: float
     t_memory_s: float
     t_pred_s: float
-    bound: str  # "compute" | "memory"
+    bound: str  # "compute" | "memory" | "launch"
     # Which dtype the op runs in, and which peak was actually available to price
     # it. They differ only on a catalogue miss; see ``peak_is_fallback``.
     dtype: str = "fp16"
@@ -605,6 +639,7 @@ class RooflinePrediction:
     # still produces a nonzero prediction.
     compute_is_unpriced: bool = False
     memory_is_unpriced: bool = False
+    serial_launches: int = 0
 
     @property
     def peak_is_fallback(self) -> bool:
@@ -652,8 +687,13 @@ def roofline(
     *,
     estimated: bool = False,
     bytes_are_fallback: bool = False,
+    serial_launches: int = 0,
 ) -> RooflinePrediction:
-    """Compute the roofline prediction for a single op."""
+    """Compute the roofline prediction for a single op.
+
+    ``serial_launches`` adds a launch-depth floor for dependent iterative work
+    that a classic FLOP/byte roofline would otherwise make look free.
+    """
     if not math.isfinite(flops) or flops < 0 or not math.isfinite(bytes_moved) or bytes_moved < 0:
         raise ValueError(
             f"roofline work terms must be finite and non-negative, got "
@@ -664,14 +704,17 @@ def roofline(
     memory_is_unpriced = bytes_moved > 0 and hw.peak_mem_bw_bytes_per_s <= 0
     t_c = flops / peak_flops if peak_flops > 0 else 0.0
     t_m = bytes_moved / hw.peak_mem_bw_bytes_per_s if hw.peak_mem_bw_bytes_per_s > 0 else 0.0
-    bound = "compute" if t_c >= t_m else "memory"
+    launches = max(0, serial_launches)
+    t_l = launches * hw.kernel_launch_overhead_s
+    t_pred = max(t_c, t_m, t_l)
+    bound = "launch" if t_l >= max(t_c, t_m) and t_l > 0 else ("compute" if t_c >= t_m else "memory")
     return RooflinePrediction(
         op=op,
         flops=flops,
         bytes=bytes_moved,
         t_compute_s=t_c,
         t_memory_s=t_m,
-        t_pred_s=max(t_c, t_m),
+        t_pred_s=t_pred,
         bound=bound,
         dtype=dtype,
         peak_dtype=peak_dtype,
@@ -680,4 +723,5 @@ def roofline(
         bytes_are_fallback=bytes_are_fallback,
         compute_is_unpriced=compute_is_unpriced,
         memory_is_unpriced=memory_is_unpriced,
+        serial_launches=launches,
     )

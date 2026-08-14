@@ -17,6 +17,7 @@ from gitm.importers.torch_trace import event_from_chrome, import_torch_trace
 from gitm.optimizer.headroom import build_headroom
 from gitm.optimizer.metrics import HardwarePeak, compute_metrics
 from gitm.optimizer.qualification import qualify
+from gitm.tracer.capture import write_trace_jsonl
 from gitm.tracer.schema import KernelEvent, MemcpyEvent, SyncEvent, Trace
 
 from .conftest import make_kernel, make_trace
@@ -376,7 +377,12 @@ def test_dedupe_identical_rows(tmp_path):
     assert stats.deduped == 1
     assert any("deduped 1" in note for note in stats.warnings)
     assert traces[0].kernels()
-    Trace.model_validate(traces[0].model_dump())
+    artifact = tmp_path / "deduped-trace.jsonl"
+    write_trace_jsonl(artifact, traces[0])
+    lines = artifact.read_text(encoding="utf-8").splitlines()
+    header = json.loads(lines[0])["_header"]
+    events = [json.loads(line) for line in lines[1:] if line.strip()]
+    Trace.model_validate({**header, "events": events})
 
 
 def test_invalid_event_drop_reaches_file_level_import_diagnostics(tmp_path):

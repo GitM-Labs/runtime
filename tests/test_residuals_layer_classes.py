@@ -161,6 +161,16 @@ V4_CONFIG = {
 
 
 @pytest.fixture
+def spec_v4():
+    return spec_from_hf_config(V4_CONFIG, name="DeepSeek-V4-Flash")
+
+
+@pytest.fixture
+def b200_hw():
+    return HardwareSpec()
+
+
+@pytest.fixture
 def v4_graph():
     spec = spec_from_hf_config(V4_CONFIG, name="DeepSeek-V4-Flash")
     return predict_moe_graph(
@@ -195,21 +205,43 @@ def test_healthy_sliding_window_layer_is_not_flagged(v4_graph):
     assert abs(res.per_kernel[0].r_kt) < NS_QUANTISATION
 
 
-def test_indexer_span_covers_both_compression_ratios(v4_graph):
-    """`attn_index_score` splits 32x between ratio-4 and ratio-128 layers.
+def test_indexer_is_uniform_because_only_csa_runs_one(v4_graph):
+    """Getting CSA/HCA right made this op *simpler*, not harder.
 
-    Sliding-window layers emit no indexer at all, so this span is entirely
-    within what the config calls the compressed layers — a different partition
-    from the one `attn_score_value` needs, which is why the fix is per-op rather
-    than one global layer taxonomy.
+    While the graph put an indexer on every compressed layer, `attn_index_score`
+    spanned 32x between the two compression rates. Only CSA layers actually run
+    an indexer, and they all share one rate — so the op is uniform and needs no
+    class split at all. The heterogeneity moved to `attn_score_value`.
     """
     idx = [n for n in v4_graph.nodes if n.op == "attn_index_score"]
-    assert {n.layer for n in idx}.isdisjoint({0, 1})
-    ts = sorted(n.prediction.t_pred_s for n in idx)
-    assert ts[-1] / ts[0] == pytest.approx(32.0, rel=0.01)
+    assert idx
+    assert {n.layer for n in idx}.isdisjoint({0, 1, 3, 5})  # not swa, not hca
+    assert len({round(n.prediction.t_pred_s, 15) for n in idx}) == 1
 
-    res = residuals(_trace([_k("lightning_indexer_topk", ts[0]), _k("lightning_indexer_topk", ts[-1])]), v4_graph)
-    assert all(abs(kr.r_kt) < NS_QUANTISATION for kr in res.per_kernel)
+    res = residuals(_trace([_k("lightning_indexer_topk", idx[0].prediction.t_pred_s)]), v4_graph)
+    kr = res.per_kernel[0]
+    assert kr.n_classes == 1
+    assert abs(kr.r_kt) < NS_QUANTISATION
+
+
+def test_attention_core_has_three_classes_at_long_context(spec_v4, b200_hw):
+    """swa / csa / hca read 128 / 640 / 8320 tokens at 1M — three distinct costs.
+
+    They collapse to two at 64K, where csa and hca coincide. A class split
+    derived from the predictions tracks that; a hardcoded taxonomy would not.
+    """
+    g = predict_moe_graph(
+        spec_v4, b200_hw, BatchConfig(batch=64, kv_cache_len=1_048_576)
+    )
+    classes = {round(n.prediction.t_pred_s, 15)
+               for n in g.nodes if n.op == "attn_score_value"}
+    assert len(classes) == 3
+
+    at_64k = predict_moe_graph(
+        spec_v4, b200_hw, BatchConfig(batch=64, kv_cache_len=65536)
+    )
+    assert len({round(n.prediction.t_pred_s, 15)
+                for n in at_64k.nodes if n.op == "attn_score_value"}) == 2
 
 
 def test_a_genuinely_slow_kernel_still_surfaces(v4_graph):

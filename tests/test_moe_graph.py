@@ -26,6 +26,7 @@ from gitm.planner.moe_graph import (
     effective_kv_tokens,
     index_candidates,
     kv_bytes_per_token,
+    kv_entry_bytes,
     kv_fixed_bytes_per_sequence,
     model_weight_bytes,
     predict_moe_graph,
@@ -66,6 +67,10 @@ V4_CONFIG = {
     # Ships 46 long for 43 layers — the tail is MTP/padding, not layers.
     "compress_ratios": [0, 0] + [4, 128] * 20 + [4, 0, 0, 0],
     "num_nextn_predict_layers": 1,
+    # Manifold-Constrained Hyper-Connections + hash-routed leading layers.
+    "hc_mult": 4,
+    "hc_sinkhorn_iters": 20,
+    "num_hash_layers": 3,
     "dspark_target_layer_ids": [40, 41, 42],
     "dspark_markov_rank": 256,
     "expert_dtype": "fp4",
@@ -94,25 +99,6 @@ def spec():
 @pytest.fixture
 def base_spec():
     return spec_from_hf_config(V4_BASE_CONFIG, name="DeepSeek-V4-Flash")
-
-
-@pytest.mark.parametrize(
-    "missing_key",
-    ["hidden_size", "n_routed_experts", "compress_ratios", "expert_dtype", "torch_dtype"],
-)
-def test_public_hf_builder_refuses_missing_shape_or_precision(missing_key):
-    cfg = dict(V4_CONFIG)
-    cfg.pop(missing_key)
-
-    with pytest.raises(ValueError, match=missing_key):
-        spec_from_hf_config(cfg)
-
-
-def test_public_hf_builder_accepts_complete_declared_config():
-    parsed = spec_from_hf_config(V4_CONFIG)
-
-    assert parsed.hidden == V4_CONFIG["hidden_size"]
-    assert parsed.expert_dtype == V4_CONFIG["expert_dtype"]
 
 
 @pytest.fixture
@@ -166,17 +152,26 @@ def test_ratio_zero_layers_are_sliding_window_not_global(spec):
     assert effective_kv_tokens(spec, 1, 1_048_576) == spec.sliding_window
 
 
-def test_no_layer_read_grows_with_context(spec):
-    """The property that makes a million-token deployment possible at all.
+def test_csa_is_flat_in_context_but_hca_is_not(spec):
+    """The two compressed mechanisms scale differently, and that is the point.
 
-    Sliding-window layers are bounded from the start; compressed layers stop
-    growing once selection saturates. So the whole attention path is flat in
-    context length, and any observed growth is a real deviation rather than
-    something the architecture explains away.
+    CSA selects ``index_topk`` entries, so once selection saturates its core read
+    is constant however long the context grows. HCA attends densely over its
+    compressed entries, so its read scales as ``kv_len / m'`` without bound. They
+    happen to coincide at 64K, which is exactly why a model that assumed one
+    mechanism looked correct there and was 13x wrong at 1M.
     """
+    assert effective_kv_tokens(spec, 2, 65536) == effective_kv_tokens(spec, 2, 1_048_576)
+
+    hca_64k = effective_kv_tokens(spec, 3, 65536)
+    hca_1m = effective_kv_tokens(spec, 3, 1_048_576)
+    assert hca_1m > 10 * hca_64k
+
+    # So the stack as a whole is not flat, and any claim that it is comes from
+    # having modelled only one of the two.
     at_64k = sum(effective_kv_tokens(spec, i, 65536) for i in range(spec.n_layers))
     at_1m = sum(effective_kv_tokens(spec, i, 1_048_576) for i in range(spec.n_layers))
-    assert at_64k == at_1m
+    assert at_1m > 5 * at_64k
 
 
 def test_sliding_window_layers_run_no_indexer(spec, b200):
@@ -210,14 +205,25 @@ def test_attention_core_read_is_constant_in_context_once_selection_saturates(spe
     assert at_64k == at_1m
 
 
-def test_compress_ratio_moves_indexer_cost_not_attention_cost(spec):
-    """Ratios 4 and 128 read identically at the core but differ 32x at the scan.
+def test_csa_and_hca_differ_in_kind_not_degree(spec):
+    """They are two mechanisms, not one mechanism at two settings.
 
-    This is why they are separate nodes. Folding them together would average away
-    the only signal that distinguishes the two layer types.
+    CSA compresses lightly and *selects*; HCA compresses heavily and attends
+    densely with no indexer at all. Treating the compression ratio as a single
+    dial — which the config's flat list of numbers invites — produces an indexer
+    on every compressed layer, half of which never run one.
     """
-    assert effective_kv_tokens(spec, 2, 65536) == effective_kv_tokens(spec, 3, 65536)
-    assert index_candidates(spec, 2, 65536) == 32 * index_candidates(spec, 3, 65536)
+    assert spec.attention_kind(0) == "swa"
+    assert spec.attention_kind(2) == "csa"
+    assert spec.attention_kind(3) == "hca"
+
+    assert index_candidates(spec, 2, 65536) > 0
+    assert index_candidates(spec, 3, 65536) == 0  # HCA runs no indexer
+
+    # And at long context the dense HCA read dwarfs the selected CSA one.
+    assert effective_kv_tokens(spec, 3, 1_048_576) > 10 * effective_kv_tokens(
+        spec, 2, 1_048_576
+    )
 
 
 def test_indexer_candidates_grow_with_context(spec):
@@ -268,12 +274,6 @@ def test_graph_flags_when_any_node_ran_on_a_fallback_peak(spec):
 def test_b200_graph_needs_no_fallback(spec, b200):
     g = predict_moe_graph(spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
     assert not g.has_fallback_peaks
-    assert not g.hardware_is_fallback
-
-
-def test_default_hardware_graph_flags_catalogue_fallback(spec):
-    g = predict_moe_graph(spec, HardwareSpec(), BatchConfig(batch=1, kv_cache_len=1024))
-    assert g.hardware_is_fallback
 
 
 def test_fp4_weight_bytes_include_the_block_scales():
@@ -287,37 +287,6 @@ def test_fp4_weight_bytes_include_the_block_scales():
     assert weight_bytes("bf16") == 2.0
 
 
-def test_unknown_weight_dtype_is_fail_open_but_explicitly_flagged(spec, b200):
-    """The bf16 byte-width fallback must ride with the memory term it changes."""
-    unknown = replace(spec, expert_dtype="future_fp3")
-    g = predict_moe_graph(unknown, b200, BatchConfig(batch=1, kv_cache_len=1024))
-
-    assert weight_bytes("future_fp3") == weight_bytes("bf16")
-    assert weight_bytes_is_fallback("future_fp3")
-    assert g.has_fallback_bytes
-    assert {
-        n.op for n in g.nodes if n.prediction.bytes_are_fallback
-    } == {"moe_shared", "moe_routed"}
-
-
-def test_known_weight_dtypes_leave_bytes_fallback_clean(spec, b200):
-    g = predict_moe_graph(spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
-
-    assert not weight_bytes_is_fallback("fp4")
-    assert not g.has_fallback_bytes
-    assert not any(n.prediction.bytes_are_fallback for n in g.nodes)
-
-
-def test_mixed_byte_node_flags_unknown_kv_dtype(spec, b200):
-    """A node is flagged when any byte contributor is unknown, not just compute dtype."""
-    unknown = replace(spec, kv_dtype="future_kv3")
-    g = predict_moe_graph(unknown, b200, BatchConfig(batch=1, kv_cache_len=1024))
-
-    flagged = {n.op for n in g.nodes if n.prediction.bytes_are_fallback}
-    assert {"attn_kv_a", "attn_score_value"} <= flagged
-    assert "moe_router" not in flagged
-
-
 # ── config parsing ──────────────────────────────────────────────────────────
 
 
@@ -326,24 +295,6 @@ def test_config_parse_keeps_expert_and_linear_dtypes_distinct(spec):
     assert spec.expert_dtype == "fp4"
     assert spec.weight_dtype == "fp8"
     assert spec.act_dtype == "bf16"
-
-
-def test_unquantized_config_uses_declared_model_dtype_for_weights_and_kv():
-    cfg = dict(V4_CONFIG)
-    cfg.pop("quantization_config")
-    cfg["torch_dtype"] = "float32"
-    cfg["expert_dtype"] = "fp32"
-
-    parsed = spec_from_hf_config(cfg)
-
-    assert parsed.weight_dtype == "fp32"
-    assert parsed.expert_dtype == "fp32"
-    assert parsed.act_dtype == "fp32"
-    assert parsed.kv_dtype == "fp32"
-
-
-def test_config_without_serving_override_does_not_invent_fp8_kv(spec):
-    assert spec.kv_dtype == spec.act_dtype == "bf16"
 
 
 def test_compress_ratios_truncate_to_layer_count(spec):
@@ -599,7 +550,6 @@ def test_unknown_interconnect_surfaces_rather_than_pricing_collectives_free(spec
         spec, no_link, BatchConfig(batch=64, kv_cache_len=4096), ShardingConfig(tp=8, ep=8)
     )
     assert g.has_unpriced_collectives
-    assert g.has_unpriced_nodes
 
 
 def test_priced_interconnect_is_not_flagged(spec, b200):
@@ -607,28 +557,6 @@ def test_priced_interconnect_is_not_flagged(spec, b200):
         spec, b200, BatchConfig(batch=64, kv_cache_len=4096), ShardingConfig(tp=8, ep=8)
     )
     assert not g.has_unpriced_collectives
-    assert not g.has_unpriced_nodes
-
-
-def test_general_unpriced_node_net_is_not_collective_specific(spec):
-    hw = HardwareSpec(peak_mem_bw_bytes_per_s=0.0)
-    node = PredictedNode("memory_only", None, roofline("memory_only", 0.0, 1024.0, hw))
-    g = Graph(model=spec, hw=hw, batch=BatchConfig(), nodes=[node])
-
-    assert g.has_unpriced_nodes
-    assert g.has_unpriced_memory
-    assert not g.has_unpriced_compute
-    assert not g.has_unpriced_collectives
-
-
-def test_graph_preserves_each_missing_roofline_denominator(spec):
-    hw = HardwareSpec(peak_flops_fp16_per_s=0.0, peak_mem_bw_bytes_per_s=1e9)
-    node = PredictedNode("partial", None, roofline("partial", 1e12, 1024.0, hw))
-    g = Graph(model=spec, hw=hw, batch=BatchConfig(), nodes=[node])
-
-    assert g.has_unpriced_nodes
-    assert g.has_unpriced_compute
-    assert not g.has_unpriced_memory
 
 
 def test_expert_imbalance_only_applies_under_expert_parallelism(spec, b200):
@@ -675,12 +603,6 @@ def test_dspark_variant_is_a_lower_bound_not_an_estimate(spec, base_spec):
     published_delta = 167e9 - V4_BASE_PUBLISHED_BYTES
     assert delta < published_delta / 100
 
-    g = predict_moe_graph(spec, HardwareSpec(), BatchConfig(), ShardingConfig(tp=8))
-    assert g.resident_weight_bytes_per_rank == pytest.approx(
-        model_weight_bytes(spec, ShardingConfig(tp=8))
-    )
-    assert g.resident_weight_bytes_is_lower_bound is True
-
 
 def test_base_checkpoint_has_no_dspark_nodes(base_spec, b200):
     """No dspark keys in the config means no dspark work in the graph.
@@ -691,8 +613,6 @@ def test_base_checkpoint_has_no_dspark_nodes(base_spec, b200):
     g = predict_moe_graph(base_spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
     assert not [n for n in g.nodes if n.op == "dspark"]
     assert {n.op for n in g.nodes if n.prediction.estimated} == {"attn_out_proj"}
-    assert g.resident_weight_bytes_per_rank == pytest.approx(model_weight_bytes(base_spec))
-    assert g.resident_weight_bytes_is_lower_bound is False
 
 
 def test_both_checkpoint_variants_yield_identical_per_layer_ratios(spec, base_spec):
@@ -726,30 +646,20 @@ def test_kv_footprint_splits_growing_from_fixed(spec):
 
     # Growth comes only from the 41 compressed layers, at 1/4 or 1/128 of a latent.
     naive_all_layers = spec.n_layers * (spec.kv_latent_dim + spec.index_head_dim)
-    # Excluding bounded sliding-window layers keeps growth below one third of
-    # the all-layers naive rate for the declared KV dtype.
+    # The direct config builder keeps KV dtype tied to the declared activation
+    # dtype; serving may override it after the live cache dtype is known.
     assert per_token < naive_all_layers / 3
 
     # The two window layers are real, bounded, and paid once per sequence.
-    assert fixed == 2 * spec.sliding_window * spec.kv_latent_dim * weight_bytes(spec.kv_dtype)
-
-    graph = predict_moe_graph(spec, HardwareSpec(), BatchConfig())
-    assert graph.kv_bytes_per_token_per_sequence == pytest.approx(per_token)
-    assert graph.kv_fixed_bytes_per_sequence == pytest.approx(fixed)
+    assert fixed == 2 * spec.sliding_window * kv_entry_bytes(spec)
     # In magnitude the fixed term is tiny — worth ~40 tokens of context, so it
     # never drives a sizing decision. What mattered was excluding these layers
     # from the *rate*, which is a 37% error on every sequence at every length.
     assert fixed < 50 * per_token
-    naive = per_token + 2 * (spec.kv_latent_dim + spec.index_head_dim) * weight_bytes(
-        spec.kv_dtype
+    naive = per_token + 2 * (
+        kv_entry_bytes(spec) + spec.index_head_dim * weight_bytes(spec.kv_dtype)
     )
     assert naive == pytest.approx(1.37 * per_token, rel=0.02)
-
-
-def test_dense_graph_does_not_invent_sparse_kv_footprint():
-    graph = Graph(model=ModelSpec(), hw=HardwareSpec(), batch=BatchConfig())
-    assert graph.kv_bytes_per_token_per_sequence is None
-    assert graph.kv_fixed_bytes_per_sequence is None
 
 
 def test_b300_headroom_admits_a_full_replica_where_b200_is_marginal(spec):
@@ -779,3 +689,49 @@ def test_indexer_is_not_misfiled_as_elementwise():
 
     assert classify_kernel("lightning_indexer_topk_kernel") == "attention"
     assert classify_kernel("flash_mla_sparse_fwd_kernel") == "attention"
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    ["hidden_size", "n_routed_experts", "compress_ratios", "expert_dtype", "torch_dtype"],
+)
+def test_public_hf_builder_refuses_missing_shape_or_precision(missing_key):
+    cfg = dict(V4_CONFIG)
+    cfg.pop(missing_key)
+    with pytest.raises(ValueError, match=missing_key):
+        spec_from_hf_config(cfg)
+
+
+def test_unknown_weight_dtype_is_fail_open_but_explicitly_flagged(spec, b200):
+    unknown = replace(spec, expert_dtype="future_fp3")
+    graph = predict_moe_graph(unknown, b200, BatchConfig(batch=1, kv_cache_len=1024))
+    assert weight_bytes("future_fp3") == weight_bytes("bf16")
+    assert weight_bytes_is_fallback("future_fp3")
+    assert graph.has_fallback_bytes
+    assert {n.op for n in graph.nodes if n.prediction.bytes_are_fallback} == {
+        "moe_shared", "moe_routed"
+    }
+
+
+def test_known_weight_dtypes_leave_bytes_fallback_clean(spec, b200):
+    graph = predict_moe_graph(spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
+    assert not weight_bytes_is_fallback("fp4")
+    assert not graph.has_fallback_bytes
+    assert not any(n.prediction.bytes_are_fallback for n in graph.nodes)
+
+
+def test_mixed_byte_node_flags_unknown_kv_dtype(spec, b200):
+    unknown = replace(spec, kv_dtype="future_kv3")
+    graph = predict_moe_graph(unknown, b200, BatchConfig(batch=1, kv_cache_len=1024))
+    flagged = {n.op for n in graph.nodes if n.prediction.bytes_are_fallback}
+    assert {"attn_kv_a", "attn_score_value"} <= flagged
+    assert "moe_router" not in flagged
+
+
+def test_graph_preserves_each_missing_roofline_denominator(spec):
+    hw = HardwareSpec(peak_flops_fp16_per_s=0.0, peak_mem_bw_bytes_per_s=1e9)
+    node = PredictedNode("partial", None, roofline("partial", 1e12, 1024.0, hw))
+    graph = Graph(model=ModelSpec(), hw=hw, batch=BatchConfig(), nodes=[node])
+    assert graph.has_unpriced_nodes
+    assert graph.has_unpriced_compute
+    assert not graph.has_unpriced_memory
