@@ -291,7 +291,7 @@ def validate_moe_config(cfg: dict[str, Any]) -> list[str]:
 
     n_layers = cfg.get("num_hidden_layers")
     ratios = cfg.get("compress_ratios")
-    if not isinstance(ratios, (list, tuple)):
+    if not isinstance(ratios, list | tuple):
         missing.append("compress_ratios must be declared for the sparse-attention graph")
     elif isinstance(n_layers, int) and n_layers > 0 and len(ratios) < n_layers:
         missing.append(

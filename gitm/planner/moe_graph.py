@@ -102,7 +102,7 @@ def validate_sparse_moe_config(cfg: dict[str, Any]) -> list[str]:
     if isinstance(n_experts, int) and not isinstance(n_experts, bool) and isinstance(top_k, int) and not isinstance(top_k, bool) and top_k > n_experts:
         errors.append(f"num_experts_per_tok={top_k} exceeds n_routed_experts={n_experts}")
     n_layers, ratios = cfg.get("num_hidden_layers"), cfg.get("compress_ratios")
-    if not isinstance(ratios, (list, tuple)):
+    if not isinstance(ratios, list | tuple):
         errors.append("compress_ratios must be declared for the sparse-attention graph")
     elif isinstance(n_layers, int) and n_layers > 0 and len(ratios) < n_layers:
         errors.append(f"compress_ratios has {len(ratios)} entries; need at least {n_layers}")
