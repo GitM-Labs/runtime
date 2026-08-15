@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from gitm.tracer.nvtx_correlate import correlate_kernels_to_ranges
+from gitm.distributed.correlate import correlate_kernels_to_ranges
 from gitm.tracer.schema import KernelEvent, MemcpyEvent, SyncEvent, TraceEvent
 
 Endpoint = Literal["host", "device", "unified"]

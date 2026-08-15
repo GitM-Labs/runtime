@@ -87,7 +87,7 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
     ops (orders of magnitude fewer predicted nodes than real kernels), producing
     runaway r_kt ratios. Each kernel is classified by its NVTX-range identity when
     the capture has one (``range_op``/``range_layer`` — see
-    :mod:`gitm.tracer.nvtx_correlate`), else by name
+    :mod:`gitm.distributed.correlate`), else by name
     (:func:`gitm.optimizer.deviation.classify_op`).
 
     **Pairing is per structural class, not one representative per op.** A dense

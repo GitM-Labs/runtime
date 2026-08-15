@@ -5,7 +5,7 @@ kernel's own device-clock window). See docs/kernel_identity.md.
 
 from __future__ import annotations
 
-from gitm.tracer.nvtx_correlate import correlate_kernels_to_ranges, parse_range_name
+from gitm.distributed.correlate import correlate_kernels_to_ranges, parse_range_name
 
 
 def _kernel(name: str, corr_id: int, dev_start: int, dev_end: int) -> dict:
