@@ -149,6 +149,19 @@ def _parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="Probe environment, GPUs, and data locations.")
 
+    inst = sub.add_parser(
+        "install",
+        help="Prepare a CUDA host: driver-matched CUPTI, pinned vLLM/torch, tracer shim.",
+    )
+    inst.add_argument("--dry-run", action="store_true",
+                      help="Print the plan and exit without executing it.")
+    inst.add_argument("--skip-stack", action="store_true",
+                      help="Do not install or replace vLLM/torch.")
+    inst.add_argument("--skip-apt", action="store_true",
+                      help="Do not install system build dependencies.")
+    inst.add_argument("--with-gpu-extras", action="store_true",
+                      help="Additionally install RAPIDS cuDF and CuPy (HFT harness only).")
+
     analyze = sub.add_parser(
         "analyze",
         help="Ingest customer Nsight/PyTorch profiler dumps into a headroom report.",
@@ -349,6 +362,15 @@ def main(argv: list[str] | None = None) -> int:
             args.capture_help()
             return 2
         return _run_capture(args, serve_argv)
+
+    if args.cmd == "install":
+        from gitm.install import main as install_main
+
+        argv: list[str] = []
+        for flag in ("dry_run", "skip_stack", "skip_apt", "with_gpu_extras"):
+            if getattr(args, flag, False):
+                argv.append("--" + flag.replace("_", "-"))
+        return install_main(argv)
 
     if args.cmd == "doctor":
         from gitm.doctor import doctor
