@@ -91,10 +91,6 @@ def test_require_compatible_is_silent_when_the_stack_fits(host):
     cuda_env.require_compatible()  # must not raise
 
 
-
-
-
-
 @pytest.mark.parametrize(
     ("driver", "expected"),
     [

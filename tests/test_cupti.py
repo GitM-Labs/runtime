@@ -105,8 +105,6 @@ def test_decode_sync_types(sync_type, kind):
     assert ev.sync_kind == kind
 
 
-
-
 # --- decode: batch ----------------------------------------------------------
 
 
@@ -168,8 +166,6 @@ def test_capture_falls_back_to_noop_trace(tmp_path, monkeypatch):
     header = json.loads(lines[0])["_header"]
     assert header["vendor"] == "none"  # no backend -> no-op
     assert header["device_count"] == 0
-
-
 
 
 # --- full backend wiring via a fake shim ------------------------------------
