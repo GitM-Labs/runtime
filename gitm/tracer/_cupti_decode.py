@@ -59,23 +59,32 @@ _SYNC_KIND: dict[int, Literal["stream", "event", "device"]] = {
 }
 
 
+def _kernel_dims(value: object, *, what: str) -> tuple[int, int, int]:
+    """Return a 3-tuple of launch dimensions, warning on missing or malformed
+    input. A truncated CUPTI record (e.g. ``[256, 1]``) must degrade to a named
+    fallback rather than raising IndexError deep in construction."""
+    if value is None:
+        warnings.warn(
+            f"CUPTI kernel {what} dimensions unavailable; using 1x1x1",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return (1, 1, 1)
+    try:
+        x, y, z = (int(value[0]), int(value[1]), int(value[2]))  # type: ignore[index]
+    except (TypeError, IndexError, ValueError):
+        warnings.warn(
+            f"CUPTI kernel {what} dimensions malformed ({value!r}); using 1x1x1",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return (1, 1, 1)
+    return (x, y, z)
+
+
 def decode_kernel(d: dict) -> KernelEvent:
-    grid = d.get("grid")
-    if grid is None:
-        warnings.warn(
-            "CUPTI kernel grid dimensions unavailable; using 1x1x1",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        grid = [1, 1, 1]
-    block = d.get("block")
-    if block is None:
-        warnings.warn(
-            "CUPTI kernel block dimensions unavailable; using 1x1x1",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        block = [1, 1, 1]
+    grid = _kernel_dims(d.get("grid"), what="grid")
+    block = _kernel_dims(d.get("block"), what="block")
     name = d.get("name")
     if not name:
         warnings.warn(
@@ -90,8 +99,8 @@ def decode_kernel(d: dict) -> KernelEvent:
         device_id=int(d["device_id"]),
         correlation_id=_opt_int(d.get("correlation_id")),
         name=name or "<anonymous>",
-        grid_x=int(grid[0]), grid_y=int(grid[1]), grid_z=int(grid[2]),
-        block_x=int(block[0]), block_y=int(block[1]), block_z=int(block[2]),
+        grid_x=grid[0], grid_y=grid[1], grid_z=grid[2],
+        block_x=block[0], block_y=block[1], block_z=block[2],
         shared_mem_bytes=int(d.get("static_shared_mem", 0)) + int(d.get("dynamic_shared_mem", 0)),
         registers_per_thread=int(d.get("registers_per_thread", 0)),
         range_op=d.get("range_op"),
