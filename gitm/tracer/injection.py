@@ -24,8 +24,10 @@ them in the shell that launches the run; ``run_env()`` renders the exact pair.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
+import warnings
 from pathlib import Path
 
 from gitm.tracer.schema import TraceEvent
@@ -110,6 +112,22 @@ def _pid_alive(pid: int) -> bool:
     prevent. Guessing "dead" costs a silently empty trace; guessing "alive" costs a
     stale file.
     """
+    if os.name == "nt":
+        # ``os.kill(pid, 0)`` is not a harmless existence probe on Windows: the
+        # CRT maps signal 0 through TerminateProcess, which can kill the very
+        # EngineCore whose live shard we are trying to protect. Query a process
+        # handle instead; access-denied still means the process exists.
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        error = ctypes.get_last_error()
+        if error == 87:  # ERROR_INVALID_PARAMETER: no such PID
+            return False
+        return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -146,10 +164,21 @@ def clear_stale_shards() -> None:
 
 def settle_seconds() -> float:
     raw = os.environ.get(ENV_SETTLE)
-    try:
-        return float(raw) if raw else DEFAULT_SETTLE_S
-    except ValueError:
+    if not raw:
         return DEFAULT_SETTLE_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not math.isfinite(value) or value < 0:
+        warnings.warn(
+            f"invalid GITM_TRACE_SETTLE_S={raw!r}; using documented default "
+            f"{DEFAULT_SETTLE_S}s",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return DEFAULT_SETTLE_S
+    return value
 
 
 def settle() -> None:
@@ -171,10 +200,17 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
     from gitm.tracer._cupti_decode import decode_records
 
     records: list[dict] = []
+    dropped_lines = 0
     for shard in shard_paths():
         try:
             text = shard.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        except OSError as exc:
+            warnings.warn(
+                f"injected trace shard unreadable ({shard}: {type(exc).__name__}: {exc}); "
+                "capture coverage is incomplete",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             continue
         for line in text.splitlines():
             line = line.strip()
@@ -183,11 +219,14 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
+                dropped_lines += 1
                 continue  # partial line from a killed process
             if not isinstance(rec, dict):
+                dropped_lines += 1
                 continue
             ts = rec.get("start_ns")
             if not isinstance(ts, int):
+                dropped_lines += 1
                 continue
             if start_ns is not None and ts < start_ns:
                 continue
@@ -195,7 +234,22 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
                 continue
             records.append(rec)
 
-    return decode_records(records)
+    if dropped_lines:
+        warnings.warn(
+            f"injected trace coverage: dropped {dropped_lines} malformed or incomplete "
+            "shard line(s)",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    events = decode_records(records)
+    if len(events) < len(records):
+        warnings.warn(
+            f"injected trace coverage: dropped {len(records) - len(events)} unmodeled "
+            "activity record(s)",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return events
 
 
 def cupti_now() -> int | None:

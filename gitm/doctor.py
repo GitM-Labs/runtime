@@ -22,8 +22,25 @@ def doctor() -> dict[str, Any]:
 
     from gitm.telemetry.backends import discover_backends
 
-    backends = discover_backends()
-    info["telemetry_backends"] = [
-        {"vendor": b.vendor, "device_count": b.device_count()} for b in backends
-    ]
+    diagnostics: list[str] = []
+    backends = discover_backends(diagnostics=diagnostics)
+    telemetry_backends: list[dict[str, Any]] = []
+    for backend in backends:
+        try:
+            telemetry_backends.append(
+                {"vendor": backend.vendor, "device_count": backend.device_count()}
+            )
+        except Exception as exc:
+            diagnostics.append(
+                f"{backend.vendor} telemetry probe failed: {type(exc).__name__}: {exc}"
+            )
+        finally:
+            try:
+                backend.close()
+            except Exception as exc:
+                diagnostics.append(
+                    f"{backend.vendor} telemetry close failed: {type(exc).__name__}: {exc}"
+                )
+    info["telemetry_backends"] = telemetry_backends
+    info["telemetry_diagnostics"] = diagnostics
     return info

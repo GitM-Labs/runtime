@@ -24,6 +24,7 @@ Dict contract (the shim emits exactly these shapes):
 
 from __future__ import annotations
 
+import warnings
 from typing import Literal
 
 from gitm.distributed.correlate import correlate_kernels_to_ranges
@@ -59,15 +60,36 @@ _SYNC_KIND: dict[int, Literal["stream", "event", "device"]] = {
 
 
 def decode_kernel(d: dict) -> KernelEvent:
-    grid = d.get("grid", [1, 1, 1])
-    block = d.get("block", [1, 1, 1])
+    grid = d.get("grid")
+    if grid is None:
+        warnings.warn(
+            "CUPTI kernel grid dimensions unavailable; using 1x1x1",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        grid = [1, 1, 1]
+    block = d.get("block")
+    if block is None:
+        warnings.warn(
+            "CUPTI kernel block dimensions unavailable; using 1x1x1",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        block = [1, 1, 1]
+    name = d.get("name")
+    if not name:
+        warnings.warn(
+            "CUPTI kernel name unavailable; using <anonymous>",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return KernelEvent(
         start_ns=int(d["start_ns"]),
         end_ns=int(d["end_ns"]),
         stream_id=int(d["stream_id"]),
         device_id=int(d["device_id"]),
         correlation_id=_opt_int(d.get("correlation_id")),
-        name=d.get("name") or "<anonymous>",
+        name=name or "<anonymous>",
         grid_x=int(grid[0]), grid_y=int(grid[1]), grid_z=int(grid[2]),
         block_x=int(block[0]), block_y=int(block[1]), block_z=int(block[2]),
         shared_mem_bytes=int(d.get("static_shared_mem", 0)) + int(d.get("dynamic_shared_mem", 0)),
@@ -78,7 +100,15 @@ def decode_kernel(d: dict) -> KernelEvent:
 
 
 def decode_memcpy(d: dict) -> MemcpyEvent:
-    src, dst = _COPY_KIND.get(int(d.get("copy_kind", 0)), ("device", "device"))
+    raw_kind = d.get("copy_kind")
+    kind = int(raw_kind) if raw_kind is not None else 0
+    if kind not in _COPY_KIND or kind == 0:
+        warnings.warn(
+            f"unknown CUPTI memcpy kind {kind}; using device↔device endpoint fallback",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    src, dst = _COPY_KIND.get(kind, ("device", "device"))
     return MemcpyEvent(
         start_ns=int(d["start_ns"]),
         end_ns=int(d["end_ns"]),
@@ -92,13 +122,21 @@ def decode_memcpy(d: dict) -> MemcpyEvent:
 
 
 def decode_sync(d: dict) -> SyncEvent:
+    raw_type = d.get("sync_type")
+    sync_type = int(raw_type) if raw_type is not None else 0
+    if sync_type not in _SYNC_KIND or sync_type == 0:
+        warnings.warn(
+            f"unknown CUPTI synchronization type {sync_type}; using device-sync fallback",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return SyncEvent(
         start_ns=int(d["start_ns"]),
         end_ns=int(d["end_ns"]),
         stream_id=int(d.get("stream_id", 0)),
         device_id=int(d.get("device_id", 0)),
         correlation_id=_opt_int(d.get("correlation_id")),
-        sync_kind=_SYNC_KIND.get(int(d.get("sync_type", 0)), "device"),
+        sync_kind=_SYNC_KIND.get(sync_type, "device"),
     )
 
 
