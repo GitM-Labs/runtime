@@ -39,7 +39,7 @@ def require_timing_partition(
     }
     if invalid:
         raise RuntimeError(f"{context} timing unavailable: invalid components {invalid}")
-    assigned = sum(components_s.values())
+    assigned = math.fsum(components_s.values())
     tolerance = max(1e-12, total * 1e-9)
     if assigned > total + tolerance:
         detail = ", ".join(f"{name}={value:.6g}s" for name, value in components_s.items())
