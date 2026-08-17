@@ -17,10 +17,20 @@ def load_library(path: Path | str | None = None, *, workload: str | None = None)
     """Load and validate every entry in the library."""
     p = Path(path) if path is not None else _library_path()
     if not p.exists():
-        return []
+        raise FileNotFoundError(
+            f"intervention library not found at {p}; candidate coverage is unavailable"
+        )
     with p.open() as fh:
-        raw = yaml.safe_load(fh) or {}
-    entries = raw.get("interventions", [])
+        raw = yaml.safe_load(fh)
+    if not isinstance(raw, dict) or not isinstance(raw.get("interventions"), list):
+        raise ValueError(
+            f"intervention library {p} has no interventions list; candidate coverage is unavailable"
+        )
+    entries = raw["interventions"]
+    if not entries:
+        raise ValueError(
+            f"intervention library {p} is empty; candidate coverage is unavailable"
+        )
     specs = [InterventionSpec.model_validate(e) for e in entries]
     if workload is not None:
         specs = [s for s in specs if workload in s.applicability.workloads]

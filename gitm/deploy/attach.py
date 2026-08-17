@@ -27,7 +27,7 @@ class AttachPlan:
     job_id: str
     workload: str | None
     mode: str  # always "user-space"
-    status: str  # "planned" | "attached" | "no_target"
+    status: str  # "planned" | "unsupported" | "no_target"
     pid: int | None
     steps: list[str] = field(default_factory=list)
     reason: str = ""
@@ -101,12 +101,17 @@ def attach_job(
             reason=f"PID {resolved} is not live.",
         ).to_dict()
 
+    # PID resolution is wired, but no injector or telemetry-shim installation is.
+    # Refuse rather than turning a validated target into a false attach success.
     return AttachPlan(
         job_id=job_id,
         workload=workload,
         mode="user-space",
-        status="attached",
+        status="unsupported",
         pid=resolved,
         steps=steps,
-        reason="attached (user-space, fail-open).",
+        reason=(
+            "target is live, but standalone PID injection is not implemented; "
+            "no telemetry shim was installed"
+        ),
     ).to_dict()

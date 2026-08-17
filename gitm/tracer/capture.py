@@ -187,12 +187,39 @@ def _device_count(backend, injected: bool) -> int:
 
         shim = load_shim()
         if shim is None:
+            warnings.warn(
+                "injected trace device count unavailable: CUPTI shim is not importable; "
+                "recording 0 devices",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return 0
-        try:
-            return int(shim.device_count())
-        except Exception:
-            return 0
-    return backend.device_count() if backend else 0
+        counter = shim.device_count
+    elif backend is not None:
+        counter = backend.device_count
+    else:
+        # ``source=none`` in the trace header is the explicit provenance for the
+        # normal no-backend path; an extra warning here would add no information.
+        return 0
+
+    try:
+        count = int(counter())
+    except Exception as exc:
+        warnings.warn(
+            f"active trace device count unavailable: {type(exc).__name__}: {exc}; "
+            "recording 0 devices",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return 0
+    if count <= 0:
+        warnings.warn(
+            f"active trace device-count probe reported {count} devices; recording 0",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return 0
+    return count
 
 
 def _backend():

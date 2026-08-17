@@ -75,4 +75,8 @@ class Sample(BaseModel):
     # keep working unchanged.
     extra: dict[str, float] = Field(default_factory=dict)
 
+    # Per-field backend failures. A partial sample remains usable, but consumers
+    # must not read a missing throttle/process field as an observed zero.
+    diagnostics: list[str] = Field(default_factory=list)
+
     labels: WorkloadLabels | None = None

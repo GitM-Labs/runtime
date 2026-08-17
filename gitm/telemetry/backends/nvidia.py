@@ -32,14 +32,22 @@ _NVML_THROTTLE_MAP: dict[int, ThrottleReason] = {
 }
 
 
-def _try(fn: Callable[[], T], default: T | None = None) -> T | None:
+def _try(
+    fn: Callable[[], T],
+    default: T | None = None,
+    *,
+    diagnostics: list[str] | None = None,
+    field: str = "NVML field",
+) -> T | None:
     """Call ``fn``; return ``default`` on any exception.
 
     Used per NVML call so a single failure doesn't drop the whole sample.
     """
     try:
         return fn()
-    except Exception:
+    except Exception as exc:
+        if diagnostics is not None:
+            diagnostics.append(f"{field} unavailable ({type(exc).__name__}: {exc})")
         return default
 
 
@@ -85,33 +93,68 @@ class NvidiaBackend:
     def sample(self, gpu_index: int, labels: WorkloadLabels | None = None) -> Sample:
         nv = self._pynvml
         h = self._handle(gpu_index)
+        diagnostics: list[str] = []
 
-        uuid = _try(lambda: nv.nvmlDeviceGetUUID(h))
+        uuid = _try(lambda: nv.nvmlDeviceGetUUID(h), diagnostics=diagnostics, field="GPU UUID")
         if isinstance(uuid, bytes):
             uuid = uuid.decode()
 
-        util = _try(lambda: nv.nvmlDeviceGetUtilizationRates(h))
-        mem = _try(lambda: nv.nvmlDeviceGetMemoryInfo(h))
-        power_mw = _try(lambda: nv.nvmlDeviceGetPowerUsage(h))
-        temp = _try(lambda: nv.nvmlDeviceGetTemperature(h, nv.NVML_TEMPERATURE_GPU))
-        sm_clock = _try(lambda: nv.nvmlDeviceGetClockInfo(h, nv.NVML_CLOCK_SM))
-        mem_clock = _try(lambda: nv.nvmlDeviceGetClockInfo(h, nv.NVML_CLOCK_MEM))
-        throttle_bits = _try(lambda: nv.nvmlDeviceGetCurrentClocksThrottleReasons(h), 0) or 0
+        util = _try(
+            lambda: nv.nvmlDeviceGetUtilizationRates(h),
+            diagnostics=diagnostics,
+            field="GPU utilization",
+        )
+        mem = _try(
+            lambda: nv.nvmlDeviceGetMemoryInfo(h), diagnostics=diagnostics, field="GPU memory"
+        )
+        power_mw = _try(
+            lambda: nv.nvmlDeviceGetPowerUsage(h), diagnostics=diagnostics, field="GPU power"
+        )
+        temp = _try(
+            lambda: nv.nvmlDeviceGetTemperature(h, nv.NVML_TEMPERATURE_GPU),
+            diagnostics=diagnostics,
+            field="GPU temperature",
+        )
+        sm_clock = _try(
+            lambda: nv.nvmlDeviceGetClockInfo(h, nv.NVML_CLOCK_SM),
+            diagnostics=diagnostics,
+            field="SM clock",
+        )
+        mem_clock = _try(
+            lambda: nv.nvmlDeviceGetClockInfo(h, nv.NVML_CLOCK_MEM),
+            diagnostics=diagnostics,
+            field="memory clock",
+        )
+        throttle_bits = _try(
+            lambda: nv.nvmlDeviceGetCurrentClocksThrottleReasons(h),
+            0,
+            diagnostics=diagnostics,
+            field="clock throttle reasons",
+        ) or 0
 
         per_proc: dict[int, float] = {}
-        procs = _try(lambda: nv.nvmlDeviceGetComputeRunningProcesses(h), []) or []
+        procs = _try(
+            lambda: nv.nvmlDeviceGetComputeRunningProcesses(h),
+            [],
+            diagnostics=diagnostics,
+            field="compute process list",
+        ) or []
         for p in procs:
             per_proc[int(p.pid)] = 0.0  # NVML doesn't expose per-process util directly
 
         ecc_sbe = _try(
             lambda: nv.nvmlDeviceGetTotalEccErrors(
                 h, nv.NVML_MEMORY_ERROR_TYPE_CORRECTED, nv.NVML_VOLATILE_ECC
-            )
+            ),
+            diagnostics=diagnostics,
+            field="corrected ECC counter",
         )
         ecc_dbe = _try(
             lambda: nv.nvmlDeviceGetTotalEccErrors(
                 h, nv.NVML_MEMORY_ERROR_TYPE_UNCORRECTED, nv.NVML_VOLATILE_ECC
-            )
+            ),
+            diagnostics=diagnostics,
+            field="uncorrected ECC counter",
         )
 
         return Sample(
@@ -132,11 +175,9 @@ class NvidiaBackend:
             per_process=per_proc,
             ecc_volatile_sbe=int(ecc_sbe) if ecc_sbe is not None else None,
             ecc_volatile_dbe=int(ecc_dbe) if ecc_dbe is not None else None,
+            diagnostics=diagnostics,
             labels=labels,
         )
 
     def close(self) -> None:
-        try:
-            self._pynvml.nvmlShutdown()
-        except Exception:
-            pass
+        self._pynvml.nvmlShutdown()

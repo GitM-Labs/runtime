@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from gitm.routing.scorer_v0 import score_dataframe, score_prospect
 
@@ -26,16 +27,15 @@ def test_score_prospect_cold():
     assert score == 7.5
 
 def test_score_prospect_unknown_tier():
-    score = score_prospect(
-        warmth=0.5,
-        signal_recency=0.5,
-        company_tier=99,
-        pain_acknowledged=0,
-        engagement_score=0.0,
-        prior_engagement=0
-    )
-    # Unknown tier should default to tier 3 (0.2)
-    assert score == 34.0
+    with pytest.raises(ValueError, match="company_tier must be 1, 2, or 3"):
+        score_prospect(
+            warmth=0.5,
+            signal_recency=0.5,
+            company_tier=99,
+            pain_acknowledged=0,
+            engagement_score=0.0,
+            prior_engagement=0,
+        )
 
 def test_score_dataframe_sorted():
     df = pd.DataFrame({

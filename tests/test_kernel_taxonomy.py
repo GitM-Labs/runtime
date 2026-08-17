@@ -159,6 +159,22 @@ def test_empty_trace_warns_about_graph_replay_and_stops_there():
     assert "CUDA-graph replay" in warnings[0]
 
 
+def test_nonpositive_kernel_durations_are_excluded_and_named():
+    kernels = [
+        make_kernel("fused_moe_kernel", start_ns=10, end_ns=10),
+        make_kernel("ampere_fp16_s16816gemm_tn", start_ns=20, end_ns=19),
+    ]
+
+    bd = summarize_kernels(kernels, window_ns=100)
+
+    assert bd.n_kernels == 0
+    assert bd.n_invalid_duration == 2
+    assert bd.kernel_time_ns == 0
+    assert any("non-positive duration" in warning for warning in bd.warnings())
+
+
+
+
 def test_idle_looking_gpu_is_warned_about():
     bd = summarize_kernels([make_kernel("fused_moe_kernel", start_ns=0, end_ns=50)],
                            window_ns=10_000)
