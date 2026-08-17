@@ -176,8 +176,6 @@ def test_nonpositive_kernel_durations_are_excluded_and_named():
     assert any("non-positive duration" in warning for warning in bd.warnings())
 
 
-
-
 def test_idle_looking_gpu_is_warned_about():
     bd = summarize_kernels([make_kernel("fused_moe_kernel", start_ns=0, end_ns=50)],
                            window_ns=10_000)

@@ -106,12 +106,6 @@ def test_autorevert_fires_on_regression():
     assert d.should_revert and d.relative_delta == pytest.approx(-0.1)
 
 
-
-
-
-
-
-
 # --------- gated rollout -------------------------------------------------------
 def test_rollout_shadow_then_manual_promote(tmp_path: Path):
     log = AuditLog(tmp_path / "audit.jsonl")
