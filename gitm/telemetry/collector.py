@@ -101,7 +101,7 @@ class Collector:
                         continue
                     for diagnostic in sample.diagnostics:
                         self._record_failure(
-                            f"sample-field:{type(backend).__name__}:{idx}:{diagnostic.split(' ', 1)[0]}",
+                            f"sample-field:{type(backend).__name__}:{idx}:{diagnostic}",
                             diagnostic,
                         )
                     for sink in self._cfg.sinks:
