@@ -101,12 +101,18 @@ def test_torch_index_picks_the_newest_cuda_the_driver_can_run(driver, expected):
 # --------------------------------------------------------------------------- #
 # pinned stacks — "for this driver, install this torch and this vllm"          #
 # --------------------------------------------------------------------------- #
-def test_cuda13_host_has_a_pinned_stack():
+def test_cuda13_host_is_deliberately_unpinned():
+    """Pinning a driver that resolves correctly can only hold the host back.
+
+    Current vLLM releases are CUDA 13 builds and bring a correct torch with
+    them. The previous pin to 0.25.1 actively downgraded hosts already running a
+    newer, verified vLLM, which is a worse failure than the one pinning prevents.
+    """
     stack = cuda_env.stack_for((13, 0))
     assert stack is not None
-    assert stack.torch == "2.11.0"
-    assert stack.vllm == "0.25.1"
-    assert "cu130" in stack.torch_index
+    assert stack.pinned is False
+    assert stack.vllm is None and stack.torch is None
+    assert stack.pip_commands() == ["pip install -U vllm"]
 
 
 def test_pip_commands_install_vllm_before_torch():
@@ -138,9 +144,11 @@ def test_cuda12_row_warns_that_it_is_a_different_engine():
     same engine a CUDA 13 host runs. That has to be loud, not buried in a pin.
     """
     cuda12, cuda13 = cuda_env.stack_for((12, 8)), cuda_env.stack_for((13, 0))
-    assert cuda12.vllm != cuda13.vllm
+    assert cuda12.pinned and not cuda13.pinned
     assert "not comparable" in cuda12.note
-    assert not cuda13.note
+    # The unpinned row still has to say what it resolves to, since the engine
+    # version is not fixed by this table and results depend on it.
+    assert "Record the resolved version" in cuda13.note
 
 
 def test_unsupported_driver_major_is_still_rejected(host, monkeypatch):

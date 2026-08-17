@@ -77,20 +77,37 @@ def test_cupti_major_follows_the_driver_not_torch(driver13, no_apt):
     """
     plan = build_plan()
     cupti = next(s for s in plan.steps if s.name == "CUPTI")
-    assert "nvidia-cuda-cupti-cu13" in cupti.argv
+    assert "nvidia-cuda-cupti" in cupti.argv
+    # The -cuNN variants are deprecated; their sdists refuse to build and abort
+    # the step rather than installing anything.
+    assert not any(a.startswith("nvidia-cuda-cupti-cu") for a in cupti.argv)
 
 
-def test_vllm_is_installed_before_torch(driver13, no_apt):
-    """Ordering is load-bearing.
+def test_vllm_is_installed_before_torch_on_a_pinned_driver(monkeypatch, no_apt):
+    """Ordering is load-bearing where a pin exists.
 
     vLLM pins an exact torch version which pip resolves to the default CUDA
     build from PyPI. Installing torch first would have it overwritten; torch is
-    therefore forced back afterwards.
+    therefore forced back afterwards. Only pinned drivers do this dance.
     """
+    monkeypatch.setattr(cuda_env, "driver_cuda", lambda: (12, 8))
     names = [" ".join(s.argv) for s in build_plan().steps]
     vllm_at = next(i for i, n in enumerate(names) if "vllm==" in n)
     torch_at = next(i for i, n in enumerate(names) if "torch==" in n)
     assert vllm_at < torch_at
+
+
+def test_an_unpinned_driver_never_names_a_version(driver13, no_apt):
+    """The regression this exists for: `gitm install` downgraded a working host.
+
+    A CUDA 13 box running vLLM 0.27.1 was moved back to 0.25.1 because the table
+    named a version. An unpinned row must emit no `==` for either package.
+    """
+    joined = " ".join(" ".join(s.argv) for s in build_plan().steps)
+    assert "vllm==" not in joined
+    assert "torch==" not in joined
+    assert "--force-reinstall" not in joined
+    assert "pip install -U vllm" in joined.replace("  ", " ")
 
 
 def test_the_shim_build_is_always_last_and_never_optional(driver13, no_apt):
@@ -139,7 +156,7 @@ def test_render_states_the_driver_the_stack_and_every_command(driver13, no_apt):
     """--dry-run output must be sufficient to review without reading the source."""
     text = build_plan().render()
     assert "CUDA 13.0" in text
-    assert "torch==" in text and "vllm==" in text
+    assert "unpinned" in text
     for step in build_plan().steps:
         assert " ".join(step.argv) in text
 

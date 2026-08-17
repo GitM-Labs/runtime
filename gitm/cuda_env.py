@@ -34,20 +34,42 @@ _TORCH_CUDA_INDEXES: tuple[tuple[int, int], ...] = ((12, 6), (12, 8), (12, 9), (
 
 @dataclass(frozen=True)
 class Stack:
-    """An exact, known-good (torch, vLLM) pin for one driver CUDA major."""
+    """The install strategy for one driver CUDA major.
 
-    torch: str
-    torch_index: str
-    vllm: str
+    Two shapes, distinguished by whether ``vllm`` is pinned:
+
+    **Unpinned** (``vllm is None``). The driver is new enough that the current
+    release resolves correctly on its own, so pinning can only hold the host
+    behind. Emits a plain ``pip install vllm``.
+
+    **Pinned** (``vllm`` is a version). The current release does not run on this
+    driver, so an exact older pair is named and torch is forced to the matching
+    CUDA build afterwards.
+    """
+
+    torch: str | None
+    torch_index: str | None
+    vllm: str | None
     note: str = ""
 
+    @property
+    def pinned(self) -> bool:
+        return self.vllm is not None
+
     def pip_commands(self) -> list[str]:
-        """vLLM FIRST, then torch. The order is load-bearing.
-        vLLM pins an exact torch version and pip resolves it from PyPI, whose default
-        build is the cu130 one. Installing torch first would just get overwritten by
-        that default when vLLM lands. So install vLLM, then force torch back to the
-        right CUDA variant of the version vLLM asked for.
+        """Commands to bring this host to the intended stack.
+
+        Unpinned hosts get a single ``pip install vllm``: pip's own resolution is
+        correct there, and naming a version would downgrade a host that is
+        already newer. Pinning is reserved for drivers where resolution is wrong.
+
+        Pinned hosts get vLLM FIRST, then torch. The order is load-bearing: vLLM
+        pins an exact torch version which pip resolves from PyPI, whose default
+        build is cu130. Installing torch first would have it overwritten when
+        vLLM lands, so torch is forced back to the right CUDA variant after.
         """
+        if not self.pinned:
+            return ["pip install -U vllm"]
         return [
             f"pip install vllm=={self.vllm}",
             f"pip install --force-reinstall --index-url {self.torch_index} torch=={self.torch}",
@@ -67,10 +89,20 @@ class Stack:
 SUPPORTED_STACKS: dict[int, Stack] = {
     # Verified end-to-end on an H100 (driver 580+): weight load, torch.compile,
     # CUDA-graph capture, 64 prompts decoded. The stack the existing report used.
+    # CUDA 13 and newer: unpinned. Current vLLM releases are CUDA 13 builds and
+    # bring a correct torch with them, so pip resolves this host correctly without
+    # help. Pinning here was actively harmful — it downgraded hosts already running
+    # a newer, working vLLM (0.27.1 verified on H200: Qwen3.6-35B-A3B loaded,
+    # torch.compile, CUDA-graph capture, DeepGEMM, FlashAttention 3, nsys capture).
     13: Stack(
-        torch="2.11.0",
-        torch_index="https://download.pytorch.org/whl/cu130",
-        vllm="0.25.1",
+        torch=None,
+        torch_index=None,
+        vllm=None,
+        note=(
+            "Unpinned. The version floor is the driver, not this table: any vLLM "
+            "built for CUDA 13 runs here. Record the resolved version alongside "
+            "results, since engine behaviour differs between releases."
+        ),
     ),
     # H100 on a 570 driver (CUDA 12.8). torch 2.11.0+cu128 initialises fine here, but
     # vLLM 0.25.1 does not: its kernels are CUDA 13 binaries and it dies at import

@@ -72,8 +72,10 @@ class Plan:
     def render(self) -> str:
         drv = f"CUDA {self.driver[0]}.{self.driver[1]}" if self.driver else "unknown"
         lines = [f"host driver: {drv}"]
-        if self.stack is not None:
+        if self.stack is not None and self.stack.pinned:
             lines.append(f"pinned stack: torch=={self.stack.torch} vllm=={self.stack.vllm}")
+        elif self.stack is not None:
+            lines.append("stack: unpinned (pip resolves correctly on this driver)")
         lines.append("")
         for i, s in enumerate(self.steps, 1):
             flag = "  (optional)" if s.optional else ""
@@ -143,28 +145,33 @@ def build_plan(
     plan.steps.append(
         Step(
             name="CUPTI",
-            argv=_pip("install", "-q", "nvidia-cuda-cupti", f"nvidia-cuda-cupti-cu{major}"),
+            argv=_pip("install", "-q", "nvidia-cuda-cupti"),
             rationale=(
                 f"The CUPTI Activity API requires libcupti's major version to match "
                 f"the driver ({major}); a mismatch yields CUPTI_ERROR_NOT_COMPATIBLE. "
-                "The versioned wheel additionally supplies cupti.h for the build."
+                "The unversioned wheel is the current distribution; the -cuNN "
+                "variants are deprecated and their sdists refuse to build."
             ),
             optional=True,
         )
     )
 
     if not skip_stack and stack is not None:
+        rationale = (
+            "vLLM is installed before torch deliberately: vLLM pins an exact torch "
+            "version which pip resolves to the default CUDA build, so torch is "
+            "forced back afterwards."
+            if stack.pinned
+            else "Unpinned: pip resolves a correct vLLM and torch on this driver. "
+            "Naming a version here would downgrade a host already running a newer one."
+        )
         for cmd in stack.pip_commands():
+            pkg = next(
+                (tok.split("==")[0] for tok in cmd.split()[2:] if not tok.startswith("-")),
+                "stack",
+            )
             plan.steps.append(
-                Step(
-                    name=f"stack: {cmd.split()[2] if len(cmd.split()) > 2 else cmd}",
-                    argv=_pip(*cmd.split()[1:]),
-                    rationale=(
-                        "vLLM is installed before torch deliberately: vLLM pins an "
-                        "exact torch version which pip resolves to the default CUDA "
-                        "build, so torch is forced back afterwards."
-                    ),
-                )
+                Step(name=f"stack: {pkg}", argv=_pip(*cmd.split()[1:]), rationale=rationale)
             )
 
     if with_gpu_extras:
