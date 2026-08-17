@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import threading
+import warnings
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -94,6 +95,7 @@ def test_chunk_count_is_the_fallback_when_usage_is_absent(sse_server):
     rec = sc.one_request(base, "m", "p", max_tokens=4, ignore_eos=True, timeout_s=30)
 
     assert rec is not None and rec.n_output_tokens == 3
+    assert rec.token_count_source == "chunks"
 
 
 def test_unreachable_server_returns_none_not_a_fake_record():
@@ -101,6 +103,34 @@ def test_unreachable_server_returns_none_not_a_fake_record():
     # first token would silently drop out of the percentiles as "unmeasurable" rather
     # than being counted as the failure it is.
     assert sc.one_request("http://127.0.0.1:1", "m", "p", 4, True, 0.5) is None
+
+
+def test_served_model_name_warns_when_endpoint_falls_back(monkeypatch):
+    def fail(*_args, **_kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(sc.urllib.request, "urlopen", fail)
+
+    with pytest.warns(RuntimeWarning, match="served-model discovery failed"):
+        assert sc.served_model_name("http://server", "configured-model") == "configured-model"
+
+
+def test_served_model_name_uses_endpoint_without_warning(monkeypatch):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"data": [{"id": "served-alias"}]}'
+
+    monkeypatch.setattr(sc.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
+
+    with warnings.catch_warnings(record=True) as caught:
+        assert sc.served_model_name("http://server", "configured-model") == "served-alias"
+    assert not caught
 
 
 def test_records_feed_the_existing_summary(sse_server):
@@ -336,3 +366,31 @@ def test_preflight_fails_closed_without_a_gpu():
     start a server that cannot possibly work."""
     dev = sc.Devices(indices=[], count=0, source="nvidia-smi unavailable")
     assert sc.check_gpus(2, dev)[0].status == "fail"
+
+
+def test_driver_stack_does_not_pass_when_build_versions_are_unreadable(monkeypatch):
+    from gitm import cuda_env
+
+    monkeypatch.setattr(cuda_env, "driver_cuda", lambda: (13, 0))
+    monkeypatch.setattr(cuda_env, "stack_for", lambda _driver: object())
+    monkeypatch.setattr(cuda_env, "check", lambda: [])
+    monkeypatch.setattr(cuda_env, "torch_cuda", lambda: None)
+    monkeypatch.setattr(cuda_env, "vllm_cuda_major", lambda: None)
+
+    check = sc.check_driver_stack()[0]
+
+    assert check.status == "warn"
+    assert "PyTorch CUDA build" in check.detail
+    assert "vLLM CUDA build" in check.detail
+
+
+def test_driver_stack_pass_requires_observed_build_versions(monkeypatch):
+    from gitm import cuda_env
+
+    monkeypatch.setattr(cuda_env, "driver_cuda", lambda: (13, 0))
+    monkeypatch.setattr(cuda_env, "stack_for", lambda _driver: object())
+    monkeypatch.setattr(cuda_env, "check", lambda: [])
+    monkeypatch.setattr(cuda_env, "torch_cuda", lambda: (13, 0))
+    monkeypatch.setattr(cuda_env, "vllm_cuda_major", lambda: 13)
+
+    assert sc.check_driver_stack()[0].status == "pass"

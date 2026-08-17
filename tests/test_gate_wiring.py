@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from gitm.agents.policy import Policy, select_interventions
 from gitm.kernels.spec import Applicability, InterventionSpec, SafetyGate
 from gitm.optimizer.preconditions import GateContext
@@ -39,6 +41,12 @@ def test_without_ctx_no_applicability_filtering():
     assert ranked[0].rejected_reason is None
 
 
+@pytest.mark.parametrize("top_n", [0, -1, True, 1.5])
+def test_policy_refuses_invalid_candidate_limit(top_n):
+    with pytest.raises(ValueError, match="top_n"):
+        select_interventions(_trace(), [], Policy(), top_n=top_n)
+
+
 def test_load_library_filters_by_workload(tmp_path):
     import yaml
 
@@ -57,3 +65,24 @@ def test_load_library_filters_by_workload(tmp_path):
     )
     assert [s.name for s in load_library(p, workload="vllm-decode")] == ["v"]
     assert {s.name for s in load_library(p)} == {"v", "e"}  # unfiltered
+
+
+def test_missing_library_refuses_with_named_path(tmp_path):
+    import pytest
+
+    from gitm.kernels.library import load_library
+
+    missing = tmp_path / "missing.yaml"
+    with pytest.raises(FileNotFoundError, match="candidate coverage is unavailable"):
+        load_library(missing)
+
+
+def test_empty_library_refuses_instead_of_looking_like_no_applicable_levers(tmp_path):
+    import pytest
+
+    from gitm.kernels.library import load_library
+
+    empty = tmp_path / "empty.yaml"
+    empty.write_text("interventions: []\n")
+    with pytest.raises(ValueError, match="candidate coverage is unavailable"):
+        load_library(empty)

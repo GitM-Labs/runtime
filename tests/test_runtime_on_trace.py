@@ -31,9 +31,17 @@ def _trace(events):
 def test_serialized_fraction_sequential_vs_overlapped():
     from gitm.optimizer.monitor import _serialized_fraction
 
-    # back-to-back on one stream -> fully serialized
+    # Back-to-back work on one stream is mandatory ordering, not evidence that
+    # independent work failed to overlap.
     seq = [_kernel("k", i * 100, i * 100 + 100, stream=7) for i in range(6)]
-    assert _serialized_fraction(seq) == pytest.approx(1.0)
+    assert _serialized_fraction(seq) is None
+
+    # Different streams establish an overlap opportunity; back-to-back execution
+    # means every observed opportunity serialized.
+    cross_stream_seq = [
+        _kernel("k", i * 100, i * 100 + 100, stream=i % 2) for i in range(6)
+    ]
+    assert _serialized_fraction(cross_stream_seq) == pytest.approx(1.0)
 
     # heavily overlapping on different streams -> not serialized
     over = [_kernel("k", 0, 1000, stream=s) for s in range(6)]
@@ -46,7 +54,8 @@ def test_residuals_compute_real_concurrency():
 
     trace = _trace([_kernel("k", i * 100, i * 100 + 100) for i in range(8)])
     res = residuals(trace, predict_graph())
-    assert res.serialized_concurrency_fraction == pytest.approx(1.0)  # all sequential, one stream
+    assert res.serialized_concurrency_fraction is None
+    assert any("cross-stream" in note for note in res.coverage_warnings)
 
 
 # --- op-identity matching (was ordinal `for i in range(min(len(obs), len(pred)))`) --
@@ -84,6 +93,57 @@ def test_residuals_skip_unmodeled_kernels():
     trace = _trace([_kernel("triton_rms_norm_kernel", 0, 100)])
     res = residuals(trace, predict_graph())
     assert res.per_kernel == []
+    assert res.total_kernels == 1
+    assert res.classified_kernels == 0
+    assert res.matched_kernels == 0
+    assert res.classification_coverage == 0.0
+    assert res.match_coverage == 0.0
+    assert res.coverage_warnings
+
+
+def test_residual_coverage_distinguishes_unclassified_from_graph_miss():
+    from gitm.optimizer.monitor import residuals
+    from gitm.planner.graph import predict_graph
+
+    # FlashAttention classifies and matches; NCCL classifies but a whole-model
+    # dense graph has no collective node; RMSNorm does not classify at all.
+    trace = _trace(
+        [
+            _kernel("flash_attn_kernel", 0, 700),
+            _kernel("ncclDevKernel_AllReduce", 700, 900),
+            _kernel("triton_rms_norm_kernel", 900, 1000),
+        ]
+    )
+    res = residuals(trace, predict_graph())
+
+    assert (res.total_kernels, res.classified_kernels, res.matched_kernels) == (3, 2, 1)
+    assert res.classification_coverage == pytest.approx(2 / 3)
+    assert res.match_coverage == pytest.approx(1 / 3)
+    assert res.classified_time_coverage == pytest.approx(0.9)
+    assert res.matched_time_coverage == pytest.approx(0.7)
+    assert any("classified" in warning for warning in res.coverage_warnings)
+    assert any("matched" in warning for warning in res.coverage_warnings)
+
+
+def test_fully_matched_residual_coverage_is_clean():
+    from gitm.optimizer.monitor import residuals
+    from gitm.planner.graph import predict_graph
+
+    res = residuals(
+        _trace(
+            [
+                _kernel("flash_attn_kernel", 0, 100, stream=0),
+                _kernel("flash_attn_kernel", 0, 100, stream=1),
+            ]
+        ),
+        predict_graph(),
+    )
+
+    assert res.classification_coverage == 1.0
+    assert res.match_coverage == 1.0
+    assert res.classified_time_coverage == 1.0
+    assert res.matched_time_coverage == 1.0
+    assert res.coverage_warnings == []
 
 
 # --- multi-basis filter ------------------------------------------------------
@@ -162,6 +222,93 @@ def test_doubly_robust_degenerate_inputs():
     assert ate == 0.0 and se == float("inf")
 
 
+def test_attribution_abstention_is_diagnostic_not_no_causal_signal():
+    from gitm.optimizer.attribution import attribute
+    from gitm.optimizer.dr import attribute_dr
+    from gitm.optimizer.monitor import KernelResidual, Residuals
+    from gitm.planner.graph import predict_graph
+
+    res = Residuals(per_kernel=[KernelResidual("only", None, 0.5, None)])
+
+    granger = attribute(res, predict_graph())
+    dr = attribute_dr(res, predict_graph())
+
+    assert granger.hypotheses == []
+    assert any("not run" in note for note in granger.diagnostics)
+    assert dr.hypotheses == []
+    assert any("not run" in note for note in dr.diagnostics)
+
+
+def test_measure_trace_excludes_zero_duration_kernels_with_diagnostic():
+    from gitm.optimizer.measure import measure_trace
+
+    trace = _trace(
+        [
+            _kernel("bad", start=10, end=10),
+            _kernel("good", start=20, end=30),
+            _kernel("good", start=40, end=50),
+        ]
+    )
+
+    result = measure_trace(trace, min_attr=1)
+
+    assert result.n_kernels == 3
+    assert result.n_invalid_duration == 1
+    assert any("excluded 1/3" in note for note in result.diagnostics)
+    assert result.serialized_fraction is None
+    assert any("cross-stream" in note for note in result.diagnostics)
+    assert all(v.node_op != "bad" for v in result.violations)
+
+
+def test_measurement_summary_names_unavailable_concurrency():
+    from gitm.optimizer.measure import measure_trace, measurement_summary
+
+    result = measure_trace(
+        _trace([_kernel("same", i * 100, i * 100 + 50, stream=0) for i in range(3)])
+    )
+
+    assert "serialized-concurrency=unavailable" in measurement_summary("demo", result)
+    assert not any(v.invariant == "stream_concurrency" for v in result.violations)
+
+
+def test_specialized_claim_uses_throughput_when_concurrency_is_unavailable():
+    from types import SimpleNamespace
+
+    from gitm.scheduler.loop import _specialized_claim_basis
+
+    basis, delta, diagnostics = _specialized_claim_basis(
+        SimpleNamespace(
+            n_kernels=3,
+            n_invalid_duration=0,
+            serialized_fraction=None,
+            diagnostics=["stream-concurrency coverage unavailable"],
+        ),
+        SimpleNamespace(speedup=1.25),
+    )
+
+    assert basis == ("throughput_delta", pytest.approx(0.25))
+    assert delta == pytest.approx(0.25)
+    assert any("no adjacent cross-stream" in note for note in diagnostics)
+
+
+def test_residuals_exclude_zero_duration_kernels_with_diagnostic():
+    from gitm.optimizer.monitor import residuals
+    from gitm.planner.graph import predict_graph
+
+    trace = _trace(
+        [
+            _kernel("flash_attn_kernel", start=10, end=10),
+            _kernel("flash_attn_kernel", start=20, end=30),
+        ]
+    )
+
+    result = residuals(trace, predict_graph())
+
+    assert result.invalid_duration_kernels == 1
+    assert len(result.per_kernel) == 1
+    assert any("non-positive timestamps" in note for note in result.coverage_warnings)
+
+
 def test_attribute_dr_ranks_pairs():
     from gitm.optimizer.dr import attribute_dr
     from gitm.optimizer.monitor import KernelResidual, Residuals
@@ -230,3 +377,20 @@ def test_replay_validation_within_tolerance():
     assert result.passed
     assert result.mean_abs_rel_err <= 0.20
     assert result.frac_within_tol > 0.7
+
+
+def test_replay_validation_refuses_zero_truth_instead_of_reporting_zero_error(monkeypatch):
+    from gitm.optimizer import replay_validation as rv
+
+    monkeypatch.setattr(rv, "_ground_truth_delta", lambda *_args, **_kwargs: 0.0)
+
+    with pytest.raises(RuntimeError, match="ground truth must be finite and positive"):
+        rv.validate(n=1)
+
+
+@pytest.mark.parametrize("n", [0, -1])
+def test_replay_validation_refuses_empty_injection_sets(n):
+    from gitm.optimizer.replay_validation import validate
+
+    with pytest.raises(ValueError, match="injection count must be positive"):
+        validate(n=n)

@@ -12,6 +12,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from .conftest import make_kernel, make_trace
 
@@ -23,6 +26,41 @@ def test_openfold_is_registered():
     assert {"openfold", "alphafold", "af2"} <= names
     assert get_factory("openfold") is not None
     assert get_factory("alphafold") is not None
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"n_proteins": 0, "max_len": 384, "warmup": 0, "plddt_tol": 1.0}, "n_proteins"),
+        ({"n_proteins": 1, "max_len": 0, "warmup": 0, "plddt_tol": 1.0}, "max_len"),
+        ({"n_proteins": 1, "max_len": 384, "warmup": -1, "plddt_tol": 1.0}, "warmup"),
+        ({"n_proteins": 1, "max_len": 384, "warmup": 0, "plddt_tol": float("nan")}, "plddt_tol"),
+    ],
+)
+def test_openfold_ab_refuses_invalid_gate_controls(tmp_path, kwargs, message):
+    from benchmarks.biotech.optimize import optimize_af2
+
+    with pytest.raises(ValueError, match=message):
+        optimize_af2(tmp_path, 42, **kwargs)
+
+
+def test_openfold_ab_refuses_zero_duration(monkeypatch):
+    import benchmarks.biotech.optimize as opt
+
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "torch",
+        SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
+    )
+    ticks = iter([1.0, 1.0])
+    monkeypatch.setattr(opt.time, "perf_counter", lambda: next(ticks))
+
+    class Runner:
+        def predict(self, _record, _msa):
+            return {"plddt": 90.0}
+
+    with pytest.raises(RuntimeError, match="timing unavailable"):
+        opt._fold_all(Runner(), [(object(), object())])
 
 
 def test_openfold_no_deps_or_data_degrades_to_no_data(tmp_path: Path, monkeypatch):
@@ -83,7 +121,12 @@ def _fake_capture_with(entered, prefix="cutlass_sm90_gemm"):
     def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
         entered["capture"] = True
         kernels = [
-            make_kernel(f"{prefix}_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 90 + (i % 9))
+            make_kernel(
+                f"{prefix}_{i % 4}",
+                start_ns=i * 100,
+                end_ns=i * 100 + 90 + (i % 9),
+                stream_id=i % 2,
+            )
             for i in range(80)
         ]
         yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")

@@ -19,6 +19,7 @@ from gitm.importers._common import (
     as_int,
     file_mtime_ns,
     finish_trace,
+    merge_normalization_stats,
 )
 from gitm.tracer.schema import KernelEvent, MemcpyEvent, SyncEvent, Trace, TraceEvent
 
@@ -266,24 +267,37 @@ def _resolve_name(row: sqlite3.Row, strings: dict[int, str]) -> str:
     return "unknown_kernel"
 
 
-def _map_memory_kind(val: Any, *, strict: bool) -> str:
+def _diag_once(diagnostics: list[str] | None, message: str) -> None:
+    if diagnostics is not None and message not in diagnostics:
+        diagnostics.append(message)
+
+
+def _map_memory_kind(
+    val: Any, *, strict: bool, diagnostics: list[str] | None = None
+) -> str:
     if val is None:
+        _diag_once(diagnostics, "memcpy memory-kind metadata missing; assumed device endpoint")
         return "device"
     try:
         iv = int(val)
     except (TypeError, ValueError):
         if strict:
             raise ImportError(f"unknown memory kind {val!r}") from None
+        _diag_once(diagnostics, f"unknown memory kind {val!r}; assumed device endpoint")
         return "device"
     if iv in _MEMORY_KIND:
         return _MEMORY_KIND[iv]
     if strict:
         raise ImportError(f"unknown CUPTI memory kind enum {iv}")
+    _diag_once(diagnostics, f"unknown CUPTI memory kind enum {iv}; assumed device endpoint")
     return "device"
 
 
-def _map_sync_type(val: Any, *, strict: bool) -> str:
+def _map_sync_type(
+    val: Any, *, strict: bool, diagnostics: list[str] | None = None
+) -> str:
     if val is None:
+        _diag_once(diagnostics, "synchronization type metadata missing; assumed stream sync")
         return "stream"
     try:
         iv = int(val)
@@ -297,11 +311,13 @@ def _map_sync_type(val: Any, *, strict: bool) -> str:
             return "stream"
         if strict:
             raise ImportError(f"unknown sync type {val!r}") from None
+        _diag_once(diagnostics, f"unknown sync type {val!r}; assumed stream sync")
         return "stream"
     if iv in _SYNC_TYPE:
         return _SYNC_TYPE[iv]
     if strict:
         raise ImportError(f"unknown CUPTI sync type enum {iv}")
+    _diag_once(diagnostics, f"unknown CUPTI sync type enum {iv}; assumed stream sync")
     return "stream"
 
 
@@ -357,6 +373,7 @@ def _iter_memcpys(
     *,
     strict: bool,
     device_id: int | None = None,
+    diagnostics: list[str] | None = None,
 ) -> Iterator[MemcpyEvent]:
     from gitm.importers._common import make_memcpy_fast
 
@@ -376,14 +393,15 @@ def _iter_memcpys(
         dst_k = _pick(row, "dstKind", "destinationKind")
         copy_k = _pick(row, "copyKind", "memcpyKind")
         if src_k is not None or dst_k is not None:
-            src = _map_memory_kind(src_k, strict=strict)
-            dst = _map_memory_kind(dst_k, strict=strict)
+            src = _map_memory_kind(src_k, strict=strict, diagnostics=diagnostics)
+            dst = _map_memory_kind(dst_k, strict=strict, diagnostics=diagnostics)
         elif copy_k is not None:
             try:
                 iv = int(copy_k)
             except (TypeError, ValueError):
                 if strict:
                     raise ImportError(f"unknown copyKind {copy_k!r}") from None
+                _diag_once(diagnostics, f"unknown copyKind {copy_k!r}; assumed device↔device")
                 src, dst = "device", "device"
             else:
                 if iv in _COPY_KIND_TO_ENDPOINTS:
@@ -391,8 +409,10 @@ def _iter_memcpys(
                 elif strict:
                     raise ImportError(f"unknown CUPTI copyKind enum {iv}")
                 else:
+                    _diag_once(diagnostics, f"unknown CUPTI copyKind enum {iv}; assumed device↔device")
                     src, dst = "device", "device"
         else:
+            _diag_once(diagnostics, "memcpy endpoint metadata missing; assumed device↔device")
             src, dst = "device", "device"
         corr = _pick(row, "correlationId", "correlation")
         dev = as_int(_pick(row, "deviceId", "device"), 0)
@@ -416,6 +436,7 @@ def _iter_syncs(
     *,
     strict: bool,
     device_id: int | None = None,
+    diagnostics: list[str] | None = None,
 ) -> Iterator[SyncEvent]:
     from gitm.importers._common import make_sync_fast
 
@@ -441,7 +462,11 @@ def _iter_syncs(
             stream_id=as_int(_pick(row, "streamId", "stream"), 0),
             device_id=dev,
             correlation_id=as_int(corr) if corr is not None else None,
-            sync_kind=_map_sync_type(_pick(row, "syncType", "typeOfSync", "type"), strict=strict),
+            sync_kind=_map_sync_type(
+                _pick(row, "syncType", "typeOfSync", "type"),
+                strict=strict,
+                diagnostics=diagnostics,
+            ),
             strict=strict,
         )
 
@@ -553,7 +578,9 @@ def import_nsys(
         rid = run_id or f"import-{uuid.uuid4().hex}"
         dcount = meta_count or (max(all_counts.keys()) + 1)
         traces: list[Trace] = []
+        normalization_stats: list[ImportStats] = []
         total_events = 0
+        import_diagnostics: list[str] = []
         # Pass 2: one device at a time — peak RAM ≈ max(per-device), not sum.
         for dev in device_ids:
             dev_events: list[TraceEvent] = []
@@ -562,8 +589,14 @@ def import_nsys(
                     conn, kernel_table, strings, device_id=dev, strict=strict
                 )
             )
-            dev_events.extend(_iter_memcpys(conn, strict=strict, device_id=dev))
-            dev_events.extend(_iter_syncs(conn, strict=strict, device_id=dev))
+            dev_events.extend(
+                _iter_memcpys(
+                    conn, strict=strict, device_id=dev, diagnostics=import_diagnostics
+                )
+            )
+            dev_events.extend(
+                _iter_syncs(conn, strict=strict, device_id=dev, diagnostics=import_diagnostics)
+            )
             if not dev_events:
                 continue
             total_events += len(dev_events)
@@ -578,6 +611,7 @@ def import_nsys(
                 strict=strict,
             )
             traces.append(trace)
+            normalization_stats.append(_st)
             del dev_events
 
         if not traces:
@@ -592,6 +626,8 @@ def import_nsys(
             per_device_kernel_counts=all_counts,
             total_raw_events=total_events,
         )
+        merge_normalization_stats(stats, normalization_stats)
+        stats.warnings.extend(import_diagnostics)
         if len(device_ids) > 1:
             stats.warnings.append(
                 f"multi-GPU input: analyzing devices {device_ids}; "

@@ -18,8 +18,10 @@ target), so it lives in ``gitm.optimizer`` and is exported for the run loop.
 
 from __future__ import annotations
 
+import math
 import re
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, field
 
 # Mangled CUDA kernel names -> a small set of stable families, so durations
 # aggregate per kernel *type* rather than per template instantiation. Shared
@@ -71,12 +73,16 @@ def kernel_roi(name_durations, floor_pct: float = 10.0) -> list[KernelROI]:
 
     ``name_durations`` is an iterable of ``(kernel_name, duration_ns)``.
     """
+    if not math.isfinite(floor_pct) or not 0.0 <= floor_pct <= 100.0:
+        raise ValueError(f"kernel ROI floor percentile must be in [0, 100], got {floor_pct!r}")
     by_fam: dict[str, list[int]] = {}
     for name, dur in name_durations:
         if dur is None or dur <= 0:
             continue
         by_fam.setdefault(kernel_family(name), []).append(int(dur))
-    total = sum(sum(v) for v in by_fam.values()) or 1
+    total = sum(sum(v) for v in by_fam.values())
+    if total <= 0:
+        return []
 
     rows: list[KernelROI] = []
     for fam, ds in by_fam.items():
@@ -95,7 +101,9 @@ def kernel_roi(name_durations, floor_pct: float = 10.0) -> list[KernelROI]:
 
 def render_roi_table(rows: list[KernelROI], *, floor_pct: float = 10.0, top: int = 20) -> str:
     """Human-readable ROI table (used in stdout and the provenance report)."""
-    total = sum(r.total_ns for r in rows) or 1
+    if not rows:
+        return "kernel ROI unavailable: no positive-duration kernels"
+    total = sum(r.total_ns for r in rows)
     us, ms = 1000.0, 1_000_000.0
     out = [f"kernel ROI (floor p{floor_pct:.0f}, total kernel time {total / ms:.1f} ms):", ""]
     hdr = (f"{'#':>2}  {'family':<22} {'calls':>7} {'total_ms':>9} {'%rt':>6} "
@@ -116,57 +124,109 @@ def render_roi_table(rows: list[KernelROI], *, floor_pct: float = 10.0, top: int
 
 @dataclass
 class GpuHeadroom:
-    mean_util_pct: float
-    peak_util_pct: float
-    compute_headroom_pct: float # 100 - mean util (coarse, time-based)
-    peak_mem_used_bytes: int
-    mem_total_bytes: int
-    mem_free_at_peak_bytes: int
-    serialized_concurrency_fraction: float # fraction of kernel-time with no overlap
+    mean_util_pct: float | None
+    peak_util_pct: float | None
+    compute_headroom_pct: float | None # 100 - mean util (coarse, time-based)
+    peak_mem_used_bytes: int | None
+    mem_total_bytes: int | None
+    mem_free_at_peak_bytes: int | None
+    serialized_concurrency_fraction: float | None # fraction of kernel-time with no overlap
     n_samples: int
+    diagnostics: list[str] = field(default_factory=list)
 
-def gpu_headroom(samples, serialized_concurrency_fraction: float = 0.0) -> GpuHeadroom | None:
+def gpu_headroom(samples, serialized_concurrency_fraction: float | None = None) -> GpuHeadroom:
     """Summarise GPU headroom from a list of telemetry sample dicts.
 
     Each sample is a dict with ``util_pct`` / ``mem_used_bytes`` /
     ``mem_total_bytes`` (the canonical :class:`gitm.telemetry.Sample` fields).
-    Returns ``None`` if there are no usable samples.
+    Missing metric families remain ``None`` and are named in ``diagnostics``;
+    memory-only telemetry must not become 100% compute headroom, or vice versa.
     """
+    if serialized_concurrency_fraction is not None and (
+        not math.isfinite(serialized_concurrency_fraction)
+        or not 0.0 <= serialized_concurrency_fraction <= 1.0
+    ):
+        raise ValueError(
+            "serialized concurrency fraction must be finite and in [0, 1], got "
+            f"{serialized_concurrency_fraction!r}"
+        )
     utils = [float(s["util_pct"]) for s in samples if s.get("util_pct") is not None]
     mems = [int(s["mem_used_bytes"]) for s in samples if s.get("mem_used_bytes") is not None]
-    total = next((int(s["mem_total_bytes"]) for s in samples if s.get("mem_total_bytes")), 0)
-    if not utils and not mems:
-        return None
-    mean_u = sum(utils) / len(utils) if utils else 0.0
-    peak_u = max(utils) if utils else 0.0
-    peak_m = max(mems) if mems else 0
+    totals = [int(s["mem_total_bytes"]) for s in samples if s.get("mem_total_bytes")]
+    diagnostics: list[str] = []
+    if not samples:
+        diagnostics.append("GPU headroom unavailable: telemetry contains no samples")
+    if not utils:
+        diagnostics.append("compute headroom unavailable: utilization telemetry is absent")
+    if not mems:
+        diagnostics.append("memory headroom unavailable: used-memory telemetry is absent")
+    if not totals:
+        diagnostics.append("memory headroom unavailable: total-memory telemetry is absent")
+    if serialized_concurrency_fraction is None:
+        diagnostics.append("concurrency headroom unavailable: no trace overlap measurement supplied")
+    mean_u = sum(utils) / len(utils) if utils else None
+    peak_u = max(utils) if utils else None
+    peak_m = max(mems) if mems else None
+    total = max(totals) if totals else None
+    mem_free = (
+        max(0, total - peak_m) if total is not None and peak_m is not None else None
+    )
     return GpuHeadroom(
         mean_util_pct=mean_u,
         peak_util_pct=peak_u,
-        compute_headroom_pct=max(0.0, 100.0 - mean_u),
+        compute_headroom_pct=max(0.0, 100.0 - mean_u) if mean_u is not None else None,
         peak_mem_used_bytes=peak_m,
         mem_total_bytes=total,
-        mem_free_at_peak_bytes=max(0, total - peak_m),
+        mem_free_at_peak_bytes=mem_free,
         serialized_concurrency_fraction=serialized_concurrency_fraction,
         n_samples=len(samples),
+        diagnostics=diagnostics,
     )
 
 def live_gpu_headroom():
     """One-shot live snapshot via the telemetry backend (no running workload required)."""
     from gitm.telemetry.backends import discover_backends
 
-    backends = discover_backends()
+    discovery_diagnostics: list[str] = []
+    backends = discover_backends(diagnostics=discovery_diagnostics)
+    for diagnostic in discovery_diagnostics:
+        warnings.warn(
+            f"live GPU headroom degraded: {diagnostic}", RuntimeWarning, stacklevel=2
+        )
+    if not backends:
+        warnings.warn(
+            "live GPU headroom unavailable: no telemetry backend found",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     out = []
     for b in backends:
-        for idx in range(b.device_count()):
-            s = b.sample(idx)
-            out.append({
-                "gpu_index": idx,
-                "util_pct": s.util_pct,
-                "mem_used_bytes": s.mem_used_bytes,
-                "mem_total_bytes": s.mem_total_bytes,
-                "power_w": s.power_w,
-                "sm_clock_mhz": s.sm_clock_mhz,
-                "throttle": s.throttle_reasons.name if s.throttle_reasons else "NONE",
-            })
+        try:
+            for idx in range(b.device_count()):
+                s = b.sample(idx)
+                for diagnostic in s.diagnostics:
+                    warnings.warn(
+                        f"live GPU headroom degraded: {diagnostic}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                out.append({
+                    "gpu_index": idx,
+                    "util_pct": s.util_pct,
+                    "mem_used_bytes": s.mem_used_bytes,
+                    "mem_total_bytes": s.mem_total_bytes,
+                    "power_w": s.power_w,
+                    "sm_clock_mhz": s.sm_clock_mhz,
+                    "throttle": s.throttle_reasons.name if s.throttle_reasons else "NONE",
+                })
+        finally:
+            try:
+                b.close()
+            except Exception as exc:
+                warnings.warn(
+                    f"live GPU headroom degraded: backend close failed "
+                    f"({type(exc).__name__}: {exc})",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
     return out

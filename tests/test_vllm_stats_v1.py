@@ -48,3 +48,33 @@ def test_v1_engine_without_stats_is_none():
         )
     )
     assert read_scheduler_stats(empty) is None
+
+
+def test_v1_scheduler_read_failure_is_diagnostic():
+    class BrokenScheduler:
+        def make_stats(self):
+            raise RuntimeError("v1 stats moved")
+
+    engine = SimpleNamespace(
+        engine_core=SimpleNamespace(scheduler=BrokenScheduler())
+    )
+
+    sample = read_scheduler_stats(engine)
+
+    assert sample is not None
+    assert sample.num_running is None
+    assert any(
+        "make_stats failed" in note and "v1 stats moved" in note
+        for note in sample.diagnostics
+    )
+
+
+def test_v1_invalid_values_are_diagnostic_not_clamped():
+    sample = read_scheduler_stats(_v1_engine(running=300, waiting=-1, cache=1.2))
+
+    assert sample is not None
+    assert sample.num_waiting is None
+    assert sample.gpu_cache_usage is None
+    assert sample.batch_occupancy is None
+    assert any("outside [0, 1]" in note for note in sample.diagnostics)
+    assert any("exceeds declared capacity" in note for note in sample.diagnostics)

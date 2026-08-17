@@ -127,6 +127,7 @@ class KernelBreakdown:
     n_truncated_names: int           # records whose name hit NAME_MAX
     n_distinct_truncated: int        # distinct such names — collisions hide here
     n_devices: int
+    n_invalid_duration: int = 0
 
     @property
     def other_share(self) -> float:
@@ -141,11 +142,31 @@ class KernelBreakdown:
         out: list[str] = []
         if self.n_kernels == 0:
             out.append(
-                "no kernels captured at all. The usual cause is decode running as "
+                "no positive-duration kernels captured. The usual cause is decode running as "
                 "CUDA-graph replay that this CUPTI does not attribute — re-run with "
                 "--enforce-eager to confirm."
             )
+            if self.n_invalid_duration:
+                out.append(
+                    f"{self.n_invalid_duration} kernel record(s) had non-positive duration "
+                    "and were excluded as invalid."
+                )
             return out
+        if self.n_invalid_duration:
+            out.append(
+                f"{self.n_invalid_duration} kernel record(s) had non-positive duration "
+                "and were excluded from all shares."
+            )
+        if self.window_ns is not None and self.window_ns <= 0:
+            out.append(
+                f"capture window duration is non-positive ({self.window_ns} ns); "
+                "GPU-active share is unavailable."
+            )
+        if self.gpu_active_share is not None and self.gpu_active_share > 1.0:
+            out.append(
+                f"GPU active share is {self.gpu_active_share:.1%}, above the capture window; "
+                "event/window clocks are inconsistent."
+            )
         if self.gpu_active_share is not None and self.gpu_active_share < 0.2:
             out.append(
                 f"GPU active only {self.gpu_active_share:.1%} of the window. Either the "
@@ -210,11 +231,15 @@ def summarize_kernels(kernels, *, window_ns: int | None = None,
     per_device: dict[int, list[tuple[int, int]]] = {}
     truncated: list[str] = []
     total_time = 0
+    invalid_duration = 0
 
     for k in kernels:
         name = getattr(k, "name", "") or ""
         start, end = int(k.start_ns), int(k.end_ns)
-        dur = max(end - start, 0)
+        dur = end - start
+        if dur <= 0:
+            invalid_duration += 1
+            continue
         total_time += dur
         by_bucket.setdefault(classify_kernel(name), []).append((name, dur))
         per_device.setdefault(int(getattr(k, "device_id", 0) or 0), []).append((start, end))
@@ -237,7 +262,11 @@ def summarize_kernels(kernels, *, window_ns: int | None = None,
     buckets.sort(key=lambda b: -b.time_ns)
 
     active = {dev: _active_ns(iv) for dev, iv in per_device.items()}
-    share = (max(active.values()) / window_ns) if (active and window_ns) else None
+    share = (
+        max(active.values()) / window_ns
+        if active and window_ns is not None and window_ns > 0
+        else None
+    )
 
     return KernelBreakdown(
         n_kernels=sum(b.n_kernels for b in buckets),
@@ -249,6 +278,7 @@ def summarize_kernels(kernels, *, window_ns: int | None = None,
         n_truncated_names=len(truncated),
         n_distinct_truncated=len(set(truncated)),
         n_devices=len(active),
+        n_invalid_duration=invalid_duration,
     )
 
 

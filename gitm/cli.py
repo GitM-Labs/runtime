@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -148,6 +149,18 @@ def _parser() -> argparse.ArgumentParser:
     _add_capture(sub)
 
     sub.add_parser("doctor", help="Probe environment, GPUs, and data locations.")
+    sub.add_parser(
+        "gpu-headroom",
+        help="Print a one-shot live GPU utilization and memory snapshot.",
+    )
+
+    plan_kitti = sub.add_parser(
+        "plan-kitti", help="Render the PointPillars execution graph for a known GPU SKU."
+    )
+    plan_kitti.add_argument("--sku", required=True, help="GPU SKU from the hardware catalogue.")
+    plan_kitti.add_argument(
+        "--baseline", type=Path, default=None, help="Optional measured baseline JSON to compare."
+    )
 
     analyze = sub.add_parser(
         "analyze",
@@ -206,8 +219,12 @@ def _parser() -> argparse.ArgumentParser:
 def _parse_target(s: str) -> float:
     s = s.strip()
     if s.endswith("%"):
-        return float(s[:-1]) / 100.0
-    return float(s)
+        target = float(s[:-1]) / 100.0
+    else:
+        target = float(s)
+    if not math.isfinite(target) or not 0.0 < target <= 1.0:
+        raise ValueError(f"target floor must be finite and in (0, 1], got {s!r}")
+    return target
 
 
 _HFT_WORKLOADS = {"hft", "hft-lob"}
@@ -309,14 +326,26 @@ def main(argv: list[str] | None = None) -> int:
             target=_parse_target(args.target),
             scratch=args.scratch,
         )
-        summary = result.get("summary", {})
+        summary = result.get("summary")
+        if not isinstance(summary, dict):
+            summary = {
+                "status": "invalid_result",
+                "diagnostic": "optimization loop returned no machine-readable summary",
+            }
         if args.report is not None:
-            args.report.write_text(result.get("report_md", ""))
+            report_md = result.get("report_md")
+            if not isinstance(report_md, str) or not report_md.strip():
+                report_md = (
+                    "# Runtime result unavailable\n\n"
+                    f"{summary.get('diagnostic', 'optimization loop returned no report')}\n"
+                )
+            args.report.write_text(report_md, encoding="utf-8")
         else:
             print(json.dumps(summary, indent=2))
-        # Non-zero so automation notices a run that measured nothing (no GPU /
-        # CUPTI shim, or the workload never ran) instead of seeing a fake pass.
-        return 3 if summary.get("status") == "no_data" else 0
+        # Only the explicit success state is a shell success. Prediction/candidate
+        # refusals and failed A/Bs may still have useful measurement reports, but
+        # automation must not read those degraded outcomes as a completed run.
+        return 0 if summary.get("status") == "ok" else 3
 
     if args.cmd == "replay":
         from gitm.optimizer.replay import predict_delta_from_files
@@ -332,7 +361,7 @@ def main(argv: list[str] | None = None) -> int:
             args.intervention, config=args.config, min_keep_delta=args.min_keep_delta
         )
         print(json.dumps(result, indent=2))
-        return 0
+        return 0 if result.get("applied") and not result.get("rolled_back") else 3
 
     if args.cmd == "attach":
         from gitm.deploy import attach_job
@@ -355,6 +384,32 @@ def main(argv: list[str] | None = None) -> int:
 
         report = doctor()
         print(json.dumps(report, indent=2))
+        return 0
+
+    if args.cmd == "gpu-headroom":
+        from gitm.optimizer.headroom_kernel_rank import live_gpu_headroom
+
+        rows = live_gpu_headroom()
+        print(json.dumps(rows, indent=2))
+        return 0 if rows else 3
+
+    if args.cmd == "plan-kitti":
+        from gitm.planner.context import hardware_spec_for, peak_for_sku
+        from gitm.planner.kitti_graph import predict_kitti_graph, render_kitti_graph
+
+        peak = peak_for_sku(args.sku)
+        if peak is None:
+            print(f"prediction refused: GPU SKU {args.sku!r} is not in the hardware catalogue")
+            return 3
+        measured = None
+        if args.baseline is not None:
+            try:
+                measured = json.loads(args.baseline.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                print(f"prediction refused: baseline {args.baseline} is unreadable ({exc})")
+                return 3
+        graph = predict_kitti_graph(hw=hardware_spec_for(peak))
+        print(render_kitti_graph(graph, measured=measured))
         return 0
 
     if args.cmd == "analyze":

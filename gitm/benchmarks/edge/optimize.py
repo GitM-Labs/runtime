@@ -23,10 +23,12 @@ WorkUnit on the GPU.
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from gitm._timing import require_positive_duration, require_positive_work
 from gitm.kernels.spec import Applicability, InterventionSpec, SafetyGate
 
 # A run_mode runs N frames in a given mode and returns a per-frame summary dict:
@@ -68,7 +70,7 @@ def _frame_equivalent(da: list, db: list, *, center_atol: float, tol_frac: float
         else:
             unmatched += 1
     unmatched += used.count(False)  # candidate boxes with no baseline partner
-    allowed = max(1, int(tol_frac * max(len(da), len(db), 1)))
+    allowed = math.ceil(tol_frac * max(len(da), len(db)))
     return unmatched <= allowed
 
 
@@ -87,6 +89,10 @@ def detections_equivalent(
     with a tolerance keeps the gate honest (a genuine regression still trips it)
     without rejecting rounding-level churn.
     """
+    if not math.isfinite(center_atol) or center_atol < 0.0:
+        raise ValueError(f"center_atol must be finite and non-negative, got {center_atol!r}")
+    if not math.isfinite(tol_frac) or not 0.0 <= tol_frac <= 1.0:
+        raise ValueError(f"tol_frac must be finite and in [0, 1], got {tol_frac!r}")
     fa, fb = a.get("frames"), b.get("frames")
     if fa is None or fb is None or len(fa) != len(fb):
         return False
@@ -134,18 +140,30 @@ def optimize_edge(
     launch jitter. ``sync`` is invoked after each run so GPU timing is honest
     (pass a device sync; default no-op for CPU/fake).
     """
+    if isinstance(reps, bool) or not isinstance(reps, int) or reps <= 0:
+        raise ValueError(f"reps must be a positive integer, got {reps!r}")
+    # Validate before executing either leg: gate controls must never be repaired
+    # after the caller supplied them.
+    detections_equivalent(
+        {"frames": []},
+        {"frames": []},
+        center_atol=center_atol,
+        tol_frac=tol_frac,
+    )
     sync = sync or (lambda: None)
 
     def _timed(mode: str) -> tuple[dict, float]:
         best = float("inf")
         summary: dict = {}
-        for _ in range(max(1, reps)):
+        for _ in range(reps):
             t0 = time.perf_counter()
             summary = run_mode(mode)
             sync()
             best = min(best, time.perf_counter() - t0)
         n = max(int(summary.get("n_frames", 0)), 0)
-        return summary, n / max(best, 1e-9)
+        require_positive_work(n, context=f"edge A/B {mode}")
+        best = require_positive_duration(best, context=f"edge A/B {mode}")
+        return summary, n / best
 
     base_summary, base_eps = _timed(baseline_mode)
     cand_summary, cand_eps = _timed(candidate_mode)
@@ -288,6 +306,8 @@ def edge_batching_spec(batch_size: int = 4) -> InterventionSpec:
     ``batch_size`` is recorded as the spec's ``value`` so the provenance reflects
     the batch size actually run, not a hardcoded constant.
     """
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
     return InterventionSpec(
         name="edge_frame_batching",
         summary=f"Run inference on batches of {batch_size} frames in one forward "
@@ -343,6 +363,8 @@ class EdgeBatchingApplicator:
         tol_frac: float = 0.05,
         spec: InterventionSpec | None = None,
     ):
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
         self._run_mode = run_mode
         self._batch_size = batch_size
         self._reps = reps

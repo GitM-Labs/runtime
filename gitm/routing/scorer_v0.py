@@ -34,9 +34,26 @@ def score_prospect(
     W_ENGAGEMENT = 0.05
     W_PRIOR = 0.05
 
+    unit_values = {
+        "warmth": warmth,
+        "signal_recency": signal_recency,
+        "engagement_score": engagement_score,
+    }
+    invalid_units = {name: value for name, value in unit_values.items() if not 0 <= value <= 1}
+    if invalid_units:
+        raise ValueError(f"routing inputs must be within [0, 1], got {invalid_units}")
+    for name, value in {
+        "pain_acknowledged": pain_acknowledged,
+        "prior_engagement": prior_engagement,
+    }.items():
+        if value not in (0, 1):
+            raise ValueError(f"{name} must be 0 or 1, got {value!r}")
+
     # Company tier score
     tier_score_map = {1: 1.0, 2: 0.6, 3: 0.2}
-    tier_score = tier_score_map.get(company_tier, 0.2)
+    if company_tier not in tier_score_map:
+        raise ValueError(f"company_tier must be 1, 2, or 3, got {company_tier!r}")
+    tier_score = tier_score_map[company_tier]
 
     score = (
         warmth * W_WARMTH +

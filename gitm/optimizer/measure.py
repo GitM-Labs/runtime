@@ -55,10 +55,12 @@ def kernel_family(name: str) -> str:
 class MeasureResult:
     n_kernels: int
     n_memcpy: int
-    serialized_fraction: float
+    serialized_fraction: float | None
     violations: list = field(default_factory=list)
     top_hypotheses: list = field(default_factory=list)
     families: list[str] = field(default_factory=list)
+    n_invalid_duration: int = 0
+    diagnostics: list[str] = field(default_factory=list)
 
 
 def measure_trace(trace: Trace, *, min_attr: int = 16) -> MeasureResult:
@@ -71,42 +73,73 @@ def measure_trace(trace: Trace, *, min_attr: int = 16) -> MeasureResult:
     kernels = trace.kernels()
     memcpys = [e for e in trace.events if e.kind == "memcpy"]
     if not kernels:
-        return MeasureResult(0, len(memcpys), 0.0)
+        return MeasureResult(
+            0,
+            len(memcpys),
+            None,
+            diagnostics=["measurement coverage unavailable: trace contains no kernels"],
+        )
 
-    sc = _serialized_fraction(kernels)
+    valid_kernels = [k for k in kernels if k.end_ns - k.start_ns > 0]
+    n_invalid = len(kernels) - len(valid_kernels)
+    diagnostics: list[str] = []
+    if n_invalid:
+        diagnostics.append(
+            f"measurement coverage: excluded {n_invalid}/{len(kernels)} kernel(s) "
+            "with non-positive duration"
+        )
+    if not valid_kernels:
+        return MeasureResult(
+            len(kernels),
+            len(memcpys),
+            None,
+            n_invalid_duration=n_invalid,
+            diagnostics=diagnostics,
+        )
+
+    sc = _serialized_fraction(valid_kernels)
+    if sc is None:
+        diagnostics.append(
+            "stream-concurrency coverage unavailable: trace has no adjacent "
+            "cross-stream kernel pairs"
+        )
     by_name: dict[str, list[int]] = {}
-    for k in kernels:
+    for k in valid_kernels:
         by_name.setdefault(k.name, []).append(k.end_ns - k.start_ns)
     med = {nm: float(np.median(v)) for nm, v in by_name.items()}
 
     res = Residuals()
     res.serialized_concurrency_fraction = sc
-    for k in kernels:
-        m = med[k.name] or 1.0
+    for k in valid_kernels:
+        m = med[k.name]
         res.per_kernel.append(
             KernelResidual(op=k.name[:40], layer=None, r_kt=((k.end_ns - k.start_ns) - m) / m, r_mt=None)
         )
     violations = check_invariants(res, multi_basis=True)
 
     fam_of = {nm: kernel_family(nm) for nm in by_name}
-    fam_counts = Counter(fam_of[k.name] for k in kernels)
+    fam_counts = Counter(fam_of[k.name] for k in valid_kernels)
     res_attr = Residuals()
     res_attr.serialized_concurrency_fraction = sc
-    for k in kernels:
+    for k in valid_kernels:
         fam = fam_of[k.name]
         if fam_counts[fam] < min_attr:
             continue
-        m = med[k.name] or 1.0
+        m = med[k.name]
         res_attr.per_kernel.append(
             KernelResidual(op=fam, layer=None, r_kt=((k.end_ns - k.start_ns) - m) / m, r_mt=None)
         )
     families = sorted({kr.op for kr in res_attr.per_kernel})
-    top_hyps = list(attribute(res_attr, predict_graph()).top(5)) if res_attr.per_kernel else []
+    ranked = attribute(res_attr, predict_graph())
+    top_hyps = list(ranked.top(5)) if res_attr.per_kernel else []
+    diagnostics.extend(ranked.diagnostics)
 
     return MeasureResult(
         n_kernels=len(kernels),
         n_memcpy=len(memcpys),
         serialized_fraction=sc,
+        n_invalid_duration=n_invalid,
+        diagnostics=diagnostics,
         violations=violations,
         top_hypotheses=top_hyps,
         families=families,
@@ -143,10 +176,16 @@ def measurement_claims(result: MeasureResult, *, limit: int = 5) -> list[Claim]:
 
 def measurement_summary(workload: str, result: MeasureResult) -> str:
     fams = ", ".join(result.families[:6]) or "none with enough samples"
+    diagnostic = f" Coverage diagnostics: {'; '.join(result.diagnostics)}." if result.diagnostics else ""
+    serialized = (
+        f"{result.serialized_fraction:.3f}"
+        if result.serialized_fraction is not None
+        else "unavailable"
+    )
     return (
         f"Measurement run for {workload!r}: {result.n_kernels:,} kernels "
         f"({result.n_memcpy:,} memcpy) captured, {len(result.violations)} invariant "
-        f"deviation(s), serialized-concurrency={result.serialized_fraction:.3f}. "
+        f"deviation(s), serialized-concurrency={serialized}. "
         f"Kernel families: {fams}. No interventions applied — this workload has no "
-        f"tuned intervention library, so the runtime reports what it measured."
+        f"tuned intervention library, so the runtime reports what it measured.{diagnostic}"
     )

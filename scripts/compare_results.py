@@ -24,7 +24,7 @@ import json
 import sys
 from pathlib import Path
 
-EXACT = ["git_sha", "gitm_version", "python", "dataset_manifests"]
+EXACT = ["schema", "git_sha", "gitm_version", "python", "dataset_manifests"]
 EXACT_PKGS = ["pydantic", "numpy", "pandas", "pyarrow", "torch", "cudf-cu12"]
 ADVISORY = ["gpu"]
 
@@ -39,13 +39,34 @@ def compare(ref: dict, other: dict) -> tuple[list[str], list[str]]:
     advisories: list[str] = []
 
     for f in EXACT:
-        if ref.get(f) != other.get(f):
-            mismatches.append(f"{f}: {ref.get(f)!r} != {other.get(f)!r}")
+        ref_value = ref.get(f)
+        other_value = other.get(f)
+        if f not in ref or f not in other or ref_value is None or other_value is None:
+            mismatches.append(
+                f"{f}: required verification field is missing or unavailable "
+                f"({ref_value!r} != {other_value!r})"
+            )
+        elif ref_value != other_value:
+            mismatches.append(f"{f}: {ref_value!r} != {other_value!r}")
 
-    rp, op = ref.get("packages", {}), other.get("packages", {})
+    rp, op = ref.get("packages"), other.get("packages")
     for pkg in EXACT_PKGS:
-        if rp.get(pkg) != op.get(pkg):
-            mismatches.append(f"packages.{pkg}: {rp.get(pkg)} != {op.get(pkg)}")
+        ref_value = rp.get(pkg) if isinstance(rp, dict) else None
+        other_value = op.get(pkg) if isinstance(op, dict) else None
+        if (
+            not isinstance(rp, dict)
+            or not isinstance(op, dict)
+            or pkg not in rp
+            or pkg not in op
+            or ref_value is None
+            or other_value is None
+        ):
+            mismatches.append(
+                f"packages.{pkg}: required version is missing or unavailable "
+                f"({ref_value!r} != {other_value!r})"
+            )
+        elif ref_value != other_value:
+            mismatches.append(f"packages.{pkg}: {ref_value} != {other_value}")
 
     if ref.get("git_dirty") or other.get("git_dirty"):
         advisories.append("a report was produced from a DIRTY git tree "

@@ -75,6 +75,20 @@ def test_failopen_failures_reset_on_reentry():
     assert g.failures == []
 
 
+def test_failopen_surfaces_broken_audit_sink():
+    class BrokenAudit:
+        def record(self, *_args, **_kwargs):
+            raise OSError("disk full")
+
+    g = FailOpenGuard(audit=BrokenAudit(), install_signal_handlers=False)
+    with pytest.warns(RuntimeWarning, match="audit sink failed"):
+        with g:
+            g.register("x", lambda: None)
+
+    assert g.audit_failures
+    assert "disk full" in g.audit_failures[0]
+
+
 # --------- auto-revert ---------------------------------------------------------
 def test_autorevert_warms_up_then_holds_within_tolerance():
     ar = AutoRevert(baseline=100.0, tolerance=0.05, window=3)
@@ -90,6 +104,25 @@ def test_autorevert_fires_on_regression():
     ar.observe(90)
     d = ar.observe(90)  # mean 90 -> -10% beyond 5%
     assert d.should_revert and d.relative_delta == pytest.approx(-0.1)
+
+
+@pytest.mark.parametrize("baseline", [float("nan"), float("inf"), 0.0, -1.0, True])
+def test_autorevert_refuses_invalid_baseline(baseline):
+    with pytest.raises(ValueError, match="baseline"):
+        AutoRevert(baseline=baseline)
+
+
+@pytest.mark.parametrize("tolerance", [float("nan"), float("inf"), -0.01, True])
+def test_autorevert_refuses_invalid_tolerance(tolerance):
+    with pytest.raises(ValueError, match="tolerance"):
+        AutoRevert(baseline=100.0, tolerance=tolerance)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), True])
+def test_autorevert_refuses_invalid_observation(value):
+    ar = AutoRevert(baseline=100.0)
+    with pytest.raises(ValueError, match="observation"):
+        ar.observe(value)
 
 
 # --------- gated rollout -------------------------------------------------------

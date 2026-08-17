@@ -6,9 +6,6 @@ For each op we compute:
     t_memory  = bytes / peak_mem_bw
     t_pred    = max(t_compute, t_memory)
 
-with a vendor-specific efficiency band ``(eff_lo, eff_hi)``: a kernel within
-that band is "as expected". Residuals outside the band drive attribution.
-
 **The peak must match the op's dtype.** A checkpoint that runs fp8 linears and
 fp4 experts priced against a bf16 peak understates its own ceiling by 2-4x, and
 an understated ceiling reads as recoverable headroom that isn't there — the one
@@ -19,6 +16,7 @@ surfaces as ``peak_is_fallback`` rather than as a confident wrong number.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 # Bytes of HBM traffic per stored weight, including the quantisation scales that
@@ -39,6 +37,22 @@ _WEIGHT_BYTES: dict[str, float] = {
 _WEIGHT_BYTES["fp4"] = _WEIGHT_BYTES["mxfp4"]
 
 
+def _canon_dtype(dtype: str) -> str:
+    """Normalize framework/config aliases before pricing or fallback checks."""
+    d = str(dtype).lower().removeprefix("torch.")
+    if d in ("bf16", "bfloat16"):
+        return "bf16"
+    if d in ("float16", "fp16", "half"):
+        return "fp16"
+    if d in ("fp4", "mxfp4", "nvfp4"):
+        return "fp4"
+    if d in ("fp8", "e4m3", "e5m2"):
+        return "fp8"
+    if d in ("fp32", "float32", "tf32"):
+        return "fp32"
+    return d
+
+
 def weight_bytes(dtype: str) -> float:
     """Bytes moved per stored weight for ``dtype``, scales included.
 
@@ -46,7 +60,12 @@ def weight_bytes(dtype: str) -> float:
     since over-counting weight traffic predicts a *slower* floor and so cannot
     manufacture headroom.
     """
-    return _WEIGHT_BYTES.get(dtype.lower(), 2.0)
+    return _WEIGHT_BYTES.get(_canon_dtype(dtype), 2.0)
+
+
+def weight_bytes_is_fallback(dtype: str) -> bool:
+    """Whether :func:`weight_bytes` substitutes bf16 for an unknown dtype."""
+    return _canon_dtype(dtype) not in _WEIGHT_BYTES
 
 
 @dataclass(frozen=True)
@@ -63,6 +82,10 @@ class HardwareSpec:
     """
 
     name: str = "A100-SXM4-80GB"
+    # True when these catalogue numbers were substituted because the runtime did
+    # not identify a priceable SKU. Direct ``HardwareSpec()`` construction is the
+    # same documented A100 fallback; catalogue-backed builders set this false.
+    is_fallback: bool = True
     peak_flops_fp16_per_s: float = 312e12
     peak_flops_bf16_per_s: float = 312e12
     peak_flops_fp32_per_s: float = 19.5e12
@@ -73,11 +96,8 @@ class HardwareSpec:
     # ``0.0`` means unknown, which makes a sharded graph refuse to guess rather
     # than predict a free all-to-all.
     interconnect_bw_bytes_per_s: float = 0.0
-    # Wall time to issue one dependent kernel, for work whose cost is the *number
-    # of launches* rather than the arithmetic in them. ~2 us is a CUDA-graph
-    # replay figure; eager launch is nearer 5 us. Calibrate from a trace — an
-    # iteration count multiplied by a wrong constant is still the right shape,
-    # which is more than a pure roofline offers here.
+    # Wall time to issue one dependent kernel. This is a separate bound from
+    # FLOPs/bytes for fused iterative work whose launch depth is answer-deciding.
     kernel_launch_overhead_s: float = 2.0e-6
     eff_lo: float = 0.55
     eff_hi: float = 0.95
@@ -103,6 +123,9 @@ class ModelSpec:
     num_kv_heads: int = 32  # < n_heads when GQA
     head_dim: int = 128
     intermediate: int = 11008
+    #: Compute dtype used to choose the tensor-core ceiling. Width alone cannot
+    #: distinguish bf16/fp16/fp32, so this must travel separately.
+    compute_dtype: str = "fp16"
     dtype_bytes: int = 2  # fp16 / bf16 — activations
     vocab: int = 32000
 
@@ -137,6 +160,36 @@ class ModelSpec:
     #: 1 = every layer is full attention, i.e. a conventional transformer.
     full_attn_layer_step: int = 1
 
+    def __post_init__(self) -> None:
+        for name in ("hidden", "n_layers", "n_heads", "num_kv_heads", "head_dim", "dtype_bytes", "vocab"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        for name in ("moe_layer_step", "full_attn_layer_step"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        for name in ("num_experts", "experts_per_token", "shared_experts", "first_dense_layers"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+        if (self.num_experts == 0) != (self.experts_per_token == 0):
+            raise ValueError("num_experts and experts_per_token must both be zero or both positive")
+        if self.experts_per_token > self.num_experts:
+            raise ValueError("experts_per_token cannot exceed num_experts")
+        if self.first_dense_layers > self.n_layers:
+            raise ValueError("first_dense_layers cannot exceed n_layers")
+        for name in ("moe_intermediate", "shared_expert_intermediate", "weight_dtype_bytes"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer when supplied, got {value!r}")
+        if not isinstance(self.intermediate, int) or isinstance(self.intermediate, bool):
+            raise ValueError(f"intermediate must be an integer, got {self.intermediate!r}")
+        if self.intermediate < 0 or (self.n_moe_layers < self.n_layers and self.intermediate == 0):
+            raise ValueError("intermediate must be positive when any dense FFN layer is present")
+
     @property
     def is_moe(self) -> bool:
         """True when *any* layer's FFN should be modeled as a mixture of experts."""
@@ -153,8 +206,7 @@ class ModelSpec:
         """
         if not self.is_moe or layer < self.first_dense_layers:
             return False
-        step = max(self.moe_layer_step, 1)
-        return (layer - self.first_dense_layers) % step == 0
+        return (layer - self.first_dense_layers) % self.moe_layer_step == 0
 
     @property
     def n_moe_layers(self) -> int:
@@ -178,8 +230,7 @@ class ModelSpec:
         magnitude, and it is why a hybrid model can serve long contexts with only
         a few percent of KV-cache utilisation.
         """
-        step = max(self.full_attn_layer_step, 1)
-        return layer % step == 0
+        return layer % self.full_attn_layer_step == 0
 
     @property
     def n_full_attention_layers(self) -> int:
@@ -189,7 +240,7 @@ class ModelSpec:
     @property
     def is_hybrid_attention(self) -> bool:
         """True when some layers use linear/recurrent attention instead of KV."""
-        return max(self.full_attn_layer_step, 1) > 1
+        return self.full_attn_layer_step > 1
 
     @property
     def linear_attn_state_elems(self) -> int:
@@ -209,17 +260,21 @@ class ModelSpec:
     @property
     def w_bytes(self) -> int:
         """Bytes per weight element (falls back to the activation dtype)."""
-        return self.weight_dtype_bytes or self.dtype_bytes
+        return self.weight_dtype_bytes if self.weight_dtype_bytes is not None else self.dtype_bytes
 
     @property
     def expert_intermediate(self) -> int:
         """Per-routed-expert FFN width (falls back to the dense width)."""
-        return self.moe_intermediate or self.intermediate
+        return self.moe_intermediate if self.moe_intermediate is not None else self.intermediate
 
     @property
     def shared_intermediate(self) -> int:
         """Per-shared-expert FFN width (falls back to the routed width)."""
-        return self.shared_expert_intermediate or self.expert_intermediate
+        return (
+            self.shared_expert_intermediate
+            if self.shared_expert_intermediate is not None
+            else self.expert_intermediate
+        )
 
     # --- parameter accounting -------------------------------------------------
     # The "35B-A3B" naming convention: total parameters vs the ones a single
@@ -380,18 +435,12 @@ class SparseMoEModelSpec:
     # Multi-token prediction (speculative decoding head)
     num_nextn_predict_layers: int = 1
 
-    # Manifold-Constrained Hyper-Connections (paper §2.2). ``hc_width`` is n_hc,
-    # the factor the residual stream is widened by — 1 disables every mHC term.
-    # Two instances per transformer block (one around attention, one around the
-    # MoE), each projecting a flattened n_hc*d residual state down to the three
-    # small mappings A (1 x n_hc), B (n_hc x n_hc) and C (n_hc x 1), then
-    # projecting B onto the doubly-stochastic manifold by Sinkhorn-Knopp.
+    # DeepSeek-V4 structural extensions. These are explicit so the graph can
+    # represent fused mHC/hash-routed layers instead of silently pricing dense
+    # substitutes.
     hc_width: int = 1
     hc_sinkhorn_iters: int = 0
     hc_blocks_per_layer: int = 2
-
-    # Leading layers that route to experts by a hash of the token id rather than
-    # a learned router (paper §2.1) — those layers run no router GEMM.
     num_hash_layers: int = 0
 
     # Low-rank state update on a subset of layers (DeepSeek "DSpark").
@@ -404,6 +453,37 @@ class SparseMoEModelSpec:
     kv_dtype: str = "fp8"  # KV cache and index keys
     act_dtype: str = "bf16"  # activations between ops
 
+    def __post_init__(self) -> None:
+        positive = (
+            "hidden", "n_layers", "n_heads", "num_kv_heads", "head_dim",
+            "q_lora_rank", "o_lora_rank", "o_groups", "vocab", "moe_intermediate_size",
+            "index_n_heads", "index_head_dim",
+        )
+        for name in positive:
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        for name in (
+            "qk_rope_head_dim", "n_shared_experts", "sliding_window",
+            "num_nextn_predict_layers", "dspark_markov_rank", "hc_sinkhorn_iters",
+            "num_hash_layers", "n_routed_experts", "num_experts_per_tok", "index_topk",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+        if self.num_experts_per_tok > self.n_routed_experts:
+            raise ValueError("num_experts_per_tok cannot exceed n_routed_experts")
+        if any(not isinstance(r, int) or isinstance(r, bool) or r < 0 for r in self.compress_ratios):
+            raise ValueError("compress_ratios must contain non-negative integers")
+        if (self.n_routed_experts == 0) != (self.num_experts_per_tok == 0):
+            raise ValueError("n_routed_experts and num_experts_per_tok must both be zero or positive")
+        if any(layer < 0 or layer >= self.n_layers for layer in self.dspark_layer_ids):
+            raise ValueError("dspark_layer_ids must refer to real transformer layers")
+        for name in ("hc_width", "hc_blocks_per_layer"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+
     def compress_ratio(self, layer: int) -> int:
         """KV compression ratio for ``layer`` (0/1 == uncompressed)."""
         if not self.compress_ratios:
@@ -414,37 +494,15 @@ class SparseMoEModelSpec:
 
     @property
     def compression_levels(self) -> tuple[int, ...]:
-        """The distinct compression rates this checkpoint interleaves, ascending.
-
-        DeepSeek-V4 uses two: ``m`` for Compressed Sparse Attention and
-        ``m' >> m`` for Heavily Compressed Attention. Derived from the config
-        rather than hardcoded, so a checkpoint with different rates — or only
-        one — still classifies.
-        """
         return tuple(sorted({r for r in self.compress_ratios if r > 1}))
 
     def attention_kind(self, layer: int) -> str:
-        """``"swa"`` | ``"csa"`` | ``"hca"`` — which attention this layer runs.
-
-        The three differ in ways that change the cost model qualitatively, not
-        just numerically (paper §2.3):
-
-        * **swa** — uncompressed and windowed. Only the sliding-window branch.
-        * **csa** — compress by ``m``, then *sparse* attention: a lightning
-          indexer scores the compressed entries and keeps ``index_topk``. Read is
-          bounded, so it is flat in context once selection saturates.
-        * **hca** — compress by ``m' >> m`` and attend **densely** over every
-          compressed entry. No indexer. Read is ``kv_len / m'``, so unlike CSA it
-          *grows with context* — HCA trades a bigger compression rate for not
-          having to select.
-
-        The largest compression level is HCA; anything else compressed is CSA.
-        """
-        r = self.compress_ratio(layer)
-        if r == 0:
+        """Return the sparse-attention family for one layer."""
+        ratio = self.compress_ratio(layer)
+        if ratio == 0:
             return "swa"
         levels = self.compression_levels
-        if len(levels) >= 2 and r == levels[-1]:
+        if len(levels) >= 2 and ratio == levels[-1]:
             return "hca"
         return "csa"
 
@@ -498,6 +556,14 @@ class ShardingConfig:
     dp: int = 1
     ep_imbalance: float = 1.0
 
+    def __post_init__(self) -> None:
+        for name in ("tp", "ep", "dp"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        if not math.isfinite(self.ep_imbalance) or self.ep_imbalance < 1.0:
+            raise ValueError("ep_imbalance must be finite and at least 1.0")
+
     @property
     def expert_shards(self) -> int:
         """Ranks the expert weights are divided across."""
@@ -513,7 +579,6 @@ class BatchConfig:
     """Decode batch shape — prompt length already paid; we predict per-step."""
 
     batch: int = 1
-    prompt_len: int = 128
     kv_cache_len: int = 128  # tokens already in KV-cache when decode starts
     # Multi-token prediction: draft positions proposed per step, and the fraction
     # the verifier keeps. A step costs the drafted work regardless; only accepted
@@ -521,10 +586,20 @@ class BatchConfig:
     speculative_tokens: int = 0
     acceptance_rate: float = 0.0
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.batch, int) or isinstance(self.batch, bool) or self.batch <= 0:
+            raise ValueError(f"batch must be a positive integer, got {self.batch!r}")
+        for name in ("kv_cache_len", "speculative_tokens"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+        if not math.isfinite(self.acceptance_rate) or not 0.0 <= self.acceptance_rate <= 1.0:
+            raise ValueError("acceptance_rate must be finite and in [0, 1]")
+
     @property
     def positions_per_step(self) -> int:
         """Sequence positions the model actually computes in one step."""
-        return self.batch * (1 + max(0, self.speculative_tokens))
+        return self.batch * (1 + self.speculative_tokens)
 
     @property
     def tokens_per_step(self) -> float:
@@ -533,7 +608,7 @@ class BatchConfig:
         Always at least ``batch``: the non-speculative token is verified, not
         drafted, so it is never rejected.
         """
-        return self.batch * (1.0 + max(0, self.speculative_tokens) * self.acceptance_rate)
+        return self.batch * (1.0 + self.speculative_tokens * self.acceptance_rate)
 
 
 @dataclass(frozen=True)
@@ -554,8 +629,16 @@ class RooflinePrediction:
     # derivation from published shapes — carried through to the report so an
     # estimate is never read as a measurement.
     estimated: bool = False
-    #: Dependent kernel launches this op costs. Non-zero only for iterative work
-    #: that cannot be overlapped with itself; see ``bound == "launch"``.
+    # Set when any dtype contributing to ``bytes`` was unknown and therefore
+    # priced at :func:`weight_bytes`'s fail-open bf16 width. This cannot be
+    # inferred from ``dtype``: a node's compute dtype and its activation, weight,
+    # or KV-cache byte contributors may differ.
+    bytes_are_fallback: bool = False
+    # Zero catalogue rates retain fail-open arithmetic, but positive work must
+    # never look free. Keep the missing denominator even if the sibling term
+    # still produces a nonzero prediction.
+    compute_is_unpriced: bool = False
+    memory_is_unpriced: bool = False
     serial_launches: int = 0
 
     @property
@@ -569,19 +652,6 @@ class RooflinePrediction:
         return _canon_dtype(self.dtype) != self.peak_dtype
 
 
-def _canon_dtype(dtype: str) -> str:
-    d = dtype.lower()
-    if d in ("bf16", "float16", "fp16", "half"):
-        return "fp16"
-    if d in ("fp4", "mxfp4", "nvfp4"):
-        return "fp4"
-    if d in ("fp8", "e4m3", "e5m2"):
-        return "fp8"
-    if d in ("fp32", "float32", "tf32"):
-        return "fp32"
-    return d
-
-
 def resolve_peak(hw: HardwareSpec, dtype: str) -> tuple[float, str]:
     """(peak FLOP/s, the dtype that peak belongs to) for ``dtype`` on ``hw``.
 
@@ -593,6 +663,8 @@ def resolve_peak(hw: HardwareSpec, dtype: str) -> tuple[float, str]:
     d = _canon_dtype(dtype)
     if d == "fp32":
         return hw.peak_flops_fp32_per_s, "fp32"
+    if d == "bf16":
+        return hw.peak_flops_bf16_per_s, "bf16"
     if d == "fp4":
         if hw.peak_flops_fp4_per_s > 0:
             return hw.peak_flops_fp4_per_s, "fp4"
@@ -614,26 +686,28 @@ def roofline(
     dtype: str = "fp16",
     *,
     estimated: bool = False,
+    bytes_are_fallback: bool = False,
     serial_launches: int = 0,
 ) -> RooflinePrediction:
     """Compute the roofline prediction for a single op.
 
-    ``serial_launches`` adds a third bound for work whose cost is the number of
-    *dependent* kernel launches rather than the arithmetic inside them. A
-    roofline cannot see this: 20 Sinkhorn iterations over a 4x4 matrix move a few
-    hundred bytes and do a few hundred FLOPs, so both classic terms round to
-    zero, while the wall time is 20 launches deep and cannot be overlapped
-    because each iteration consumes the previous one's output. Ignoring it does
-    not make the prediction slightly optimistic — it makes it absent.
+    ``serial_launches`` adds a launch-depth floor for dependent iterative work
+    that a classic FLOP/byte roofline would otherwise make look free.
     """
+    if not math.isfinite(flops) or flops < 0 or not math.isfinite(bytes_moved) or bytes_moved < 0:
+        raise ValueError(
+            f"roofline work terms must be finite and non-negative, got "
+            f"flops={flops!r}, bytes_moved={bytes_moved!r}"
+        )
     peak_flops, peak_dtype = resolve_peak(hw, dtype)
+    compute_is_unpriced = flops > 0 and peak_flops <= 0
+    memory_is_unpriced = bytes_moved > 0 and hw.peak_mem_bw_bytes_per_s <= 0
     t_c = flops / peak_flops if peak_flops > 0 else 0.0
     t_m = bytes_moved / hw.peak_mem_bw_bytes_per_s if hw.peak_mem_bw_bytes_per_s > 0 else 0.0
-    t_l = max(0, serial_launches) * hw.kernel_launch_overhead_s
+    launches = max(0, serial_launches)
+    t_l = launches * hw.kernel_launch_overhead_s
     t_pred = max(t_c, t_m, t_l)
-    bound = "launch" if t_l >= max(t_c, t_m) and t_l > 0 else (
-        "compute" if t_c >= t_m else "memory"
-    )
+    bound = "launch" if t_l >= max(t_c, t_m) and t_l > 0 else ("compute" if t_c >= t_m else "memory")
     return RooflinePrediction(
         op=op,
         flops=flops,
@@ -646,5 +720,8 @@ def roofline(
         peak_dtype=peak_dtype,
         peak_flops_per_s=peak_flops,
         estimated=estimated,
-        serial_launches=max(0, serial_launches),
+        bytes_are_fallback=bytes_are_fallback,
+        compute_is_unpriced=compute_is_unpriced,
+        memory_is_unpriced=memory_is_unpriced,
+        serial_launches=launches,
     )

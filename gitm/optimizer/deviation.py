@@ -19,6 +19,7 @@ because it keys by predicted op name (many kernels share one op).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -122,8 +123,12 @@ def _departs(
     inv_mt: Invariant | None,
 ) -> bool:
     """True if observed kernel ``ok`` is out-of-band vs its predicted node."""
-    t_obs = max((ok.end_ns - ok.start_ns) / 1e9, 1e-12)
-    t_pred = max(node_pred_s, 1e-12)
+    t_obs = (ok.end_ns - ok.start_ns) / 1e9
+    if not math.isfinite(t_obs) or t_obs <= 0.0:
+        return True
+    if not math.isfinite(node_pred_s) or node_pred_s <= 0.0:
+        return True
+    t_pred = node_pred_s
     r_kt = (t_obs - t_pred) / t_pred
     if inv_kt is not None and abs(r_kt) > inv_kt.band_width:
         return True

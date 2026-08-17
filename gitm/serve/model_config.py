@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from gitm.planner.moe_graph import is_sparse_moe_config, spec_from_hf_config
+from gitm.planner.moe_graph import spec_from_hf_config
 from gitm.planner.roofline import (
     _WEIGHT_BYTES,
     BatchConfig,
@@ -209,6 +209,22 @@ def _first_present(cfg: dict[str, Any], keys: tuple[str, ...]) -> Any:
     return None
 
 
+def is_sparse_moe_config(cfg: dict[str, Any]) -> bool:
+    """True when any routed-expert shape field makes this a sparse candidate.
+
+    This deliberately recognizes partial configs. A config that declares an
+    expert count but omits top-k must reach :func:`validate_moe_config` and be
+    refused, never fall through to the dense graph because it was incomplete.
+    """
+    # ``intermediate_size`` is also the standard dense-MLP field, so only the
+    # explicitly MoE spelling is a sparse signal on that axis.
+    return (
+        _first_present(cfg, _EXPERT_COUNT_ALIASES) is not None
+        or _first_present(cfg, _EXPERT_TOPK_ALIASES) is not None
+        or cfg.get("moe_intermediate_size") is not None
+    )
+
+
 def validate_moe_config(cfg: dict[str, Any]) -> list[str]:
     """Dominant-term fields this config fails to declare usably. Empty == usable.
 
@@ -219,16 +235,77 @@ def validate_moe_config(cfg: dict[str, Any]) -> list[str]:
     supported config would carry.
     """
     missing: list[str] = []
-    if _first_present(cfg, _EXPERT_COUNT_ALIASES) is None:
-        missing.append(" | ".join(_EXPERT_COUNT_ALIASES) + " (routed expert count)")
-    if _first_present(cfg, _EXPERT_TOPK_ALIASES) is None:
-        missing.append(" | ".join(_EXPERT_TOPK_ALIASES) + " (experts per token)")
-    if _first_present(cfg, _EXPERT_INTER_ALIASES) is None:
-        missing.append(" | ".join(_EXPERT_INTER_ALIASES) + " (expert intermediate size)")
+
+    def positive_alias(keys: tuple[str, ...], label: str) -> int | None:
+        value = _first_present(cfg, keys)
+        joined = " | ".join(keys)
+        if value is None:
+            missing.append(f"{joined} ({label})")
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            missing.append(f"{joined} ({label}) must be a positive integer, got {value!r}")
+            return None
+        return value
+
+    n_experts = positive_alias(_EXPERT_COUNT_ALIASES, "routed expert count")
+    top_k = positive_alias(_EXPERT_TOPK_ALIASES, "experts per token")
+    positive_alias(_EXPERT_INTER_ALIASES, "expert intermediate size")
+    if n_experts is not None and top_k is not None and top_k > n_experts:
+        missing.append(
+            f"experts per token {top_k} exceeds routed expert count {n_experts}"
+        )
+
+    # The sparse graph is a V4-shaped attention model, not a generic MoE graph.
+    # Every field below changes a node's compute/bytes; defaulting any of them to
+    # V4 values would fabricate a plausible graph for a partial or foreign model.
+    for key in (
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "q_lora_rank",
+        "o_lora_rank",
+        "o_groups",
+        "vocab_size",
+        "index_n_heads",
+        "index_head_dim",
+        "index_topk",
+        "sliding_window",
+    ):
+        value = cfg.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            missing.append(f"{key} must be a declared positive integer, got {value!r}")
+    qk_rope = cfg.get("qk_rope_head_dim")
+    if isinstance(qk_rope, bool) or not isinstance(qk_rope, int) or qk_rope < 0:
+        missing.append(
+            f"qk_rope_head_dim must be a declared non-negative integer, got {qk_rope!r}"
+        )
+    shared = cfg.get("n_shared_experts")
+    if isinstance(shared, bool) or not isinstance(shared, int) or shared < 0:
+        missing.append(
+            f"n_shared_experts must be a declared non-negative integer, got {shared!r}"
+        )
+    if cfg.get("torch_dtype") is None:
+        missing.append("torch_dtype must be declared; activation width cannot be guessed")
+
+    n_layers = cfg.get("num_hidden_layers")
+    ratios = cfg.get("compress_ratios")
+    if not isinstance(ratios, list | tuple):
+        missing.append("compress_ratios must be declared for the sparse-attention graph")
+    elif isinstance(n_layers, int) and n_layers > 0 and len(ratios) < n_layers:
+        missing.append(
+            f"compress_ratios has {len(ratios)} entries; need at least {n_layers} for {n_layers} layers"
+        )
+    elif any(isinstance(r, bool) or not isinstance(r, int) or r < 0 for r in ratios):
+        missing.append("compress_ratios must contain non-negative integers")
 
     # Quantisation: a *declared* method must be one the roofline can price. No
     # ``quantization_config`` is fine — that is an unquantised (bf16) checkpoint.
     q = cfg.get("quantization_config") or {}
+    if not isinstance(q, dict):
+        missing.append("quantization_config must be an object when declared")
+        q = {}
     method = q.get("quant_method")
     if method is not None and str(method).lower() not in KNOWN_DTYPES:
         missing.append(
@@ -236,8 +313,25 @@ def validate_moe_config(cfg: dict[str, Any]) -> list[str]:
             f"(not priceable; known: {', '.join(sorted(KNOWN_DTYPES))})"
         )
     expert_dtype = cfg.get("expert_dtype")
-    if expert_dtype is not None and str(expert_dtype).lower() not in KNOWN_DTYPES:
+    if expert_dtype is None:
+        missing.append(
+            "expert_dtype must be declared; routed and shared expert byte width cannot be guessed"
+        )
+    elif str(expert_dtype).lower() not in KNOWN_DTYPES:
         missing.append(f"expert_dtype={expert_dtype!r} (not priceable)")
+    return missing
+
+
+def validate_priceable_dtypes(spec: SparseMoEModelSpec) -> list[str]:
+    """Final resolved dtypes that would make byte-width pricing fall back."""
+    missing: list[str] = []
+    for field_name in ("weight_dtype", "expert_dtype", "kv_dtype", "act_dtype"):
+        value = getattr(spec, field_name)
+        if str(value).lower() not in KNOWN_DTYPES:
+            missing.append(
+                f"{field_name}={value!r} (not priceable; known: "
+                f"{', '.join(sorted(KNOWN_DTYPES))})"
+            )
     return missing
 
 
@@ -272,6 +366,7 @@ class LiveSpec:
     source_path: Path
     model_ref: str
     applied_overrides: dict[str, Any] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
     ok: bool = True
 
 
@@ -310,6 +405,7 @@ def live_moe_spec(
     supplied (tests). Returns :class:`LiveSpec` on success or :class:`LiveSpecError`
     with the reason — never a defaulted spec, so a report can only ever show a
     prediction against the model that is genuinely loaded.
+
     """
     model_ref = model_ref_from_cmdline(target.cmdline)
     if not model_ref:
@@ -340,6 +436,9 @@ def live_moe_spec(
     # path. The dense planner is the right tool for those, so decline rather than
     # emit a confident wrong floor.
     if not is_sparse_moe_config(cfg):
+        missing = validate_moe_config(cfg)
+        if not missing:
+            missing = ["index_topk or compress_ratios"]
         return LiveSpecError(
             reason=(
                 f"{model_ref!r} at {cfg_path} is not a DeepSeek-V4-class sparse-MoE model "
@@ -347,6 +446,7 @@ def live_moe_spec(
                 "predict_moe_graph models."
             ),
             model_ref=model_ref,
+            missing_keys=missing,
         )
 
     missing = validate_moe_config(cfg)
@@ -368,15 +468,47 @@ def live_moe_spec(
         spec_changes["kv_dtype"] = overrides["kv_dtype"]
     if "act_dtype" in overrides:
         spec_changes["act_dtype"] = overrides["act_dtype"]
+        if "kv_dtype" not in overrides:
+            # vLLM's absent --kv-cache-dtype means ``auto``: follow the resolved
+            # compute dtype, not a model-family-specific fp8 guess.
+            spec_changes["kv_dtype"] = overrides["act_dtype"]
     if spec_changes:
         from dataclasses import replace
 
         spec = replace(spec, **spec_changes)
 
+    unpriceable = validate_priceable_dtypes(spec)
+    if unpriceable:
+        return LiveSpecError(
+            reason=(
+                f"{model_ref!r} at {cfg_path} resolves to dtypes this planner cannot "
+                "price without substituting bf16 byte widths."
+            ),
+            model_ref=model_ref,
+            missing_keys=unpriceable,
+        )
+
     sharding = ShardingConfig(
         tp=overrides.get("tp", 1), ep=overrides.get("ep", 1), dp=overrides.get("dp", 1)
     )
     batch = BatchConfig(kv_cache_len=overrides.get("max_model_len", default_kv_cache_len))
+    warnings: list[str] = []
+    if cfg.get("expert_dtype") is None:
+        warnings.append(
+            "expert_dtype absent; inherited "
+            f"weight_dtype={spec.weight_dtype!r} for routed and shared expert weights"
+        )
+    warnings.append("decode batch was not observed; using batch=1 single-sequence floor")
+    if "max_model_len" not in overrides:
+        warnings.append(
+            f"KV cache length was not declared on the launch command; using "
+            f"kv_cache_len={default_kv_cache_len}"
+        )
+    if overrides.get("ep_enabled") and overrides.get("dp", 1) > 1:
+        warnings.append(
+            "expert parallelism with data_parallel_size>1 is approximated over the "
+            "tensor-parallel group"
+        )
 
     return LiveSpec(
         spec=spec,
@@ -385,4 +517,5 @@ def live_moe_spec(
         source_path=cfg_path,
         model_ref=model_ref,
         applied_overrides=overrides,
+        warnings=warnings,
     )

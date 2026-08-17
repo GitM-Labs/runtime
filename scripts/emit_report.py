@@ -102,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
     report = build_report()
     text = json.dumps(report, indent=2, sort_keys=True)
     if args.out:
-        args.out.write_text(text + "\n")
+        args.out.write_text(text + "\n", encoding="utf-8")
         print(f"wrote {args.out}")
     else:
         print(text)

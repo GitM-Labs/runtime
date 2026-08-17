@@ -7,6 +7,7 @@ rolled-back interventions stay visible. The report is the moat.
 
 from __future__ import annotations
 
+import math
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -25,7 +26,27 @@ class Claim:
     intervention_name: str
     predicted_delta: float
     measured_delta: float | None
+    # Whether the residual is specific to this claim, aggregated over the run,
+    # or tied to an autoresearch target op. The report hides the default label.
+    residual_scope: str = "claim"
     rolled_back: bool = False
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.residual_value):
+            raise ValueError("residual_value must be finite")
+        if not math.isfinite(self.predicted_delta):
+            raise ValueError("predicted_delta must be finite")
+        if self.measured_delta is not None and not math.isfinite(self.measured_delta):
+            raise ValueError("measured_delta must be finite when present")
+
+    @property
+    def residual_display_value(self) -> float:
+        """Value used in the compact table cell; raw truth remains available."""
+        return max(-1.0, min(1.0, self.residual_value))
+
+    @property
+    def residual_saturated(self) -> bool:
+        return abs(self.residual_value) > 1.0
 
 
 @dataclass
@@ -61,6 +82,7 @@ def write_report(
     provenance: Provenance,
     *,
     qualification_diagnostic: str = "",
+    runtime_diagnostics: list[str] | None = None,
     summary: str | None = None,
 ) -> str:
     """Render the provenance report as markdown."""
@@ -74,6 +96,7 @@ def write_report(
         "claims": claims,
         "provenance": provenance,
         "qualification_diagnostic": qualification_diagnostic,
+        "runtime_diagnostics": runtime_diagnostics or [],
         "summary": summary or _default_summary(claims),
         "now_ns": time.time_ns(),
     }
@@ -84,7 +107,7 @@ def _default_summary(claims: list[Claim]) -> str:
     verified = [c for c in claims if c.measured_delta is not None and not c.rolled_back]
     if not verified:
         return "No claims verified within budget. See diagnostic below."
-    total = sum(c.measured_delta or 0.0 for c in verified)
+    total = sum(c.measured_delta for c in verified if c.measured_delta is not None)
     return f"{len(verified)} verified claims, aggregate measured delta {total:+.1%}."
 
 

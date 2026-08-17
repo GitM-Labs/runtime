@@ -72,10 +72,54 @@ from gitm.planner.roofline import (
     HardwareSpec,
     ShardingConfig,
     SparseMoEModelSpec,
+    _canon_dtype,
     distinct_experts,
     roofline,
     weight_bytes,
+    weight_bytes_is_fallback,
 )
+
+_REQUIRED_POSITIVE_CONFIG_FIELDS = (
+    "hidden_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
+    "head_dim", "q_lora_rank", "o_lora_rank", "o_groups", "vocab_size",
+    "n_routed_experts", "num_experts_per_tok", "moe_intermediate_size",
+    "index_n_heads", "index_head_dim", "index_topk", "sliding_window",
+)
+
+
+def validate_sparse_moe_config(cfg: dict[str, Any]) -> list[str]:
+    """Return fields that cannot be omitted without inventing graph shape/bytes."""
+    errors: list[str] = []
+    for key in _REQUIRED_POSITIVE_CONFIG_FIELDS:
+        value = cfg.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f"{key} must be a declared positive integer, got {value!r}")
+    for key in ("qk_rope_head_dim", "n_shared_experts"):
+        value = cfg.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            errors.append(f"{key} must be a declared non-negative integer, got {value!r}")
+    n_experts, top_k = cfg.get("n_routed_experts"), cfg.get("num_experts_per_tok")
+    if isinstance(n_experts, int) and not isinstance(n_experts, bool) and isinstance(top_k, int) and not isinstance(top_k, bool) and top_k > n_experts:
+        errors.append(f"num_experts_per_tok={top_k} exceeds n_routed_experts={n_experts}")
+    n_layers, ratios = cfg.get("num_hidden_layers"), cfg.get("compress_ratios")
+    if not isinstance(ratios, list | tuple):
+        errors.append("compress_ratios must be declared for the sparse-attention graph")
+    elif isinstance(n_layers, int) and n_layers > 0 and len(ratios) < n_layers:
+        errors.append(f"compress_ratios has {len(ratios)} entries; need at least {n_layers}")
+    elif any(isinstance(r, bool) or not isinstance(r, int) or r < 0 for r in ratios):
+        errors.append("compress_ratios must contain non-negative integers")
+    q = cfg.get("quantization_config")
+    if q is not None and not isinstance(q, dict):
+        errors.append("quantization_config must be an object when declared")
+    elif isinstance(q, dict) and q.get("quant_method") is not None and weight_bytes_is_fallback(str(q["quant_method"])):
+        errors.append(f"quantization_config.quant_method={q['quant_method']!r} is not priceable")
+    for key in ("expert_dtype", "torch_dtype"):
+        value = cfg.get(key)
+        if value is None:
+            errors.append(f"{key} must be declared; byte width cannot be guessed")
+        elif weight_bytes_is_fallback(str(value)):
+            errors.append(f"{key}={value!r} is not priceable")
+    return errors
 
 
 def effective_kv_tokens(spec: SparseMoEModelSpec, layer: int, kv_len: int) -> int:
@@ -279,11 +323,15 @@ def _emit_layer(
     aw = weight_bytes(spec.act_dtype)
     ww = weight_bytes(spec.weight_dtype)
     ew = weight_bytes(spec.expert_dtype)
+    af = weight_bytes_is_fallback(spec.act_dtype)
+    wf = weight_bytes_is_fallback(spec.weight_dtype)
+    ef = weight_bytes_is_fallback(spec.expert_dtype)
+    kf = weight_bytes_is_fallback(spec.kv_dtype)
     wd, ed = spec.weight_dtype, spec.expert_dtype
 
     def add(
         op: str, flops: float, byts: float, dtype: str,
-        *, estimated: bool = False, serial_launches: int = 0,
+        *, byte_fallback: bool = False, estimated: bool = False, serial_launches: int = 0,
     ) -> None:
         name = f"{prefix}{op}"
         g.nodes.append(
@@ -292,6 +340,7 @@ def _emit_layer(
                 roofline(
                     name, flops, byts, hw, dtype,
                     estimated=estimated, serial_launches=serial_launches,
+                    bytes_are_fallback=byte_fallback,
                 ),
             )
         )
@@ -305,10 +354,10 @@ def _emit_layer(
     # head. Every rank pays for them in full, so TP's speedup on attention is
     # strictly less than ``tp``.
     f, b = _linear(positions, h, spec.q_lora_rank, aw, ww)
-    add("attn_q_a", f, b, wd)
+    add("attn_q_a", f, b, wd, byte_fallback=af or wf)
 
     f, b = _linear(positions, spec.q_lora_rank, spec.n_heads * spec.q_head_dim // tp, aw, ww)
-    add("attn_q_b", f, b, wd)
+    add("attn_q_b", f, b, wd, byte_fallback=af or wf)
 
     # KV entries and their compression weights, plus the cache write for the
     # positions just computed. CSA computes *two* KV series and two weight series
@@ -318,7 +367,7 @@ def _emit_layer(
     kind = spec.attention_kind(layer)
     n_kv_proj = {"csa": 4, "hca": 2}.get(kind, 1)
     f, b = _linear(positions, h, spec.kv_latent_dim * n_kv_proj, aw, ww)
-    add("attn_kv_a", f, b + positions * kv_entry_bytes(spec), wd)
+    add("attn_kv_a", f, b + positions * kv_entry_bytes(spec), wd, byte_fallback=af or wf or kf)
 
     if kind != "swa":
         # The compressor itself: a row-softmax over the window's weights and the
@@ -331,6 +380,7 @@ def _emit_layer(
             3.0 * positions * window * spec.kv_latent_dim / r,
             2.0 * positions * window * spec.kv_latent_dim * aw / r,
             spec.act_dtype,
+            byte_fallback=af,
         )
 
     # ── indexer: project the query, then scan the compressed candidate set ───
@@ -350,7 +400,7 @@ def _emit_layer(
         f, b = _linear(
             positions, spec.q_lora_rank, spec.index_n_heads * spec.index_head_dim, aw, ww
         )
-        add("attn_index_proj", f, b, wd)
+        add("attn_index_proj", f, b, wd, byte_fallback=af or wf)
 
         add(
             "attn_index_score",
@@ -362,6 +412,7 @@ def _emit_layer(
             # why the dtype and the byte width disagree here.
             sequences * cand * spec.index_head_dim * 1.0,
             "fp4",
+            byte_fallback=kf,
         )
 
     # ── attention core over the selected positions ──────────────────────────
@@ -382,6 +433,7 @@ def _emit_layer(
         # waiting to happen if the graph divided here.
         sequences * t_eff * kv_entry_bytes(spec),
         wd,
+        byte_fallback=kf,
     )
 
     # RMSNorm on every query head and on the single compressed KV head, plus
@@ -399,6 +451,7 @@ def _emit_layer(
         3.0 * normed + 6.0 * roped,
         2.0 * normed * aw + 2.0 * roped * aw,
         spec.act_dtype,
+        byte_fallback=af,
     )
 
     # Output projection, grouped and low-rank. ``o_groups`` partitions the head
@@ -410,7 +463,7 @@ def _emit_layer(
     f_b, b_b = _linear(positions, spec.o_lora_rank, h, aw, ww)
     # Named to match the dense graph's output projection: it is the same op in
     # the same place, so residuals for it stay comparable across model families.
-    add("attn_out_proj", f_a + f_b, b_a + b_b, wd, estimated=True)
+    add("attn_out_proj", f_a + f_b, b_a + b_b, wd, byte_fallback=af or wf, estimated=True)
 
     # ── manifold-constrained hyper-connections ──────────────────────────────
     # Two per block (around attention, around the MoE). The residual stream is
@@ -446,6 +499,7 @@ def _emit_layer(
                 f_gen + mix_flops + sinkhorn_flops,
                 b_gen + norm_bytes + mix_bytes,
                 wd,
+                byte_fallback=af or wf,
                 serial_launches=1,
             )
 
@@ -455,7 +509,7 @@ def _emit_layer(
     # alone (paper §2.1), so they run no router GEMM at all.
     if layer >= spec.num_hash_layers:
         f, b = _linear(positions, h, spec.n_routed_experts, aw, ww)
-        add("moe_router", f, b, wd)
+        add("moe_router", f, b, wd, byte_fallback=af or wf)
 
     inter = spec.moe_intermediate_size
     # gate + up + down == three h x inter matrices per expert.
@@ -469,6 +523,7 @@ def _emit_layer(
             per_expert_weights * spec.n_shared_experts * ew / tp
             + aw * (positions * h * 2 + positions * inter * 2 * spec.n_shared_experts / tp),
             ed,
+            byte_fallback=af or ef,
         )
 
     # Shared with the dense MoE roofline — one owner for the union term. Note the
@@ -490,6 +545,7 @@ def _emit_layer(
         per_expert_weights * distinct * ew * skew / es
         + aw * (positions * h * 2 + positions * inter * 2 * spec.num_experts_per_tok / es),
         ed,
+        byte_fallback=af or ef,
     )
 
     # ── low-rank state update on the tail layers ────────────────────────────
@@ -500,7 +556,7 @@ def _emit_layer(
         # Coarse: a down-up low-rank pair. The published shape isn't public, so
         # this establishes an order of magnitude and flags itself as an estimate
         # rather than sitting silently in the total.
-        add("dspark", f_d + f_u, b_d + b_u, wd, estimated=True)
+        add("dspark", f_d + f_u, b_d + b_u, wd, byte_fallback=af or wf, estimated=True)
 
     # ── cross-rank traffic ──────────────────────────────────────────────────
     # Priced against the interconnect, not HBM, by swapping the bandwidth term.
@@ -516,7 +572,7 @@ def _emit_layer(
             g.nodes.append(
                 PredictedNode(
                     name, layer,
-                    roofline(name, 0.0, byts, link, spec.act_dtype, estimated=True),
+                    roofline(name, 0.0, byts, link, spec.act_dtype, estimated=True, bytes_are_fallback=af),
                 )
             )
 
@@ -606,9 +662,15 @@ def predict_moe_graph(
     # Sharded along the vocabulary under TP.
     aw = weight_bytes(spec.act_dtype)
     ww = weight_bytes(spec.weight_dtype)
+    af = weight_bytes_is_fallback(spec.act_dtype)
+    wf = weight_bytes_is_fallback(spec.weight_dtype)
     f, b = _linear(positions, spec.hidden, spec.vocab // max(1, sh.tp), aw, ww)
     g.nodes.append(
-        PredictedNode("lm_head", None, roofline("lm_head", f, b, hw, spec.weight_dtype))
+        PredictedNode(
+            "lm_head", None,
+            roofline("lm_head", f, b, hw, spec.weight_dtype,
+                     bytes_are_fallback=af or wf),
+        )
     )
 
     return g
@@ -642,31 +704,36 @@ def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None) -> Spar
     ``num_hidden_layers`` entries index real layers, so the tail is dropped
     rather than silently shifting every layer's ratio.
     """
+    errors = validate_sparse_moe_config(cfg)
+    if errors:
+        raise ValueError("sparse-MoE config is not predictable: " + "; ".join(errors))
+
     q = cfg.get("quantization_config") or {}
-    weight_dtype = str(q.get("quant_method", "bf16")).lower()
-    n_layers = int(cfg.get("num_hidden_layers", 43))
-    ratios = tuple(int(r) for r in (cfg.get("compress_ratios") or ())[:n_layers])
+    act_dtype = _canon_dtype(str(cfg["torch_dtype"]))
+    weight_dtype = _canon_dtype(str(q.get("quant_method") or act_dtype))
+    n_layers = int(cfg["num_hidden_layers"])
+    ratios = tuple(int(r) for r in cfg["compress_ratios"][:n_layers])
 
     return SparseMoEModelSpec(
         name=name or str(cfg.get("model_type", "sparse-moe")),
-        hidden=int(cfg.get("hidden_size", 4096)),
+        hidden=int(cfg["hidden_size"]),
         n_layers=n_layers,
-        n_heads=int(cfg.get("num_attention_heads", 64)),
-        num_kv_heads=int(cfg.get("num_key_value_heads", 1)),
-        head_dim=int(cfg.get("head_dim", 512)),
+        n_heads=int(cfg["num_attention_heads"]),
+        num_kv_heads=int(cfg["num_key_value_heads"]),
+        head_dim=int(cfg["head_dim"]),
         qk_rope_head_dim=int(cfg.get("qk_rope_head_dim", 64)),
-        q_lora_rank=int(cfg.get("q_lora_rank", 1024)),
-        o_lora_rank=int(cfg.get("o_lora_rank", 1024)),
-        o_groups=int(cfg.get("o_groups", 1)),
-        vocab=int(cfg.get("vocab_size", 129280)),
-        n_routed_experts=int(cfg.get("n_routed_experts", 256)),
-        n_shared_experts=int(cfg.get("n_shared_experts", 1)),
-        num_experts_per_tok=int(cfg.get("num_experts_per_tok", 6)),
-        moe_intermediate_size=int(cfg.get("moe_intermediate_size", 2048)),
-        index_n_heads=int(cfg.get("index_n_heads", 64)),
-        index_head_dim=int(cfg.get("index_head_dim", 128)),
-        index_topk=int(cfg.get("index_topk", 512)),
-        sliding_window=int(cfg.get("sliding_window", 0) or 0),
+        q_lora_rank=int(cfg["q_lora_rank"]),
+        o_lora_rank=int(cfg["o_lora_rank"]),
+        o_groups=int(cfg["o_groups"]),
+        vocab=int(cfg["vocab_size"]),
+        n_routed_experts=int(cfg["n_routed_experts"]),
+        n_shared_experts=int(cfg["n_shared_experts"]),
+        num_experts_per_tok=int(cfg["num_experts_per_tok"]),
+        moe_intermediate_size=int(cfg["moe_intermediate_size"]),
+        index_n_heads=int(cfg["index_n_heads"]),
+        index_head_dim=int(cfg["index_head_dim"]),
+        index_topk=int(cfg["index_topk"]),
+        sliding_window=int(cfg["sliding_window"]),
         compress_ratios=ratios,
         num_nextn_predict_layers=int(cfg.get("num_nextn_predict_layers", 0)),
         # mHC: ``hc_mult`` is n_hc, the residual-stream widening factor.
@@ -676,9 +743,7 @@ def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None) -> Spar
         dspark_layer_ids=tuple(int(i) for i in (cfg.get("dspark_target_layer_ids") or ())),
         dspark_markov_rank=int(cfg.get("dspark_markov_rank", 0)),
         weight_dtype=weight_dtype,
-        expert_dtype=str(cfg.get("expert_dtype", weight_dtype)).lower(),
-        # vLLM serves this checkpoint with an fp8 KV cache; the config does not
-        # declare cache dtype, so it is a serving decision, not a model fact.
-        kv_dtype="fp8",
-        act_dtype=str(cfg.get("torch_dtype", "bf16")).lower().replace("bfloat16", "bf16"),
+        expert_dtype=_canon_dtype(str(cfg["expert_dtype"])),
+        kv_dtype=act_dtype,
+        act_dtype=act_dtype,
     )

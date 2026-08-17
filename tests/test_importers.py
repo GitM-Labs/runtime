@@ -17,6 +17,7 @@ from gitm.importers.torch_trace import event_from_chrome, import_torch_trace
 from gitm.optimizer.headroom import build_headroom
 from gitm.optimizer.metrics import HardwarePeak, compute_metrics
 from gitm.optimizer.qualification import qualify
+from gitm.tracer.capture import write_trace_jsonl
 from gitm.tracer.schema import KernelEvent, MemcpyEvent, SyncEvent, Trace
 
 from .conftest import make_kernel, make_trace
@@ -105,6 +106,27 @@ def test_nsys_sync_enum_branches():
     assert "device" in kinds
 
 
+def test_nsys_unknown_enums_are_retained_as_import_diagnostics(tmp_path):
+    src = FIXTURES / "nsys_2024_min.sqlite"
+    dst = tmp_path / "unknown-enums.sqlite"
+    dst.write_bytes(src.read_bytes())
+    conn = sqlite3.connect(dst)
+    conn.execute(
+        "UPDATE CUPTI_ACTIVITY_KIND_MEMCPY SET srcKind=NULL, dstKind=NULL, copyKind=999 "
+        "WHERE rowid=1"
+    )
+    conn.execute(
+        "UPDATE CUPTI_ACTIVITY_KIND_SYNCHRONIZATION SET syncType=999 WHERE rowid=1"
+    )
+    conn.commit()
+    conn.close()
+
+    _, stats = import_nsys(dst, device=0)
+
+    assert any("unknown CUPTI copyKind enum 999" in note for note in stats.warnings)
+    assert any("unknown CUPTI sync type enum 999" in note for note in stats.warnings)
+
+
 def test_nsys_multi_device_selection():
     # Default: all devices
     all_traces, stats = import_nsys(FIXTURES / "nsys_2024_min.sqlite")
@@ -143,11 +165,12 @@ def test_torch_json_and_gz():
 
 
 def test_torch_array_form_and_missing_grid():
-    ts, _ = import_torch_trace(FIXTURES / "torch_trace_array.json")
+    ts, stats = import_torch_trace(FIXTURES / "torch_trace_array.json")
     t = ts[0]
     assert t.kernels()
     # grid defaults to 1 when absent
     assert all(k.grid_x >= 1 and k.block_x >= 1 for k in t.kernels())
+    assert any("grid dimensions" in warning for warning in stats.warnings)
 
 
 def test_torch_us_to_ns_conversion():
@@ -351,9 +374,77 @@ def test_dedupe_identical_rows(tmp_path):
     conn.close()
     with pytest.warns(UserWarning, match="deduped"):
         traces, stats = import_nsys(dst, device=0)
-    # dedupe count is on the per-device finish_trace; check events cleaned
+    assert stats.deduped == 1
+    assert any("deduped 1" in note for note in stats.warnings)
     assert traces[0].kernels()
-    Trace.model_validate(traces[0].model_dump())
+    artifact = tmp_path / "deduped-trace.jsonl"
+    write_trace_jsonl(artifact, traces[0])
+    lines = artifact.read_text(encoding="utf-8").splitlines()
+    header = json.loads(lines[0])["_header"]
+    events = [json.loads(line) for line in lines[1:] if line.strip()]
+    Trace.model_validate({**header, "events": events})
+
+
+def test_invalid_event_drop_reaches_file_level_import_diagnostics(tmp_path):
+    src = FIXTURES / "parity_nsys.sqlite"
+    dst = tmp_path / "invalid.sqlite"
+    dst.write_bytes(src.read_bytes())
+    conn = sqlite3.connect(dst)
+    conn.execute(
+        "UPDATE CUPTI_ACTIVITY_KIND_KERNEL SET end = start - 1 "
+        "WHERE rowid = (SELECT rowid FROM CUPTI_ACTIVITY_KIND_KERNEL LIMIT 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.warns(UserWarning, match="dropped 1 event"):
+        traces, stats = import_nsys(dst, device=0)
+
+    assert traces[0].kernels()
+    assert stats.dropped_invalid == 1
+    assert any("dropped 1 event" in note for note in stats.warnings)
+
+    with pytest.warns(UserWarning, match="dropped 1 event"):
+        result = analyze_paths([dst], run_id="invalid-event-report")
+    assert "dropped 1 event" in result.report_md
+
+
+def test_malformed_gpu_event_parse_drop_reaches_customer_report(tmp_path):
+    trace_path = tmp_path / "malformed-gpu-event.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    {
+                        "ph": "X",
+                        "cat": "kernel",
+                        "name": "valid_kernel",
+                        "ts": 1.0,
+                        "dur": 100.0,
+                        "args": {"device": 0, "stream": 1},
+                    },
+                    {
+                        "ph": "X",
+                        "cat": "kernel",
+                        "name": "broken_kernel",
+                        "ts": "not-a-timestamp",
+                        "dur": 100.0,
+                        "args": {"device": 0, "stream": 1},
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    traces, stats = import_torch_trace(trace_path)
+    assert len(traces[0].kernels()) == 1
+    assert stats.total_raw_events == 2
+    assert stats.dropped_invalid == 1
+    assert any("dropped 1 GPU event" in note for note in stats.warnings)
+
+    result = analyze_paths([trace_path], run_id="malformed-gpu-event-report")
+    assert "dropped 1 GPU event" in result.report_md
 
 
 def test_atomic_write(tmp_path):
@@ -447,7 +538,7 @@ def test_golden_customer_report(tmp_path):
 
     if os.environ.get("GITM_UPDATE_GOLDEN") == "1":
         golden.write_text(md)
-    assert md == golden.read_text(), (
+    assert md == golden.read_text(encoding="utf-8"), (
         "customer report drifted from golden — set GITM_UPDATE_GOLDEN=1 if intentional"
     )
 

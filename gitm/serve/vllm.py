@@ -47,6 +47,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -252,6 +253,17 @@ def check_driver_stack() -> list[Check]:
     problems = cuda_env.check()
     if problems:
         return [Check("cuda-stack", "fail", "\n".join(str(p) for p in problems))]
+    unverified = cuda_env.unverified_cuda_components()
+    if unverified:
+        return [
+            Check(
+                "cuda-stack",
+                "warn",
+                f"driver CUDA {driver[0]}.{driver[1]} detected, but "
+                f"{' and '.join(unverified)} could not be verified; "
+                "stack compatibility is unknown",
+            )
+        ]
     return [Check("cuda-stack", "pass", f"driver CUDA {driver[0]}.{driver[1]}, stack consistent")]
 
 
@@ -424,7 +436,13 @@ def served_model_name(base: str, fallback: str) -> str:
         with urllib.request.urlopen(base + "/v1/models", timeout=10) as r:
             data = json.loads(r.read())
         return data["data"][0]["id"]
-    except Exception:
+    except Exception as exc:
+        warnings.warn(
+            f"served-model discovery failed at {base}/v1/models; using configured "
+            f"fallback {fallback!r} ({type(exc).__name__}: {exc})",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return fallback
 
 
@@ -544,6 +562,7 @@ def one_request(base: str, model: str, prompt: str, max_tokens: int,
     # usage is authoritative; the chunk count is the fallback when a build doesn't
     # emit it, and it undercounts whenever a chunk carries several tokens.
     rec.n_output_tokens = usage_tokens if usage_tokens is not None else chunks
+    rec.token_count_source = "usage" if usage_tokens is not None else "chunks"
     return rec
 
 
@@ -759,8 +778,11 @@ def launch_and_capture(args, serve_argv: list[str] | None = None):
 
     print(f"\n==> {len(records)} ok / {failures} failed in {wall:.1f}s")
     if summary.ttft_p50_s is not None:
+        tpot = f"{summary.tpot_p50_s * 1e3:.1f} ms" if summary.tpot_p50_s is not None else "n/a"
         print(f"    TTFT p50/p95 {summary.ttft_p50_s * 1e3:.0f}/{summary.ttft_p95_s * 1e3:.0f} ms"
-              f"   TPOT p50 {(summary.tpot_p50_s or 0) * 1e3:.1f} ms")
+              f"   TPOT p50 {tpot}")
+    for warning in summary.warnings:
+        print(f"    WARN: {warning}")
     print_result(result)
 
     if result.status == "no_kernels":

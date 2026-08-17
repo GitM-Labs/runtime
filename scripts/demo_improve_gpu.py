@@ -23,14 +23,17 @@ from __future__ import annotations
 import argparse
 import json
 import time
+import warnings
 from pathlib import Path
 
+from gitm._timing import require_positive_duration
 
-def _serialized(trace) -> float:
+
+def _serialized(trace) -> float | None:
     from gitm.optimizer.monitor import _serialized_fraction
 
     kernels = [e for e in trace.events if e.kind == "kernel"]
-    return _serialized_fraction(kernels) if kernels else 0.0
+    return _serialized_fraction(kernels) if kernels else None
 
 
 def _mean_util(path: Path) -> float | None:
@@ -62,8 +65,12 @@ def _run_observed(fn, label: str, outdir: Path) -> tuple[object, dict]:
         from gitm.telemetry.sinks import build_sink
 
         tele = Collector(CollectorConfig(interval_s=0.05, sinks=[build_sink(f"jsonl:{tele_path}")]))
-    except Exception:
-        pass
+    except Exception as exc:
+        warnings.warn(
+            f"demo telemetry unavailable: {type(exc).__name__}: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     if tele:
         tele.start()
@@ -71,7 +78,9 @@ def _run_observed(fn, label: str, outdir: Path) -> tuple[object, dict]:
         t0 = time.perf_counter()
         result = fn()
         cupy.cuda.runtime.deviceSynchronize()
-        elapsed = max(time.perf_counter() - t0, 1e-9)
+        elapsed = require_positive_duration(
+            time.perf_counter() - t0, context=f"demo observation {label}"
+        )
     if tele:
         tele.stop()
 
@@ -80,6 +89,7 @@ def _run_observed(fn, label: str, outdir: Path) -> tuple[object, dict]:
         "serialized": _serialized(tr),
         "util_pct": _mean_util(tele_path),
         "n_kernels": len([e for e in tr.events if e.kind == "kernel"]),
+        "diagnostics": list(tele.diagnostics) if tele is not None else ["telemetry unavailable"],
     }
 
 
@@ -123,13 +133,22 @@ def main(argv=None) -> int:
     # --- 1. OBSERVE -----------------------------------------------------------
     before_res, before = _run_observed(serial, "before", args.outdir)
     util_s = f"{before['util_pct']:.0f}%" if before["util_pct"] is not None else "n/a"
+    serialized_s = (
+        f"{before['serialized']:.3f}" if before["serialized"] is not None else "unavailable"
+    )
     print("1. OBSERVE (serial baseline under the runtime):")
     print("     why: run the work once, untouched, to measure how much of the GPU it actually uses.")
     print(f"     wall-clock {before['elapsed_s'] * 1e3:.2f} ms | util {util_s} | "
-          f"serialized {before['serialized']:.3f} | {before['n_kernels']} kernels\n")
+          f"serialized {serialized_s} | {before['n_kernels']} kernels\n")
 
     # --- 2. DECIDE ------------------------------------------------------------
-    idle = before["util_pct"] is None or before["util_pct"] < 85.0
+    if before["util_pct"] is None:
+        print("     telemetry unavailable — refusing an idle-GPU claim and intervention decision.")
+        return 1
+    if before["serialized"] is None:
+        print("     cross-stream evidence unavailable — refusing a concurrency intervention decision.")
+        return 1
+    idle = before["util_pct"] < 85.0
     serial_heavy = before["serialized"] > 0.5
     print("2. DECIDE (runtime maps headroom -> lever):")
     print("     why: an idle GPU running serialized, independent work is the signature that parallelizing across streams should help.")
@@ -160,15 +179,25 @@ def main(argv=None) -> int:
         return 1
 
     util_a = f"{after['util_pct']:.0f}%" if after["util_pct"] is not None else "n/a"
+    serialized_a = (
+        f"{after['serialized']:.3f}" if after["serialized"] is not None else "unavailable"
+    )
     speedup = before["elapsed_s"] / after["elapsed_s"]
     print()
     print("                     BEFORE (serial)     AFTER (parallel)")
     print(f"     wall-clock      {before['elapsed_s'] * 1e3:>10.2f} ms    {after['elapsed_s'] * 1e3:>10.2f} ms")
     print(f"     throughput      {K / before['elapsed_s']:>10.0f} mm/s  {K / after['elapsed_s']:>10.0f} mm/s")
     print(f"     GPU util        {util_s:>12}      {util_a:>12}")
-    print(f"     serialized      {before['serialized']:>12.3f}      {after['serialized']:>12.3f}")
-    print(f"\n  >>> runtime-driven improvement: {speedup:.2f}x faster, "
-          f"serialization {before['serialized']:.2f} -> {after['serialized']:.2f}  (correctness-gated)")
+    print(f"     serialized      {serialized_s:>12}      {serialized_a:>12}")
+    serialization_delta = (
+        f", serialization {before['serialized']:.2f} -> {after['serialized']:.2f}"
+        if after["serialized"] is not None
+        else ", post-change serialization unavailable"
+    )
+    print(
+        f"\n  >>> runtime-driven improvement: {speedup:.2f}x faster{serialization_delta} "
+        " (correctness-gated)"
+    )
     return 0
 
 

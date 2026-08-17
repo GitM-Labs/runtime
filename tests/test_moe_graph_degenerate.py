@@ -82,12 +82,10 @@ def test_no_sliding_window_means_global_not_zero(spec, hw):
     assert attn > 0
 
 
-def test_a_config_stripped_to_nothing_still_prices_attention(hw):
-    """``spec_from_hf_config({})`` takes every default, including no
-    compression and no window — the exact shape that used to cost zero."""
-    g = predict_moe_graph(spec_from_hf_config({}), hw, BatchConfig(batch=8, kv_cache_len=4096))
-    attn = sum(n.prediction.flops for n in g.nodes if n.op == "attn_score_value")
-    assert attn > 0
+def test_a_config_stripped_to_nothing_is_refused_instead_of_defaulted(hw):
+    """A missing live config cannot inherit a plausible sparse architecture."""
+    with pytest.raises(ValueError, match="hidden_size"):
+        spec_from_hf_config({})
 
 
 # ── degenerate but legal shapes stay finite and non-negative ────────────────
@@ -125,11 +123,16 @@ def test_degenerate_shapes_stay_finite(spec, hw, label, mutation):
     assert g.total_pred_s > 0, label
 
 
-@pytest.mark.parametrize("batch,ctx", [(1, 0), (1, 1), (0, 4096), (1, 1 << 24), (4096, 1)])
+@pytest.mark.parametrize("batch,ctx", [(1, 0), (1, 1), (1, 1 << 24), (4096, 1)])
 def test_extreme_batch_and_context_stay_finite(spec, hw, batch, ctx):
     g = predict_moe_graph(spec, hw, BatchConfig(batch=batch, kv_cache_len=ctx))
     assert _all_finite(g)
     assert math.isfinite(g.total_pred_s)
+
+
+def test_zero_batch_is_refused_instead_of_becoming_a_zero_work_graph(spec, hw):
+    with pytest.raises(ValueError, match="batch must be a positive integer"):
+        BatchConfig(batch=0)
 
 
 def test_expert_parallelism_beyond_the_expert_count_stays_finite(spec, hw):

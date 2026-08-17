@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import copy
 import gc
+import math
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +32,7 @@ import yaml
 
 from gitm.kernels.spec import InterventionSpec
 from gitm.optimizer.vllm_knobs import get_knob, knob_kind, set_knob
+from gitm.safety.failopen import FailOpenGuard
 
 if TYPE_CHECKING:
     from gitm.safety.audit import AuditLog
@@ -74,39 +77,82 @@ def apply_intervention(
     blocks the apply). Pass one only where the applicator mutates a real target;
     a dry-run leaves it ``None`` so the trail stays free of no-op entries.
     """
-    snapshot = applicator.snapshot()
-
-    # Step 2: apply. A bad value (validation error) rolls straight back.
+    if not math.isfinite(min_keep_delta):
+        raise ValueError(f"min_keep_delta must be finite, got {min_keep_delta!r}")
     try:
-        applicator.apply(spec)
+        snapshot = applicator.snapshot()
     except Exception as exc:
-        applicator.restore(snapshot)
-        _audit(audit, "revert", spec, cause=f"apply failed, restored: {exc}",
-               knobs=_knob_values(spec))
-        return ApplyResult(False, rolled_back=True, measured_delta=None,
-                           error=f"apply failed, restored: {exc}")
-    _audit(audit, "apply", spec, cause="applied live", knobs=_knob_values(spec))
+        return ApplyResult(
+            False,
+            rolled_back=False,
+            measured_delta=None,
+            error=f"baseline snapshot failed; intervention not applied: {exc}",
+        )
 
-    # Step 3: measure. A crash mid-measurement also rolls back.
-    try:
-        delta = applicator.measure(spec)
-    except Exception as exc:
-        applicator.restore(snapshot)
-        _audit(audit, "revert", spec, cause=f"measure failed, restored: {exc}",
-               knobs=_knob_values(spec))
-        return ApplyResult(False, rolled_back=True, measured_delta=None,
-                           error=f"measure failed, restored: {exc}")
+    def _apply_measure_decide() -> ApplyResult:
+        # Step 2: apply. A bad value (validation error) rolls straight back.
+        try:
+            applicator.apply(spec)
+        except Exception as exc:
+            applicator.restore(snapshot)
+            _audit(audit, "revert", spec, cause=f"apply failed, restored: {exc}",
+                   knobs=_knob_values(spec))
+            return ApplyResult(False, rolled_back=True, measured_delta=None,
+                               error=f"apply failed, restored: {exc}")
+        _audit(audit, "apply", spec, cause="applied live", knobs=_knob_values(spec))
 
-    # Step 4: keep-or-rollback on the regression threshold.
-    if delta is not None and delta < min_keep_delta:
-        applicator.restore(snapshot)
-        _audit(audit, "revert", spec, knobs=_knob_values(spec),
-               cause=f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}")
-        return ApplyResult(True, rolled_back=True, measured_delta=delta,
-                           error=f"regression {delta:+.3f} < keep threshold "
-                                 f"{min_keep_delta:+.3f}, restored")
+        # Step 3: measure. A recoverable crash rolls back immediately. The
+        # surrounding fail-open guard also restores on BaseException/process
+        # exit paths that an Exception handler must not swallow.
+        try:
+            delta = applicator.measure(spec)
+        except Exception as exc:
+            applicator.restore(snapshot)
+            _audit(audit, "revert", spec, cause=f"measure failed, restored: {exc}",
+                   knobs=_knob_values(spec))
+            return ApplyResult(False, rolled_back=True, measured_delta=None,
+                               error=f"measure failed, restored: {exc}")
 
-    return ApplyResult(True, rolled_back=False, measured_delta=delta)
+        if delta is not None and (
+            isinstance(delta, bool)
+            or not isinstance(delta, int | float)
+            or not math.isfinite(float(delta))
+        ):
+            applicator.restore(snapshot)
+            error = f"measurement delta must be finite, got {delta!r}; intervention restored"
+            _audit(audit, "revert", spec, cause=error, knobs=_knob_values(spec))
+            return ApplyResult(False, rolled_back=True, measured_delta=None, error=error)
+
+        # Step 4: keep-or-rollback on the regression threshold.
+        if delta is None:
+            warnings.warn(
+                f"intervention {spec.name!r} was applied without a measurement; "
+                "the change is unverified",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if delta is not None and delta < min_keep_delta:
+            applicator.restore(snapshot)
+            _audit(audit, "revert", spec, knobs=_knob_values(spec),
+                   cause=f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}")
+            return ApplyResult(True, rolled_back=True, measured_delta=delta,
+                               error=f"regression {delta:+.3f} < keep threshold "
+                                     f"{min_keep_delta:+.3f}, restored")
+
+        return ApplyResult(True, rolled_back=False, measured_delta=delta)
+
+    with FailOpenGuard(audit=audit) as guard:
+        guard.register(
+            spec.name,
+            lambda: applicator.restore(snapshot),
+            cause="apply gate exited before a keep/rollback decision",
+        )
+        result = _apply_measure_decide()
+        # Every ordinary return above either kept the change deliberately or
+        # restored it synchronously. Exceptional exits retain the registration,
+        # so the context restores before propagating the interruption.
+        guard.disarm(spec.name)
+        return result
 
 
 def _audit(
@@ -117,8 +163,12 @@ def _audit(
         return
     try:
         audit.record(event, spec.name, cause, **detail)
-    except Exception:
-        pass
+    except Exception as exc:
+        warnings.warn(
+            f"intervention safety audit failed for {event} {spec.name!r}: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def _knob_values(spec: Any) -> dict[str, Any]:
@@ -307,7 +357,9 @@ class LiveEngineApplicator:
         self._restart_mode = restart_mode
         self._getter = getter or get_knob
         self._setter = setter or set_knob
-        self._reps = max(1, reps)
+        if isinstance(reps, bool) or not isinstance(reps, int) or reps <= 0:
+            raise ValueError(f"A/B repetition count must be a positive integer, got {reps!r}")
+        self._reps = reps
         # force_restart is kept for custom deployments that still classify a
         # knob as scheduling but want to measure it through the restart path.
         self._force_restart = force_restart
@@ -327,7 +379,13 @@ class LiveEngineApplicator:
         stdev is 0.0 for a single rep → the noise band is 0 and keep falls back to
         ``delta > 0``, i.e. reps=1 behaves exactly as before reps were added.
         """
-        samples = [self._tps(self.engine) for _ in range(self._reps)]
+        samples = [float(self._tps(self.engine)) for _ in range(self._reps)]
+        invalid = [sample for sample in samples if not math.isfinite(sample) or sample <= 0.0]
+        if invalid:
+            raise ValueError(
+                "decode throughput samples must be finite and positive; "
+                f"observed {invalid!r}"
+            )
         mean = sum(samples) / len(samples)
         if len(samples) < 2:
             return mean, 0.0
@@ -430,8 +488,10 @@ class LiveEngineApplicator:
         if callable(fn):
             try:
                 fn(engine)
-            except Exception:
-                pass
+            except Exception as exc:
+                warnings.warn(
+                    f"engine activation hook failed: {exc}", RuntimeWarning, stacklevel=2
+                )
 
     @staticmethod
     def _shutdown(engine: Any) -> None:
@@ -440,8 +500,10 @@ class LiveEngineApplicator:
         if callable(custom):
             try:
                 custom(engine)
-            except Exception:
-                pass
+            except Exception as exc:
+                warnings.warn(
+                    f"engine shutdown hook failed: {exc}", RuntimeWarning, stacklevel=2
+                )
 
         for path in ("shutdown", "llm_engine.shutdown", "engine.shutdown"):
             obj: Any = engine
@@ -452,8 +514,12 @@ class LiveEngineApplicator:
             if callable(obj):
                 try:
                     obj()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    warnings.warn(
+                        f"engine shutdown path {path!r} failed: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                 break
         try:
             gc.collect()
@@ -462,8 +528,12 @@ class LiveEngineApplicator:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
-        except Exception:
-            pass
+        except Exception as exc:
+            warnings.warn(
+                f"GPU cleanup after engine shutdown unavailable: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def measure(self, spec: InterventionSpec) -> float | None:
         baseline = self._baseline_tps if self._baseline_tps is not None else self._bench_stats()[0]

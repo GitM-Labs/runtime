@@ -47,7 +47,7 @@ class BaselineSummary:
     mean: float
     stddev: float
     spread: float  # (max - min) / mean
-    gpu_active_overall: float  # worst (max) across runs
+    gpu_active_overall: float | None  # worst (max) across runs; None = unmeasured
     recorded: float  # the number we publish = mean
     gates: list[GateResult] = field(default_factory=list)
     seeds: list[int] = field(default_factory=list)
@@ -96,7 +96,9 @@ def aggregate(runs: list[BaselineRun], config: BenchConfig) -> BaselineSummary:
     mean = statistics.fmean(values)
     stddev = statistics.pstdev(values) if len(values) > 1 else 0.0
     spread = (max(values) - min(values)) / mean if mean else float("inf")
-    gpu_overall = max(r.gpu_active_overall() for r in runs)
+    gpu_values = [r.gpu_active_overall() for r in runs]
+    gpu_coverage_ok = all(value is not None for value in gpu_values)
+    gpu_overall = max(value for value in gpu_values if value is not None) if gpu_coverage_ok else None
 
     gates: list[GateResult] = []
 
@@ -119,13 +121,43 @@ def aggregate(runs: list[BaselineRun], config: BenchConfig) -> BaselineSummary:
     )
 
     # Gate 2: saturation / swap rule.
-    sat_ok = gpu_overall < config.gpu_active_ceiling
+    sat_ok = gpu_overall is not None and gpu_overall < config.gpu_active_ceiling
     gates.append(
         GateResult(
             "saturation",
             sat_ok,
-            f"GPU active {gpu_overall:.1%} vs ceiling {config.gpu_active_ceiling:.0%}"
-            + ("" if sat_ok else " — trips swap rule, shard same day"),
+            (
+                f"GPU active {gpu_overall:.1%} vs ceiling {config.gpu_active_ceiling:.0%}"
+                + ("" if sat_ok else " — trips swap rule, shard same day")
+                if gpu_overall is not None
+                else "GPU-active coverage unavailable: at least one run has no positive-wall-time "
+                "stall breakdown; saturation sign-off refused"
+            ),
+        )
+    )
+
+    provenance_issues: list[str] = []
+    for run in runs:
+        if not run.git_sha or run.git_sha == "unknown":
+            provenance_issues.append(f"seed {run.seed}: git SHA unavailable")
+        if not run.manifest_sha256:
+            provenance_issues.append(f"seed {run.seed}: dataset manifest digest unavailable")
+        if not run.gpu_name or run.gpu_name.lower() in {"cpu", "gpu-unknown"}:
+            provenance_issues.append(f"seed {run.seed}: GPU identity unavailable ({run.gpu_name!r})")
+        if run.device_count < 1:
+            provenance_issues.append(f"seed {run.seed}: no GPU devices reported")
+        if run.started_at_ns <= 0:
+            provenance_issues.append(f"seed {run.seed}: start timestamp unavailable")
+        if run.ended_at_ns <= run.started_at_ns:
+            provenance_issues.append(f"seed {run.seed}: end timestamp does not follow start")
+        provenance_issues.extend(f"seed {run.seed}: {note}" for note in run.provenance_warnings)
+    gates.append(
+        GateResult(
+            "provenance",
+            not provenance_issues,
+            "all runs pin code, dataset, and GPU identity"
+            if not provenance_issues
+            else "; ".join(provenance_issues),
         )
     )
 

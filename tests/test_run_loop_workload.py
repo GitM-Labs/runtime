@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +18,22 @@ from .conftest import make_kernel, make_trace
 # Digest of an empty kernel list — sha256(repr([]))[:16]. A real trace must not
 # produce this; if it does, the workload didn't actually run.
 EMPTY_DIGEST = "4f53cda18c2baa0c"
+
+
+@pytest.mark.parametrize("budget", ["0s", "0.0h"])
+def test_loop_refuses_nonpositive_budget(budget, tmp_path):
+    from gitm import optimize
+
+    with pytest.raises(ValueError, match="budget must be positive"):
+        optimize(workload="custom", budget=budget, scratch=str(tmp_path))
+
+
+@pytest.mark.parametrize("target", [0.0, -0.1, 1.01, float("nan"), float("inf")])
+def test_loop_refuses_invalid_target_floor(target, tmp_path):
+    from gitm import optimize
+
+    with pytest.raises(ValueError, match="target floor"):
+        optimize(workload="custom", budget="1s", target=target, scratch=str(tmp_path))
 
 
 def test_no_data_guard_does_not_fabricate_claims(tmp_path: Path):
@@ -32,6 +49,44 @@ def test_no_data_guard_does_not_fabricate_claims(tmp_path: Path):
     assert summary["diagnostic"]  # explains why nothing was measured
     assert Path(summary["report_path"]).exists()
     assert "NO DATA" in result["report_md"]
+
+
+def test_zero_duration_kernel_does_not_bypass_no_data_guard(tmp_path, monkeypatch):
+    import gitm.scheduler.loop as loop
+
+    @contextmanager
+    def invalid_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield make_trace(
+            events=[make_kernel("invalid", start_ns=10, end_ns=10)],
+            vendor="nvidia",
+            run_id=run_id or "r",
+        )
+
+    monkeypatch.setattr(loop, "capture", invalid_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    from gitm import optimize
+
+    result = optimize(
+        workload="custom",
+        budget="1s",
+        scratch=str(tmp_path),
+        workload_runner=lambda: {"events": 1},
+    )
+
+    assert result["summary"]["status"] == "no_data"
+    assert result["summary"]["n_claims"] == 0
+    assert "positive-duration" in result["report_md"]
+
+
+def test_qualification_direct_caller_refuses_invalid_kernel_durations():
+    from gitm.optimizer.qualification import qualify
+
+    trace = make_trace(events=[make_kernel("broken", start_ns=20, end_ns=10)])
+    result = qualify(trace)
+
+    assert result.commit is False
+    assert "non-positive duration" in result.diagnostic
 
 
 _UNSET = object()  # identity sentinel — a real workload_id could legitimately be any string
@@ -215,6 +270,43 @@ def _fake_capture_with_kernels(prefix: str):
     return fake_capture
 
 
+def _priceable_moe_engine():
+    cfg = SimpleNamespace(
+        model_type="deepseek_v4",
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=64,
+        qk_rope_head_dim=16,
+        q_lora_rank=16,
+        o_lora_rank=16,
+        o_groups=1,
+        n_routed_experts=4,
+        n_shared_experts=0,
+        num_experts_per_tok=1,
+        moe_intermediate_size=32,
+        index_n_heads=1,
+        index_head_dim=16,
+        index_topk=32,
+        sliding_window=16,
+        compress_ratios=[0, 4],
+        expert_dtype="fp4",
+        quantization_config={"quant_method": "fp8"},
+        torch_dtype="bfloat16",
+        vocab_size=128,
+    )
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=cfg, dtype="bf16", max_model_len=4096),
+        cache_config=SimpleNamespace(max_model_len=4096, cache_dtype="fp8"),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+            enable_expert_parallel=False,
+        ),
+    )
+
+
 def test_non_vllm_workload_emits_measurement_not_vllm_claims(tmp_path: Path, monkeypatch):
     """HFT (no intervention library) must report real kernels, never vLLM knobs."""
     import gitm.scheduler.loop as loop
@@ -243,16 +335,121 @@ def test_vllm_workload_still_uses_intervention_path(tmp_path: Path, monkeypatch)
 
     monkeypatch.setattr(loop, "capture", _fake_capture_with_kernels("paged_attention"))
     monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setenv("GITM_GPU_SKU", "NVIDIA B200")
+
+    from gitm import optimize
+
+    result = optimize(
+        _priceable_moe_engine(),
+        workload="vllm-decode",
+        budget="1s",
+        scratch=str(tmp_path),
+        workload_runner=lambda: {},
+    )
+    assert result["summary"]["mode"] == "intervention"
+
+
+def test_vllm_missing_intervention_library_degrades_with_named_coverage_refusal(
+    tmp_path: Path, monkeypatch
+):
+    import gitm.scheduler.loop as loop
+
+    monkeypatch.setattr(loop, "capture", _fake_capture_with_kernels("paged_attention"))
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(
+        loop,
+        "load_library",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            FileNotFoundError("missing.yaml; candidate coverage is unavailable")
+        ),
+    )
+    monkeypatch.setenv("GITM_GPU_SKU", "NVIDIA B200")
+
+    from gitm import optimize
+
+    result = optimize(
+        _priceable_moe_engine(),
+        workload="vllm-decode",
+        budget="1s",
+        scratch=str(tmp_path),
+        workload_runner=lambda: {},
+    )
+
+    assert result["summary"]["status"] == "candidate_coverage_unavailable"
+    assert result["summary"]["mode"] == "measurement"
+    assert result["summary"]["n_claims"] == 0
+    assert "missing.yaml" in result["report_md"]
+    assert "candidate coverage" in result["report_md"]
+
+
+def test_vllm_without_live_model_refuses_prediction_claims(tmp_path: Path, monkeypatch):
+    import gitm.scheduler.loop as loop
+
+    monkeypatch.setattr(loop, "capture", _fake_capture_with_kernels("paged_attention"))
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setenv("GITM_GPU_SKU", "NVIDIA B200")
 
     from gitm import optimize
 
     result = optimize(
         workload="vllm-decode", budget="1s", scratch=str(tmp_path), workload_runner=lambda: {}
     )
-    assert result["summary"]["mode"] == "intervention"
+
+    assert result["summary"]["status"] == "prediction_refused"
+    assert result["summary"]["mode"] == "measurement"
+    assert result["summary"]["n_claims"] == 0
+    assert "no live engine" in result["report_md"]
+    refusal = Path(result["run_dir"]) / "prediction_refusal.json"
+    assert refusal.exists() and "no live engine" in refusal.read_text()
 
 
-def test_vllm_loop_runs_autoresearch(tmp_path: Path, monkeypatch):
+def test_vllm_loop_surfaces_residual_coverage(tmp_path: Path, monkeypatch):
+    """Unclassified work must be visible in both the JSON and human report."""
+    import json
+
+    import gitm.planner.context as planner_context
+    import gitm.scheduler.loop as loop
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [
+            make_kernel("flash_attn_kernel", start_ns=0, end_ns=900),
+            make_kernel("triton_rms_norm_kernel", start_ns=900, end_ns=1000),
+        ]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setenv("GITM_GPU_SKU", "NVIDIA B200")
+    monkeypatch.setattr(planner_context, "_query_nvml", lambda: ("NVIDIA B200", None))
+
+    from gitm import optimize
+
+    result = optimize(
+        _priceable_moe_engine(),
+        workload="vllm-decode",
+        budget="1s",
+        scratch=str(tmp_path),
+        workload_runner=lambda: {},
+    )
+    payload = json.loads((Path(result["run_dir"]) / "residuals.json").read_text())
+    predicted = json.loads((Path(result["run_dir"]) / "predicted_graph.json").read_text())
+
+    assert payload["coverage"]["total_kernels"] == 2
+    assert payload["coverage"]["matched_kernels"] == 1
+    assert payload["coverage"]["warnings"]
+    assert predicted["resident_weight_bytes_per_rank"] > 0
+    assert predicted["resident_weight_bytes_is_lower_bound"] is False
+    assert predicted["kv_bytes_per_token_per_sequence"] > 0
+    assert predicted["kv_fixed_bytes_per_sequence"] > 0
+    assert "## Runtime diagnostics" in result["report_md"]
+    assert "matched to the predicted graph" in result["report_md"]
+    assert "GPU count was unavailable" in result["report_md"]
+
+
+def test_vllm_loop_without_model_does_not_run_autoresearch_on_default_graph(
+    tmp_path: Path, monkeypatch
+):
     """The vllm path runs agentic autoresearch: it classifies the bottleneck via
     trace telemetry (the serialized same-stream "paged_attention" kernels are
     also roofline-predicted memory-bound at batch=1, so classification is
@@ -275,16 +472,13 @@ def test_vllm_loop_runs_autoresearch(tmp_path: Path, monkeypatch):
         workload="vllm-decode", budget="30s", scratch=str(tmp_path), workload_runner=lambda: {}
     )
     s = result["summary"]
-    assert s["bottleneck_class"] == "memory_bound"
-    assert s["n_autoresearch"] == 0
+    assert s["status"] == "prediction_refused"
+    assert s["n_claims"] == 0
+    assert "bottleneck_class" not in s
 
-    ar_json = (Path(result["run_dir"]) / "autoresearch.json").read_text(encoding="utf-8")
-    # Denylisted knobs with unchecked prerequisites must never surface, regardless
-    # of which bottleneck class the run classifies as.
-    assert "max_num_partial_prefills=" not in ar_json
-    assert "long_prefill_token_threshold=" not in ar_json
-
-    # Dry-run (no live engine) mutates nothing, so no safety trail is written.
+    # The prediction gate fires before candidate ranking/autoresearch, so neither
+    # artifact can imply that a default graph supported an optimization.
+    assert not (Path(result["run_dir"]) / "autoresearch.json").exists()
     assert not (Path(result["run_dir"]) / "audit.jsonl").exists()
 
 
@@ -294,6 +488,96 @@ def test_cli_run_returns_nonzero_on_no_data(tmp_path: Path, capsys):
 
     rc = main(["run", "--workload", "vllm-decode", "--budget", "1s", "--scratch", str(tmp_path)])
     assert rc == 3
+
+
+@pytest.mark.parametrize("target", ["nan", "inf", "0%", "101%"])
+def test_cli_run_rejects_invalid_target_before_optimization(target, monkeypatch):
+    import gitm
+    from gitm.cli import main
+
+    called = False
+
+    def fake_optimize(**_kwargs):
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr(gitm, "optimize", fake_optimize)
+    with pytest.raises(ValueError, match="target floor"):
+        main(["run", "--workload", "vllm-decode", "--target", target])
+    assert called is False
+
+
+def test_cli_apply_returns_nonzero_when_nothing_was_applied(tmp_path, capsys):
+    import json
+
+    import yaml
+
+    from gitm.cli import main
+    from gitm.kernels.spec import InterventionSpec
+
+    spec = InterventionSpec(
+        name="noop", summary="test", knob="block_size", value=16,
+        expected_delta_lo=0.0, expected_delta_mean=0.1, expected_delta_hi=0.2,
+        source="https://example.test",
+    )
+    path = tmp_path / "intervention.yaml"
+    path.write_text(yaml.safe_dump(json.loads(spec.model_dump_json())), encoding="utf-8")
+
+    assert main(["apply", "--intervention", str(path)]) == 3
+    assert "no target config" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["prediction_refused", "candidate_coverage_unavailable", "intervention_failed"],
+)
+def test_cli_run_returns_nonzero_for_every_degraded_status(status, monkeypatch):
+    import gitm
+    from gitm.cli import main
+
+    monkeypatch.setattr(
+        gitm,
+        "optimize",
+        lambda **_kwargs: {"summary": {"status": status}, "report_md": "diagnostic"},
+    )
+
+    assert main(["run", "--workload", "vllm-decode", "--budget", "1s"]) == 3
+
+
+def test_cli_run_refuses_malformed_loop_result(monkeypatch, tmp_path):
+    import gitm
+    from gitm.cli import main
+
+    monkeypatch.setattr(gitm, "optimize", lambda **_kwargs: {})
+    report = tmp_path / "report.md"
+
+    rc = main(["run", "--workload", "vllm-decode", "--report", str(report)])
+
+    assert rc == 3
+    assert "returned no machine-readable summary" in report.read_text()
+
+
+def test_default_engine_throughput_probe_refuses_missing_work_count(monkeypatch):
+    from gitm.scheduler.loop import _engine_throughput_fn
+
+    ticks = iter([1.0, 2.0])
+    monkeypatch.setattr("gitm.scheduler.loop.time.perf_counter", lambda: next(ticks))
+    probe = _engine_throughput_fn(object(), lambda: {})
+
+    with pytest.raises(RuntimeError, match="runner returned none"):
+        probe(object())
+
+
+def test_default_engine_throughput_probe_refuses_zero_work(monkeypatch):
+    from gitm.scheduler.loop import _engine_throughput_fn
+
+    ticks = iter([1.0, 2.0])
+    monkeypatch.setattr("gitm.scheduler.loop.time.perf_counter", lambda: next(ticks))
+    probe = _engine_throughput_fn(object(), lambda: {"generated_tokens": 0})
+
+    with pytest.raises(RuntimeError, match="work coverage unavailable"):
+        probe(object())
 
 
 def test_hft_harness_importable_from_package():
@@ -354,6 +638,7 @@ def test_vllm_decode_factory_returns_wired_runner(monkeypatch):
     fake.LLM = _LLM
     fake.SamplingParams = _SamplingParams
     monkeypatch.setitem(sys.modules, "vllm", fake)
+    monkeypatch.setattr("gitm.cuda_env.require_compatible", lambda: None)
     monkeypatch.setenv("GITM_VLLM_PROMPTS", "3")
     monkeypatch.setenv("GITM_VLLM_MAX_TOKENS", "5")
     monkeypatch.delenv("GITM_VLLM_SYNTHETIC", raising=False)

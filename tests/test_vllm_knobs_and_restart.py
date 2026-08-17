@@ -261,6 +261,25 @@ def test_restart_apply_rolls_back_to_original_engine_on_regression():
     assert app.engine is e0  # original engine restored
 
 
+@pytest.mark.parametrize("sample", [0.0, -1.0, float("nan"), float("inf")])
+def test_live_engine_ab_refuses_invalid_throughput_samples(sample):
+    engine = _TpsEngine(sample)
+    app = LiveEngineApplicator(engine, throughput_fn=_tps_of)
+
+    result = apply_intervention(_spec("max_num_seqs", 64), app)
+
+    assert not result.rolled_back
+    assert not result.applied
+    assert "finite and positive" in result.error
+    assert app.last_result is None
+
+
+@pytest.mark.parametrize("reps", [0, -1, 1.5, True])
+def test_live_engine_ab_refuses_invalid_repetition_counts(reps):
+    with pytest.raises(ValueError, match="repetition count must be a positive integer"):
+        LiveEngineApplicator(_TpsEngine(100.0), throughput_fn=_tps_of, reps=reps)
+
+
 
 def test_serial_restart_releases_baseline_before_building_candidate():
     class Engine(_TpsEngine):
@@ -393,8 +412,19 @@ def test_causes_sorted_by_severity_desc():
 # --------------------------------------------------------------------------- #
 # end-to-end: scheduler stats feed attribution + claim evidence (Task 2)      #
 # --------------------------------------------------------------------------- #
+class _DenseHFConfig:
+    def __init__(self):
+        self.hidden_size = 768
+        self.num_hidden_layers = 12
+        self.num_attention_heads = 12
+        self.intermediate_size = 3072
+        self.vocab_size = 50272
+        self.torch_dtype = "bf16"
+
+
 class _ModelCfgBf16:
     dtype = "torch.bfloat16"
+    hf_config = _DenseHFConfig()
 
 
 class _LowOccScheduler:
@@ -443,6 +473,7 @@ def test_run_loop_scheduler_stats_feed_attribution_and_claims(tmp_path, monkeypa
 
     monkeypatch.setattr(loop, "capture", fake_capture)
     monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setenv("GITM_GPU_SKU", "A100-SXM4-80GB")
 
     engine = _FullEngine()
     # Non-expiring budget: max_num_seqs_dynamic ranks low and this asserts it's
@@ -464,7 +495,7 @@ def test_run_loop_scheduler_stats_feed_attribution_and_claims(tmp_path, monkeypa
     # Scheduler summary surfaced in the run summary (synchronous first sample).
     assert out["summary"]["scheduler_stats"] is not None
 
-def test_report_kernel_time_residual_uses_weighted_total_and_clamps():
+def test_report_kernel_time_residual_preserves_raw_weighted_total():
     from gitm.optimizer.monitor import KernelResidual, Residuals
     from gitm.scheduler.loop import _agg_kt_residual
 
@@ -475,7 +506,9 @@ def test_report_kernel_time_residual_uses_weighted_total_and_clamps():
         ]
     )
 
-    assert _agg_kt_residual(res) == 1.0
+    assert _agg_kt_residual(res) == pytest.approx(
+        (211e-6 - 10.01e-6) / 10.01e-6
+    )
 
     sane = Residuals(
         per_kernel=[
@@ -494,7 +527,7 @@ def test_ar_target_residual_uses_the_search_target_not_a_hardcoded_zero():
     empty = AutoresearchRun(bottleneck_class="idle_stall", results=[], target=None)
     assert _ar_target_residual(empty) == 0.0
 
-    # A real target -> its residual surfaces, clamped like every other residual.
+    # A real target -> its raw residual surfaces; display capping belongs to Claim.
     modest = AutoresearchRun(
         bottleneck_class="idle_stall", results=[],
         target=ResidualTarget(op="attn_score_value", residual=0.42, n_kernels=8),
@@ -505,4 +538,4 @@ def test_ar_target_residual_uses_the_search_target_not_a_hardcoded_zero():
         bottleneck_class="idle_stall", results=[],
         target=ResidualTarget(op="attn_score_value", residual=17.8, n_kernels=8),
     )
-    assert _ar_target_residual(huge) == 1.0
+    assert _ar_target_residual(huge) == 17.8

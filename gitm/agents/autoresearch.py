@@ -38,6 +38,7 @@ realized deltas and sample the knob space stochastically.
 from __future__ import annotations
 
 import random
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
@@ -63,6 +64,7 @@ __all__ = [
     "IDLE_STALL",
     "MEMORY_BOUND",
     "COMPUTE_BOUND",
+    "UNCLASSIFIED",
     "classify_bottleneck",
     "ResidualTarget",
     "largest_residual",
@@ -97,7 +99,8 @@ __all__ = [
 IDLE_STALL = "idle_stall"
 MEMORY_BOUND = "memory_bound"
 COMPUTE_BOUND = "compute_bound"
-BOTTLENECK_CLASSES = (IDLE_STALL, MEMORY_BOUND, COMPUTE_BOUND)
+UNCLASSIFIED = "unclassified"
+BOTTLENECK_CLASSES = (IDLE_STALL, MEMORY_BOUND, COMPUTE_BOUND, UNCLASSIFIED)
 
 #: Serialized-concurrency fraction above this ⇒ kernels ran back-to-back on one
 #: stream instead of overlapping: scheduling gaps / launch-bound idle time.
@@ -125,18 +128,18 @@ def _roofline_memory_fraction(residuals: Residuals | None) -> float | None:
 
 
 def classify_bottleneck(trace: Trace, residuals: Residuals | None = None) -> str:
-    """Map a captured trace to one of ``idle_stall`` / ``memory_bound`` / ``compute_bound``.
+    """Classify a measured trace, or return ``unclassified`` without valid kernels.
 
     Two signals, scored against a threshold each; the stronger wins, neither
-    crossing defaults to compute bound: serialized-concurrency fraction (poor
+    crossing selects compute bound: serialized-concurrency fraction (poor
     kernel overlap ⇒ idle/scheduling gaps), and memory pressure (memcpy share
     of GPU-op time, widened by the roofline-predicted memory-bound fraction of
     matched kernel time when ``residuals`` is passed). Without ``residuals``
     this is the memcpy-only heuristic.
     """
-    kernels = trace.kernels()
+    kernels = [k for k in trace.kernels() if k.end_ns > k.start_ns]
     if not kernels:
-        return COMPUTE_BOUND
+        return UNCLASSIFIED
 
     memcpys = [e for e in trace.events if e.kind == "memcpy"]
     sc = _serialized_fraction(kernels)
@@ -145,11 +148,15 @@ def classify_bottleneck(trace: Trace, residuals: Residuals | None = None) -> str
     gpu_op_ns = kernel_ns + memcpy_ns
     memcpy_frac = memcpy_ns / gpu_op_ns if gpu_op_ns else 0.0
 
-    sc_score = sc / _SC_THRESHOLD
+    sc_score = sc / _SC_THRESHOLD if sc is not None else None
     mem_score = memcpy_frac / _MEMCPY_THRESHOLD
     roofline_frac = _roofline_memory_fraction(residuals)
     if roofline_frac is not None:
         mem_score = max(mem_score, roofline_frac / _MEMCPY_THRESHOLD)
+    if mem_score >= 1.0 and (sc_score is None or mem_score > sc_score):
+        return MEMORY_BOUND
+    if sc_score is None:
+        return UNCLASSIFIED
     if max(sc_score, mem_score) < 1.0:
         return COMPUTE_BOUND
     return IDLE_STALL if sc_score >= mem_score else MEMORY_BOUND  # ties favor idle_stall
@@ -213,6 +220,7 @@ _RULES: dict[str, list[tuple[str, object, str]]] = {
         ("compilation_config", 3,
          "raise torch.compile to level 3 for kernel fusion + piecewise CUDA graphs"),
     ],
+    "unclassified": [],
 }
 
 
@@ -393,6 +401,7 @@ _CLASS_KEYWORDS: dict[str, tuple[str, ...]] = {
     "idle_stall": ("prefill", "partial", "schedul", "chunk", "overlap"),
     "memory_bound": ("cache", "swap", "offload", "block", "gpu_memory", "kv", "preempt", "cpu"),
     "compute_bound": ("compil", "cudagraph", "cuda_graph", "graph", "quant", "fus", "eager"),
+    "unclassified": (),
 }
 
 
@@ -553,8 +562,23 @@ def _visible_gpu_count() -> int:
     try:
         import torch
 
-        return torch.cuda.device_count() or 1
-    except Exception:
+        count = int(torch.cuda.device_count())
+        if count > 0:
+            return count
+        warnings.warn(
+            f"GPU-count detection reported {count}; autoresearch is using 1 and "
+            "may omit multi-GPU candidates",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return 1
+    except Exception as exc:
+        warnings.warn(
+            "GPU-count detection failed; autoresearch is using 1 and may omit "
+            f"multi-GPU candidates ({type(exc).__name__}: {exc})",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return 1
 
 
@@ -585,7 +609,13 @@ def _argparse_domains(engine_args_cls: object) -> dict[str, _ArgDomain]:
         import argparse
 
         parser = engine_args_cls.add_cli_args(argparse.ArgumentParser())  # type: ignore[attr-defined]
-    except Exception:
+    except Exception as exc:
+        warnings.warn(
+            "vLLM CLI-domain introspection unavailable; candidate grids will use "
+            f"coarser dataclass annotations ({type(exc).__name__}: {exc})",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return {}
     out: dict[str, _ArgDomain] = {}
     for action in getattr(parser, "_actions", []):
@@ -634,6 +664,8 @@ def _knobs_from_engine_args(
     """
     import dataclasses
 
+    if gpu_count is not None and gpu_count <= 0:
+        raise ValueError(f"gpu_count must be positive when supplied, got {gpu_count}")
     gpus = _visible_gpu_count() if gpu_count is None else gpu_count
     domains = _argparse_domains(engine_args_cls)
     knobs: list[Knob] = []
@@ -668,11 +700,32 @@ def _engine_arg_knobs(*, gpu_count: int | None = None) -> list[Knob]:
     """
     try:
         from vllm import EngineArgs  # type: ignore
-    except Exception:
+    except Exception as exc:
+        warnings.warn(
+            "vLLM EngineArgs unavailable; autoresearch is using the frozen fallback "
+            f"knob catalog ({type(exc).__name__}: {exc})",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return list(_FALLBACK_KNOBS)
     try:
-        return _knobs_from_engine_args(EngineArgs, gpu_count=gpu_count) or list(_FALLBACK_KNOBS)
-    except Exception:
+        knobs = _knobs_from_engine_args(EngineArgs, gpu_count=gpu_count)
+        if knobs:
+            return knobs
+        warnings.warn(
+            "vLLM EngineArgs introspection produced no searchable knobs; autoresearch "
+            "is using the frozen fallback knob catalog",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return list(_FALLBACK_KNOBS)
+    except Exception as exc:
+        warnings.warn(
+            "vLLM EngineArgs introspection failed; autoresearch is using the frozen "
+            f"fallback knob catalog ({type(exc).__name__}: {exc})",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return list(_FALLBACK_KNOBS)
 
 

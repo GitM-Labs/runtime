@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import gitm.agents.autoresearch as ar
 from gitm.agents.autoresearch import (
     AutoresearchRun,
@@ -68,12 +70,21 @@ def test_proposed_knobs_are_disjoint_from_catalog() -> None:
 
 
 def test_classify_idle_stall_from_serialized_kernels() -> None:
-    # Back-to-back kernels on one stream, no overlap ⇒ serialized concurrency = 1.
+    # Back-to-back kernels on alternating streams expose independent scheduling
+    # opportunities that failed to overlap.
+    events = [
+        make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90, stream_id=i % 2)
+        for i in range(6)
+    ]
+    assert classify_bottleneck(make_trace(events=events)) == "idle_stall"
+
+
+def test_classify_single_stream_is_unclassified_without_overlap_opportunity() -> None:
     events = [
         make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90, stream_id=0)
         for i in range(6)
     ]
-    assert classify_bottleneck(make_trace(events=events)) == "idle_stall"
+    assert classify_bottleneck(make_trace(events=events)) == ar.UNCLASSIFIED
 
 
 def test_classify_memory_bound_from_memcpy_heavy_trace() -> None:
@@ -106,8 +117,11 @@ def test_classify_compute_bound_when_overlapped_and_no_memcpy() -> None:
     assert classify_bottleneck(make_trace(events=events)) == "compute_bound"
 
 
-def test_classify_empty_trace_defaults_to_compute() -> None:
-    assert classify_bottleneck(make_trace(events=[])) == "compute_bound"
+def test_classify_empty_or_invalid_trace_is_unclassified() -> None:
+    assert classify_bottleneck(make_trace(events=[])) == ar.UNCLASSIFIED
+    assert classify_bottleneck(
+        make_trace(events=[make_kernel("zero", start_ns=10, end_ns=10)])
+    ) == ar.UNCLASSIFIED
 
 
 # --- classify_bottleneck: roofline-weighted memory signal ---------------------
@@ -215,7 +229,7 @@ def test_unknown_class_yields_no_results() -> None:
 
 def test_autoresearch_end_to_end_classifies_and_runs() -> None:
     events = [
-        make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90, stream_id=0)
+        make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90, stream_id=i % 2)
         for i in range(6)
     ]
     config: dict = {}
@@ -561,7 +575,8 @@ def test_fallback_proposer_uses_table_only_when_primary_is_empty() -> None:
 
 def test_autoresearch_end_to_end_with_engineargs_proposer() -> None:
     events = [
-        make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90, stream_id=0) for i in range(6)
+        make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90, stream_id=i % 2)
+        for i in range(6)
     ]  # serialized → idle_stall
     proposer = EngineArgsProposer(
         knobs=[Knob("max_num_partial_prefills", "int", default=1)], catalog_knobs=set()
@@ -615,9 +630,13 @@ def test_engineargs_proposer_is_a_vllm_bound_generative_proposer() -> None:
     assert specs and all(s.applicability.workloads == ["vllm-decode"] for s in specs)
 
 
-def test_vllm_knob_source_yields_offline_fallback_without_vllm() -> None:
+def test_vllm_knob_source_warns_when_using_offline_fallback(monkeypatch) -> None:
     # vLLM isn't importable in CI → the source yields the frozen fallback catalog.
-    knobs = VLLMKnobSource().knobs()
+    import sys
+
+    monkeypatch.setitem(sys.modules, "vllm", None)
+    with pytest.warns(RuntimeWarning, match="frozen fallback knob catalog"):
+        knobs = VLLMKnobSource().knobs()
     assert knobs and all(isinstance(k, Knob) for k in knobs)
     names = {k.name for k in knobs}
     assert "cpu_offload_gb" in names
@@ -722,7 +741,8 @@ def test_argparse_domains_empty_when_no_cli_builder() -> None:
     class _Bare:
         pass
 
-    assert _argparse_domains(_Bare) == {}
+    with pytest.warns(RuntimeWarning, match="CLI-domain introspection unavailable"):
+        assert _argparse_domains(_Bare) == {}
 
 
 # --- hardware-applicability: skip multi-GPU knobs on a single-GPU box --------
@@ -756,6 +776,32 @@ def test_visible_gpu_count_is_a_positive_int() -> None:
     # invariant that must hold everywhere is "a usable, positive count".
     n = _visible_gpu_count()
     assert isinstance(n, int) and n >= 1
+
+
+def test_visible_gpu_count_warns_when_torch_reports_no_gpus(monkeypatch) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 0)))
+    with pytest.warns(RuntimeWarning, match="GPU-count detection reported 0"):
+        assert _visible_gpu_count() == 1
+
+
+def test_visible_gpu_count_keeps_observed_multi_gpu_count_clean(monkeypatch) -> None:
+    import sys
+    import warnings
+    from types import SimpleNamespace
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 4)))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert _visible_gpu_count() == 4
+
+
+@pytest.mark.parametrize("count", [0, -1])
+def test_knobs_from_engine_args_refuses_invalid_explicit_gpu_count(count) -> None:
+    with pytest.raises(ValueError, match="gpu_count must be positive"):
+        _knobs_from_engine_args(_FakeEngineArgs, gpu_count=count)
 
 
 def test_vllm_knob_source_gpu_count_override_is_accepted_offline() -> None:
@@ -796,7 +842,8 @@ def test_classify_always_returns_a_known_class() -> None:
     traces = [
         make_trace(events=[]),  # empty → compute default
         make_trace(events=[
-            make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90) for i in range(6)
+            make_kernel("k", start_ns=i * 100, end_ns=i * 100 + 90, stream_id=i % 2)
+            for i in range(6)
         ]),  # serialized → idle
         make_trace(events=[make_kernel("k", start_ns=0, end_ns=1000)]
                    + [make_memcpy(start_ns=i * 10, end_ns=i * 10 + 5) for i in range(4)]),

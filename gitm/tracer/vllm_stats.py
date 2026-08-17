@@ -25,11 +25,13 @@ honest "no engine stats" outcome, never fabricated numbers.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
+import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -44,8 +46,8 @@ class SchedulerSample:
     num_unfinished: int | None = None  # total in-flight requests
     preemptions_cumulative: int | None = None  # running total of preemptions
     gpu_cache_usage: float | None = None  # KV-cache blocks used / total, 0..1
-    cpu_cache_usage: float | None = None
     batch_occupancy: float | None = None  # num_running / max_num_seqs, 0..1
+    diagnostics: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -66,6 +68,7 @@ class SchedulerStatsSummary:
     # series on the same wall clock as vLLM's per-request timestamps and as
     # ``Trace.captured_at_ns`` — the join across the three views. 0 when unset.
     t0_wall_ns: int = 0
+    diagnostics: list[str] = field(default_factory=list)
 
 
 # SLO defaults for goodput. Serving-shaped starting points, not tuned: a request
@@ -89,13 +92,22 @@ class RequestRecord:
     first_token_wall_s: float | None = None
     finished_wall_s: float | None = None
     n_output_tokens: int = 0
+    # ``authoritative`` means usage metadata or engine token_ids; ``chunks`` is
+    # the SSE-event fallback (one event can carry multiple tokens); ``unknown``
+    # means no trustworthy denominator exists.
+    token_count_source: str = "unknown"
+
+    @property
+    def token_count_authoritative(self) -> bool:
+        return self.token_count_source in {"usage", "engine"}
 
     @property
     def ttft_s(self) -> float | None:
         """Time to first token — the queue+prefill wait the user actually feels."""
         if self.arrival_wall_s is None or self.first_token_wall_s is None:
             return None
-        return max(self.first_token_wall_s - self.arrival_wall_s, 0.0)
+        span = self.first_token_wall_s - self.arrival_wall_s
+        return span if math.isfinite(span) and span >= 0.0 else None
 
     @property
     def tpot_s(self) -> float | None:
@@ -106,11 +118,27 @@ class RequestRecord:
         inter-token interval at all and yields ``None`` rather than a number
         derived from a zero-length gap.
         """
+        if not self.token_count_authoritative:
+            return None
         if self.first_token_wall_s is None or self.finished_wall_s is None:
             return None
         if self.n_output_tokens < 2:
             return None
-        span = max(self.finished_wall_s - self.first_token_wall_s, 0.0)
+        span = self.finished_wall_s - self.first_token_wall_s
+        if not math.isfinite(span) or span < 0.0:
+            return None
+        return span / (self.n_output_tokens - 1)
+
+    @property
+    def estimated_tpot_s(self) -> float | None:
+        """Chunk-count TPOT estimate, never admitted to SLO goodput."""
+        if self.token_count_source != "chunks" or self.n_output_tokens < 2:
+            return None
+        if self.first_token_wall_s is None or self.finished_wall_s is None:
+            return None
+        span = self.finished_wall_s - self.first_token_wall_s
+        if not math.isfinite(span) or span < 0.0:
+            return None
         return span / (self.n_output_tokens - 1)
 
     def meets_slo(self, ttft_slo_s: float, tpot_slo_s: float) -> bool:
@@ -124,8 +152,14 @@ class RequestRecord:
         ttft = self.ttft_s
         if ttft is None or ttft > ttft_slo_s:
             return False
+        if not self.token_count_authoritative:
+            return False
+        if self.n_output_tokens == 1:
+            return True
+        if self.n_output_tokens < 1:
+            return False
         tpot = self.tpot_s
-        return tpot is None or tpot <= tpot_slo_s
+        return tpot is not None and tpot <= tpot_slo_s
 
 
 @dataclass
@@ -141,17 +175,20 @@ class ServingSummary:
     n_requests: int
     n_ttft: int
     n_tpot: int
+    n_tpot_estimated: int
     ttft_p50_s: float | None
     ttft_p95_s: float | None
     ttft_p99_s: float | None
     tpot_p50_s: float | None
     tpot_p95_s: float | None
     tpot_p99_s: float | None
+    tpot_estimated_p50_s: float | None
     n_met_slo: int
     goodput_rps: float | None  # SLO-meeting requests per second over the window
     window_s: float | None
     ttft_slo_s: float
     tpot_slo_s: float
+    warnings: list[str]
 
 
 def _percentile(vals: list[float], q: float) -> float | None:
@@ -182,6 +219,7 @@ def request_records_from_outputs(outputs: Any) -> list[RequestRecord]:
         if outs:
             try:
                 rec.n_output_tokens = len(outs[0].token_ids)
+                rec.token_count_source = "engine"
             except (AttributeError, TypeError, IndexError):
                 pass
         metrics = getattr(o, "metrics", None)
@@ -212,32 +250,77 @@ def summarize_requests(
     """
     ttfts = [t for t in (r.ttft_s for r in records) if t is not None]
     tpots = [t for t in (r.tpot_s for r in records) if t is not None]
+    estimated_tpots = [t for t in (r.estimated_tpot_s for r in records) if t is not None]
     met = [r for r in records if r.meets_slo(ttft_slo_s, tpot_slo_s)]
 
-    arrivals = [r.arrival_wall_s for r in records if r.arrival_wall_s is not None]
-    finishes = [r.finished_wall_s for r in records if r.finished_wall_s is not None]
+    arrivals = [
+        r.arrival_wall_s
+        for r in records
+        if r.arrival_wall_s is not None and math.isfinite(r.arrival_wall_s)
+    ]
+    finishes = [
+        r.finished_wall_s
+        for r in records
+        if r.finished_wall_s is not None and math.isfinite(r.finished_wall_s)
+    ]
     window_s: float | None = None
     if arrivals and finishes:
-        window_s = max(max(finishes) - min(arrivals), 0.0)
+        span = max(finishes) - min(arrivals)
+        window_s = span if span >= 0.0 else None
     # A zero-length window (single instantaneous request, or clock granularity)
     # has no meaningful rate — report the count, not a division by ~0.
     goodput = (len(met) / window_s) if window_s else None
+
+    warnings: list[str] = []
+    def _has_invalid_timestamps(r: RequestRecord) -> bool:
+        pairs = (
+            (r.arrival_wall_s, r.first_token_wall_s),
+            (r.first_token_wall_s, r.finished_wall_s),
+        )
+        return any(
+            start is not None
+            and end is not None
+            and (not math.isfinite(start) or not math.isfinite(end) or end < start)
+            for start, end in pairs
+        )
+
+    invalid_timestamps = sum(_has_invalid_timestamps(r) for r in records)
+    if invalid_timestamps:
+        warnings.append(
+            f"latency coverage: {invalid_timestamps} request(s) have non-finite or "
+            "non-monotonic timestamps; excluded from latency and SLO goodput"
+        )
+    if records and arrivals and finishes and not window_s:
+        warnings.append("goodput unavailable: request window has no positive duration")
+    if estimated_tpots:
+        warnings.append(
+            f"TPOT coverage: {len(estimated_tpots)} request(s) use SSE chunk-count estimates; "
+            "excluded from authoritative TPOT percentiles and SLO goodput"
+        )
+    missing_counts = sum(1 for r in records if r.token_count_source == "unknown")
+    if missing_counts:
+        warnings.append(
+            f"TPOT coverage: {missing_counts} request(s) have no authoritative output-token count"
+        )
 
     return ServingSummary(
         n_requests=len(records),
         n_ttft=len(ttfts),
         n_tpot=len(tpots),
+        n_tpot_estimated=len(estimated_tpots),
         ttft_p50_s=_percentile(ttfts, 0.50),
         ttft_p95_s=_percentile(ttfts, 0.95),
         ttft_p99_s=_percentile(ttfts, 0.99),
         tpot_p50_s=_percentile(tpots, 0.50),
         tpot_p95_s=_percentile(tpots, 0.95),
         tpot_p99_s=_percentile(tpots, 0.99),
+        tpot_estimated_p50_s=_percentile(estimated_tpots, 0.50),
         n_met_slo=len(met),
         goodput_rps=goodput,
         window_s=window_s,
         ttft_slo_s=ttft_slo_s,
         tpot_slo_s=tpot_slo_s,
+        warnings=warnings,
     )
 
 
@@ -286,7 +369,32 @@ def _schedulers(engine: Any) -> list[Any]:
     return list(sched) if isinstance(sched, list | tuple) else [sched]
 
 
-def _v1_scheduler_stats(scheduler: Any) -> dict[str, Any]:
+def _nonnegative_count(
+    value: Any, field_name: str, diagnostics: list[str] | None
+) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value >= 0:
+            return value
+        if diagnostics is not None:
+            diagnostics.append(f"{field_name} reported negative count {value}")
+    return None
+
+
+def _unit_fraction(
+    value: Any, field_name: str, diagnostics: list[str] | None
+) -> float | None:
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        result = float(value)
+        if math.isfinite(result) and 0.0 <= result <= 1.0:
+            return result
+        if diagnostics is not None:
+            diagnostics.append(f"{field_name} reported {value!r} outside [0, 1]")
+    return None
+
+
+def _v1_scheduler_stats(
+    scheduler: Any, diagnostics: list[str] | None = None
+) -> dict[str, Any]:
     """vLLM V1 stats via ``scheduler.make_stats()`` — V1 doesn't keep the V0
     running/waiting deques in the same shape, but exposes a stats object with
     ``num_running_reqs`` / ``num_waiting_reqs`` / ``kv_cache_usage``. Best-effort;
@@ -298,19 +406,23 @@ def _v1_scheduler_stats(scheduler: Any) -> dict[str, Any]:
         return {}
     try:
         stats = make()
-    except Exception:
+    except Exception as exc:
+        if diagnostics is not None:
+            diagnostics.append(
+                f"vLLM V1 scheduler make_stats failed: {type(exc).__name__}: {exc}"
+            )
         return {}
     if stats is None:
         return {}
     out: dict[str, Any] = {}
     for field_name, attr in (("num_running", "num_running_reqs"),
                              ("num_waiting", "num_waiting_reqs")):
-        v = getattr(stats, attr, None)
-        if isinstance(v, int):
+        v = _nonnegative_count(getattr(stats, attr, None), attr, diagnostics)
+        if v is not None:
             out[field_name] = v
-    ku = getattr(stats, "kv_cache_usage", None)
-    if isinstance(ku, int | float):
-        out["gpu_cache_usage"] = float(ku)
+    ku = _unit_fraction(getattr(stats, "kv_cache_usage", None), "kv_cache_usage", diagnostics)
+    if ku is not None:
+        out["gpu_cache_usage"] = ku
     return out
 
 
@@ -352,7 +464,11 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
                 ("preemptions_cumulative", "num_cumulative_preemption", False),
             ):
                 raw = getattr(sch, attr, None)
-                val = _len_or_none(raw) if is_len else (raw if isinstance(raw, int) else None)
+                val = (
+                    _len_or_none(raw)
+                    if is_len
+                    else _nonnegative_count(raw, attr, sample.diagnostics)
+                )
                 if val is not None:
                     totals[field_name] = totals.get(field_name, 0) + val
         for field_name, val in totals.items():
@@ -360,7 +476,7 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
             saw_any = True
 
         # KV-cache usage off the first scheduler's block manager (best-effort, V0).
-        usage = _gpu_cache_usage(schedulers[0])
+        usage = _gpu_cache_usage(schedulers[0], sample.diagnostics)
         if usage is not None:
             sample.gpu_cache_usage = usage
             saw_any = True
@@ -368,15 +484,7 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
         # vLLM V1: fill running / waiting / cache from the scheduler's stat object
         # where the VO deques weren't exposed (they read empty on V1)
         for sch in schedulers:
-            for field_name, val in _v1_scheduler_stats(sch).items():
-                if getattr(sample, field_name) is None:
-                    setattr(sample, field_name, val)
-                    saw_any = True
-
-        # vLLM V1: fill running / waiting / cache from the scheduler's stat object
-        # where the VO deques weren't exposed (they read empty on V1)
-        for sch in schedulers:
-            for field_name, val in _v1_scheduler_stats(sch).items():
+            for field_name, val in _v1_scheduler_stats(sch, sample.diagnostics).items():
                 if getattr(sample, field_name) is None:
                     setattr(sample, field_name, val)
                     saw_any = True
@@ -390,10 +498,16 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
     )
     if callable(getter):
         try:
-            sample.num_unfinished = int(getter())
-            saw_any = True
-        except Exception:
-            pass
+            count = _nonnegative_count(
+                getter(), "num_unfinished", sample.diagnostics
+            )
+            if count is not None:
+                sample.num_unfinished = count
+                saw_any = True
+        except Exception as exc:
+            sample.diagnostics.append(
+                f"unfinished-request probe failed: {type(exc).__name__}: {exc}"
+            )
 
     if sample.num_running is not None:
         max_seqs = _max_num_seqs(engine)
@@ -403,12 +517,20 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
             # transient over-count (or a partially-exposed config) can never make a
             # half-empty engine read as full and silently suppress under_filled.
             capacity = max_seqs * max(len(schedulers), 1)
-            sample.batch_occupancy = min(1.0, sample.num_running / capacity)
+            if sample.num_running <= capacity:
+                sample.batch_occupancy = sample.num_running / capacity
+            else:
+                sample.diagnostics.append(
+                    f"num_running {sample.num_running} exceeds declared capacity {capacity}; "
+                    "batch occupancy unavailable"
+                )
 
-    return sample if saw_any else None
+    return sample if saw_any or sample.diagnostics else None
 
 
-def _gpu_cache_usage(scheduler: Any) -> float | None:
+def _gpu_cache_usage(
+    scheduler: Any, diagnostics: list[str] | None = None
+) -> float | None:
     """KV-cache block occupancy (0..1) off a scheduler's block manager, if exposed."""
     bm = getattr(scheduler, "block_manager", None)
     if bm is None:
@@ -418,8 +540,24 @@ def _gpu_cache_usage(scheduler: Any) -> float | None:
     total = getattr(bm, "num_total_gpu_blocks", None)
     if callable(free_fn) and isinstance(total, int) and total > 0:
         try:
-            return max(0.0, 1.0 - free_fn() / total)
-        except Exception:
+            free = free_fn()
+            if (
+                isinstance(free, bool)
+                or not isinstance(free, int | float)
+                or not math.isfinite(float(free))
+                or not 0 <= free <= total
+            ):
+                if diagnostics is not None:
+                    diagnostics.append(
+                        f"KV-cache free-block probe reported {free!r} outside [0, {total}]"
+                    )
+                return None
+            return 1.0 - float(free) / total
+        except Exception as exc:
+            if diagnostics is not None:
+                diagnostics.append(
+                    f"KV-cache usage probe failed: {type(exc).__name__}: {exc}"
+                )
             return None
     return None
 
@@ -435,6 +573,17 @@ class SchedulerStatsSampler:
 
     def __init__(self, engine: Any, *, interval_s: float = 0.05) -> None:
         self.engine = engine
+        if not math.isfinite(interval_s) or interval_s <= 0.0:
+            raise ValueError(
+                f"scheduler sampling interval must be finite and positive, got {interval_s!r}"
+            )
+        self.diagnostics: list[str] = []
+        self._diagnostic_keys: set[str] = set()
+        if interval_s < 1e-3:
+            self._record_failure(
+                "interval-clamped",
+                f"requested {interval_s!r}s; using the 0.001s minimum",
+            )
         self.interval_s = max(interval_s, 1e-3)
         self.samples: list[SchedulerSample] = []
         self._stop = threading.Event()
@@ -445,6 +594,9 @@ class SchedulerStatsSampler:
     def start(self) -> None:
         if self._thread is not None or self.engine is None:
             return
+        # A stopped sampler may be reused for a new window. Relative timestamps
+        # restart at zero, so old-window samples cannot remain in the same series.
+        self.samples.clear()
         # Two clocks taken together: monotonic for sample spacing (immune to wall
         # clock jumps), wall for the join against request timestamps and the
         # trace. Captured back-to-back so the offset between the two clocks is
@@ -457,9 +609,14 @@ class SchedulerStatsSampler:
         try:
             s0 = read_scheduler_stats(self.engine, t_ns=0)
             if s0 is not None:
+                self._surface_sample_diagnostics(s0)
                 self.samples.append(s0)
-        except Exception:
-            pass
+            else:
+                self._record_failure(
+                    "unavailable", "engine exposes no recognized scheduler fields"
+                )
+        except Exception as exc:
+            self._record_failure("initial-read", f"scheduler stats read failed: {exc}")
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="gitm-vllm-stats", daemon=True)
         self._thread.start()
@@ -469,9 +626,14 @@ class SchedulerStatsSampler:
             try:
                 s = read_scheduler_stats(self.engine, t_ns=time.perf_counter_ns() - self._t0_ns)
                 if s is not None:
+                    self._surface_sample_diagnostics(s)
                     self.samples.append(s)
-            except Exception:
-                pass  # best-effort; never let sampling crash the run
+                else:
+                    self._record_failure(
+                        "unavailable", "engine exposes no recognized scheduler fields"
+                    )
+            except Exception as exc:
+                self._record_failure("background-read", f"scheduler stats read failed: {exc}")
             self._stop.wait(self.interval_s)
 
     def stop(self) -> None:
@@ -479,13 +641,33 @@ class SchedulerStatsSampler:
             return
         self._stop.set()
         self._thread.join(timeout=2.0)
+        if self._thread.is_alive():
+            self._record_failure("join-timeout", "scheduler sampler did not stop within 2 seconds")
         self._thread = None
+
+    def _record_failure(self, key: str, detail: str) -> None:
+        if key in self._diagnostic_keys:
+            return
+        self._diagnostic_keys.add(key)
+        message = f"scheduler telemetry degraded [{key}]: {detail}"
+        self.diagnostics.append(message)
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
+
+    def _surface_sample_diagnostics(self, sample: SchedulerSample) -> None:
+        for message in sample.diagnostics:
+            self._record_failure(f"field:{message.split(':', 1)[0]}", message)
 
     def summary(self) -> SchedulerStatsSummary:
         # Snapshot first: stop() joins with a timeout, so in the pathological case
         # where the daemon thread is still alive, summarize must iterate a stable
         # copy rather than a list being appended to concurrently.
-        return summarize(list(self.samples), t0_wall_ns=self._t0_wall_ns)
+        result = summarize(list(self.samples), t0_wall_ns=self._t0_wall_ns)
+        if self.diagnostics:
+            # The sampler versions field diagnostics with stable deduplication keys
+            # and a user-facing prefix. Direct ``summarize`` callers still receive
+            # the raw per-sample diagnostics, while this boundary emits one copy.
+            result.diagnostics = list(self.diagnostics)
+        return result
 
     def to_records(self) -> list[dict[str, Any]]:
         """Samples as plain dicts, ready for JSONL alongside the kernel trace."""
@@ -512,8 +694,14 @@ def summarize(
     preempt = _vals("preemptions_cumulative")
     cache = _vals("gpu_cache_usage")
     swapped = _vals("num_swapped")
-    duration_s = max(samples[-1].t_ns - samples[0].t_ns, 0) / 1e9
+    if any(sample.t_ns < 0 for sample in samples) or any(
+        later.t_ns < earlier.t_ns
+        for earlier, later in zip(samples, samples[1:], strict=False)
+    ):
+        raise ValueError("scheduler sample timestamps are not monotonic non-negative values")
+    duration_s = (samples[-1].t_ns - samples[0].t_ns) / 1e9
 
+    diagnostics = list(dict.fromkeys(note for sample in samples for note in sample.diagnostics))
     return SchedulerStatsSummary(
         n_samples=len(samples),
         duration_s=duration_s,
@@ -528,6 +716,7 @@ def summarize(
         peak_gpu_cache_usage=max(cache) if cache else None,
         peak_swapped=int(max(swapped)) if swapped else None,
         t0_wall_ns=t0_wall_ns,
+        diagnostics=diagnostics,
     )
 
 

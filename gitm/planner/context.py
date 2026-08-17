@@ -120,6 +120,7 @@ class PlannerContext:
     peak: HardwarePeak | None
     sku: str | None
     num_gpus: int
+    num_gpus_is_fallback: bool = False
 
 
 def _query_nvml() -> tuple[str | None, int | None]:
@@ -170,6 +171,7 @@ def hardware_spec_for(peak: HardwarePeak | None) -> HardwareSpec:
     quant = quant_peaks_for_sku(peak.name)
     return HardwareSpec(
         name=peak.name,
+        is_fallback=False,
         peak_flops_fp16_per_s=peak.peak_flops,
         peak_flops_bf16_per_s=peak.peak_flops,
         peak_flops_fp8_per_s=quant.get("fp8", 0.0),
@@ -215,18 +217,30 @@ def build_planner_context(
     *,
     workload: str = "vllm-decode",
     num_gpus: int | None = None,
+    has_collective: bool = False,
+    has_interconnect: bool | None = None,
 ) -> PlannerContext:
     """Assemble the gate context + hardware peaks for this run.
 
     ``GITM_GPU_SKU`` overrides NVML (useful in CI / on a box without pynvml).
     """
+    if num_gpus is not None and num_gpus <= 0:
+        raise ValueError(f"num_gpus must be positive when supplied, got {num_gpus}")
     env_sku = os.environ.get("GITM_GPU_SKU")
     # Only touch NVML if something it provides is actually missing.
     nvml_name = nvml_count = None
     if env_sku is None or num_gpus is None:
         nvml_name, nvml_count = _query_nvml()
     sku = env_sku or nvml_name
-    n = num_gpus or nvml_count or 1
+    if num_gpus is not None:
+        n = num_gpus
+        num_gpus_is_fallback = False
+    elif nvml_count is not None and nvml_count > 0:
+        n = nvml_count
+        num_gpus_is_fallback = False
+    else:
+        n = 1
+        num_gpus_is_fallback = True
     peak = peak_for_sku(sku)
     dtype = _engine_dtype(engine)
     kv_len = _engine_kv_len(engine)
@@ -237,7 +251,15 @@ def build_planner_context(
         hardware=sku,
         kv_cache_len=kv_len,
         num_gpus=n,
-        has_collective=n > 1,
-        has_interconnect=n > 1,  # refined later by NVLink/IB probe
+        # A device count proves neither fact. Callers may pass trace/probe-backed
+        # evidence; otherwise both remain unavailable/false.
+        has_collective=has_collective,
+        has_interconnect=has_interconnect,
     )
-    return PlannerContext(gate=gate, peak=peak, sku=sku, num_gpus=n)
+    return PlannerContext(
+        gate=gate,
+        peak=peak,
+        sku=sku,
+        num_gpus=n,
+        num_gpus_is_fallback=num_gpus_is_fallback,
+    )

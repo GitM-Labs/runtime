@@ -45,10 +45,24 @@ def test_apply_keeps_on_positive_delta():
 
 def test_apply_only_when_no_measurement_keeps():
     cfg = {"block_size": 8}
-    res = apply_intervention(_spec(), DictApplicator(cfg))  # measure -> None
+    with pytest.warns(RuntimeWarning, match="applied without a measurement"):
+        res = apply_intervention(_spec(), DictApplicator(cfg))  # measure -> None
     assert res.applied and not res.rolled_back
     assert res.measured_delta is None
     assert cfg["block_size"] == 16
+
+
+def test_broken_apply_audit_sink_warns():
+    class BrokenAudit:
+        def record(self, *_args, **_kwargs):
+            raise OSError("disk full")
+
+    with pytest.warns(RuntimeWarning, match="safety audit failed"):
+        result = apply_intervention(
+            _spec(), DictApplicator({"block_size": 8}, measure_fn=lambda _s: 0.1), audit=BrokenAudit()
+        )
+
+    assert result.applied and not result.rolled_back
 
 
 # --- rollback case 1: bad value (apply raises) ------------------------------
@@ -76,6 +90,18 @@ def test_rollback_on_measure_crash():
     assert not res.applied and res.rolled_back
     assert "measure failed" in res.error
     assert cfg == {"block_size": 8}  # restored despite the apply having mutated it
+
+
+def test_failopen_restores_on_baseexception_during_measurement():
+    cfg = {"block_size": 8}
+
+    def interrupt(_spec):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        apply_intervention(_spec(), DictApplicator(cfg, measure_fn=interrupt))
+
+    assert cfg == {"block_size": 8}
 
 
 # --- regression rollback ----------------------------------------------------
@@ -195,6 +221,26 @@ def test_apply_from_file_with_config(tmp_path):
     out = apply_intervention_from_file(spec_path, config=target)
     assert out["applied"] is True and out["rolled_back"] is False
     assert yaml.safe_load(target.read_text())["block_size"] == 16
+
+
+@pytest.mark.parametrize("threshold", [float("nan"), float("inf"), float("-inf")])
+def test_apply_refuses_nonfinite_keep_threshold(threshold):
+    with pytest.raises(ValueError, match="min_keep_delta"):
+        apply_intervention(
+            _spec(), DictApplicator({"block_size": 8}), min_keep_delta=threshold
+        )
+
+
+@pytest.mark.parametrize("delta", [float("nan"), float("inf"), float("-inf")])
+def test_apply_rolls_back_nonfinite_measurement(delta):
+    cfg = {"block_size": 8}
+    app = DictApplicator(cfg, measure_fn=lambda _spec: delta)
+
+    result = apply_intervention(_spec(), app)
+
+    assert result.rolled_back and not result.applied
+    assert "finite" in result.error
+    assert cfg["block_size"] == 8
 
 
 # --- library now carries the 21 curated levers ------------------------------

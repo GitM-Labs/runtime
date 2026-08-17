@@ -18,6 +18,7 @@ the engine passes at the ticket's ±20 % tolerance.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -66,7 +67,9 @@ def _build_trace(rng: np.random.Generator, n_kernels: int, hot_fraction: float) 
 
 def _ground_truth_delta(trace: Trace, spec: InterventionSpec, rng: np.random.Generator) -> float:
     """Per-kernel simulated wall-clock saving fraction (independent of predict_delta)."""
-    total = max(trace.duration_ns, 1)
+    total = trace.duration_ns
+    if total <= 0:
+        raise ValueError(f"synthetic trace duration must be positive, got {total!r}")
     saved = 0.0
     for k in trace.kernels():
         if _applies(spec, k.name):
@@ -91,6 +94,10 @@ class ValidationResult:
 
 
 def validate(n: int = 300, *, seed: int = 0, tolerance: float = 0.20) -> ValidationResult:
+    if n <= 0:
+        raise ValueError(f"validation injection count must be positive, got {n!r}")
+    if not math.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError(f"validation tolerance must be finite and non-negative, got {tolerance!r}")
     rng = np.random.default_rng(seed)
     spec = _synthetic_spec()
     errs: list[float] = []
@@ -100,7 +107,13 @@ def validate(n: int = 300, *, seed: int = 0, tolerance: float = 0.20) -> Validat
         trace = _build_trace(rng, n_k, hot_frac)
         truth = _ground_truth_delta(trace, spec, rng)
         pred = predict_delta(trace, spec)
-        errs.append(abs(pred - truth) / abs(truth) if truth else 0.0)
+        if not math.isfinite(truth) or truth <= 0.0:
+            raise RuntimeError(
+                f"replay validation ground truth must be finite and positive, got {truth!r}"
+            )
+        if not math.isfinite(pred):
+            raise RuntimeError(f"replay validation prediction must be finite, got {pred!r}")
+        errs.append(abs(pred - truth) / abs(truth))
     arr = np.asarray(errs)
     return ValidationResult(
         n=n,

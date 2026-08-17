@@ -28,6 +28,7 @@ that cannot tell it was traced.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import urllib.parse
@@ -68,6 +69,27 @@ class AttachOptions:
     metrics_interval: float = 1.0
     dry_run: bool = False
     proc: Path = discover.PROC
+
+    def __post_init__(self) -> None:
+        for name in ("duration_s", "request_timeout", "metrics_interval"):
+            value = getattr(self, name)
+            if not isinstance(value, int | float) or isinstance(value, bool):
+                raise ValueError(f"{name} must be a finite positive number, got {value!r}")
+            if not math.isfinite(float(value)) or value <= 0:
+                raise ValueError(f"{name} must be a finite positive number, got {value!r}")
+        if isinstance(self.requests, bool) or not isinstance(self.requests, int) or self.requests < 0:
+            raise ValueError(f"requests must be a non-negative integer, got {self.requests!r}")
+        for name in ("concurrency", "input_tokens", "output_tokens"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        for name, value in (("pid", self.pid), ("port", self.port)):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        if self.port is not None and self.port > 65535:
+            raise ValueError(f"port must be at most 65535, got {self.port!r}")
 
     @property
     def mode(self) -> str:
@@ -323,6 +345,7 @@ def attach_and_capture(opts: AttachOptions) -> tuple[int, CaptureResult | None]:
     server_window = metrics.window_from_snapshots(
         before, after, window_s=wall, samples=samples
     )
+    server_window.notes.extend(sampler.diagnostics)
 
     # Server-side truth is the summary for observe mode, where no client exists. In
     # drive mode both are kept: when the client's view and the server's histograms
@@ -382,27 +405,8 @@ def attach_and_capture(opts: AttachOptions) -> tuple[int, CaptureResult | None]:
     print(f"\n==> window closed after {wall:.1f}s — server left running (PID {target.pid})")
     if opts.mode == "drive":
         print(f"    client: {len(records)} ok / {failures} failed")
-    if server_window.requests_finished is not None:
-        print(
-            f"    server: {server_window.requests_finished:.0f} requests, "
-            f"{(server_window.generation_tokens or 0):.0f} output tokens"
-            + (
-                f", {server_window.output_tokens_per_s:.0f} tok/s"
-                if server_window.output_tokens_per_s
-                else ""
-            )
-        )
-        if server_window.ttft_mean_s is not None:
-            print(
-                f"    server TTFT mean {server_window.ttft_mean_s * 1e3:.0f} ms   "
-                f"TPOT mean {(server_window.tpot_mean_s or 0) * 1e3:.1f} ms"
-            )
-        if server_window.running_p50 is not None and server_window.waiting_p50 is not None:
-            print(
-                f"    queue depth p50/p95 running "
-                f"{server_window.running_p50:.0f}/{server_window.running_p95:.0f}, "
-                f"waiting {server_window.waiting_p50:.0f}/{server_window.waiting_p95:.0f}"
-            )
+    for line in _server_metric_lines(server_window):
+        print(line)
     print_result(result)
     for note in server_window.notes:
         print("  - " + note)
@@ -416,6 +420,36 @@ def attach_and_capture(opts: AttachOptions) -> tuple[int, CaptureResult | None]:
     return 0, result
 
 
+def _server_metric_lines(window: metrics.ServerWindow) -> list[str]:
+    """Human summary that preserves missing server metrics as unknown."""
+    if window.requests_finished is None:
+        return []
+    generation = (
+        f"{window.generation_tokens:.0f} output tokens"
+        if window.generation_tokens is not None
+        else "output-token count unavailable"
+    )
+    lines = [
+        f"    server: {window.requests_finished:.0f} requests, {generation}"
+        + (f", {window.output_tokens_per_s:.0f} tok/s" if window.output_tokens_per_s else "")
+    ]
+    if window.ttft_mean_s is not None:
+        tpot = (
+            f"{window.tpot_mean_s * 1e3:.1f} ms"
+            if window.tpot_mean_s is not None
+            else "unavailable"
+        )
+        lines.append(
+            f"    server TTFT mean {window.ttft_mean_s * 1e3:.0f} ms   TPOT mean {tpot}"
+        )
+    if window.running_p50 is not None and window.waiting_p50 is not None:
+        lines.append(
+            f"    queue depth p50/p95 running {window.running_p50:.0f}/{window.running_p95:.0f}, "
+            f"waiting {window.waiting_p50:.0f}/{window.waiting_p95:.0f}"
+        )
+    return lines
+
+
 def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
     """Write ``predicted_moe_graph.json`` — a per-rank floor from the live config.
 
@@ -424,6 +458,7 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
     prints the named-key refusal and writes nothing — a defaulted DeepSeek prediction
     next to a real trace would be read as a measurement, which is the one outcome the
     gate exists to prevent. Never raises into the capture path.
+
     """
     from gitm.serve.model_config import LiveSpec, live_moe_spec
 
@@ -442,14 +477,47 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
     from gitm.planner.context import build_planner_context, hardware_spec_for
     from gitm.planner.moe_graph import predict_moe_graph
 
-    hw = hardware_spec_for(build_planner_context().peak)
+    planner_ctx = build_planner_context()
+    hw = hardware_spec_for(planner_ctx.peak)
     g = predict_moe_graph(resolved.spec, hw, resolved.batch, resolved.sharding)
     sh, spec = resolved.sharding, resolved.spec
+    warnings = list(resolved.warnings)
+    if planner_ctx.peak is None:
+        warnings.append(
+            f"GPU SKU {planner_ctx.sku or 'unknown'!r} is not in the hardware catalogue; "
+            f"pricing uses fallback {hw.name!r}"
+        )
+    if planner_ctx.num_gpus_is_fallback:
+        warnings.append("GPU count was unavailable; recording a fallback count of 1")
+    if g.has_unpriced_nodes:
+        missing = []
+        if g.has_unpriced_compute:
+            missing.append("compute throughput")
+        if g.has_unpriced_memory:
+            missing.append("memory bandwidth")
+        warnings.append(f"predicted nodes have unpriced {' and '.join(missing)}")
+    if g.has_fallback_peaks:
+        warnings.append("priced against fallback compute peaks; the ceiling is low")
+    if g.has_fallback_bytes:
+        warnings.append(
+            "byte widths include an unknown-dtype bf16 fallback; the memory floor is approximate"
+        )
+    if g.resident_weight_bytes_is_lower_bound:
+        warnings.append(
+            "resident weight footprint is a lower bound because DSpark parameter shapes are private"
+        )
+    n_estimated = sum(1 for n in g.nodes if n.prediction.estimated)
+    if n_estimated:
+        warnings.append(f"{n_estimated} predicted node(s) use documented estimated cost models")
 
     payload = {
         "model_ref": resolved.model_ref,
         "config_source": str(resolved.source_path),
-        "hardware": hw.name,
+        "hardware": planner_ctx.sku,
+        "hardware_pricing": hw.name,
+        "hardware_is_fallback": planner_ctx.peak is None,
+        "num_gpus": planner_ctx.num_gpus,
+        "num_gpus_is_fallback": planner_ctx.num_gpus_is_fallback,
         "sharding": {"tp": sh.tp, "ep": sh.ep, "dp": sh.dp},
         "dtypes": {
             "weight": spec.weight_dtype,
@@ -460,8 +528,17 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
         "batch": {"batch": resolved.batch.batch, "kv_cache_len": resolved.batch.kv_cache_len},
         "applied_overrides": resolved.applied_overrides,
         "total_pred_s": g.total_pred_s,
+        "resident_weight_bytes_per_rank": g.resident_weight_bytes_per_rank,
+        "resident_weight_bytes_is_lower_bound": g.resident_weight_bytes_is_lower_bound,
+        "kv_bytes_per_token_per_sequence": g.kv_bytes_per_token_per_sequence,
+        "kv_fixed_bytes_per_sequence": g.kv_fixed_bytes_per_sequence,
         "has_unpriced_collectives": g.has_unpriced_collectives,
+        "has_unpriced_nodes": g.has_unpriced_nodes,
+        "has_unpriced_compute": g.has_unpriced_compute,
+        "has_unpriced_memory": g.has_unpriced_memory,
         "has_fallback_peaks": g.has_fallback_peaks,
+        "has_fallback_bytes": g.has_fallback_bytes,
+        "warnings": warnings,
         "nodes": [
             {
                 "op": n.op,
@@ -472,6 +549,9 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
                 "flops": n.prediction.flops,
                 "bytes": n.prediction.bytes,
                 "estimated": n.prediction.estimated,
+                "bytes_are_fallback": n.prediction.bytes_are_fallback,
+                "compute_is_unpriced": n.prediction.compute_is_unpriced,
+                "memory_is_unpriced": n.prediction.memory_is_unpriced,
             }
             for n in g.nodes
         ],
@@ -484,10 +564,8 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
         f"(TP={sh.tp} EP={sh.ep} DP={sh.dp}, "
         f"w={spec.weight_dtype}/e={spec.expert_dtype}/kv={spec.kv_dtype})"
     )
-    if g.has_unpriced_collectives:
-        print("    - collectives are unpriced (SKU has no interconnect bandwidth in the catalogue)")
-    if g.has_fallback_peaks:
-        print("    - priced against fallback peaks — the ceiling is low in a known direction")
+    for warning in warnings:
+        print(f"    - {warning}")
 
 
 def describe_targets(proc: Path = discover.PROC) -> list[dict]:

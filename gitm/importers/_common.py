@@ -34,6 +34,27 @@ class ImportStats:
     device_name: str | None = None
 
 
+def merge_normalization_stats(target: ImportStats, children: Iterable[ImportStats]) -> None:
+    """Carry per-device cleanup evidence into the file-level import result."""
+    for child in children:
+        target.deduped += child.deduped
+        target.dropped_invalid += child.dropped_invalid
+        for note in child.warnings:
+            if note.startswith(("deduped ", "dropped ")):
+                continue
+            if note not in target.warnings:
+                target.warnings.append(note)
+    if target.deduped:
+        target.warnings.append(
+            f"deduped {target.deduped} exactly-identical event row(s) across imported devices"
+        )
+    if target.dropped_invalid:
+        target.warnings.append(
+            f"dropped {target.dropped_invalid} event(s) with invalid or non-monotonic "
+            "timestamps across imported devices"
+        )
+
+
 class ImportError(Exception):
     """Per-file import failure with a customer-readable message."""
 
@@ -435,6 +456,12 @@ def finish_trace(
         total_raw_events=len(events),
         per_device_kernel_counts=per_device_kernel_counts(cleaned),
     )
+    if deduped:
+        stats.warnings.append(f"deduped {deduped} exactly-identical event row(s)")
+    if dropped:
+        stats.warnings.append(
+            f"dropped {dropped} event(s) with invalid or non-monotonic timestamps"
+        )
     return trace, stats
 
 

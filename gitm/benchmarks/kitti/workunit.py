@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from gitm._timing import require_positive_duration
+
 # SHA256 of pointpillar_7728.pth (OpenPCDet KITTI PointPillars checkpoint).
 # Confirm with: sha256sum pointpillar_7728.pth
 CHECKPOINT_SHA256 = "4c83fc0fa02575b9b3e9dec676f698e7a70bb5a795e89f91df8a96b916fa19e2"
@@ -50,23 +52,20 @@ class WorkUnitResult:
     @property
     def data_stall_frac(self) -> float:
         """Fraction of frame time spent on data loading + voxelization."""
-        if self.t_total_s <= 0:
-            return 0.0
-        return (self.t_load_s + self.t_preprocess_s) / self.t_total_s
+        wall = require_positive_duration(self.t_total_s, context=f"KITTI frame {self.frame_id}")
+        return (self.t_load_s + self.t_preprocess_s) / wall
 
     @property
     def sync_stall_frac(self) -> float:
         """Fraction of frame time spent on NMS (CPU-serialized post-processing)."""
-        if self.t_total_s <= 0:
-            return 0.0
-        return self.t_postprocess_s / self.t_total_s
+        wall = require_positive_duration(self.t_total_s, context=f"KITTI frame {self.frame_id}")
+        return self.t_postprocess_s / wall
 
     @property
     def gpu_active_frac(self) -> float:
         """Fraction of frame time spent in GPU backbone + BEV head."""
-        if self.t_total_s <= 0:
-            return 0.0
-        return self.t_inference_s / self.t_total_s
+        wall = require_positive_duration(self.t_total_s, context=f"KITTI frame {self.frame_id}")
+        return self.t_inference_s / wall
 
 
 class WorkUnit:

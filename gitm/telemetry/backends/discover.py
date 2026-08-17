@@ -6,38 +6,59 @@ binary works unchanged on NVIDIA-only, AMD-only, and mixed-vendor nodes.
 
 from __future__ import annotations
 
+import warnings
+
 from gitm.telemetry.backends.base import Backend
 
 
-def discover_backends() -> list[Backend]:
+def discover_backends(*, diagnostics: list[str] | None = None) -> list[Backend]:
     """Return all live vendor backends in discovery order.
 
-    Each candidate is constructed in a try/except — if its vendor library is
-    missing or no devices are present, it is silently skipped. The result is
-    deterministic given the host.
+    A missing optional vendor library or a valid zero-device backend is expected
+    and stays quiet. Unexpected import, initialization, count, or cleanup failures
+    are appended to ``diagnostics``; direct callers that do not supply a list get
+    a runtime warning instead.
     """
     found: list[Backend] = []
 
-    try:
+    def record(vendor: str, detail: str) -> None:
+        message = f"{vendor} telemetry discovery failed: {detail}"
+        if diagnostics is not None:
+            diagnostics.append(message)
+        else:
+            warnings.warn(message, RuntimeWarning, stacklevel=3)
+
+    def attempt(vendor: str, factory) -> None:
+        backend: Backend | None = None
+        try:
+            backend = factory()
+            count = backend.device_count()
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValueError(f"device_count returned invalid value {count!r}")
+            if count > 0:
+                found.append(backend)
+                backend = None
+        except ImportError:
+            return
+        except Exception as exc:
+            record(vendor, f"{type(exc).__name__}: {exc}")
+        finally:
+            if backend is not None:
+                try:
+                    backend.close()
+                except Exception as exc:
+                    record(vendor, f"backend close failed ({type(exc).__name__}: {exc})")
+
+    def nvidia():
         from gitm.telemetry.backends.nvidia import NvidiaBackend
 
-        nv = NvidiaBackend()
-        if nv.device_count() > 0:
-            found.append(nv)
-        else:
-            nv.close()
-    except Exception:
-        pass
+        return NvidiaBackend()
 
-    try:
+    def amd():
         from gitm.telemetry.backends.amd import AmdBackend
 
-        amd = AmdBackend()
-        if amd.device_count() > 0:
-            found.append(amd)
-        else:
-            amd.close()
-    except Exception:
-        pass
+        return AmdBackend()
 
+    attempt("nvidia", nvidia)
+    attempt("amd", amd)
     return found

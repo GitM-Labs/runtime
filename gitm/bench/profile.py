@@ -140,37 +140,78 @@ def run_profile(
     completes so a partial profile is better than none.
     """
     out_dir = Path(out_dir)
+    if not isinstance(host_capture_s, int) or isinstance(host_capture_s, bool) or host_capture_s <= 0:
+        raise ValueError("host_capture_s must be a positive integer")
     out_dir.mkdir(parents=True, exist_ok=True)
     tools = tools or ProfilerTools.detect()
 
     argv, bundle = wrap_command(config, command, out_dir, tools=tools)
 
-    # Host-side samplers run alongside; py-spy attaches to the launched tree.
-    host_procs: list[subprocess.Popen] = []
+    # Launch first so py-spy can attach to this process and its descendants. For
+    # a vendor-wrapped command the root is nsys/rocprof; --subprocesses follows
+    # the actual workload rather than pretending a detected tool captured it.
+    workload = subprocess.Popen(argv)
+    host_procs: list[tuple[str, subprocess.Popen]] = []
+    sar_output = None
     if tools.sar:
         bundle.host_sar = out_dir / "host_sar.log"
-        host_procs.append(
+        sar_output = open(bundle.host_sar, "w")  # noqa: SIM115 - owned until sampler exits
+        host_procs.append((
+            "sar",
             subprocess.Popen(
                 [tools.sar, "-u", "1", str(host_capture_s)],
-                stdout=open(bundle.host_sar, "w"),
+                stdout=sar_output,
                 stderr=subprocess.DEVNULL,
-            )
-        )
+            ),
+        ))
     else:
         bundle.missing.append("sar")
-    if not tools.py_spy:
+    if tools.py_spy:
+        bundle.host_pyspy = out_dir / "host_flamegraph.svg"
+        host_procs.append((
+            "py-spy",
+            subprocess.Popen(
+                [
+                    tools.py_spy,
+                    "record",
+                    "--pid",
+                    str(workload.pid),
+                    "--subprocesses",
+                    "--duration",
+                    str(host_capture_s),
+                    "--output",
+                    str(bundle.host_pyspy),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ),
+        ))
+    else:
         bundle.missing.append("py-spy")
 
-    subprocess.run(argv, check=False)
+    workload.wait()
+    if workload.returncode != 0:
+        bundle.missing.append(f"workload command failed (exit {workload.returncode})")
 
-    for hp in host_procs:
+    for name, hp in host_procs:
         try:
             hp.wait(timeout=host_capture_s + 5)
         except subprocess.TimeoutExpired:
             hp.terminate()
+            hp.wait(timeout=5)
+            bundle.missing.append(f"{name} sampler timed out")
+        else:
+            if hp.returncode != 0:
+                bundle.missing.append(f"{name} capture failed (exit {hp.returncode})")
+    if sar_output is not None:
+        sar_output.close()
+    if tools.py_spy and bundle.host_pyspy and not bundle.host_pyspy.exists():
+        bundle.missing.append("py-spy capture produced no flamegraph")
 
     if config.vendor == "nvidia" and tools.nsys and bundle.gpu_report:
         bundle.gpu_csv = _export_nsys_csv(tools.nsys, bundle.gpu_report, out_dir)
+        if bundle.gpu_csv is None:
+            bundle.missing.append("nsys GPU CSV export")
 
     return bundle
 
@@ -284,14 +325,21 @@ def build_breakdown(phases: list[PhaseTiming]) -> list[StallPhase]:
         gpu = p.gpu_busy_s / wall
         sync = p.sync_s / wall
         cpu = p.cpu_s / wall
-        data_stall = max(0.0, 1.0 - gpu - sync - cpu)
+        components = {"gpu_busy_s": gpu, "sync_s": sync, "cpu_s": cpu}
+        invalid = {name: value for name, value in components.items() if value < 0 or value > 1}
+        if invalid or gpu + sync + cpu > 1.0 + 1e-9:
+            raise ValueError(
+                f"phase {p.phase!r} has contradictory/overlapping timing attribution: "
+                f"gpu={gpu:.3f}, sync={sync:.3f}, cpu={cpu:.3f}; refusing to clamp"
+            )
+        data_stall = 1.0 - gpu - sync - cpu
         out.append(
             StallPhase(
                 phase=p.phase,
-                cpu=min(1.0, cpu),
-                data_stall=min(1.0, data_stall),
-                sync=min(1.0, sync),
-                gpu_active=min(1.0, gpu),
+                cpu=cpu,
+                data_stall=data_stall,
+                sync=sync,
+                gpu_active=gpu,
                 throughput=p.throughput,
                 wall_clock_s=wall,
             )

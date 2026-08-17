@@ -51,6 +51,15 @@ def test_decode_kernel_anonymous_name():
     assert ev.name == "<anonymous>"
 
 
+def test_decode_kernel_warns_when_shape_or_name_is_missing():
+    from gitm.tracer._cupti_decode import decode_kernel
+
+    with pytest.warns(RuntimeWarning, match="kernel grid dimensions unavailable"):
+        decode_kernel(_kernel_rec(grid=None))
+    with pytest.warns(RuntimeWarning, match="kernel name unavailable"):
+        decode_kernel(_kernel_rec(name=None))
+
+
 # --- decode: memcpy copy-kind mapping ---------------------------------------
 
 
@@ -94,6 +103,21 @@ def test_decode_sync_types(sync_type, kind):
         "stream_id": 2, "correlation_id": 0,
     })
     assert ev.sync_kind == kind
+
+
+def test_decode_unknown_cupti_enums_warn_before_using_safe_endpoint_defaults():
+    from gitm.tracer._cupti_decode import decode_memcpy, decode_sync
+
+    memcpy = {
+        "kind": "memcpy", "copy_kind": 99, "bytes": 1,
+        "start_ns": 10, "end_ns": 20, "device_id": 0, "stream_id": 0,
+    }
+    with pytest.warns(RuntimeWarning, match="unknown CUPTI memcpy kind 99"):
+        decode_memcpy(memcpy)
+
+    sync = {"kind": "sync", "sync_type": 99, "start_ns": 10, "end_ns": 20}
+    with pytest.warns(RuntimeWarning, match="unknown CUPTI synchronization type 99"):
+        decode_sync(sync)
 
 
 # --- decode: batch ----------------------------------------------------------
@@ -157,6 +181,26 @@ def test_capture_falls_back_to_noop_trace(tmp_path, monkeypatch):
     header = json.loads(lines[0])["_header"]
     assert header["vendor"] == "none"  # no backend -> no-op
     assert header["device_count"] == 0
+
+
+@pytest.mark.parametrize(
+    "counter, message",
+    [
+        (lambda: 0, "reported 0 devices"),
+        (lambda: (_ for _ in ()).throw(RuntimeError("driver denied")), "driver denied"),
+    ],
+)
+def test_capture_warns_when_active_backend_device_count_is_unavailable(counter, message):
+    import importlib
+    from types import SimpleNamespace
+
+    capture_mod = importlib.import_module("gitm.tracer.capture")
+    backend = SimpleNamespace(device_count=counter)
+
+    with pytest.warns(RuntimeWarning, match=message):
+        count = capture_mod._device_count(backend, injected=False)
+
+    assert count == 0
 
 
 # --- full backend wiring via a fake shim ------------------------------------

@@ -17,6 +17,7 @@ def _rec(arrival, first, finished, n_tokens):
         first_token_wall_s=first,
         finished_wall_s=finished,
         n_output_tokens=n_tokens,
+        token_count_source="engine",
     )
 
 
@@ -42,6 +43,20 @@ def test_single_token_response_has_no_tpot():
 def test_missing_timestamps_yield_none_not_zero():
     r = RequestRecord(n_output_tokens=8)
     assert r.ttft_s is None and r.tpot_s is None
+
+
+def test_nonmonotonic_timestamps_are_excluded_and_warned():
+    record = _rec(10.0, 9.0, 8.0, 3)
+
+    summary = summarize_requests([record])
+
+    assert record.ttft_s is None
+    assert record.tpot_s is None
+    assert summary.n_ttft == 0
+    assert summary.n_tpot == 0
+    assert summary.n_met_slo == 0
+    assert summary.goodput_rps is None
+    assert any("non-monotonic" in warning for warning in summary.warnings)
 
 
 # --------------------------------------------------------------------------- #
@@ -113,6 +128,52 @@ def test_single_token_request_not_penalised_for_absent_tpot():
     assert s.n_met_slo == 1
 
 
+def test_chunk_count_tpot_is_flagged_and_excluded_from_goodput():
+    record = RequestRecord(
+        arrival_wall_s=0.0,
+        first_token_wall_s=0.1,
+        finished_wall_s=1.1,
+        n_output_tokens=3,
+        token_count_source="chunks",
+    )
+
+    summary = summarize_requests([record], ttft_slo_s=1.0, tpot_slo_s=1.0)
+
+    assert record.tpot_s is None
+    assert record.estimated_tpot_s == 0.5
+    assert summary.n_tpot == 0
+    assert summary.n_tpot_estimated == 1
+    assert summary.n_met_slo == 0
+    assert summary.goodput_rps == 0.0
+    assert any("excluded" in warning for warning in summary.warnings)
+
+
+def test_unknown_token_count_cannot_pass_tpot_slo_by_absence():
+    record = RequestRecord(
+        arrival_wall_s=0.0,
+        first_token_wall_s=0.1,
+        finished_wall_s=1.0,
+        n_output_tokens=0,
+    )
+
+    summary = summarize_requests([record])
+
+    assert summary.n_met_slo == 0
+    assert any("no authoritative" in warning for warning in summary.warnings)
+
+
+def test_authoritative_zero_token_count_cannot_pass_slo():
+    record = RequestRecord(
+        arrival_wall_s=0.0,
+        first_token_wall_s=0.1,
+        finished_wall_s=0.1,
+        n_output_tokens=0,
+        token_count_source="usage",
+    )
+
+    assert not record.meets_slo(ttft_slo_s=1.0, tpot_slo_s=1.0)
+
+
 # --------------------------------------------------------------------------- #
 # vLLM RequestOutput adaptation                                               #
 # --------------------------------------------------------------------------- #
@@ -123,6 +184,7 @@ def test_records_from_vllm_outputs():
     )
     (rec,) = request_records_from_outputs([out])
     assert rec.n_output_tokens == 3
+    assert rec.token_count_source == "engine"
     assert rec.ttft_s == 0.5
 
 

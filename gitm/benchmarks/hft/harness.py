@@ -25,7 +25,10 @@ import argparse
 import json
 import os
 import time
+import warnings
 from pathlib import Path
+
+from gitm._timing import require_positive_duration
 
 
 def select_backend():
@@ -35,7 +38,13 @@ def select_backend():
         import cupy
 
         return "gpu", cudf, cupy
-    except Exception:
+    except Exception as exc:
+        warnings.warn(
+            f"cuDF/CuPy backend unavailable; HFT harness is using the CPU fallback "
+            f"and cannot produce a GPU baseline ({type(exc).__name__}: {exc})",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         import numpy
         import pandas
 
@@ -52,7 +61,12 @@ def _gpu_name(kind: str) -> tuple[str, int]:
         props = cupy.cuda.runtime.getDeviceProperties(0)
         name = props["name"].decode() if isinstance(props["name"], bytes) else str(props["name"])
         return name, n
-    except Exception:
+    except Exception as exc:
+        warnings.warn(
+            f"GPU identity probe failed ({type(exc).__name__}: {exc})",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return "gpu-unknown", 1
 
 
@@ -162,7 +176,9 @@ def main(argv: list[str] | None = None) -> int:
     # Warm window: replay the loaded events, measuring sustained throughput.
     t0 = time.perf_counter()
     summary = run_pipeline(df, dflib)
-    elapsed = max(time.perf_counter() - t0, 1e-9)
+    elapsed = require_positive_duration(
+        time.perf_counter() - t0, context="HFT harness"
+    )
 
     events_per_second = summary["events"] / elapsed
     print(f"[hft harness:{kind}] {summary['events']} events in {elapsed:.3f}s "

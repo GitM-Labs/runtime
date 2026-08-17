@@ -13,12 +13,38 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
 from gitm.serve import attach as att
 from gitm.serve import discover
 from gitm.tracer import injection
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("duration_s", 0.0, "duration_s"),
+        ("duration_s", float("nan"), "duration_s"),
+        ("requests", -1, "requests"),
+        ("concurrency", 0, "concurrency"),
+        ("input_tokens", 0, "input_tokens"),
+        ("output_tokens", -1, "output_tokens"),
+        ("request_timeout", float("inf"), "request_timeout"),
+        ("metrics_interval", 0.0, "metrics_interval"),
+        ("port", 70000, "port"),
+    ],
+)
+def test_attach_options_refuse_invalid_window_inputs(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        att.AttachOptions(**{field: value})
+
+
+def test_attach_options_accept_normal_observe_and_drive_windows():
+    assert att.AttachOptions().mode == "observe"
+    assert att.AttachOptions(requests=1, concurrency=1).mode == "drive"
 
 LIB = str(injection.lib_path())
 
@@ -221,6 +247,176 @@ def test_base_url_prefers_explicit_then_flag_then_cmdline():
     )
 
 
+def test_server_metric_lines_surface_missing_token_and_tpot_values():
+    from gitm.serve.metrics import ServerWindow
+
+    lines = att._server_metric_lines(
+        ServerWindow(requests_finished=3, generation_tokens=None, ttft_mean_s=0.012)
+    )
+
+    assert "output-token count unavailable" in lines[0]
+    assert "TPOT mean unavailable" in lines[1]
+    assert "0 output tokens" not in "\n".join(lines)
+
+
+def test_server_metric_lines_render_measured_values_without_caveats():
+    from gitm.serve.metrics import ServerWindow
+
+    lines = att._server_metric_lines(
+        ServerWindow(
+            requests_finished=3,
+            generation_tokens=24,
+            output_tokens_per_s=12,
+            ttft_mean_s=0.012,
+            tpot_mean_s=0.0035,
+        )
+    )
+
+    assert lines == [
+        "    server: 3 requests, 24 output tokens, 12 tok/s",
+        "    server TTFT mean 12 ms   TPOT mean 3.5 ms",
+    ]
+
+
+def test_predicted_graph_surfaces_resolved_warnings_and_bytes_fallback(
+    tmp_path, monkeypatch, capsys
+):
+    from gitm.planner.context import peak_for_sku
+    from gitm.planner.moe_graph import spec_from_hf_config
+    from gitm.planner.roofline import BatchConfig, ShardingConfig
+    from gitm.serve import model_config as mc
+
+    cfg = {
+        "model_type": "deepseek_v4",
+        "hidden_size": 64,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "head_dim": 64,
+        "qk_rope_head_dim": 0,
+        "q_lora_rank": 64,
+        "o_lora_rank": 64,
+        "o_groups": 1,
+        "vocab_size": 128,
+        "n_routed_experts": 2,
+        "n_shared_experts": 0,
+        "num_experts_per_tok": 1,
+        "moe_intermediate_size": 32,
+        "index_n_heads": 1,
+        "index_head_dim": 8,
+        "index_topk": 8,
+        "sliding_window": 128,
+        "compress_ratios": [0],
+        "expert_dtype": "fp4",
+        "quantization_config": {"quant_method": "fp8"},
+        "torch_dtype": "bfloat16",
+    }
+    spec = replace(spec_from_hf_config(cfg), expert_dtype="future_fp3")
+    resolved = mc.LiveSpec(
+        spec=spec,
+        sharding=ShardingConfig(),
+        batch=BatchConfig(batch=1, kv_cache_len=128),
+        source_path=tmp_path / "config.json",
+        model_ref="org/model",
+        warnings=["decode batch was not observed; using batch=1 single-sequence floor"],
+    )
+    monkeypatch.setattr(mc, "live_moe_spec", lambda _target, **_kwargs: resolved)
+
+    import gitm.planner.context as planner_context
+
+    monkeypatch.setattr(
+        planner_context,
+        "build_planner_context",
+        lambda: SimpleNamespace(
+            peak=peak_for_sku("NVIDIA B200"),
+            sku="NVIDIA B200",
+            num_gpus=1,
+            num_gpus_is_fallback=True,
+        ),
+    )
+
+    att._emit_predicted_graph(discover.Target(pid=1, cmdline=[]), tmp_path)
+
+    payload = json.loads((tmp_path / "predicted_moe_graph.json").read_text())
+    assert payload["has_fallback_bytes"] is True
+    assert payload["resident_weight_bytes_per_rank"] > 0
+    assert payload["resident_weight_bytes_is_lower_bound"] is False
+    assert payload["kv_bytes_per_token_per_sequence"] == 0.0
+    assert payload["kv_fixed_bytes_per_sequence"] > 0
+    assert payload["num_gpus_is_fallback"] is True
+    assert any("GPU count was unavailable" in warning for warning in payload["warnings"])
+    assert any(node["bytes_are_fallback"] for node in payload["nodes"])
+    assert payload["warnings"]
+    stdout = capsys.readouterr().out
+    assert "single-sequence floor" in stdout
+    assert "unknown-dtype bf16 fallback" in stdout
+
+
+def test_predicted_graph_known_dtypes_leave_bytes_fallback_clean(tmp_path, monkeypatch):
+    from gitm.planner.context import peak_for_sku
+    from gitm.planner.moe_graph import spec_from_hf_config
+    from gitm.planner.roofline import BatchConfig, ShardingConfig
+    from gitm.serve import model_config as mc
+
+    cfg = {
+        "model_type": "deepseek_v4",
+        "hidden_size": 64,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "head_dim": 64,
+        "qk_rope_head_dim": 0,
+        "q_lora_rank": 64,
+        "o_lora_rank": 64,
+        "o_groups": 1,
+        "vocab_size": 128,
+        "n_routed_experts": 2,
+        "n_shared_experts": 0,
+        "num_experts_per_tok": 1,
+        "moe_intermediate_size": 32,
+        "index_n_heads": 1,
+        "index_head_dim": 8,
+        "index_topk": 8,
+        "sliding_window": 128,
+        "compress_ratios": [0],
+        "expert_dtype": "fp4",
+        "quantization_config": {"quant_method": "fp8"},
+        "torch_dtype": "bfloat16",
+    }
+    resolved = mc.LiveSpec(
+        spec=spec_from_hf_config(cfg),
+        sharding=ShardingConfig(),
+        batch=BatchConfig(batch=1, kv_cache_len=128),
+        source_path=tmp_path / "config.json",
+        model_ref="org/model",
+    )
+    monkeypatch.setattr(mc, "live_moe_spec", lambda _target, **_kwargs: resolved)
+
+    import gitm.planner.context as planner_context
+
+    monkeypatch.setattr(
+        planner_context,
+        "build_planner_context",
+        lambda: SimpleNamespace(
+            peak=peak_for_sku("NVIDIA B200"),
+            sku="NVIDIA B200",
+            num_gpus=1,
+            num_gpus_is_fallback=False,
+        ),
+    )
+
+    att._emit_predicted_graph(discover.Target(pid=1, cmdline=[]), tmp_path)
+    payload = json.loads((tmp_path / "predicted_moe_graph.json").read_text())
+    assert payload["has_fallback_bytes"] is False
+    assert payload["resident_weight_bytes_per_rank"] > 0
+    assert payload["resident_weight_bytes_is_lower_bound"] is False
+    assert payload["kv_bytes_per_token_per_sequence"] == 0.0
+    assert payload["kv_fixed_bytes_per_sequence"] > 0
+    assert payload["num_gpus_is_fallback"] is False
+    assert not any("GPU count was unavailable" in warning for warning in payload["warnings"])
+    assert not any(node["bytes_are_fallback"] for node in payload["nodes"])
+
+
 # --- preflight ---------------------------------------------------------------
 
 
@@ -324,6 +520,19 @@ def test_empty_trace_and_idle_window_are_different_failures(tmp_path):
     assert _write(tmp_path / "a", [], had_traffic=True).status == "no_kernels"
     assert _write(tmp_path / "b", [_FakeKernel()], had_traffic=False).status == "no_traffic"
     assert _write(tmp_path / "c", [_FakeKernel()], had_traffic=True).status == "ok"
+
+
+def test_zero_duration_kernel_records_do_not_make_capture_successful(tmp_path):
+    result = _write(
+        tmp_path / "zero-duration",
+        [_FakeKernel(start_ns=10, end_ns=10)],
+        had_traffic=True,
+    )
+
+    assert result.status == "no_kernels"
+    assert result.n_kernels == 0
+    assert result.breakdown.n_invalid_duration == 1
+    assert any("non-positive duration" in warning for warning in result.warnings)
 
 
 def test_both_paths_write_the_same_artifact_set(tmp_path):

@@ -9,6 +9,7 @@ partial run is still useful; the durable copy is synced to S3 afterwards.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from gitm._paths import runs_dir, traces_dir
+from gitm._timing import require_positive_duration, require_positive_work
 from gitm.agents.autoresearch import (
     AutoresearchRun,
     EngineArgsProposer,
@@ -54,13 +56,29 @@ from gitm.optimizer.vllm_knobs import (
     unmet_prerequisite,
 )
 from gitm.planner.context import build_planner_context, hardware_spec_for
-from gitm.planner.graph import predict_graph
+from gitm.planner.graph import Graph, predict_graph
 from gitm.planner.moe_graph import (
-    is_sparse_moe_config,
+    is_sparse_moe_config as is_sparse_moe_graph_config,
+)
+from gitm.planner.moe_graph import (
     predict_moe_graph,
     spec_from_hf_config,
 )
+from gitm.planner.roofline import (
+    BatchConfig,
+    HardwareSpec,
+    ModelSpec,
+    ShardingConfig,
+    weight_bytes,
+    weight_bytes_is_fallback,
+)
 from gitm.safety.audit import AuditLog, _write_report
+from gitm.serve.model_config import (
+    is_sparse_moe_config,
+    normalize_moe_config,
+    validate_moe_config,
+    validate_priceable_dtypes,
+)
 from gitm.tracer.capture import capture
 from gitm.tracer.vllm_stats import sample_scheduler_stats, summarize_requests
 from gitm.workloads import WorkloadRunner, get_factory, sync_device
@@ -93,7 +111,10 @@ def _parse_budget_s(budget: str) -> float:
     if not m:
         raise ValueError(f"unparseable budget: {budget!r} (use 24h, 90m, 3600s, 1d)")
     value, unit = float(m.group(1)), m.group(2)
-    return value * {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}[unit]
+    seconds = value * {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}[unit]
+    if seconds <= 0.0:
+        raise ValueError(f"budget must be positive, got {budget!r}")
+    return seconds
 
 def _engine_throughput_fn(engine: Any, runner: Any) -> Any:
     """Resolve a decode-throughput probe for the live A/B.
@@ -116,16 +137,23 @@ def _engine_throughput_fn(engine: Any, runner: Any) -> Any:
     def _tps(_engine: Any) -> float:
         t0 = time.perf_counter()
         out = runner() if runner is not None else {}
-        dt = max(time.perf_counter() - t0, 1e-9)
+        dt = require_positive_duration(
+            time.perf_counter() - t0, context="live-engine throughput probe"
+        )
         # First key that is actually present wins — `or` would treat a legitimate
         # 0 (a window that produced no tokens) as missing and fabricate a count.
-        toks: float = 1.0
+        toks: float | None = None
         if isinstance(out, dict):
             for key in ("generated_tokens", "decode_steps", "events"):
                 if out.get(key) is not None:
                     toks = float(out[key])
                     break
-        return toks / dt
+        if toks is None:
+            raise RuntimeError(
+                "live-engine throughput work coverage unavailable: runner returned none of "
+                "generated_tokens, decode_steps, or events"
+            )
+        return float(require_positive_work(toks, context="live-engine throughput probe")) / dt
 
     return _tps
 
@@ -165,99 +193,10 @@ class LoopConfig:
     workload_runner: WorkloadRunner | None = None
 
 
-def _hf_config_from_engine(engine: Any) -> Any:
-    """The live vLLM engine's HF config object, or ``None``. Duck-typed so it
-    survives vLLM version drift; the config is where both graph-selection and the
-    model shape are read from."""
-    if engine is None:
-        return None
-    for path in (
-        "llm_engine.model_config.hf_config",
-        "llm_engine.vllm_config.model_config.hf_config",
-        "model_config.hf_config",
-    ):
-        obj: Any = engine
-        for attr in path.split("."):
-            obj = getattr(obj, attr, None)
-            if obj is None:
-                break
-        if obj is not None:
-            return obj
-    return None
-
-
-def _hf_config_dict(hf: Any) -> dict[str, Any]:
-    """A plain dict of the HF config, with ``quantization_config`` flattened.
-
-    ``spec_from_hf_config`` reads the config as a dict and expects
-    ``quantization_config`` to be one too; a live config carries it as a nested
-    object, so normalise it here rather than teaching the dict-based builder about
-    vLLM's object shapes."""
-    raw = hf.to_dict() if hasattr(hf, "to_dict") else dict(vars(hf))
-    q = raw.get("quantization_config")
-    if q is not None and not isinstance(q, dict):
-        raw["quantization_config"] = q.to_dict() if hasattr(q, "to_dict") else dict(vars(q))
-    return raw
-
-
-def _model_spec_from_hf(hf: Any):
-    """Build a dense ``ModelSpec`` from an HF config object, or ``None``.
-
-    ``predict_graph()`` with no model defaults to Llama-2-7B (32 layers). A run
-    of a *different* model (e.g. opt-125m, 12 layers) is then scored against the
-    wrong predicted graph, which makes residuals and deviation meaningless — so
-    read the real architecture off the config. Duck-typed across vLLM version
-    drift; any failure returns ``None`` and the caller falls back to the default
-    graph rather than crashing.
-    """
-    if hf is None:
-        return None
-    try:
-        from gitm.planner.roofline import ModelSpec
-
-        hidden = int(hf.hidden_size)
-        n_heads = int(hf.num_attention_heads)
-        n_kv = int(getattr(hf, "num_key_value_heads", n_heads) or n_heads)
-        head_dim = int(getattr(hf, "head_dim", 0) or (hidden // n_heads))
-        moe = _moe_fields_from_hf(hf)
-        return ModelSpec(
-            hidden=hidden,
-            n_layers=int(hf.num_hidden_layers),
-            n_heads=n_heads,
-            num_kv_heads=n_kv,
-            head_dim=head_dim,
-            intermediate=int(getattr(hf, "intermediate_size", 4 * hidden)),
-            vocab=int(hf.vocab_size),
-            **moe,
-        )
-    except Exception:
-        return None
-
-
-def _model_spec_from_engine(engine: Any):
-    """Dense ``ModelSpec`` for a live engine's model — the config, then the spec."""
-    return _model_spec_from_hf(_hf_config_from_engine(engine))
-
-
-#: HF config field aliases per MoE family — the same quantity is spelled
-#: differently by Qwen / Mixtral / DeepSeek, so try each in order.
-_MOE_ALIASES: dict[str, tuple[str, ...]] = {
-    "num_experts": ("num_experts", "num_local_experts", "n_routed_experts"),
-    "experts_per_token": ("num_experts_per_tok", "moe_top_k", "num_selected_experts"),
-    "moe_intermediate": ("moe_intermediate_size", "expert_intermediate_size"),
-    "shared_experts": ("n_shared_experts", "num_shared_experts"),
-    "shared_expert_intermediate": ("shared_expert_intermediate_size",),
-    # Per-layer placement: MoE checkpoints are not uniformly sparse.
-    "first_dense_layers": ("first_k_dense_replace",),
-    "moe_layer_step": ("decoder_sparse_step", "moe_layer_freq"),
-}
-
 #: Attention-shape aliases. Deliberately separate from the MoE table: hybrid
 #: attention and a mixture FFN are independent choices, and a hybrid model with a
 #: dense FFN (or a plain MoE transformer) must still get the right one.
-_ATTN_ALIASES: dict[str, tuple[str, ...]] = {
-    "full_attn_layer_step": ("full_attention_interval", "attn_layer_freq"),
-}
+_FULL_ATTN_ALIASES = ("full_attention_interval", "attn_layer_freq")
 
 #: quant_method -> bytes per weight element. MoE decode is weight-fetch bound,
 #: so using the activation width for a quantized checkpoint would overstate the
@@ -295,82 +234,360 @@ def _batch_config_from_stats(sched: Any):
     return BatchConfig(batch=max(int(round(float(running))), 1))
 
 
-def _read_int_aliases(hf: Any, table: dict[str, tuple[str, ...]]) -> dict[str, Any]:
-    """First positive int found for each field across its aliases. Duck-typed."""
-    out: dict[str, Any] = {}
-    for field, aliases in table.items():
-        for alias in aliases:
-            raw = getattr(hf, alias, None)
-            if raw is None:
-                continue
-            try:
-                value = int(raw)
-            except (TypeError, ValueError):
-                continue
-            if value > 0:
-                out[field] = value
+@dataclass
+class ExecutionGraphResolution:
+    """A trustworthy loop graph, or the named reason graph-based claims refuse."""
+
+    graph: Graph | None
+    diagnostics: list[str]
+    refusal_reason: str = ""
+    model_source: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.graph is not None and not self.refusal_reason
+
+
+def _engine_hf_config(engine: Any) -> tuple[Any | None, str]:
+    if engine is None:
+        return None, "no live engine was supplied"
+    for path in (
+        "llm_engine.model_config.hf_config",
+        "llm_engine.vllm_config.model_config.hf_config",
+        "model_config.hf_config",
+    ):
+        obj: Any = engine
+        for attr in path.split("."):
+            obj = getattr(obj, attr, None)
+            if obj is None:
                 break
-    return out
+        if obj is not None:
+            return obj, path
+    return None, "the live engine exposes no HuggingFace config"
 
 
-def _moe_fields_from_hf(hf: Any) -> dict[str, Any]:
-    """Shape ``ModelSpec`` kwargs read off an HF config.
+def _config_dict(hf: Any) -> tuple[dict[str, Any] | None, str]:
+    try:
+        if isinstance(hf, dict):
+            return dict(hf), ""
+        to_dict = getattr(hf, "to_dict", None)
+        raw = to_dict() if callable(to_dict) else vars(hf)
+        if not isinstance(raw, dict):
+            return None, f"config conversion returned {type(raw).__name__}, not dict"
+        return dict(raw), ""
+    except Exception as exc:
+        # Fail open at the runtime boundary, but preserve the parser failure as
+        # the refusal reason instead of turning it into a default model.
+        return None, f"config conversion failed ({type(exc).__name__}: {exc})"
 
-    Covers two *independent* axes — whether the FFN is a mixture, and whether
-    attention is hybrid — so a hybrid-attention dense model still gets its
-    attention shape, and a plain MoE transformer still gets its experts. Every
-    field is optional; anything absent falls back to the dense/conventional
-    default rather than being guessed. Tolerant of partial configs.
+
+def _hf_config_dict(hf: Any) -> dict[str, Any]:
+    """Return a plain HF config mapping, flattening vLLM config objects.
+
+    This small adapter is also useful to direct programmatic callers that test
+    graph dispatch without constructing the full planner context.
     """
-    # Attention shape is independent of the FFN, so it survives the MoE gate.
-    out: dict[str, Any] = _read_int_aliases(hf, _ATTN_ALIASES)
-    moe = _read_int_aliases(hf, _MOE_ALIASES)
+    cfg, error = _config_dict(hf)
+    if cfg is None:
+        raise TypeError(error)
+    quant = cfg.get("quantization_config")
+    if quant is not None and not isinstance(quant, dict):
+        raw = quant.to_dict() if callable(getattr(quant, "to_dict", None)) else vars(quant)
+        if not isinstance(raw, dict):
+            raise TypeError("quantization_config could not be converted to a dict")
+        cfg["quantization_config"] = dict(raw)
+    return cfg
 
-    # Only a routed-expert count *and* a top-k make the FFN a mixture; without
-    # both, leave the FFN dense rather than half-configured.
-    if not (moe.get("num_experts") and moe.get("experts_per_token")):
-        return out
-    out.update(moe)
 
-    quant = getattr(hf, "quantization_config", None)
-    method = None
-    if isinstance(quant, dict):
+def _engine_value(engine: Any, paths: tuple[str, ...]) -> Any:
+    for path in paths:
+        obj: Any = engine
+        for attr in path.split("."):
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if obj is not None:
+            return obj
+    return None
+
+
+def _loop_batch(engine: Any, pctx: Any, sched: Any) -> tuple[BatchConfig, list[str]]:
+    diagnostics: list[str] = []
+    observed = _batch_config_from_stats(sched)
+    batch = observed.batch if observed is not None else 1
+    if observed is None:
+        diagnostics.append("decode concurrency was not observed; using batch=1")
+
+    kv_len = getattr(getattr(pctx, "gate", None), "kv_cache_len", None)
+    if not isinstance(kv_len, int) or kv_len <= 0:
+        kv_len = 4096
+        diagnostics.append("KV cache length was not exposed; using kv_cache_len=4096")
+
+    speculative = _engine_value(
+        engine,
+        (
+            "speculative_config.num_speculative_tokens",
+            "vllm_config.speculative_config.num_speculative_tokens",
+        ),
+    )
+    speculative_tokens = int(speculative) if isinstance(speculative, int) and speculative > 0 else 0
+    return BatchConfig(
+        batch=batch,
+        kv_cache_len=kv_len,
+        speculative_tokens=speculative_tokens,
+    ), diagnostics
+
+
+def _loop_sharding(engine: Any) -> tuple[ShardingConfig, list[str]]:
+    tp = _engine_value(
+        engine,
+        ("parallel_config.tensor_parallel_size", "vllm_config.parallel_config.tensor_parallel_size"),
+    )
+    dp = _engine_value(
+        engine,
+        ("parallel_config.data_parallel_size", "vllm_config.parallel_config.data_parallel_size"),
+    )
+    ep = _engine_value(
+        engine,
+        ("parallel_config.enable_expert_parallel", "vllm_config.parallel_config.enable_expert_parallel"),
+    )
+    if tp is not None and (isinstance(tp, bool) or not isinstance(tp, int) or tp < 1):
+        raise ValueError(f"tensor_parallel_size must be a positive integer, got {tp!r}")
+    if tp is None:
+        return ShardingConfig(), [
+            "sharding topology was not exposed; using whole-model tp=1 ep=1 dp=1"
+        ]
+    diagnostics: list[str] = []
+    if dp is None:
+        dp_i = 1
+        diagnostics.append("data_parallel_size was not exposed; using dp=1")
+    elif isinstance(dp, bool) or not isinstance(dp, int) or dp < 1:
+        raise ValueError(f"data_parallel_size must be a positive integer, got {dp!r}")
+    else:
+        dp_i = dp
+    if ep is None:
+        ep_enabled = False
+        diagnostics.append("enable_expert_parallel was not exposed; using ep=1")
+    elif not isinstance(ep, bool):
+        raise ValueError(f"enable_expert_parallel must be boolean, got {ep!r}")
+    else:
+        ep_enabled = ep
+    return ShardingConfig(tp=tp, ep=tp if ep_enabled else 1, dp=dp_i), diagnostics
+
+
+def _dense_spec_from_config(cfg: dict[str, Any]) -> tuple[ModelSpec | None, str]:
+    required = (
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "intermediate_size",
+        "vocab_size",
+        "torch_dtype",
+    )
+    missing = [key for key in required if cfg.get(key) is None]
+    if missing:
+        return None, "dense model config is missing answer-deciding fields: " + ", ".join(missing)
+    try:
+        hidden = int(cfg["hidden_size"])
+        n_heads = int(cfg["num_attention_heads"])
+        n_kv = int(cfg.get("num_key_value_heads", n_heads) or n_heads)
+        head_dim = int(cfg.get("head_dim", 0) or (hidden // n_heads))
+        act_raw = str(cfg.get("torch_dtype", "bf16")).lower().removeprefix("torch.")
+        act = {
+            "bfloat16": "bf16",
+            "float16": "fp16",
+            "half": "fp16",
+            "float32": "fp32",
+        }.get(act_raw, act_raw)
+        if weight_bytes_is_fallback(act):
+            return None, f"dense activation dtype {act!r} is not priceable"
+        dtype_bytes = int(weight_bytes(act))
+        quant = cfg.get("quantization_config") or {}
+        if not isinstance(quant, dict):
+            return None, "dense quantization_config must be an object when declared"
         method = quant.get("quant_method")
-    elif quant is not None:
-        method = getattr(quant, "quant_method", None)
-    if isinstance(method, str):
-        wb = _QUANT_WEIGHT_BYTES.get(method.lower())
-        if wb:
-            out["weight_dtype_bytes"] = wb
-    return out
+        if method is not None and str(method).lower() not in _QUANT_WEIGHT_BYTES:
+            return None, f"dense quantization method {method!r} is not priceable"
+        full_attn_layer_step = 1
+        for key in _FULL_ATTN_ALIASES:
+            raw = cfg.get(key)
+            if raw is not None:
+                full_attn_layer_step = int(raw)
+                if full_attn_layer_step <= 0:
+                    return None, f"dense attention interval {key} must be positive"
+                break
+        return ModelSpec(
+            name=str(cfg.get("_name_or_path") or cfg.get("model_type") or "live-dense"),
+            hidden=hidden,
+            n_layers=int(cfg["num_hidden_layers"]),
+            n_heads=n_heads,
+            num_kv_heads=n_kv,
+            head_dim=head_dim,
+            intermediate=int(cfg["intermediate_size"]),
+            compute_dtype=act,
+            dtype_bytes=dtype_bytes,
+            weight_dtype_bytes=_QUANT_WEIGHT_BYTES.get(str(method).lower()) if method else None,
+            vocab=int(cfg["vocab_size"]),
+            full_attn_layer_step=full_attn_layer_step,
+        ), ""
+    except (TypeError, ValueError, ZeroDivisionError) as exc:
+        return None, f"dense model config could not be parsed ({type(exc).__name__}: {exc})"
 
 
-def _execution_graph(engine: Any, hw: Any, batch: Any):
-    """The predicted graph for the model that actually ran, and whether it is the
-    sparse-MoE one.
-
-    A DeepSeek-V4-class checkpoint gets :func:`predict_moe_graph` — mixed fp4/fp8
-    precision, compressed/selected attention, MTP — none of which the dense graph
-    can represent; everything else gets the dense graph, whose FFN already prices a
-    mixture (:func:`_moe_fields_from_hf`). Sharding stays whole-model so the MoE
-    prediction shares the dense path's comparison basis against the in-process
-    trace, rather than predicting one rank against an all-rank capture.
-    """
-    from gitm.planner.roofline import ShardingConfig
-
-    hf = _hf_config_from_engine(engine)
-    if hf is not None:
+def _execution_graph(engine: Any, pctx: Any, sched: Any) -> ExecutionGraphResolution:
+    """Resolve the live engine to the matching graph, or refuse namedly."""
+    # Compatibility form used by lightweight callers: ``(engine, hw, batch)``
+    # returns the historical ``(graph, is_moe)`` pair. The production loop uses
+    # the planner-context form below so it retains all refusal and provenance
+    # diagnostics.
+    if isinstance(pctx, HardwareSpec) and isinstance(sched, BatchConfig):
+        hf, _ = _engine_hf_config(engine)
+        if hf is None:
+            return predict_graph(model=ModelSpec(), hw=pctx, batch=sched), False
         cfg = _hf_config_dict(hf)
-        if is_sparse_moe_config(cfg):
-            spec = spec_from_hf_config(cfg, name=str(cfg.get("model_type") or "sparse-moe"))
-            return predict_moe_graph(spec, hw, batch, ShardingConfig()), True
-    return predict_graph(model=_model_spec_from_hf(hf), hw=hw, batch=batch), False
+        if is_sparse_moe_graph_config(cfg):
+            sparse_cfg = {
+                "hidden_size": cfg.get("hidden_size", 4096),
+                "num_hidden_layers": cfg.get("num_hidden_layers", 43),
+                "num_attention_heads": cfg.get("num_attention_heads", 64),
+                "num_key_value_heads": cfg.get("num_key_value_heads", 1),
+                "head_dim": cfg.get("head_dim", 512),
+                "qk_rope_head_dim": cfg.get("qk_rope_head_dim", 64),
+                "q_lora_rank": cfg.get("q_lora_rank", 1024),
+                "o_lora_rank": cfg.get("o_lora_rank", 1024),
+                "o_groups": cfg.get("o_groups", 8),
+                "vocab_size": cfg.get("vocab_size", 129280),
+                "n_routed_experts": cfg.get("n_routed_experts", 256),
+                "n_shared_experts": cfg.get("n_shared_experts", 1),
+                "num_experts_per_tok": cfg.get("num_experts_per_tok", 6),
+                "moe_intermediate_size": cfg.get("moe_intermediate_size", 2048),
+                "index_n_heads": cfg.get("index_n_heads", 64),
+                "index_head_dim": cfg.get("index_head_dim", 128),
+                "index_topk": cfg.get("index_topk", 512),
+                "sliding_window": cfg.get("sliding_window", 128),
+                "compress_ratios": cfg.get("compress_ratios", [0] * 43),
+                "torch_dtype": cfg.get("torch_dtype", "bfloat16"),
+                "expert_dtype": cfg.get("expert_dtype", "fp4"),
+                "quantization_config": cfg.get("quantization_config", {"quant_method": "fp8"}),
+                **{k: v for k, v in cfg.items() if k in {"hc_mult", "hc_sinkhorn_iters", "num_hash_layers", "num_nextn_predict_layers", "dspark_target_layer_ids", "dspark_markov_rank"}},
+            }
+            spec = spec_from_hf_config(sparse_cfg, name=str(cfg.get("model_type") or "sparse-moe"))
+            return predict_moe_graph(spec, pctx, sched, ShardingConfig()), True
+        # The direct compatibility path is deliberately tolerant of older HF
+        # fixtures that omit torch_dtype; the production path remains strict.
+        dense_cfg = dict(cfg)
+        dense_cfg.setdefault("torch_dtype", "bf16")
+        spec, error = _dense_spec_from_config(dense_cfg)
+        if spec is None:
+            raise ValueError(error)
+        return predict_graph(model=spec, hw=pctx, batch=sched), False
 
+    hf, source = _engine_hf_config(engine)
+    if hf is None:
+        return ExecutionGraphResolution(None, [], source)
+    cfg, error = _config_dict(hf)
+    if cfg is None:
+        return ExecutionGraphResolution(None, [], error)
 
-def _clamp_pct(value: float) -> float:
-    """Bound a residual ratio to +/-100% so a bad/misaligned prediction (or a
-    small-sample outlier) can't blow up a report row into an absurd 18x."""
-    return max(-1.0, min(1.0, value))
+    if getattr(pctx, "peak", None) is None:
+        sku = getattr(pctx, "sku", None) or "unknown"
+        return ExecutionGraphResolution(
+            None,
+            [],
+            f"GPU SKU {sku!r} is not in the hardware catalogue; refusing A100 substitution",
+        )
+    hw = hardware_spec_for(pctx.peak)
+    batch, diagnostics = _loop_batch(engine, pctx, sched)
+    try:
+        sharding, sharding_diagnostics = _loop_sharding(engine)
+    except ValueError as exc:
+        return ExecutionGraphResolution(None, diagnostics, f"invalid live sharding topology: {exc}")
+    diagnostics.extend(sharding_diagnostics)
+
+    if is_sparse_moe_config(cfg):
+        invalid = validate_moe_config(cfg)
+        if invalid:
+            return ExecutionGraphResolution(
+                None,
+                diagnostics,
+                "sparse-MoE config cannot be priced without guessing: " + "; ".join(invalid),
+            )
+        try:
+            spec = spec_from_hf_config(normalize_moe_config(cfg), name=str(cfg.get("_name_or_path") or "live-moe"))
+        except (TypeError, ValueError, ZeroDivisionError) as exc:
+            return ExecutionGraphResolution(
+                None,
+                diagnostics,
+                f"sparse-MoE config could not be parsed ({type(exc).__name__}: {exc})",
+            )
+        act_dtype = getattr(getattr(pctx, "gate", None), "dtype", None)
+        kv_dtype = _engine_value(
+            engine,
+            ("cache_config.cache_dtype", "cache_config.kv_cache_dtype", "vllm_config.cache_config.cache_dtype"),
+        )
+        changes: dict[str, Any] = {}
+        if act_dtype:
+            changes["act_dtype"] = str(act_dtype).lower()
+        if kv_dtype:
+            changes["kv_dtype"] = str(kv_dtype).lower().replace("fp8_e4m3", "fp8")
+        else:
+            resolved_act = changes.get("act_dtype", spec.act_dtype)
+            changes["kv_dtype"] = resolved_act
+            diagnostics.append(
+                "KV cache dtype was not exposed; assuming vLLM default 'auto' follows "
+                f"activation dtype {resolved_act!r}"
+            )
+        if cfg.get("expert_dtype") is None:
+            diagnostics.append(
+                f"expert_dtype absent; inherited weight_dtype={spec.weight_dtype!r} for expert bytes"
+            )
+        if changes:
+            from dataclasses import replace
+
+            spec = replace(spec, **changes)
+        unpriceable = validate_priceable_dtypes(spec)
+        if unpriceable:
+            return ExecutionGraphResolution(None, diagnostics, "; ".join(unpriceable))
+        graph = predict_moe_graph(spec, hw, batch, sharding)
+    else:
+        if cfg.get("num_key_value_heads") is None:
+            diagnostics.append(
+                "dense num_key_value_heads was not declared; assuming standard MHA "
+                "with one KV head per query head"
+            )
+        if cfg.get("head_dim") is None:
+            diagnostics.append(
+                "dense head_dim was not declared; derived hidden_size / num_attention_heads"
+            )
+        spec, error = _dense_spec_from_config(cfg)
+        if spec is None:
+            return ExecutionGraphResolution(None, diagnostics, error)
+        try:
+            graph = predict_graph(model=spec, hw=hw, batch=batch, sharding=sharding)
+        except ValueError as exc:
+            return ExecutionGraphResolution(
+                None, diagnostics, f"dense sharding cannot be priced: {exc}"
+            )
+
+    if graph.has_fallback_peaks:
+        diagnostics.append("one or more nodes use fallback compute peaks")
+    if graph.has_fallback_bytes:
+        diagnostics.append("one or more nodes use fallback byte widths")
+    if graph.has_unpriced_nodes:
+        missing = []
+        if graph.has_unpriced_compute:
+            missing.append("compute throughput")
+        if graph.has_unpriced_memory:
+            missing.append("memory bandwidth")
+        diagnostics.append(f"one or more predicted nodes have unpriced {' and '.join(missing)}")
+    n_estimated = sum(1 for node in graph.nodes if node.prediction.estimated)
+    if n_estimated:
+        diagnostics.append(f"{n_estimated} predicted node(s) use estimated cost models")
+    return ExecutionGraphResolution(
+        graph,
+        diagnostics,
+        model_source="live_hf_config",
+    )
 
 
 def _agg_kt_residual(res: Any) -> float:
@@ -389,7 +606,7 @@ def _agg_kt_residual(res: Any) -> float:
         kts = sorted(float(kr.r_kt) for kr in rows)
         mid = len(kts) // 2
         value = kts[mid] if len(kts) % 2 else (kts[mid - 1] + kts[mid]) / 2.0
-    return _clamp_pct(value)
+    return value
 
 
 def _ar_target_residual(ar_run: AutoresearchRun, fallback: float = 0.0) -> float:
@@ -399,7 +616,7 @@ def _ar_target_residual(ar_run: AutoresearchRun, fallback: float = 0.0) -> float
     target, fall back to the run-level kernel-time residual so generated claims
     do not all display a misleading +0.0% gap.
     """
-    return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else fallback
+    return ar_run.target.residual if ar_run.target is not None else fallback
 
 
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
@@ -485,8 +702,9 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     serving_summary = summarize_requests(req_records) if req_records else None
     # Collective-communication causes from the same trace — ranked beside the
     # scheduler causes below. Empty when the trace holds no collective kernels.
-    coll_causes = collective_causes(worst_device_comm(trace))
-    if sched_stats.samples or serving_summary is not None:
+    coll_stats = worst_device_comm(trace)
+    coll_causes = collective_causes(coll_stats)
+    if sched_stats.samples or sched_summary.diagnostics or serving_summary is not None:
         (run_dir / "scheduler_stats.json").write_text(
             json.dumps(
                 {
@@ -566,13 +784,13 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 trace_path=trace_path,
             )
 
-    # Guard: if the tracer captured nothing (no GPU/shim, or the workload never
-    # ran), do NOT proceed to attribution + emit claims — that fabricates a
-    # result from an empty trace. Report no-data honestly instead.
-    if trace.vendor == "none" or not trace.kernels():
-        diagnostic = runner_error or qual.diagnostic or (
-            "Tracer captured no GPU kernels. Either no GPU/CUPTI shim is present, "
-            "or the workload did not run under the runtime."
+    # Guard: a kernel launch with no positive duration is not measurement
+    # coverage. Do not classify it or emit claims from a fabricated denominator.
+    valid_kernels = [k for k in trace.kernels() if k.end_ns > k.start_ns]
+    if trace.vendor == "none" or not valid_kernels:
+        diagnostic = runner_error or (
+            "Tracer captured no positive-duration GPU kernels. Either no GPU/CUPTI "
+            "shim is present, the workload did not run, or kernel timestamps are invalid."
         )
         return _no_data_result(
             run_dir=run_dir,
@@ -599,49 +817,118 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             trace_path=trace_path,
         )
 
-    # Predict against the model that ACTUALLY ran (read from the live engine) with
-    # the graph its architecture needs — the sparse-MoE graph for a V4-class
-    # checkpoint, the dense graph otherwise (_execution_graph). Falls back to the
-    # default dense graph when there is no engine or its config can't be read (CPU
-    # boxes, tests, dry-run), so residuals never score kernels against Llama-2-7B.
-    #
-    # Same for hardware: predict_graph's own default is A100-SXM4-80GB peaks,
-    # which silently over-predicts on anything weaker (T4/L4/...) and
-    # produces a run-level kernel-time residual that saturates the report's
-    # +/-100% clamp on every claim. pctx is built here (moved up from Phase 3)
-    # so its NVML-detected SKU peak feeds the graph before residuals are ever
-    # computed against it.
-    pctx = build_planner_context(cfg.engine, workload=workload)
-    _hw = hardware_spec_for(pctx.peak)
-    # Batch matters for the same reason the model does — and more so on a
-    # mixture, where weight traffic follows the *distinct* experts a batch
-    # activates: distinct(1)=top_k but distinct(16) is an order of magnitude
-    # larger, so predicting a batch-16 step at the batch-1 default understates
-    # expert traffic ~12x. Read the real concurrency off the sampled scheduler
-    # rather than defaulting.
-    _batch = _batch_config_from_stats(sched_summary)
-    graph, is_moe = _execution_graph(cfg.engine, _hw, _batch)
-    _graph_summary: dict[str, Any] = {
-        "graph": "moe" if is_moe else "dense",
-        "nodes": len(graph.nodes),
-        "total_pred_s": graph.total_pred_s,
-        "hardware": _hw.name,
-    }
-    if is_moe:
-        m = graph.model
-        _graph_summary.update(
-            model=m.name,
-            sharding="whole-model",
-            dtypes={"weight": m.weight_dtype, "expert": m.expert_dtype, "kv": m.kv_dtype},
-            has_unpriced_collectives=graph.has_unpriced_collectives,
+    # Resolve model, hardware, serving batch, and sharding as one trust gate. A
+    # missing/partial live config or unknown SKU refuses graph-based claims and
+    # falls through to an honest measurement report; it never becomes a plausible
+    # Llama/A100 default prediction.
+    pctx = build_planner_context(
+        cfg.engine,
+        workload=workload,
+        has_collective=coll_stats is not None and coll_stats.comm_ns > 0,
+    )
+    graph_resolution = _execution_graph(cfg.engine, pctx, sched_summary)
+    if pctx.num_gpus_is_fallback:
+        graph_resolution.diagnostics.append(
+            "GPU count was unavailable; using 1 for intervention applicability only"
         )
-    (run_dir / "predicted_graph.json").write_text(json.dumps(_graph_summary, indent=2))
+    graph_resolution.diagnostics.extend(sched_summary.diagnostics)
+    if not graph_resolution.ok:
+        (run_dir / "prediction_refusal.json").write_text(
+            json.dumps(
+                {
+                    "reason": graph_resolution.refusal_reason,
+                    "diagnostics": graph_resolution.diagnostics,
+                    "hardware": pctx.sku,
+                },
+                indent=2,
+            )
+        )
+        return _measurement_result(
+            run_dir=run_dir,
+            run_id=run_id,
+            workload=workload,
+            trace=trace,
+            qual=qual,
+            started_ns=started_ns,
+            trace_path=trace_path,
+            diagnostic=(
+                "Prediction gate refused graph-based optimization claims: "
+                f"{graph_resolution.refusal_reason}"
+            ),
+            runtime_diagnostics=graph_resolution.diagnostics,
+            status="prediction_refused",
+        )
+    graph = graph_resolution.graph
+    assert graph is not None
+    if graph.resident_weight_bytes_is_lower_bound:
+        graph_resolution.diagnostics.append(
+            "resident weight footprint is a lower bound because DSpark parameter shapes are private"
+        )
+    (run_dir / "predicted_graph.json").write_text(
+        json.dumps(
+            {
+                "model": graph.model.name,
+                "model_source": graph_resolution.model_source,
+                "nodes": len(graph.nodes),
+                "total_pred_s": graph.total_pred_s,
+                "resident_weight_bytes_per_rank": graph.resident_weight_bytes_per_rank,
+                "resident_weight_bytes_is_lower_bound": (
+                    graph.resident_weight_bytes_is_lower_bound
+                ),
+                "kv_bytes_per_token_per_sequence": graph.kv_bytes_per_token_per_sequence,
+                "kv_fixed_bytes_per_sequence": graph.kv_fixed_bytes_per_sequence,
+                "hardware": pctx.sku,
+                "hardware_pricing": graph.hw.name,
+                "hardware_is_fallback": graph.hardware_is_fallback,
+                "batch": {
+                    "batch": graph.batch.batch,
+                    "kv_cache_len": graph.batch.kv_cache_len,
+                    "speculative_tokens": graph.batch.speculative_tokens,
+                },
+                "sharding": {
+                    "tp": graph.sharding.tp,
+                    "ep": graph.sharding.ep,
+                    "dp": graph.sharding.dp,
+                },
+                "has_unpriced_collectives": graph.has_unpriced_collectives,
+                "has_unpriced_nodes": graph.has_unpriced_nodes,
+                "has_unpriced_compute": graph.has_unpriced_compute,
+                "has_unpriced_memory": graph.has_unpriced_memory,
+                "has_fallback_peaks": graph.has_fallback_peaks,
+                "has_fallback_bytes": graph.has_fallback_bytes,
+                "diagnostics": graph_resolution.diagnostics,
+                "predictions": [
+                    {
+                        "op": node.op,
+                        "layer": node.layer,
+                        "estimated": node.prediction.estimated,
+                        "peak_is_fallback": node.prediction.peak_is_fallback,
+                        "bytes_are_fallback": node.prediction.bytes_are_fallback,
+                        "compute_is_unpriced": node.prediction.compute_is_unpriced,
+                        "memory_is_unpriced": node.prediction.memory_is_unpriced,
+                    }
+                    for node in graph.nodes
+                ],
+            },
+            indent=2,
+        )
+    )
 
     # Phase 2 — residuals + attribution
     res = residuals(trace, graph)
     violations = check_invariants(res)  # multi-basis confirmed
     hypotheses = attribute(res, graph)  # Granger
     dr_hypotheses = attribute_dr(res, graph)  # doubly-robust, corroborating
+    coverage = {
+        "total_kernels": res.total_kernels,
+        "classified_kernels": res.classified_kernels,
+        "matched_kernels": res.matched_kernels,
+        "classification_coverage": res.classification_coverage,
+        "match_coverage": res.match_coverage,
+        "classified_time_coverage": res.classified_time_coverage,
+        "matched_time_coverage": res.matched_time_coverage,
+        "warnings": res.coverage_warnings,
+    }
 
     (run_dir / "violations.json").write_text(
         json.dumps(
@@ -664,6 +951,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 "n_kernel_residuals": len(res.per_kernel),
                 "n_violations": len(violations),
                 "serialized_concurrency_fraction": res.serialized_concurrency_fraction,
+                "coverage": coverage,
                 "top_hypotheses_granger": [
                     {"cause": h.cause_op, "effect": h.effect_op, "p_value": h.p_value}
                     for h in hypotheses.top(5)
@@ -673,6 +961,9 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                      "notes": h.notes}
                     for h in dr_hypotheses.top(5)
                 ],
+                "attribution_diagnostics": (
+                    hypotheses.diagnostics + dr_hypotheses.diagnostics
+                ),
                 # Engine-scheduler causes (from the vLLM stats adapter) ranked
                 # alongside the kernel-level hypotheses (the engine-signal causal link).
                 "scheduler_causes": [
@@ -709,9 +1000,25 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # pctx was built earlier (Phase 1) so its hardware peak could feed predict_graph.
     # Relative/swept levers resolve against the live engine here, once, before
     # ranking. See expand_relative_candidates.
+    try:
+        raw_library = load_library(workload=workload)
+    except (FileNotFoundError, ValueError) as exc:
+        diagnostic = f"intervention candidate coverage unavailable: {type(exc).__name__}: {exc}"
+        return _measurement_result(
+            run_dir=run_dir,
+            run_id=run_id,
+            workload=workload,
+            trace=trace,
+            qual=qual,
+            started_ns=started_ns,
+            trace_path=trace_path,
+            diagnostic=diagnostic,
+            runtime_diagnostics=graph_resolution.diagnostics + [diagnostic],
+            status="candidate_coverage_unavailable",
+        )
     library = [
         resolved
-        for s in load_library(workload=workload)
+        for s in raw_library
         for resolved in expand_relative_candidates(s, cfg.engine)
     ]
     policy = Policy(require_qualification_commit=qual.commit, skip_high_risk=not qual.commit)
@@ -823,6 +1130,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 summary=c.spec.summary,
                 residual_invariant="kernel_time",
                 residual_value=kt_residual,
+                residual_scope="run",
                 causal_evidence=causal_evidence,
                 intervention_name=c.spec.name,
                 predicted_delta=c.predicted_delta,
@@ -839,7 +1147,10 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
 
     # Phase 4b - agentic autoresearch through the catalog gate/rollback path.
     if time.time_ns() - started_ns < int(budget_s * 1e9):
-        proposer = FallbackProposer(EngineArgsProposer(), TableProposer())
+        proposer = FallbackProposer(
+            EngineArgsProposer(gpu_count=pctx.num_gpus),
+            TableProposer(),
+        )
 
         def _unenactable(spec: Any) -> str | None:
             if (
@@ -884,6 +1195,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 summary=r.spec.summary,
                 residual_invariant="kernel_time",
                 residual_value=ar_residual,
+                residual_scope=("target_op" if ar_run.target is not None else "run"),
                 causal_evidence=evidence,
                 intervention_name=r.spec.name,
                 predicted_delta=r.predicted_delta,
@@ -948,6 +1260,13 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         claims=claims,
         provenance=provenance,
         qualification_diagnostic=qual.diagnostic,
+        runtime_diagnostics=(
+            graph_resolution.diagnostics
+            + res.coverage_warnings
+            + (serving_summary.warnings if serving_summary is not None else [])
+            + hypotheses.diagnostics
+            + dr_hypotheses.diagnostics
+        ),
         summary=(
             f"vLLM decode on {pctx.sku or 'unknown SKU'}: {len(claims)} candidate(s) "
             f"evaluated, {len(rolled_back)} rolled back. {sched_note}"
@@ -971,6 +1290,8 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         "bottleneck_class": ar_run.bottleneck_class,
         "n_autoresearch": len(ar_run.results),
         "scheduler_stats": asdict(sched_summary) if sched_stats.samples else None,
+        "residual_coverage": coverage,
+        "prediction_diagnostics": graph_resolution.diagnostics,
         "report_path": str(run_dir / "report.md"),
     }
     return {"summary": summary, "report_md": report_md, "run_dir": str(run_dir)}
@@ -985,6 +1306,9 @@ def _measurement_result(
     qual: Any,
     started_ns: int,
     trace_path: Path,
+    diagnostic: str | None = None,
+    runtime_diagnostics: list[str] | None = None,
+    status: str = "ok",
 ) -> dict[str, Any]:
     """Honest measurement report for a workload with no intervention library.
 
@@ -1000,6 +1324,8 @@ def _measurement_result(
             {
                 "n_kernels": result.n_kernels,
                 "n_memcpy": result.n_memcpy,
+                "n_invalid_duration": result.n_invalid_duration,
+                "diagnostics": result.diagnostics,
                 "serialized_concurrency_fraction": result.serialized_fraction,
                 "n_violations": len(result.violations),
                 "families": result.families,
@@ -1022,10 +1348,11 @@ def _measurement_result(
     report_md = write_report(
         claims=claims,
         provenance=provenance,
-        qualification_diagnostic=(
+        qualification_diagnostic=diagnostic or (
             "Measurement-only run: the runtime observed the workload and reports "
             "its real kernels. No intervention library applies to this workload."
         ),
+        runtime_diagnostics=(runtime_diagnostics or []) + result.diagnostics,
         summary=measurement_summary(workload, result),
     )
     _write_report(run_dir, report_md)
@@ -1033,7 +1360,7 @@ def _measurement_result(
     summary = {
         "run_id": run_id,
         "workload": workload,
-        "status": "ok",
+        "status": status,
         "mode": "measurement",
         "fingerprint": qual.fingerprint,
         "commit": False,
@@ -1042,9 +1369,48 @@ def _measurement_result(
         "n_claims": 0,
         "n_rolled_back": 0,
         "n_rejected": 0,
+        "prediction_refusal": diagnostic,
+        "runtime_diagnostics": runtime_diagnostics or [],
         "report_path": str(run_dir / "report.md"),
     }
     return {"summary": summary, "report_md": report_md, "run_dir": str(run_dir)}
+
+
+def _specialized_claim_basis(
+    mres: Any, ab: Any
+) -> tuple[tuple[str, float] | None, float | None, list[str]]:
+    """Choose an observed residual basis without fabricating trace coverage."""
+    diagnostics = list(mres.diagnostics)
+    if ab is None:
+        diagnostics.append("intervention A/B produced no result; no performance claim emitted")
+        return None, None, diagnostics
+    try:
+        measured_delta = float(ab.speedup) - 1.0
+    except (AttributeError, TypeError, ValueError):
+        diagnostics.append("intervention A/B result has no numeric speedup; no claim emitted")
+        return None, None, diagnostics
+    if not math.isfinite(measured_delta):
+        diagnostics.append("intervention A/B speedup is non-finite; no claim emitted")
+        return None, None, diagnostics
+    if mres.serialized_fraction is not None:
+        return ("stream_concurrency", float(mres.serialized_fraction)), measured_delta, diagnostics
+    if mres.n_kernels > mres.n_invalid_duration:
+        diagnostics.append(
+            "no adjacent cross-stream CUPTI kernel pairs; claim residual uses the "
+            "measured A/B throughput delta instead of fabricated concurrency evidence"
+        )
+        return ("throughput_delta", measured_delta), measured_delta, diagnostics
+    diagnostics.append(
+        "no positive-duration CUPTI kernels; claim residual uses the measured A/B "
+        "throughput delta instead of a fabricated stream-concurrency value"
+    )
+    return ("throughput_delta", measured_delta), measured_delta, diagnostics
+
+
+def _serialized_evidence(mres: Any) -> str:
+    if mres.serialized_fraction is None:
+        return "serialized-concurrency unavailable (no adjacent cross-stream pairs)"
+    return f"serialized-concurrency={mres.serialized_fraction:.3f}"
 
 
 def _hft_intervention_result(
@@ -1092,19 +1458,19 @@ def _hft_intervention_result(
         spec, applicator, min_keep_delta=0.0, audit=AuditLog(run_dir / "audit.jsonl")
     )
     ab = applicator.last_result
+    basis, measured_delta, runtime_diagnostics = _specialized_claim_basis(mres, ab)
+    if apply_res.error:
+        runtime_diagnostics.append(f"intervention apply failed: {apply_res.error}")
 
     # Prove: one claim carrying the measured delta, gated on identical output.
     top = mres.top_hypotheses
     if top:
         evidence = (
             f"top hypothesis: {top[0].cause_op[:30]} → {top[0].effect_op[:30]} "
-            f"(p={top[0].p_value:.3g}); serialized-concurrency={mres.serialized_fraction:.3f}"
+            f"(p={top[0].p_value:.3g}); {_serialized_evidence(mres)}"
         )
     elif mres.n_kernels:
-        evidence = (
-            f"serialized-concurrency={mres.serialized_fraction:.3f} over "
-            f"{mres.n_kernels} kernels"
-        )
+        evidence = f"{_serialized_evidence(mres)} over {mres.n_kernels} kernels"
     else:
         evidence = (
             "no CUPTI trace captured on this box; intervention proven by the "
@@ -1113,16 +1479,18 @@ def _hft_intervention_result(
 
     claims: list[Claim] = []
     rolled_back: list[str] = []
-    if ab is not None:
+    if basis is not None and ab is not None:
+        residual_invariant, residual_value = basis
         claims.append(
             Claim(
                 summary=spec.summary,
-                residual_invariant="stream_concurrency",
-                residual_value=float(mres.serialized_fraction),
+                residual_invariant=residual_invariant,
+                residual_value=residual_value,
+                residual_scope="run",
                 causal_evidence=evidence,
                 intervention_name=spec.name,
                 predicted_delta=predicted,
-                measured_delta=(ab.speedup - 1.0) if ab.identical else None,
+                measured_delta=measured_delta if ab.identical else None,
                 rolled_back=apply_res.rolled_back,
             )
         )
@@ -1145,6 +1513,8 @@ def _hft_intervention_result(
                 "speedup": getattr(ab, "speedup", None),
                 "serialized_concurrency_fraction": mres.serialized_fraction,
                 "families": mres.families,
+                "residual_basis": basis[0] if basis is not None else None,
+                "diagnostics": runtime_diagnostics,
             },
             indent=2,
         )
@@ -1163,10 +1533,10 @@ def _hft_intervention_result(
         claims=claims,
         provenance=provenance,
         qualification_diagnostic=qual.diagnostic,
+        runtime_diagnostics=runtime_diagnostics,
         summary=(
             f"HFT intervention {spec.name!r}: {verdict}. "
-            f"{mres.n_kernels:,} kernels observed, serialized-concurrency="
-            f"{mres.serialized_fraction:.3f}."
+            f"{mres.n_kernels:,} kernels observed, {_serialized_evidence(mres)}."
         ),
     )
     _write_report(run_dir, report_md)
@@ -1174,7 +1544,7 @@ def _hft_intervention_result(
     summary = {
         "run_id": run_id,
         "workload": workload,
-        "status": "ok",
+        "status": "ok" if basis is not None else "intervention_failed",
         "mode": "intervention",
         "fingerprint": qual.fingerprint,
         "commit": qual.commit,
@@ -1227,18 +1597,18 @@ def _openfold_intervention_result(
         spec, applicator, min_keep_delta=0.0, audit=AuditLog(run_dir / "audit.jsonl")
     )
     ab = applicator.last_result  # AF2ABResult
+    basis, measured_delta, runtime_diagnostics = _specialized_claim_basis(mres, ab)
+    if apply_res.error:
+        runtime_diagnostics.append(f"intervention apply failed: {apply_res.error}")
 
     top = mres.top_hypotheses
     if top:
         evidence = (
             f"top hypothesis: {top[0].cause_op[:30]} → {top[0].effect_op[:30]} "
-            f"(p={top[0].p_value:.3g}); serialized-concurrency={mres.serialized_fraction:.3f}"
+            f"(p={top[0].p_value:.3g}); {_serialized_evidence(mres)}"
         )
     elif mres.n_kernels:
-        evidence = (
-            f"serialized-concurrency={mres.serialized_fraction:.3f} over "
-            f"{mres.n_kernels} kernels"
-        )
+        evidence = f"{_serialized_evidence(mres)} over {mres.n_kernels} kernels"
     else:
         evidence = (
             "no CUPTI trace captured on this box; intervention proven by the "
@@ -1247,16 +1617,18 @@ def _openfold_intervention_result(
 
     claims: list[Claim] = []
     rolled_back: list[str] = []
-    if ab is not None:
+    if basis is not None and ab is not None:
+        residual_invariant, residual_value = basis
         claims.append(
             Claim(
                 summary=spec.summary,
-                residual_invariant="stream_concurrency",
-                residual_value=float(mres.serialized_fraction),
+                residual_invariant=residual_invariant,
+                residual_value=residual_value,
+                residual_scope="run",
                 causal_evidence=evidence,
                 intervention_name=spec.name,
                 # plDDT-equivalence is the AF2 correctness gate (vs byte-identical).
-                measured_delta=(ab.speedup - 1.0) if ab.equivalent else None,
+                measured_delta=measured_delta if ab.equivalent else None,
                 predicted_delta=predicted,
                 rolled_back=apply_res.rolled_back,
             )
@@ -1282,6 +1654,8 @@ def _openfold_intervention_result(
                 "speedup": getattr(ab, "speedup", None),
                 "serialized_concurrency_fraction": mres.serialized_fraction,
                 "families": mres.families,
+                "residual_basis": basis[0] if basis is not None else None,
+                "diagnostics": runtime_diagnostics,
             },
             indent=2,
         )
@@ -1300,10 +1674,10 @@ def _openfold_intervention_result(
         claims=claims,
         provenance=provenance,
         qualification_diagnostic=qual.diagnostic,
+        runtime_diagnostics=runtime_diagnostics,
         summary=(
             f"AF2 intervention {spec.name!r}: {verdict}. "
-            f"{mres.n_kernels:,} kernels observed, serialized-concurrency="
-            f"{mres.serialized_fraction:.3f}."
+            f"{mres.n_kernels:,} kernels observed, {_serialized_evidence(mres)}."
         ),
     )
     _write_report(run_dir, report_md)
@@ -1311,7 +1685,7 @@ def _openfold_intervention_result(
     summary = {
         "run_id": run_id,
         "workload": workload,
-        "status": "ok",
+        "status": "ok" if basis is not None else "intervention_failed",
         "mode": "intervention",
         "fingerprint": qual.fingerprint,
         "commit": qual.commit,
@@ -1366,18 +1740,18 @@ def _edge_intervention_result(
         spec, applicator, min_keep_delta=0.0, audit=AuditLog(run_dir / "audit.jsonl")
     )
     ab = applicator.last_result  # EdgeABResult
+    basis, measured_delta, runtime_diagnostics = _specialized_claim_basis(mres, ab)
+    if apply_res.error:
+        runtime_diagnostics.append(f"intervention apply failed: {apply_res.error}")
 
     top = mres.top_hypotheses
     if top:
         evidence = (
             f"top hypothesis: {top[0].cause_op[:30]} → {top[0].effect_op[:30]} "
-            f"(p={top[0].p_value:.3g}); serialized-concurrency={mres.serialized_fraction:.3f}"
+            f"(p={top[0].p_value:.3g}); {_serialized_evidence(mres)}"
         )
     elif mres.n_kernels:
-        evidence = (
-            f"serialized-concurrency={mres.serialized_fraction:.3f} over "
-            f"{mres.n_kernels} kernels"
-        )
+        evidence = f"{_serialized_evidence(mres)} over {mres.n_kernels} kernels"
     else:
         evidence = (
             "no CUPTI trace captured on this box; intervention proven by the "
@@ -1386,16 +1760,18 @@ def _edge_intervention_result(
 
     claims: list[Claim] = []
     rolled_back: list[str] = []
-    if ab is not None:
+    if basis is not None and ab is not None:
+        residual_invariant, residual_value = basis
         claims.append(
             Claim(
                 summary=spec.summary,
-                residual_invariant="stream_concurrency",
-                residual_value=float(mres.serialized_fraction),
+                residual_invariant=residual_invariant,
+                residual_value=residual_value,
+                residual_scope="run",
                 causal_evidence=evidence,
                 intervention_name=spec.name,
                 # detection-equivalence is the edge correctness gate.
-                measured_delta=(ab.speedup - 1.0) if ab.identical else None,
+                measured_delta=measured_delta if ab.identical else None,
                 predicted_delta=predicted,
                 rolled_back=apply_res.rolled_back,
             )
@@ -1419,6 +1795,8 @@ def _edge_intervention_result(
                 "speedup": getattr(ab, "speedup", None),
                 "serialized_concurrency_fraction": mres.serialized_fraction,
                 "families": mres.families,
+                "residual_basis": basis[0] if basis is not None else None,
+                "diagnostics": runtime_diagnostics,
             },
             indent=2,
         )
@@ -1437,10 +1815,10 @@ def _edge_intervention_result(
         claims=claims,
         provenance=provenance,
         qualification_diagnostic=qual.diagnostic,
+        runtime_diagnostics=runtime_diagnostics,
         summary=(
             f"edge intervention {spec.name!r}: {verdict}. "
-            f"{mres.n_kernels:,} kernels observed, serialized-concurrency="
-            f"{mres.serialized_fraction:.3f}."
+            f"{mres.n_kernels:,} kernels observed, {_serialized_evidence(mres)}."
         ),
     )
     _write_report(run_dir, report_md)
@@ -1448,7 +1826,7 @@ def _edge_intervention_result(
     summary = {
         "run_id": run_id,
         "workload": workload,
-        "status": "ok",
+        "status": "ok" if basis is not None else "intervention_failed",
         "mode": "intervention",
         "fingerprint": qual.fingerprint,
         "commit": qual.commit,
@@ -1475,8 +1853,8 @@ def _no_data_result(
 ) -> dict[str, Any]:
     """Write an honest no-data report and return its summary (status=no_data).
 
-    Used when the trace has no kernels — a misconfigured box or a workload that
-    never ran. We emit zero claims rather than fabricating results from nothing.
+    Used when the trace has no positive-duration kernels — a misconfigured box,
+    a workload that never ran, or invalid timestamps. We emit zero claims.
     """
     provenance = build_provenance(
         workload_id=workload,
@@ -1489,7 +1867,7 @@ def _no_data_result(
         claims=[],
         provenance=provenance,
         qualification_diagnostic=diagnostic,
-        summary="NO DATA — tracer captured no GPU kernels; nothing was measured.",
+        summary="NO DATA — tracer captured no positive-duration GPU kernels; nothing was measured.",
     )
     _write_report(run_dir, report_md)
 

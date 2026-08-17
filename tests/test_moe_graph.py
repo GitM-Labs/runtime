@@ -15,10 +15,13 @@ headroom report would then bill against.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from gitm.optimizer.deviation import classify_op
 from gitm.planner.context import hardware_spec_for, peak_for_sku
+from gitm.planner.graph import Graph, PredictedNode
 from gitm.planner.moe_graph import (
     effective_kv_tokens,
     index_candidates,
@@ -32,9 +35,12 @@ from gitm.planner.moe_graph import (
 from gitm.planner.roofline import (
     BatchConfig,
     HardwareSpec,
+    ModelSpec,
     ShardingConfig,
     resolve_peak,
+    roofline,
     weight_bytes,
+    weight_bytes_is_fallback,
 )
 
 # The shape of DeepSeek-V4-Flash-0731, trimmed to the keys the planner reads.
@@ -640,7 +646,9 @@ def test_kv_footprint_splits_growing_from_fixed(spec):
 
     # Growth comes only from the 41 compressed layers, at 1/4 or 1/128 of a latent.
     naive_all_layers = spec.n_layers * (spec.kv_latent_dim + spec.index_head_dim)
-    assert per_token < naive_all_layers / 5
+    # The direct config builder keeps KV dtype tied to the declared activation
+    # dtype; serving may override it after the live cache dtype is known.
+    assert per_token < naive_all_layers / 3
 
     # The two window layers are real, bounded, and paid once per sequence.
     assert fixed == 2 * spec.sliding_window * kv_entry_bytes(spec)
@@ -681,3 +689,49 @@ def test_indexer_is_not_misfiled_as_elementwise():
 
     assert classify_kernel("lightning_indexer_topk_kernel") == "attention"
     assert classify_kernel("flash_mla_sparse_fwd_kernel") == "attention"
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    ["hidden_size", "n_routed_experts", "compress_ratios", "expert_dtype", "torch_dtype"],
+)
+def test_public_hf_builder_refuses_missing_shape_or_precision(missing_key):
+    cfg = dict(V4_CONFIG)
+    cfg.pop(missing_key)
+    with pytest.raises(ValueError, match=missing_key):
+        spec_from_hf_config(cfg)
+
+
+def test_unknown_weight_dtype_is_fail_open_but_explicitly_flagged(spec, b200):
+    unknown = replace(spec, expert_dtype="future_fp3")
+    graph = predict_moe_graph(unknown, b200, BatchConfig(batch=1, kv_cache_len=1024))
+    assert weight_bytes("future_fp3") == weight_bytes("bf16")
+    assert weight_bytes_is_fallback("future_fp3")
+    assert graph.has_fallback_bytes
+    assert {n.op for n in graph.nodes if n.prediction.bytes_are_fallback} == {
+        "moe_shared", "moe_routed"
+    }
+
+
+def test_known_weight_dtypes_leave_bytes_fallback_clean(spec, b200):
+    graph = predict_moe_graph(spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
+    assert not weight_bytes_is_fallback("fp4")
+    assert not graph.has_fallback_bytes
+    assert not any(n.prediction.bytes_are_fallback for n in graph.nodes)
+
+
+def test_mixed_byte_node_flags_unknown_kv_dtype(spec, b200):
+    unknown = replace(spec, kv_dtype="future_kv3")
+    graph = predict_moe_graph(unknown, b200, BatchConfig(batch=1, kv_cache_len=1024))
+    flagged = {n.op for n in graph.nodes if n.prediction.bytes_are_fallback}
+    assert {"attn_kv_a", "attn_score_value"} <= flagged
+    assert "moe_router" not in flagged
+
+
+def test_graph_preserves_each_missing_roofline_denominator(spec):
+    hw = HardwareSpec(peak_flops_fp16_per_s=0.0, peak_mem_bw_bytes_per_s=1e9)
+    node = PredictedNode("partial", None, roofline("partial", 1e12, 1024.0, hw))
+    graph = Graph(model=ModelSpec(), hw=hw, batch=BatchConfig(), nodes=[node])
+    assert graph.has_unpriced_nodes
+    assert graph.has_unpriced_compute
+    assert not graph.has_unpriced_memory

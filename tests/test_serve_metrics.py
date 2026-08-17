@@ -62,6 +62,11 @@ def test_parse_ignores_comments_and_nan():
     assert snap["vllm:num_requests_running"] == 3.0
 
 
+def test_parse_ignores_infinite_values():
+    snap = metrics.parse_prometheus("vllm:num_requests_running +Inf\n")
+    assert "vllm:num_requests_running" not in snap
+
+
 def test_window_is_the_difference_not_the_lifetime():
     w = metrics.window_from_snapshots(BEFORE, AFTER, window_s=10.0)
 
@@ -122,6 +127,12 @@ def test_missing_window_length_leaves_throughput_unset():
     w = metrics.window_from_snapshots(BEFORE, AFTER)
     assert w.generation_tokens == 2560.0
     assert w.output_tokens_per_s is None
+
+
+def test_nonpositive_window_refuses_throughput_with_note():
+    w = metrics.window_from_snapshots(BEFORE, AFTER, window_s=0.0)
+    assert w.output_tokens_per_s is None
+    assert any("finite and positive" in note for note in w.notes)
 
 
 def test_fetch_never_raises_on_a_dead_endpoint():

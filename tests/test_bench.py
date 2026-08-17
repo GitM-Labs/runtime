@@ -124,6 +124,11 @@ def _run(seed: int, value: float, gpu: float = 0.7) -> object:
         warm_window_s=60,
         git_sha="abc1234",
         gitm_version="0.0.1",
+        manifest_sha256="manifest123",
+        gpu_name="A100",
+        device_count=1,
+        started_at_ns=1,
+        ended_at_ns=2,
         stall_breakdown=[
             StallPhase(phase="all", cpu=0.03, data_stall=max(0.0, 1 - gpu - 0.03 - 0.05),
                        sync=0.05, gpu_active=gpu, throughput=value, wall_clock_s=60.0)
@@ -166,6 +171,69 @@ def test_baseline_fails_on_saturation():
     summary = aggregate(runs, cfg)
     assert not summary.passed
     assert any(g.name == "saturation" and not g.passed for g in summary.gates)
+
+
+def test_baseline_refuses_missing_gpu_activity_instead_of_substituting_zero():
+    from gitm.bench.baseline import aggregate
+
+    runs = [_run(42, 26e6), _run(43, 26e6), _run(44, 26e6)]
+    for run in runs:
+        run.stall_breakdown = []
+
+    summary = aggregate(runs, _hft_config())
+
+    assert summary.gpu_active_overall is None
+    gate = next(g for g in summary.gates if g.name == "saturation")
+    assert not gate.passed
+    assert "coverage unavailable" in gate.detail
+
+
+def test_baseline_refuses_cpu_or_unpinned_runs():
+    from gitm.bench.baseline import aggregate
+
+    runs = [_run(42, 26e6), _run(43, 26e6), _run(44, 26e6)]
+    runs[0].gpu_name = "cpu"
+    runs[1].manifest_sha256 = None
+
+    summary = aggregate(runs, _hft_config())
+
+    gate = next(g for g in summary.gates if g.name == "provenance")
+    assert not gate.passed
+    assert "GPU identity unavailable" in gate.detail
+    assert "manifest digest unavailable" in gate.detail
+
+
+def test_baseline_refuses_missing_or_reversed_timing_provenance():
+    from gitm.bench.baseline import aggregate
+
+    runs = [_run(42, 26e6), _run(43, 26e6), _run(44, 26e6)]
+    runs[0].started_at_ns = 0
+    runs[1].ended_at_ns = runs[1].started_at_ns
+
+    summary = aggregate(runs, _hft_config())
+
+    gate = next(g for g in summary.gates if g.name == "provenance")
+    assert not gate.passed
+    assert "start timestamp unavailable" in gate.detail
+    assert "end timestamp does not follow start" in gate.detail
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+def test_baseline_run_refuses_unusable_metric_values(value):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        _run(42, value)
+
+
+@pytest.mark.parametrize("target", [0.0, -1.0, float("nan"), float("inf")])
+def test_bench_config_refuses_unusable_baseline_target(target):
+    from pydantic import ValidationError
+
+    cfg = _hft_config().model_dump()
+    cfg["baseline_target"] = target
+    with pytest.raises(ValidationError):
+        type(_hft_config()).model_validate(cfg)
 
 
 def test_baseline_fails_on_too_few_runs_and_below_target():
@@ -227,6 +295,126 @@ def test_wrap_command_marks_missing_profiler():
     argv, bundle = wrap_command(cfg, ["echo", "hi"], "/tmp", tools=tools)
     assert argv == ["echo", "hi"]  # passes command through unwrapped
     assert "nsys" in bundle.missing
+
+
+def test_profile_marks_failed_workload_command(tmp_path):
+    import sys
+
+    from gitm.bench.profile import ProfilerTools, run_profile
+
+    bundle = run_profile(
+        _hft_config(),
+        [sys.executable, "-c", "raise SystemExit(7)"],
+        tmp_path,
+        tools=ProfilerTools(nsys=None, rocprof=None, py_spy=None, sar=None),
+    )
+
+    assert any("exit 7" in item for item in bundle.missing)
+    assert not bundle.complete
+
+
+def test_profile_launches_pyspy_and_records_its_artifact(monkeypatch, tmp_path):
+    from gitm.bench import profile
+
+    calls = []
+
+    class Proc:
+        def __init__(self, argv, **_kwargs):
+            self.argv = argv
+            self.pid = 4321
+            self.returncode = None
+            calls.append(argv)
+            if argv[0] == "py-spy":
+                output = Path(argv[argv.index("--output") + 1])
+                output.write_text("<svg/>")
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+        def terminate(self):
+            self.returncode = -15
+
+    monkeypatch.setattr(profile.subprocess, "Popen", Proc)
+    bundle = profile.run_profile(
+        _hft_config(),
+        ["workload"],
+        tmp_path,
+        host_capture_s=1,
+        tools=profile.ProfilerTools(nsys=None, rocprof=None, py_spy="py-spy", sar=None),
+    )
+
+    pyspy = next(call for call in calls if call[0] == "py-spy")
+    assert pyspy[pyspy.index("--pid") + 1] == "4321"
+    assert "--subprocesses" in pyspy
+    assert bundle.host_pyspy == tmp_path / "host_flamegraph.svg"
+    assert bundle.host_pyspy.exists()
+    assert not any("py-spy" in item for item in bundle.missing)
+
+
+def test_profile_surfaces_failed_pyspy_capture(monkeypatch, tmp_path):
+    from gitm.bench import profile
+
+    class Proc:
+        def __init__(self, argv, **_kwargs):
+            self.argv = argv
+            self.pid = 4321
+            self.returncode = None
+
+        def wait(self, timeout=None):
+            self.returncode = 9 if self.argv[0] == "py-spy" else 0
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+
+    monkeypatch.setattr(profile.subprocess, "Popen", Proc)
+    bundle = profile.run_profile(
+        _hft_config(),
+        ["workload"],
+        tmp_path,
+        host_capture_s=1,
+        tools=profile.ProfilerTools(nsys=None, rocprof=None, py_spy="py-spy", sar=None),
+    )
+
+    assert any("py-spy capture failed (exit 9)" in item for item in bundle.missing)
+    assert not bundle.complete
+
+
+def test_profile_cli_prints_every_bundle_artifact(monkeypatch, tmp_path, capsys):
+    from types import SimpleNamespace
+
+    from gitm.bench import cli
+    from gitm.bench.profile import ProfileBundle
+
+    bundle = ProfileBundle(
+        out_dir=tmp_path,
+        gpu_report=tmp_path / "gpu.nsys-rep",
+        gpu_csv=tmp_path / "gpu.csv",
+        host_pyspy=tmp_path / "host.svg",
+        host_sar=tmp_path / "host.log",
+    )
+    monkeypatch.setattr("gitm.bench.schema.BenchConfig.from_toml", lambda _path: object())
+    monkeypatch.setattr("gitm.bench.runner.build_command", lambda _cfg, _seed: ["workload"])
+    monkeypatch.setattr("gitm.bench.profile.run_profile", lambda *_args, **_kwargs: bundle)
+
+    rc = cli._cmd_profile(SimpleNamespace(config=tmp_path / "bench.toml", seed=1, out=tmp_path))
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["gpu_report"] == str(bundle.gpu_report)
+    assert payload["gpu_csv"] == str(bundle.gpu_csv)
+    assert payload["host_pyspy"] == str(bundle.host_pyspy)
+    assert payload["host_sar"] == str(bundle.host_sar)
+
+
+def test_breakdown_refuses_to_clamp_overlapping_timings():
+    from gitm.bench.profile import PhaseTiming, build_breakdown
+
+    with pytest.raises(ValueError, match="refusing to clamp"):
+        build_breakdown(
+            [PhaseTiming("overlap", wall_clock_s=1.0, gpu_busy_s=0.8, cpu_s=0.4)]
+        )
 
 
 # --- edge manifest ----------------------------------------------------------
@@ -326,7 +514,7 @@ def test_run_seed_end_to_end_with_echo_harness(tmp_path: Path, monkeypatch):
         'name="hft"\nvendor="nvidia"\nmetric="events_per_second"\n'
         'warm_window_s=60\nseeds=[42]\n'
         '[dataset]\nroot="hft"\n'
-        f'[work_unit]\ncommand="python {harness} --seed {{seed}}"\n'
+        f'[work_unit]\ncommand="python {harness.as_posix()} --seed {{seed}}"\n'
         '[expected_stall]\ncpu={lo=0,hi=0.05}\ndata_stall={lo=0.1,hi=0.25}\n'
         'sync={lo=0.05,hi=0.15}\ngpu_active={lo=0.6,hi=0.8}\n'
     )

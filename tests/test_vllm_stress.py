@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from gitm.kernels.spec import InterventionSpec
 from gitm.optimizer.apply import LiveEngineApplicator, apply_intervention
 from gitm.optimizer.deviation import deviating_kernel_indices, deviation_summary, deviation_trace
@@ -93,14 +95,17 @@ class _RaisingEngine:
         raise RuntimeError("engine busy")
 
 
-def test_sampler_swallows_engine_exceptions():
+def test_sampler_surfaces_engine_exceptions_without_crashing():
     sampler = SchedulerStatsSampler(_RaisingEngine(), interval_s=0.002)
-    sampler.start()
-    for _ in range(500):
-        pass
-    sampler.stop()  # must not raise
+    with pytest.warns(RuntimeWarning, match="scheduler telemetry degraded"):
+        sampler.start()
+        for _ in range(500):
+            pass
+        sampler.stop()  # must not raise
     # A raising engine yields no usable samples, summary is the empty shape.
-    assert sampler.summary().n_samples == 0
+    summary = sampler.summary()
+    assert summary.n_samples == 0
+    assert summary.diagnostics
 
 
 def test_sampler_repeated_start_stop_is_safe():
@@ -129,6 +134,51 @@ def test_read_scheduler_stats_partial_engine():
     s = read_scheduler_stats(_Partial())
     assert s is not None and s.num_waiting == 3
     assert s.num_running is None and s.batch_occupancy is None
+
+
+def test_scheduler_sampler_surfaces_unrecognized_engine_shape():
+    sampler = SchedulerStatsSampler(object(), interval_s=1.0)
+
+    with pytest.warns(RuntimeWarning, match="no recognized scheduler fields"):
+        sampler.start()
+        sampler.stop()
+
+    assert any(
+        "no recognized scheduler fields" in note
+        for note in sampler.summary().diagnostics
+    )
+
+
+def test_read_scheduler_stats_surfaces_field_probe_failures():
+    class BlockManager:
+        num_total_gpu_blocks = 8
+
+        def get_num_free_gpu_blocks(self):
+            raise RuntimeError("cache probe broke")
+
+    class Scheduler:
+        running = [object()]
+        block_manager = BlockManager()
+
+    class Engine:
+        scheduler = Scheduler()
+
+        def get_num_unfinished_requests(self):
+            raise RuntimeError("unfinished probe broke")
+
+    sample = read_scheduler_stats(Engine())
+
+    assert sample is not None
+    assert sample.num_running == 1
+    assert any("cache usage probe failed" in note for note in sample.diagnostics)
+    assert any("unfinished-request probe failed" in note for note in sample.diagnostics)
+
+
+def test_reversed_scheduler_sample_timeline_is_refused():
+    from gitm.tracer.vllm_stats import SchedulerSample
+
+    with pytest.raises(ValueError, match="timestamps are not monotonic"):
+        summarize([SchedulerSample(t_ns=10), SchedulerSample(t_ns=5)])
 
 
 def test_summarize_single_sample():
@@ -220,14 +270,15 @@ def test_occupancy_clamped_under_multiple_schedulers():
 
 
 def test_measure_rolls_back_on_nonpositive_baseline():
-    """An unmeasurable (zero) baseline must roll the candidate back, not keep it."""
+    """An unmeasurable baseline refuses before apply, so no rollback is claimed."""
     class _Idle:
         scheduler_config = _SchedCfg()
 
-    # Baseline probe returns 0 (idle engine), so measure() raises after apply.
+    # Baseline probe returns 0 (idle engine), so snapshot refuses before apply.
     app = LiveEngineApplicator(_Idle(), throughput_fn=lambda e: 0.0, restart_fn=lambda _e, _kv: _Idle())
     res = apply_intervention(_spec("max_num_seqs", 256), app, min_keep_delta=0.0)
-    assert not res.applied and res.rolled_back
+    assert not res.applied and not res.rolled_back
+    assert "intervention not applied" in res.error
 
 
 def test_deviation_multistep_does_not_keep_everything():

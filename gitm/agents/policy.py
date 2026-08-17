@@ -34,6 +34,8 @@ def select_interventions(
     *,
     ctx: GateContext | None = None,
 ) -> list[RankedCandidate]:
+    if isinstance(top_n, bool) or not isinstance(top_n, int) or top_n <= 0:
+        raise ValueError(f"top_n must be a positive integer, got {top_n!r}")
     candidates: list[RankedCandidate] = []
 
     for spec in library:

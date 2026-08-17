@@ -9,6 +9,7 @@ engine, and the loop is driven through a monkeypatched capture window.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -80,6 +81,39 @@ def test_build_planner_context_sku_override(monkeypatch):
     assert pctx.gate.workload == "vllm-decode"
     assert pctx.gate.hardware == "NVIDIA A100-SXM4-80GB"
     assert pctx.gate.dtype is None  # no engine attached
+    assert pctx.num_gpus_is_fallback is False
+
+
+def test_build_planner_context_flags_unknown_gpu_count(monkeypatch):
+    import gitm.planner.context as context
+
+    monkeypatch.setenv("GITM_GPU_SKU", "NVIDIA B200")
+    monkeypatch.setattr(context, "_query_nvml", lambda: ("NVIDIA B200", None))
+
+    pctx = context.build_planner_context()
+
+    assert pctx.num_gpus == 1
+    assert pctx.num_gpus_is_fallback is True
+
+
+def test_multi_gpu_count_does_not_fabricate_collective_or_interconnect(monkeypatch):
+    import gitm.planner.context as context
+
+    monkeypatch.setattr(context, "_query_nvml", lambda: ("NVIDIA A100-SXM4-80GB", 4))
+
+    pctx = context.build_planner_context()
+
+    assert pctx.num_gpus == 4
+    assert pctx.gate.has_collective is False
+    assert pctx.gate.has_interconnect is None
+
+
+@pytest.mark.parametrize("count", [0, -1])
+def test_build_planner_context_refuses_invalid_explicit_gpu_count(count):
+    from gitm.planner.context import build_planner_context
+
+    with pytest.raises(ValueError, match="num_gpus must be positive"):
+        build_planner_context(num_gpus=count)
 
 
 def test_unknown_sku_yields_no_peak(monkeypatch):
@@ -115,6 +149,7 @@ def test_hardware_spec_for_uses_detected_peak_not_default():
     l4_peak = HardwarePeak(name="NVIDIA L4", peak_flops=121e12, peak_bw_bytes_s=300e9)
     hw = hardware_spec_for(l4_peak)
     assert hw.name == "NVIDIA L4"
+    assert not hw.is_fallback
     assert hw.peak_flops_fp16_per_s == 121e12
     assert hw.peak_flops_bf16_per_s == 121e12
     assert hw.peak_mem_bw_bytes_per_s == 300e9
@@ -124,7 +159,9 @@ def test_hardware_spec_for_falls_back_to_default_on_unknown_sku():
     from gitm.planner.context import hardware_spec_for
     from gitm.planner.roofline import HardwareSpec
 
-    assert hardware_spec_for(None) == HardwareSpec()
+    hw = hardware_spec_for(None)
+    assert hw == HardwareSpec()
+    assert hw.is_fallback
 
 
 def test_predict_graph_on_l4_predicts_slower_than_default_a100():
@@ -318,7 +355,27 @@ class _LiveEngine:
     """Duck-typed vLLM engine with a restartable max_num_seqs lever."""
 
     def __init__(self, max_num_seqs: int = 32):
-        self.model_config = _ModelConfig()
+        self.model_config = SimpleNamespace(
+            dtype="torch.bfloat16",
+            max_model_len=4096,
+            hf_config=SimpleNamespace(
+                model_type="llama",
+                hidden_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=1,
+                num_key_value_heads=1,
+                head_dim=64,
+                intermediate_size=128,
+                vocab_size=128,
+                torch_dtype="bfloat16",
+            ),
+        )
+        self.cache_config = SimpleNamespace(max_model_len=4096, cache_dtype="bf16")
+        self.parallel_config = SimpleNamespace(
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+            enable_expert_parallel=False,
+        )
         self.max_num_seqs = max_num_seqs
         # Decode throughput scales with batch width, so raising max_num_seqs is a
         # measurable win and is kept. Other structural knobs raise from restart
@@ -351,6 +408,7 @@ def test_run_loop_live_engine_keeps_winning_knob_and_rolls_back_unswappable(
 
     monkeypatch.setattr(loop, "capture", fake_capture)
     monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setenv("GITM_GPU_SKU", "NVIDIA B200")
 
     engine = _LiveEngine()
     cfg = LoopConfig(
@@ -384,8 +442,8 @@ def test_run_loop_live_engine_keeps_winning_knob_and_rolls_back_unswappable(
     assert summary["n_rolled_back"] >= 1
 
 
-def test_run_loop_no_engine_is_predict_only(tmp_path: Path, monkeypatch):
-    """Without an engine, candidates are unverified (no measured delta), never won."""
+def test_run_loop_no_engine_refuses_default_prediction(tmp_path: Path, monkeypatch):
+    """Without an engine, measurement survives but graph-based claims refuse."""
     from contextlib import contextmanager
 
     import gitm.scheduler.loop as loop
@@ -401,6 +459,7 @@ def test_run_loop_no_engine_is_predict_only(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(loop, "sync_device", lambda: None)
 
     out = run_loop(LoopConfig(workload="vllm-decode", budget="5s", scratch=str(tmp_path)))
-    assert out["summary"]["status"] == "ok"
-    # No scheduler stats without an engine.
-    assert out["summary"]["scheduler_stats"] is None
+    assert out["summary"]["status"] == "prediction_refused"
+    assert out["summary"]["mode"] == "measurement"
+    assert out["summary"]["n_claims"] == 0
+    assert "no live engine" in out["report_md"]

@@ -58,7 +58,7 @@ def load(trace_path: Path):
     return _load_trace_jsonl(trace_path)
 
 
-def analyse(trace, sku: str):
+def analyse(trace, sku: str, *, hardware_assumed: bool = False):
     """Everything the report needs, as plain data."""
     from gitm.importers.analyze import _predicted_floor_s, _resolve_peak
     from gitm.optimizer.collective_signal import collective_causes, worst_device_comm
@@ -69,6 +69,18 @@ def analyse(trace, sku: str):
 
     kernels = trace.kernels()
     breakdown = summarize_kernels(kernels, window_ns=trace.duration_ns)
+    if breakdown.n_kernels == 0:
+        return {
+            "breakdown": breakdown,
+            "peak": None,
+            "sku_known": False,
+            "hardware_assumed": hardware_assumed,
+            "metrics": None,
+            "headroom": None,
+            "roi": [],
+            "comm": None,
+            "causes": [],
+        }
 
     peak, sku_known = _resolve_peak(sku)
     metrics = compute_metrics(trace, peak)
@@ -87,6 +99,7 @@ def analyse(trace, sku: str):
         "breakdown": breakdown,
         "peak": peak,
         "sku_known": sku_known,
+        "hardware_assumed": hardware_assumed,
         "metrics": metrics,
         "headroom": headroom,
         "roi": roi,
@@ -168,13 +181,19 @@ def render(a: dict, *, serving: dict | None, trace) -> str:
                 f"- TTFT p50/p95: {_ms(serving.get('ttft_p50_s'))} / {_ms(serving.get('ttft_p95_s'))}",
                 f"- TPOT p50/p95: {_ms(serving.get('tpot_p50_s'))} / {_ms(serving.get('tpot_p95_s'))}",
                 f"- requests: {serving.get('n_requests')} "
-                f"({serving.get('n_failed_requests', 0)} failed), "
+                f"({serving.get('n_failed_requests', 'n/a')} failed), "
                 f"goodput {serving.get('goodput_rps')}",
                 "",
                 "Latency is client-side (includes network); vLLM's own histograms are in "
                 "metrics_before.txt / metrics_after.txt.", ""]
 
     caveats = fp8_caveat(a["sku_known"], a["peak"].name) + list(h.caveats)
+    if a["hardware_assumed"]:
+        caveats.insert(
+            0,
+            f"No --sku was supplied; pricing assumes {a['peak'].name}. "
+            "Utilization ratios are not a detected-hardware measurement.",
+        )
     out += ["## Caveats", ""] + [f"- {c}" for c in caveats] + [""]
     return "\n".join(out)
 
@@ -220,13 +239,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("target", type=Path, help="capture dir (or a trace.jsonl)")
     ap.add_argument("--compare", type=Path, default=None,
                     help="a second capture dir to diff against (e.g. the eager reference)")
-    ap.add_argument("--sku", default=DEFAULT_SKU)
+    ap.add_argument("--sku", default=None)
     ap.add_argument("--out", type=Path, default=None, help="markdown path (default <dir>/headroom.md)")
     args = ap.parse_args(sys.argv[1:] if argv is None else argv)
 
     trace_path = resolve_trace(args.target)
     trace = load(trace_path)
-    a = analyse(trace, args.sku)
+    sku = args.sku or DEFAULT_SKU
+    a = analyse(trace, sku, hardware_assumed=args.sku is None)
 
     if a["breakdown"].n_kernels == 0:
         print("No kernels in this trace — there is no headroom claim to make.", file=sys.stderr)
@@ -242,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
     md = render(a, serving=serving, trace=trace)
     if args.compare:
         other_path = resolve_trace(args.compare)
-        b = analyse(load(other_path), args.sku)
+        b = analyse(load(other_path), sku, hardware_assumed=args.sku is None)
         md += compare(a, b, label_a=args.target.name, label_b=args.compare.name)
 
     out_md = args.out or (trace_path.parent / "headroom.md")

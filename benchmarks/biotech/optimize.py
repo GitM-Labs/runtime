@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import statistics
 import time
@@ -33,6 +34,7 @@ from pathlib import Path
 
 from benchmarks.biotech.fetch import read_fasta
 from benchmarks.biotech.harness import _msa_path, load_openfold_runner
+from gitm._timing import require_positive_duration, require_positive_work
 from gitm.kernels.spec import Applicability, InterventionSpec, SafetyGate
 
 
@@ -57,11 +59,17 @@ def _fold_all(runner, proteins) -> tuple[float, float | None]:
     for r, msa in proteins:
         out = runner.predict(r, msa)
         if "plddt" in out:
-            plddts.append(float(out["plddt"]))
+            plddt = float(out["plddt"])
+            if not math.isfinite(plddt):
+                raise RuntimeError(f"OpenFold quality evidence is non-finite: {plddt!r}")
+            plddts.append(plddt)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    elapsed = max(time.perf_counter() - t0, 1e-9)
-    sph = len(proteins) / elapsed * 3600.0
+    elapsed = require_positive_duration(
+        time.perf_counter() - t0, context="OpenFold A/B"
+    )
+    count = require_positive_work(len(proteins), context="OpenFold A/B")
+    sph = count / elapsed * 3600.0
     return sph, (statistics.median(plddts) if plddts else None)
 
 
@@ -91,6 +99,15 @@ class AF2ABResult:
 def optimize_af2(stage: Path, seed: int, *, n_proteins: int, max_len: int,
                  warmup: int, plddt_tol: float) -> AF2ABResult:
     """Run the fp32-vs-bf16 A/B and return a gated verdict."""
+    for name, value, minimum in (
+        ("n_proteins", n_proteins, 1),
+        ("max_len", max_len, 1),
+        ("warmup", warmup, 0),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
+    if not math.isfinite(plddt_tol) or plddt_tol < 0.0:
+        raise ValueError(f"plddt_tol must be finite and non-negative, got {plddt_tol!r}")
     import torch
 
     proteins = _select(stage, max_len=max_len, n=n_proteins)

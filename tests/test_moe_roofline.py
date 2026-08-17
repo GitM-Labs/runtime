@@ -13,7 +13,14 @@ from __future__ import annotations
 import pytest
 
 from gitm.planner.graph import predict_graph
-from gitm.planner.roofline import BatchConfig, HardwareSpec, ModelSpec, distinct_experts
+from gitm.planner.roofline import (
+    BatchConfig,
+    HardwareSpec,
+    ModelSpec,
+    ShardingConfig,
+    distinct_experts,
+    roofline,
+)
 
 # Qwen3.6-35B-A3B-FP8 shaped: narrow hidden, many narrow experts, one shared
 # expert, fp8 weights with bf16 activations.
@@ -84,6 +91,20 @@ def test_dense_spec_is_not_moe_and_falls_back():
     assert m.expert_intermediate == m.intermediate
 
 
+def test_dense_graph_uses_configured_compute_dtype_for_peak_selection():
+    hw = HardwareSpec(
+        peak_flops_fp16_per_s=100.0,
+        peak_flops_fp32_per_s=10.0,
+        peak_mem_bw_bytes_per_s=1e30,
+    )
+
+    graph = predict_graph(ModelSpec(n_layers=1, compute_dtype="fp32"), hw)
+
+    assert graph.nodes
+    assert all(node.prediction.dtype == "fp32" for node in graph.nodes)
+    assert all(node.prediction.peak_dtype == "fp32" for node in graph.nodes)
+
+
 def test_moe_spec_properties():
     assert MOE.is_moe
     assert MOE.top_k == 8
@@ -92,10 +113,41 @@ def test_moe_spec_properties():
     assert MOE.shared_intermediate == 768  # falls back to the routed width
 
 
-def test_num_experts_without_top_k_stays_dense():
-    """Half-configured is dense, not a mixture — no silent guessing."""
-    assert not ModelSpec(num_experts=256).is_moe
-    assert not ModelSpec(experts_per_token=8).is_moe
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"num_experts": 256},
+        {"experts_per_token": 8},
+        {"num_experts": 4, "experts_per_token": 8},
+        {"weight_dtype_bytes": 0},
+        {"moe_layer_step": 0},
+        {"full_attn_layer_step": 0},
+    ],
+)
+def test_model_spec_refuses_values_that_were_silently_clamped_or_defaulted(kwargs):
+    with pytest.raises(ValueError):
+        ModelSpec(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: BatchConfig(batch=0),
+        lambda: BatchConfig(speculative_tokens=-1),
+        lambda: BatchConfig(acceptance_rate=1.1),
+        lambda: ShardingConfig(tp=0),
+        lambda: ShardingConfig(ep_imbalance=0.5),
+    ],
+)
+def test_decode_and_sharding_specs_refuse_invalid_fallback_inputs(factory):
+    with pytest.raises(ValueError):
+        factory()
+
+
+@pytest.mark.parametrize("flops, bytes_moved", [(-1.0, 1.0), (1.0, -1.0), (float("nan"), 1.0)])
+def test_roofline_refuses_invalid_work_terms(flops, bytes_moved):
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        roofline("bad", flops, bytes_moved, H100)
 
 
 # --- graph: dense back-compat -------------------------------------------------
@@ -396,32 +448,6 @@ def test_hybrid_and_moe_compose():
     g = predict_graph(m, H100, BatchConfig(batch=8, kv_cache_len=4096))
     assert g.total_pred_s > 0
     assert all(n.prediction.bytes > 0 for n in g.nodes)
-
-
-def test_hf_attention_shape_survives_a_dense_ffn():
-    """Regression: attention shape and FFN sparsity are independent axes, so a
-    hybrid model with a dense FFN must still get full_attn_layer_step."""
-    from gitm.scheduler.loop import _moe_fields_from_hf
-
-    class HybridDense:  # hybrid attention, no experts
-        full_attention_interval = 4
-
-    class PlainMoE:  # experts, conventional attention
-        num_experts = 64
-        num_experts_per_tok = 4
-
-    assert _moe_fields_from_hf(HybridDense()) == {"full_attn_layer_step": 4}
-    got = _moe_fields_from_hf(PlainMoE())
-    assert got["num_experts"] == 64 and "full_attn_layer_step" not in got
-
-
-def test_hf_half_configured_moe_stays_dense():
-    from gitm.scheduler.loop import _moe_fields_from_hf
-
-    class OnlyExpertCount:
-        num_experts = 64  # no top-k
-
-    assert _moe_fields_from_hf(OnlyExpertCount()) == {}
 
 
 # --- real batch from scheduler stats -----------------------------------------

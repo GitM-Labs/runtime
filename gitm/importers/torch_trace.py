@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -22,6 +23,7 @@ from gitm.importers._common import (
     file_mtime_ns,
     filter_device,
     finish_trace,
+    merge_normalization_stats,
     per_device_kernel_counts,
 )
 from gitm.tracer.schema import MemcpyEvent, Trace, TraceEvent
@@ -163,6 +165,32 @@ def _classify(cat: str | None, name: str, args: dict[str, Any] | None) -> str | 
     return None
 
 
+def _launch_metadata_fallbacks(obj: dict[str, Any]) -> tuple[str, ...]:
+    """Neutral launch placeholders used for a parsed GPU event, for surfacing."""
+    args = obj.get("args") if isinstance(obj.get("args"), dict) else {}
+    cat = obj.get("cat")
+    name = str(obj.get("name") or "")
+    kind = _classify(str(cat) if cat is not None else None, name, args)
+    if kind != "kernel" and not (kind is None and str(cat).lower() in {"cuda", "gpu"}):
+        return ()
+    missing: list[str] = []
+    if not name:
+        missing.append("kernel name")
+    if _arg_get(args, _GRID_KEYS) is None and _arg_get(args, ("gridX", "grid_x")) is None:
+        missing.append("grid dimensions")
+    if _arg_get(args, _BLOCK_KEYS) is None and _arg_get(args, ("blockX", "block_x")) is None:
+        missing.append("block dimensions")
+    return tuple(missing)
+
+
+def _append_launch_metadata_warnings(stats: ImportStats, counts: dict[str, int]) -> None:
+    for field, count in sorted(counts.items()):
+        stats.warnings.append(
+            f"launch metadata coverage: {count} parsed kernel event(s) omitted {field}; "
+            "the importer used the neutral value 1"
+        )
+
+
 
 def _memcpy_event(
     *,
@@ -215,6 +243,17 @@ def event_from_chrome(
         ts = float(obj.get("ts", 0.0))
         dur = float(obj.get("dur", 0.0))
     except (TypeError, ValueError):
+        if strict:
+            raise ImportError(
+                f"invalid GPU event timestamp/duration: ts={obj.get('ts')!r}, "
+                f"dur={obj.get('dur')!r}"
+            ) from None
+        return None
+    if not math.isfinite(ts) or not math.isfinite(dur):
+        if strict:
+            raise ImportError(
+                f"non-finite GPU event timestamp/duration: ts={ts!r}, dur={dur!r}"
+            )
         return None
     start_ns = int(ts * 1000.0)
     end_ns = int((ts + dur) * 1000.0)
@@ -635,10 +674,16 @@ def _import_torch_from_event_dicts(
 ) -> tuple[list[Trace], ImportStats]:
     """Shared finish path once raw chrome event dicts are in hand."""
     events: list[TraceEvent] = []
+    metadata_fallbacks: dict[str, int] = {}
+    parse_dropped = 0
     for obj in raw_events:
         ev = event_from_chrome(obj, strict=strict)
         if ev is not None:
             events.append(ev)
+            for field in _launch_metadata_fallbacks(obj):
+                metadata_fallbacks[field] = metadata_fallbacks.get(field, 0) + 1
+        elif _device_id_from_chrome_obj(obj) is not None:
+            parse_dropped += 1
     if not events:
         raise ImportError(
             f"{path.name}: no complete GPU kernel/memcpy events found in traceEvents"
@@ -669,6 +714,7 @@ def _import_torch_from_event_dicts(
     rid = run_id or f"import-{uuid.uuid4().hex}"
     dcount = device_count_from_events(events)
     traces: list[Trace] = []
+    normalization_stats: list[ImportStats] = []
     for dev in device_ids:
         dev_events = filter_device(events, dev)
         if not dev_events:
@@ -684,6 +730,7 @@ def _import_torch_from_event_dicts(
             strict=strict,
         )
         traces.append(trace)
+        normalization_stats.append(_st)
     if not traces:
         raise ImportError(f"{path.name}: no events left after device filter")
     stats = ImportStats(
@@ -693,8 +740,16 @@ def _import_torch_from_event_dicts(
         device_name=device_name,
         captured_at_source="mtime",
         per_device_kernel_counts=all_counts,
-        total_raw_events=len(events),
+        total_raw_events=len(raw_events),
     )
+    merge_normalization_stats(stats, normalization_stats)
+    if parse_dropped:
+        stats.dropped_invalid += parse_dropped
+        stats.warnings.append(
+            f"dropped {parse_dropped} GPU event(s) with invalid timestamp/duration fields "
+            "during parsing"
+        )
+    _append_launch_metadata_warnings(stats, metadata_fallbacks)
     if len(device_ids) > 1:
         stats.warnings.append(
             f"multi-GPU input: analyzing devices {device_ids}; "
@@ -778,8 +833,10 @@ def import_torch_trace(
 
     buckets: dict[int, list[TraceEvent]] = defaultdict(list)
     all_counts: dict[int, int] = defaultdict(int)
+    metadata_fallbacks: dict[str, int] = {}
     scanned_sku: str | None = None
     n_raw = 0
+    parse_dropped = 0
     try:
         for obj in _iter_chrome_event_dicts(
             path, gzipped=bool(gzipped), max_decompressed_bytes=max_decompressed_bytes
@@ -799,7 +856,11 @@ def import_torch_trace(
                     continue
             ev = event_from_chrome(obj, strict=strict)
             if ev is None:
+                if _device_id_from_chrome_obj(obj) is not None:
+                    parse_dropped += 1
                 continue
+            for field in _launch_metadata_fallbacks(obj):
+                metadata_fallbacks[field] = metadata_fallbacks.get(field, 0) + 1
             buckets[ev.device_id].append(ev)
             if getattr(ev, "kind", None) == "kernel":
                 all_counts[ev.device_id] += 1
@@ -828,6 +889,7 @@ def import_torch_trace(
     rid = run_id or f"import-{uuid.uuid4().hex}"
     dcount = max(device_ids) + 1
     traces: list[Trace] = []
+    normalization_stats: list[ImportStats] = []
     total_events = 0
     for dev in device_ids:
         dev_events = buckets.pop(dev)
@@ -843,6 +905,7 @@ def import_torch_trace(
             strict=strict,
         )
         traces.append(trace)
+        normalization_stats.append(_st)
 
     if not traces:
         raise ImportError(f"{path.name}: no events left after device filter")
@@ -854,8 +917,16 @@ def import_torch_trace(
         device_name=scanned_sku,
         captured_at_source="mtime",
         per_device_kernel_counts=dict(all_counts),
-        total_raw_events=total_events,
+        total_raw_events=n_raw,
     )
+    merge_normalization_stats(stats, normalization_stats)
+    if parse_dropped:
+        stats.dropped_invalid += parse_dropped
+        stats.warnings.append(
+            f"dropped {parse_dropped} GPU event(s) with invalid timestamp/duration fields "
+            "during parsing"
+        )
+    _append_launch_metadata_warnings(stats, metadata_fallbacks)
     if len(device_ids) > 1:
         stats.warnings.append(
             f"multi-GPU input: analyzing devices {device_ids}; "

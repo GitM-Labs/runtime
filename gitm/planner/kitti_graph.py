@@ -49,7 +49,6 @@ class KittiNode:
     device: str          # "gpu" | "cpu" | "pcie"
     prediction: RooflinePrediction | None = None
     note: str = ""
-    expected_stream_id: int = 0  # -1 for CPU, 0+ for CUDA streams
 
 
 @dataclass
@@ -81,9 +80,8 @@ def predict_kitti_graph(hw: HardwareSpec | None = None) -> KittiGraph:
     CPU stages are annotated but not predicted — they depend on the host CPU
     and are measured directly by WorkUnit.
 
-    The stream-concurrency invariant predicts that voxelization (CPU, stream=-1)
-    for frame N+1 should overlap backbone inference (GPU, stream=0) for frame N.
-    The graph makes this expectation explicit via expected_stream_id.
+    CPU/GPU pipeline overlap is measured from the captured workload; this graph
+    models per-stage device placement and roofline cost only.
     """
     hw = hw or HardwareSpec()
     g = KittiGraph(hw=hw)
@@ -93,7 +91,6 @@ def predict_kitti_graph(hw: HardwareSpec | None = None) -> KittiGraph:
         name="load_bin",
         device="cpu",
         note="np.fromfile: ~15k points x 4 float32 = ~240 KB I/O. Not roofline-modeled.",
-        expected_stream_id=-1,
     ))
 
     # Stage 2: Voxelization (CPU — scatter 15k points into 12k pillars)
@@ -103,7 +100,6 @@ def predict_kitti_graph(hw: HardwareSpec | None = None) -> KittiGraph:
         name="voxelization",
         device="cpu",
         note="Host-side scatter into voxel grid. CPU memory-bound. ~48 MB writes.",
-        expected_stream_id=-1,  # CPU thread — overlaps GPU stream 0 (stream-concurrency invariant)
     ))
 
     # Stage 3: H2D copy (PCIe — pillar features host -> device)
@@ -124,7 +120,6 @@ def predict_kitti_graph(hw: HardwareSpec | None = None) -> KittiGraph:
             bound="memory",
         ),
         note=f"pillar features: {h2d_bytes / 1e6:.1f} MB @ ~20 GB/s PCIe",
-        expected_stream_id=0,
     ))
 
     # Stage 4: Pillar Feature Encoder / VFE (GPU)
@@ -142,7 +137,6 @@ def predict_kitti_graph(hw: HardwareSpec | None = None) -> KittiGraph:
         device="gpu",
         prediction=roofline("pillar_vfe", vfe_flops, vfe_bytes, hw, dtype="fp32"),
         note="PointPillar feature encoder: linear + BN + ReLU per pillar",
-        expected_stream_id=0,
     ))
 
     # Stage 5: BEV scatter (GPU — pillar features -> spatial BEV grid)
@@ -157,7 +151,6 @@ def predict_kitti_graph(hw: HardwareSpec | None = None) -> KittiGraph:
         device="gpu",
         prediction=roofline("bev_scatter", 0, bev_scatter_bytes, hw, dtype="fp32"),
         note="Scatter pillar features -> 2D BEV pseudo-image",
-        expected_stream_id=0,
     ))
 
     # Stage 6: 2D Backbone CNN (GPU)
@@ -173,7 +166,6 @@ def predict_kitti_graph(hw: HardwareSpec | None = None) -> KittiGraph:
         device="gpu",
         prediction=roofline("backbone_2d", backbone_flops, backbone_bytes, hw, dtype="fp32"),
         note="Strided 2D CNN: 3 blocks, progressively downsampled BEV features",
-        expected_stream_id=0,
     ))
 
     # Stage 7: Detection head (GPU — anchor-based classification + regression)
@@ -189,7 +181,6 @@ def predict_kitti_graph(hw: HardwareSpec | None = None) -> KittiGraph:
         device="gpu",
         prediction=roofline("detection_head", head_flops, head_bytes, hw, dtype="fp32"),
         note="SSD-style anchor cls + box regression, 1x1 conv",
-        expected_stream_id=0,
     ))
 
     # Stage 8: NMS (CPU — CPU-accelerated iou3d_nms_cuda is a separate CUDA kernel
@@ -198,7 +189,6 @@ def predict_kitti_graph(hw: HardwareSpec | None = None) -> KittiGraph:
         name="nms",
         device="cpu",
         note="iou3d_nms_cuda: box decode + IoU matrix + suppression. CPU-sync stall.",
-        expected_stream_id=-1,
     ))
 
     return g
@@ -239,10 +229,16 @@ def render_kitti_graph(
     ]
 
     if measured:
-        fps      = measured.get("frames_per_second", 0)
-        frame_ms = 1000 / fps if fps > 0 else 0
-        gpu_pct  = measured.get("gpu_active_pct", 0)
-        data_pct = measured.get("data_stall_pct", 0)
+        fps = measured.get("frames_per_second")
+        gpu_pct = measured.get("gpu_active_pct")
+        data_pct = measured.get("data_stall_pct")
+        if not isinstance(fps, int | float) or fps <= 0:
+            lines += ["", "Measured comparison refused: frames_per_second is missing or non-positive."]
+            return "\n".join(lines)
+        if not isinstance(gpu_pct, int | float) or not isinstance(data_pct, int | float):
+            lines += ["", "Measured comparison refused: stall coverage fields are missing."]
+            return "\n".join(lines)
+        frame_ms = 1000 / fps
         lines += [
             "",
             "Measured (baseline):",

@@ -26,7 +26,16 @@ def test_requires_collective_and_interconnect():
     assert applicable(spec, ok_ctx)[0]
     no_ic = GateContext(workload="vllm-decode", num_gpus=2, has_collective=True)
     ok, reason = applicable(spec, no_ic)
-    assert not ok and "interconnect" in reason
+    assert not ok and "topology is unknown" in reason
+
+    known_absent = GateContext(
+        workload="vllm-decode",
+        num_gpus=2,
+        has_collective=True,
+        has_interconnect=False,
+    )
+    ok, reason = applicable(spec, known_absent)
+    assert not ok and "none was reported" in reason
 
 
 def test_unified_library_scopes_by_workload():

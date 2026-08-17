@@ -29,13 +29,14 @@ def test_workunit_result_stall_fracs_sum_to_one():
     assert abs(total - 1.0) < 1e-9
 
 
-def test_workunit_result_zero_total_returns_zero_fracs():
+def test_workunit_result_zero_total_refuses_fabricated_zero_fracs():
+    import pytest
+
     from gitm.benchmarks.kitti.workunit import WorkUnitResult
 
     r = WorkUnitResult(frame_id="000000", n_detections=0, t_total_s=0.0)
-    assert r.data_stall_frac == 0.0
-    assert r.sync_stall_frac == 0.0
-    assert r.gpu_active_frac == 0.0
+    with pytest.raises(RuntimeError, match="timing unavailable"):
+        _ = r.data_stall_frac
 
 
 def test_workunit_result_detections_default_empty():
@@ -48,6 +49,20 @@ def test_workunit_result_detections_default_empty():
 def test_workunit_importable_without_openpcdet():
     """Importing WorkUnit must not raise even if OpenPCDet is absent."""
     from gitm.benchmarks.kitti.workunit import WorkUnit  # noqa: F401
+
+
+def test_plan_kitti_cli_wires_known_hardware_graph(capsys):
+    from gitm.cli import main
+
+    assert main(["plan-kitti", "--sku", "A100-SXM4-80GB"]) == 0
+    assert "PointPillars predicted execution graph" in capsys.readouterr().out
+
+
+def test_plan_kitti_cli_refuses_unknown_hardware(capsys):
+    from gitm.cli import main
+
+    assert main(["plan-kitti", "--sku", "mystery-gpu"]) == 3
+    assert "prediction refused" in capsys.readouterr().out
 
 
 def test_workunit_from_checkpoint_raises_import_error_without_openpcdet(
