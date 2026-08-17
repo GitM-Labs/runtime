@@ -11,7 +11,3 @@ from gitm._timing import require_positive_duration
 def test_nonpositive_or_nonfinite_timing_is_refused(duration):
     with pytest.raises(RuntimeError, match="timing unavailable"):
         require_positive_duration(duration, context="test workload")
-
-
-
-

@@ -38,7 +38,11 @@ def discover_backends(*, diagnostics: list[str] | None = None) -> list[Backend]:
             if count > 0:
                 found.append(backend)
                 backend = None
-        except ImportError:
+        except ModuleNotFoundError:
+            # Vendor library genuinely not installed — skip quietly. A broken
+            # transitive import inside the backend raises ImportError (not
+            # ModuleNotFoundError) and falls through to be recorded, rather than
+            # masquerading as an absent library.
             return
         except Exception as exc:
             record(vendor, f"{type(exc).__name__}: {exc}")
