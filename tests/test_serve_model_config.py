@@ -188,12 +188,19 @@ def test_live_moe_spec_refuses_dense_model_at_the_architecture_gate(tmp_path):
     _write_config(ckpt, {"model_type": "dense", "hidden_size": 4096})  # no MoE fields
     r = mc.live_moe_spec(_target(["vllm", "serve", str(ckpt)]), environ={})
     assert isinstance(r, mc.LiveSpecError)
-    assert "not a DeepSeek-V4-class" in r.reason
+    # Names both families it is not: a checkpoint can now fail this gate by
+    # missing the sparse-attention machinery OR the mixed layer schedule, and a
+    # refusal that named only one would send the reader looking for the wrong
+    # thing.
+    assert "DeepSeek-V4-class" in r.reason
+    assert "hybrid linear-attention MoE" in r.reason
+    assert "dense planner" in r.reason
 
 
 def test_live_moe_spec_refuses_mixtral_style_moe(tmp_path):
-    # A real MoE, but standard attention — predict_moe_graph would mis-model its
-    # KV path, so the sidecar declines rather than emit a confident wrong floor.
+    # A real MoE, but standard attention and a uniform layer schedule — neither
+    # graph family models it, so the sidecar declines rather than emit a
+    # confident wrong floor.
     ckpt = tmp_path / "ckpt"
     _write_config(ckpt, {
         "model_type": "mixtral",
@@ -204,7 +211,7 @@ def test_live_moe_spec_refuses_mixtral_style_moe(tmp_path):
     })
     r = mc.live_moe_spec(_target(["vllm", "serve", str(ckpt)]), environ={})
     assert isinstance(r, mc.LiveSpecError)
-    assert "not a DeepSeek-V4-class" in r.reason
+    assert "DeepSeek-V4-class" in r.reason
 
 
 def test_live_moe_spec_refuses_when_no_config_found(tmp_path):

@@ -8,6 +8,9 @@ mangled C++, and rules written against invented names prove nothing.
 
 from __future__ import annotations
 
+import pytest
+
+from gitm.optimizer.deviation import classify_op
 from gitm.tracer.kernel_taxonomy import (
     NAME_MAX,
     _active_ns,
@@ -196,3 +199,187 @@ def test_healthy_moe_trace_produces_no_warnings():
     ]
     bd = summarize_kernels(kernels, window_ns=1000)
     assert bd.warnings() == []
+
+# ── Qwen3.6 / hybrid-MoE classification gaps ──────────────────────────────────
+#
+# Classification gaps found by a real Qwen3.6-35B-A3B capture on an H200.
+#
+# Every name below was taken from that trace or from the kernel inventory the
+# engine's own backend selection implies. The capture recorded 9,473,114 kernels
+# and the breakdown put 18.7% of device time in ``other`` and reported the ``gemm``
+# bucket at 3.6% — a trace describing a model whose projections had vanished.
+#
+# Two kinds of defect are pinned here, and they are not equally bad:
+#
+# * **Unmatched** — the kernel falls to ``other``. Visible, and the breakdown warns
+#   about it once it passes a quarter of device time.
+# * **Misfiled** — the kernel lands in a bucket that is wrong. Silent, and it
+#   inflates a bucket that downstream analysis trusts. This is the worse failure,
+#   and the FlashInfer sampler was an instance of it.
+
+# ── gated DeltaNet: 30 of this model's 40 layers ───────────────────────────
+
+GDN_DECODE = [
+    "_causal_conv1d_update_kernel",
+    "fused_recurrent_gated_delta_rule_packed_decode_kernel",
+]
+
+GDN_PREFILL = [
+    "_fused_post_conv_kernel",
+    "chunk_scaled_dot_kkt_fwd_kernel",
+    "solve_tril_16x16_kernel",
+    "recompute_w_u_fwd_kernel",
+    "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+    "chunk_fwd_kernel_o",
+    "_FullyFusedDeltaRuleSm90",
+]
+
+
+@pytest.mark.parametrize("name", GDN_DECODE + GDN_PREFILL)
+def test_every_gated_deltanet_kernel_reaches_linear_attention(name):
+    """Four separate causes put six of these in ``other``: no convolution needle
+    existed at all; ``chunk_o``/``chunk_h`` were written with the suffix in the
+    wrong position for the real names; ``wy_fast`` is the module name rather than
+    the kernel name; and the CuTeDSL path is CamelCase, which lowercases to a
+    single token that no underscored delta needle matches."""
+    assert classify_kernel(name) == "linear_attn"
+
+
+def test_the_cutedsl_fast_path_is_matched_despite_camelcase():
+    """``_FullyFusedDeltaRuleSm90`` -> ``_fullyfuseddeltarulesm90``. Every needle
+    of the form ``delta_rule`` misses it, so the SM90 fast path — the one Hopper
+    actually runs — was the least visible kernel in the model."""
+    assert classify_kernel("_FullyFusedDeltaRuleSm90") == "linear_attn"
+    assert classify_op("_FullyFusedDeltaRuleSm90") == "linattn_recurrent"
+
+
+def test_the_convolution_is_its_own_graph_node():
+    """A distinct kernel runs it, so folding it into the recurrent node would
+    leave that kernel permanently unattributable."""
+    assert classify_op("_causal_conv1d_update_kernel") == "linattn_conv"
+    assert classify_op("_fused_post_conv_kernel") == "linattn_conv"
+
+
+def test_recurrent_kernels_do_not_leak_into_softmax_attention():
+    """A GDN layer's traffic is constant in context; ``attn_score_value`` is
+    predicted to grow with it. Mapping one onto the other would report the
+    difference as a deviation on every long-context step."""
+    for name in GDN_DECODE + GDN_PREFILL:
+        assert classify_op(name) != "attn_score_value"
+
+
+# ── nvjet: the GEMM family that had no needle ──────────────────────────────
+
+NVJET = [
+    "nvjet_sm90_tst_128x8_64x12_4x1_v_bz_TNT",
+    "nvjet_sm90_tst_64x8_64x16_4x1_v_bz_TNT",
+    "nvjet_sm90_tst_64x8_64x16_1x1_h_bz_TNT",
+    "nvjet_sm90_tst_512x8_64x3_2x1_v_bz_TNT",
+    "nvjet_sm90_tst_8x64_64x16_4x1_v_bz_TNN",
+]
+
+
+@pytest.mark.parametrize("name", NVJET)
+def test_nvjet_is_recognised_as_a_gemm(name):
+    """cuBLAS's JIT-generated Hopper GEMM family. ``TNT``/``TNN`` is BLAS
+    transpose notation and ``128x8_64x12`` is a tile shape, but the name carries
+    none of ``gemm``/``cublas``/``cutlass``, so 7.98 s of a 42.8 s trace sat
+    unclassified."""
+    assert classify_kernel(name) == "gemm"
+
+
+def test_the_nvjet_family_is_no_longer_split_by_an_incidental_needle():
+    """The sharper half of the bug: ``..._splitK_...`` variants classified as
+    GEMM only because ``splitk`` happened to be a needle, so one kernel family
+    landed in two buckets by accident of naming."""
+    plain = "nvjet_sm90_tst_64x8_64x16_4x1_v_bz_TNT"
+    split = "nvjet_sm90_tst_64x8_64x16_4x1_v_bz_splitK_TNT"
+    assert classify_kernel(plain) == classify_kernel(split) == "gemm"
+
+
+def test_a_bare_gemm_still_maps_to_no_graph_node():
+    """``classify_kernel`` and ``classify_op`` deliberately disagree here.
+    The bucket answers "what ran"; the op answers "which predicted node is
+    this". A GEMM whose name does not carry its projection cannot be assigned
+    to one, and guessing would attribute real work to the wrong op."""
+    assert classify_kernel(NVJET[0]) == "gemm"
+    assert classify_op(NVJET[0]) is None
+
+
+# ── the misfile ────────────────────────────────────────────────────────────
+
+FLASHINFER_SAMPLER = "void flashinfer::sampling::TopKTopPSamplingFromProbKernel<...>"
+
+
+def test_the_flashinfer_sampler_is_sampling_not_attention():
+    """``flashinfer`` was a *vendor* needle sitting in the attention bucket ahead
+    of the sampling rule, and this engine logs "Using FlashInfer for top-p &
+    top-k sampling". So sampler cost was reported as attention cost — silent,
+    and it inflated a bucket that gets trusted."""
+    assert classify_kernel(FLASHINFER_SAMPLER) == "sampling"
+
+
+def test_removing_the_vendor_needle_did_not_strand_the_sampler():
+    """The second-order trap: ``sample`` is not a substring of ``sampling``, and
+    ``top_k`` is not a substring of ``TopKTopP``. Deleting the vendor needle
+    without adding operation-shaped ones would have moved the kernel from a
+    wrong bucket to no bucket."""
+    assert classify_kernel("TopPSamplingFromProbsKernel") == "sampling"
+    assert classify_kernel("top_k_renorm_probs_kernel") == "sampling"
+
+
+@pytest.mark.parametrize("name", [
+    "flashinfer::BatchPrefillWithPagedKVCacheKernel",
+    "flashinfer::BatchDecodeWithPagedKVCacheKernel",
+])
+def test_flashinfers_actual_attention_kernels_still_classify(name):
+    """They are named for what they do, so they are matched by operation rather
+    than by vendor."""
+    assert classify_kernel(name) == "attention"
+
+
+def test_moe_routing_is_not_claimed_by_the_loose_sampling_needles():
+    """``topk_softmax`` is MoE routing and the ``moe`` rule runs far earlier.
+    Adding bare ``topk``/``topp`` to sampling must not reach past it."""
+    assert classify_kernel("topk_softmax_kernel") == "moe"
+
+
+# ── routing versus expert GEMMs ────────────────────────────────────────────
+
+
+def test_fused_gating_is_routing_not_an_expert_gemm():
+    """``topkGating`` was claimed by the generic ``moe`` needle, putting cheap
+    routing work inside the node whose weight traffic dominates the step."""
+    name = "_ZN4vllm3moe10topkGatingILi8ELi256ELi4ELi16ELi32Ei13__nv_bfloat16E"
+    assert classify_kernel(name) == "moe"
+    assert classify_op(name) == "moe_router"
+
+
+def test_expert_gemms_remain_routed():
+    assert classify_op("fused_moe_kernel") == "moe_routed"
+
+
+# ── norm + rotary + insert ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("name", [
+    "_triton_mrope_forward",
+    "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+    "rotary_embedding_kernel",
+])
+def test_rope_kernels_map_to_the_fused_node_every_family_emits(name):
+    """Both graph families emit ``attn_qnorm_rope_insert`` as one node because
+    vLLM runs it as one fused kernel, but no ``classify_op`` rule existed to
+    receive it — so the node was predicted and never matched on either path."""
+    assert classify_op(name) == "attn_qnorm_rope_insert"
+
+
+def test_a_fused_kernel_lands_in_one_coarse_bucket_by_rule_order():
+    """The coarse taxonomy has no notion of a kernel doing several things, so a
+    norm+rope+quant+insert kernel takes whichever bucket matches first — ``quant``
+    here, since it precedes ``norm`` and ``rope``. That is a compromise rather
+    than a defect, and it is why ``classify_op`` above (which maps to a *node*,
+    not a category) is the mapping the residual path uses."""
+    name = "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"
+    assert classify_kernel(name) == "quant"
+    assert classify_op(name) == "attn_qnorm_rope_insert"

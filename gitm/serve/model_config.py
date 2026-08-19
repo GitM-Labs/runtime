@@ -33,12 +33,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from gitm.planner.moe_graph import is_sparse_moe_config, spec_from_hf_config
+from gitm.planner.moe_graph import spec_from_hf_config
 from gitm.planner.roofline import (
     _WEIGHT_BYTES,
     BatchConfig,
     ShardingConfig,
-    SparseMoEModelSpec,
 )
 from gitm.serve import discover
 
@@ -264,14 +263,21 @@ def normalize_moe_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass
 class LiveSpec:
-    """A live server resolved into everything :func:`predict_moe_graph` needs."""
+    """A live server resolved into everything a predicted graph needs.
 
-    spec: SparseMoEModelSpec
+    ``family`` names which graph prices this spec. It is carried rather than
+    re-derived at the call site so the predictor can never disagree with the
+    reader that built the spec — the two would then be modelling different
+    architectures and the mismatch would surface only as a residual.
+    """
+
+    spec: Any  # SparseMoEModelSpec | HybridMoEModelSpec, per ``family``
     sharding: ShardingConfig
     batch: BatchConfig
     source_path: Path
     model_ref: str
     applied_overrides: dict[str, Any] = field(default_factory=dict)
+    family: str = "sparse_moe"
     ok: bool = True
 
 
@@ -335,32 +341,48 @@ def live_moe_spec(
     except (OSError, ValueError) as e:
         return LiveSpecError(reason=f"could not read {cfg_path}: {e}", model_ref=model_ref)
 
-    # predict_moe_graph models DeepSeek-V4-class compressed/selected attention;
-    # feeding it a Mixtral-style MoE (standard attention) would mis-price the KV
-    # path. The dense planner is the right tool for those, so decline rather than
-    # emit a confident wrong floor.
-    if not is_sparse_moe_config(cfg):
+    # Which family models this checkpoint. Dispatch on declared shape rather
+    # than on a single hardcoded check: the sparse-MoE graph prices DeepSeek-V4
+    # compressed/selected attention, the hybrid graph prices interleaved
+    # linear/full attention, and feeding either the other's checkpoint mis-prices
+    # the term that dominates. A checkpoint matching neither is declined rather
+    # than given a confident wrong floor.
+    from gitm.planner.registry import detect_family
+
+    family = detect_family(cfg)
+    if family == "dense":
         return LiveSpecError(
             reason=(
-                f"{model_ref!r} at {cfg_path} is not a DeepSeek-V4-class sparse-MoE model "
-                "(no index_topk / compress_ratios); its attention is not what "
-                "predict_moe_graph models."
+                f"{model_ref!r} at {cfg_path} is neither a hybrid linear-attention MoE "
+                "(no mixed layer_types / full_attention_interval) nor a DeepSeek-V4-class "
+                "sparse-MoE model (no index_topk / compress_ratios). The dense planner "
+                "models it, but has no config reader."
             ),
             model_ref=model_ref,
         )
 
-    missing = validate_moe_config(cfg)
-    if missing:
-        return LiveSpecError(
-            reason=(
-                f"{model_ref!r} at {cfg_path} is not a sparse-MoE config this planner can "
-                "predict without guessing its dominant terms."
-            ),
-            model_ref=model_ref,
-            missing_keys=missing,
-        )
+    if family == "hybrid":
+        from gitm.planner.hybrid_graph import spec_from_hf_config as _hybrid_spec
 
-    spec = spec_from_hf_config(normalize_moe_config(cfg), name=model_ref)
+        try:
+            spec = _hybrid_spec(cfg, name=model_ref)
+        except ValueError as e:
+            # The reader refuses to substitute another checkpoint's value for a
+            # shape this config does not declare.
+            return LiveSpecError(reason=f"{model_ref!r} at {cfg_path}: {e}",
+                                 model_ref=model_ref)
+    else:
+        missing = validate_moe_config(cfg)
+        if missing:
+            return LiveSpecError(
+                reason=(
+                    f"{model_ref!r} at {cfg_path} is not a sparse-MoE config this planner "
+                    "can predict without guessing its dominant terms."
+                ),
+                model_ref=model_ref,
+                missing_keys=missing,
+            )
+        spec = spec_from_hf_config(normalize_moe_config(cfg), name=model_ref)
 
     overrides = serving_overrides_from_cmdline(target.cmdline)
     spec_changes: dict[str, Any] = {}
@@ -385,4 +407,5 @@ def live_moe_spec(
         source_path=cfg_path,
         model_ref=model_ref,
         applied_overrides=overrides,
+        family=family,
     )

@@ -61,9 +61,24 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # attention kernels these models ship with.
     # "local_cumsum", not bare "cumsum": top-p sampling runs a cumulative sum over
     # sorted probabilities, and the loose needle would file it as linear attention.
-    ("linear_attn", ("delta_rule", "gated_delta", "deltanet", "fused_recurrent",
-                     "linear_attn", "solve_tril", "wy_fast", "local_cumsum",
-                     "chunk_o", "chunk_h", "selective_scan", "mamba")),
+    # "chunk_o"/"chunk_h" are kept for older flash-linear-attention builds, but
+    # they do not match the current kernel names: those put the suffix last
+    # (`chunk_fwd_kernel_o`, `chunk_gated_delta_rule_fwd_kernel_h_blockdim64`),
+    # so "chunk_fwd" is the needle that actually fires. Confirmed against a
+    # Qwen3.6-35B-A3B capture, where six GDN kernels — three quarters of the
+    # model's layers — landed in `other`.
+    #
+    # "deltarule" carries no underscore on purpose: the CuTeDSL fast path is
+    # `_FullyFusedDeltaRuleSm90`, and CamelCase lowercases to one token, so every
+    # underscored delta needle misses the SM90 path that Hopper actually runs.
+    #
+    # The short causal convolution belongs here too: it is part of the GDN layer,
+    # not a separate mechanism, and it has no other home in this vocabulary.
+    ("linear_attn", ("delta_rule", "gated_delta", "deltanet", "deltarule",
+                     "fused_recurrent", "linear_attn", "solve_tril", "wy_fast",
+                     "local_cumsum", "chunk_o", "chunk_h", "chunk_fwd",
+                     "chunk_scaled_dot", "recompute_w_u", "causal_conv1d",
+                     "post_conv", "selective_scan", "mamba")),
     # Sparse/compressed attention needles ride in this bucket rather than a
     # separate one: they are attention by cost and by what a lever would target.
     # The indexer needles are load-bearing — a "lightning_indexer" kernel matches
@@ -71,23 +86,46 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # claim it lands as elementwise. That is worse than `other`: `other` is a
     # visible finding, whereas a misfiled kernel makes the attention bucket look
     # cheap and the elementwise bucket look inexplicably expensive.
+    # "flashinfer" is deliberately absent. It is a *vendor*, not an operation:
+    # FlashInfer ships attention, sampling, norm and GEMM kernels, and vLLM logs
+    # "Using FlashInfer for top-p & top-k sampling" on this stack. With the
+    # vendor needle here — ahead of the sampling rule — every FlashInfer sampler
+    # was reported as attention time. A misfile is worse than `other`: `other` is
+    # a visible finding, whereas this silently inflated a bucket that gets
+    # trusted. Its actual attention kernels are named for what they do, so they
+    # are matched by name below.
     ("attention", ("flash_fwd", "flash_attn", "flashattn", "fmha", "paged_attention",
                    "paged_attn", "attention", "attn_score", "splitkv", "merge_attn",
                    "mha_fwd", "cutlass_mla", "flash_mla", "mla_sparse", "sparse_mla",
-                   "indexer", "lightning_index", "flashinfer")),
+                   "indexer", "lightning_index", "batchprefill", "batchdecode",
+                   "pagedkv", "prepare_varlen", "compute_attn")),
     ("kv_cache", ("reshape_and_cache", "slot_mapping", "copy_blocks", "swap_blocks",
                   "concat_and_cache", "block_table")),
+    # "nvjet" is cuBLAS's JIT-generated Hopper/Blackwell GEMM family
+    # (`nvjet_sm90_tst_128x8_64x12_4x1_v_bz_TNT` — tile shape and BLAS transpose
+    # notation). It carries none of the classic needles, so on a Qwen3.6 H200
+    # capture 18.7% of all device time sat in `other` while the `gemm` bucket
+    # reported 3.6%. Worse, the family was *split*: the `..._splitK_...`
+    # variants matched "splitk" and classified, so one kernel family landed in
+    # two buckets by accident of naming.
     ("gemm", ("gemm", "cutlass", "sgemm", "hgemm", "s16816", "s161616", "matmul",
               "cublas", "marlin", "machete", "scaled_mm", "wgrad", "tensorop",
-              "gemv", "splitk")),
+              "gemv", "splitk", "nvjet", "xmma")),
     ("quant", ("quant", "dequant", "scaled_fp8", "per_token_group", "awq", "gptq",
                "fp8_", "int8_", "nvfp4", "mxfp4")),
     ("norm", ("rms_norm", "rmsnorm", "layer_norm", "layernorm", "fused_add_rms",
               "l2norm", "l2_norm")),
     ("rope", ("rope", "rotary")),
     ("activation", ("silu", "gelu", "swiglu", "act_and_mul", "relu")),
-    ("sampling", ("sample", "argmax", "top_k", "top_p", "softmax", "penalt",
-                  "logits", "logprob", "multinomial", "gumbel")),
+    # "sampling" and the unpunctuated "topk"/"topp" are load-bearing: FlashInfer
+    # names its sampler `TopKTopPSamplingFromProbKernel`, and neither "sample"
+    # (not a substring of "sampling") nor "top_k" (not a substring of "TopKTopP")
+    # matches it. Removing the vendor needle from `attention` without adding
+    # these would move the sampler from a wrong bucket to no bucket.
+    # MoE's `topk_softmax` router is claimed by the `moe` rule far above, so the
+    # loose needles here cannot reach it.
+    ("sampling", ("sample", "sampling", "argmax", "top_k", "top_p", "topk", "topp",
+                  "softmax", "penalt", "logits", "logprob", "multinomial", "gumbel")),
     ("elementwise", ("elementwise", "vectorized", "fill", "copy", "cat_", "concat",
                      "index", "transpose", "gather", "scatter", "reduce", "cast",
                      "arange", "zero", "memset", "unrolled")),

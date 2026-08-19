@@ -7,6 +7,9 @@ import json
 import sys
 from pathlib import Path
 
+from gitm.optimizer.deviation import add_deviate_arguments
+from gitm.planner.registry import add_plan_arguments
+
 
 def _add_capture(sub) -> None:
     """``gitm capture serve|attach`` — get a kernel trace out of a vLLM server.
@@ -148,6 +151,19 @@ def _parser() -> argparse.ArgumentParser:
     _add_capture(sub)
 
     sub.add_parser("doctor", help="Probe environment, GPUs, and data locations.")
+
+    add_plan_arguments(sub.add_parser(
+        "plan",
+        help="Predicted roofline floor for a checkpoint — no GPU, no server needed.",
+        epilog="Takes a catalogue entry name (see --list) or a path to a config.json.",
+    ))
+
+
+    add_deviate_arguments(sub.add_parser(
+        "deviate",
+        help="Subtract a predicted graph from a captured trace.",
+        epilog="Streams the trace, so a multi-GB capture is fine.",
+    ))
 
     inst = sub.add_parser(
         "install",
@@ -362,6 +378,40 @@ def main(argv: list[str] | None = None) -> int:
             args.capture_help()
             return 2
         return _run_capture(args, serve_argv)
+
+    if args.cmd == "deviate":
+        from gitm.optimizer.deviation import main as deviate_main
+
+        dev_argv: list[str] = [str(args.trace)]
+        for flag in ("no_graph", "as_json"):
+            if getattr(args, flag, False):
+                dev_argv.append("--" + ("json" if flag == "as_json" else "no-graph"))
+        for name, flag in (
+            ("model", "--model"), ("gpu", "--gpu"), ("batch", "--batch"),
+            ("kv_len", "--kv-len"), ("steps", "--steps"), ("tp", "--tp"), ("ep", "--ep"),
+        ):
+            val = getattr(args, name, None)
+            if val is not None:
+                dev_argv += [flag, str(val)]
+        return deviate_main(dev_argv)
+
+    if args.cmd == "plan":
+        from gitm.planner.registry import main as plan_main
+
+        plan_argv: list[str] = []
+        if args.model:
+            plan_argv.append(args.model)
+        for flag in ("list", "as_json"):
+            if getattr(args, flag, False):
+                plan_argv.append("--" + ("json" if flag == "as_json" else flag))
+        for name, flag in (
+            ("gpu", "--gpu"), ("batch", "--batch"), ("kv_len", "--kv-len"),
+            ("tp", "--tp"), ("ep", "--ep"), ("dp", "--dp"), ("sweep", "--sweep"),
+        ):
+            val = getattr(args, name, None)
+            if val is not None:
+                plan_argv += [flag, str(val)]
+        return plan_main(plan_argv)
 
     if args.cmd == "install":
         from gitm.install import main as install_main
