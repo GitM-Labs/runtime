@@ -440,20 +440,28 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
         return
 
     from gitm.planner.context import build_planner_context, hardware_spec_for
-    from gitm.planner.moe_graph import predict_moe_graph
 
     hw = hardware_spec_for(build_planner_context().peak)
-    g = predict_moe_graph(resolved.spec, hw, resolved.batch, resolved.sharding)
+    if resolved.family == "hybrid":
+        from gitm.planner.hybrid_graph import predict_hybrid_graph
+
+        g = predict_hybrid_graph(resolved.spec, hw, resolved.batch, resolved.sharding)
+    else:
+        from gitm.planner.moe_graph import predict_moe_graph
+
+        g = predict_moe_graph(resolved.spec, hw, resolved.batch, resolved.sharding)
     sh, spec = resolved.sharding, resolved.spec
 
     payload = {
         "model_ref": resolved.model_ref,
+        "family": resolved.family,
         "config_source": str(resolved.source_path),
         "hardware": hw.name,
         "sharding": {"tp": sh.tp, "ep": sh.ep, "dp": sh.dp},
         "dtypes": {
             "weight": spec.weight_dtype,
-            "expert": spec.expert_dtype,
+            # Only the sparse-MoE family prices experts separately from linears.
+            "expert": getattr(spec, "expert_dtype", spec.weight_dtype),
             "kv": spec.kv_dtype,
             "act": spec.act_dtype,
         },
@@ -478,11 +486,13 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
     }
     (out_dir / "predicted_moe_graph.json").write_text(json.dumps(payload, indent=2))
 
+    dtypes = f"w={spec.weight_dtype}/kv={spec.kv_dtype}"
+    if hasattr(spec, "expert_dtype"):
+        dtypes = f"w={spec.weight_dtype}/e={spec.expert_dtype}/kv={spec.kv_dtype}"
     print(
-        f"==> predicted graph: {resolved.model_ref} per-rank floor "
+        f"==> predicted graph [{resolved.family}]: {resolved.model_ref} per-rank floor "
         f"{g.total_pred_s * 1e3:.2f} ms/step "
-        f"(TP={sh.tp} EP={sh.ep} DP={sh.dp}, "
-        f"w={spec.weight_dtype}/e={spec.expert_dtype}/kv={spec.kv_dtype})"
+        f"(TP={sh.tp} EP={sh.ep} DP={sh.dp}, {dtypes})"
     )
     if g.has_unpriced_collectives:
         print("    - collectives are unpriced (SKU has no interconnect bandwidth in the catalogue)")

@@ -15,10 +15,23 @@ headroom report would then bill against.
 
 from __future__ import annotations
 
+import textwrap
+
 import pytest
 
 from gitm.optimizer.deviation import classify_op
 from gitm.planner.context import hardware_spec_for, peak_for_sku
+from gitm.planner.hybrid_graph import (
+    HybridMoEModelSpec,
+    attention_page_bytes,
+    is_hybrid_moe_config,
+    mamba_page_bytes,
+    predict_hybrid_graph,
+)
+from gitm.planner.hybrid_graph import kv_bytes_per_token as hybrid_kv_bytes_per_token
+from gitm.planner.hybrid_graph import model_weight_bytes as hybrid_model_weight_bytes
+from gitm.planner.hybrid_graph import spec_from_hf_config as hybrid_spec_from_hf_config
+from gitm.planner.model_catalogue import available, load_entry, load_spec, predict
 from gitm.planner.moe_graph import (
     effective_kv_tokens,
     index_candidates,
@@ -681,3 +694,633 @@ def test_indexer_is_not_misfiled_as_elementwise():
 
     assert classify_kernel("lightning_indexer_topk_kernel") == "attention"
     assert classify_kernel("flash_mla_sparse_fwd_kernel") == "attention"
+
+# ── The hybrid linear-attention MoE graph family ──────────────────────────────
+#
+# The hybrid linear-attention MoE graph.
+#
+# Two layer types with different asymptotics is the whole point of this family, so
+# most of what follows is about keeping them apart: a graph that prices thirty
+# gated-DeltaNet layers as though they held KV caches produces a plausible total
+# and mis-attributes every context-dependent residual.
+#
+# Where a figure can be checked against something outside this repository it is —
+# vLLM's own page-size arithmetic, and the published checkpoint size.
+
+# Aliased on import: ``kv_bytes_per_token``, ``model_weight_bytes`` and
+# ``spec_from_hf_config`` all exist in BOTH families with the same names and
+# different meanings. A bare import here rebinds the sparse-MoE ones for the
+# whole module, and every DeepSeek-V4 test above then silently runs against a
+# Qwen reader — which is exactly what happened when these files were merged.
+
+# Qwen/Qwen3.6-35B-A3B, trimmed to the fields the graph reads.
+QWEN36 = {
+    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+    "model_type": "qwen3_5_moe",
+    "text_config": {
+        "attn_output_gate": True,
+        "dtype": "bfloat16",
+        "full_attention_interval": 4,
+        "head_dim": 256,
+        "hidden_size": 2048,
+        "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 10,
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 128,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32,
+        "linear_value_head_dim": 128,
+        "mamba_ssm_dtype": "float32",
+        "moe_intermediate_size": 512,
+        "mtp_num_hidden_layers": 1,
+        "num_attention_heads": 16,
+        "num_experts": 256,
+        "num_experts_per_tok": 8,
+        "num_hidden_layers": 40,
+        "num_key_value_heads": 2,
+        "partial_rotary_factor": 0.25,
+        "shared_expert_intermediate_size": 512,
+        "vocab_size": 248320,
+    },
+    "vision_config": {"depth": 27, "hidden_size": 1152},
+}
+
+H200 = HardwareSpec(
+    name="H200",
+    peak_flops_bf16_per_s=989e12,
+    peak_flops_fp16_per_s=989e12,
+    peak_mem_bw_bytes_per_s=4.8e12,
+    interconnect_bw_bytes_per_s=900e9,
+)
+
+
+@pytest.fixture
+def hybrid_spec() -> HybridMoEModelSpec:
+    """Read from the checkpoint's own config, as the attach path does.
+
+    Named distinctly from the sparse-MoE ``spec`` fixture above: a second
+    module-level ``def hybrid_spec`` would rebind the first, silently handing every
+    DeepSeek-V4 test a Qwen shape.
+    """
+    return hybrid_spec_from_hf_config(QWEN36, name="Qwen/Qwen3.6-35B-A3B")
+
+
+@pytest.fixture
+def catalogued() -> HybridMoEModelSpec:
+    """Read from ``gitm/planner/models/*.yaml``, as an offline caller does."""
+    from gitm.planner.model_catalogue import load_spec
+
+    return load_spec("qwen3.6-35b-a3b")
+
+
+# ── the two readers must agree ─────────────────────────────────────────────
+
+
+def test_catalogue_entry_matches_the_checkpoint_config(hybrid_spec, catalogued):
+    """Two independent paths to the same spec: a transcribed YAML file and the
+    checkpoint's own ``config.json``.
+
+    They can drift — a catalogue entry is hand-written, and a checkpoint can be
+    re-uploaded with revised shapes. Drift is exactly what makes a stale
+    catalogue dangerous, because it keeps producing confident predictions for a
+    model that has changed underneath it. Comparing every field except the two
+    that are legitimately different (``name``, and ``conv_dim``, which the YAML
+    states explicitly and the config reader derives) pins that.
+    """
+    from dataclasses import fields
+
+    differing = {
+        f.name: (getattr(hybrid_spec, f.name), getattr(catalogued, f.name))
+        for f in fields(HybridMoEModelSpec)
+        if f.name != "name" and getattr(hybrid_spec, f.name) != getattr(catalogued, f.name)
+    }
+    assert differing == {}
+
+
+# ── reading the checkpoint ──────────────────────────────────────────────────
+
+
+def test_config_is_read_through_the_multimodal_wrapper(hybrid_spec):
+    """Every shape sits under ``text_config``; the top level carries only the
+    vision tower and token ids. A reader looking at the top level finds nothing
+    and falls back to defaults that describe a different model."""
+    assert hybrid_spec.n_layers == 40
+    assert hybrid_spec.hidden == 2048
+    assert hybrid_spec.vocab == 248320
+
+
+def test_the_layer_schedule_is_read_not_inferred(hybrid_spec):
+    """Phase matters and an interval does not carry it.
+
+    Qwen places full attention at layers 3, 7 ... 39. A modulo rule guessed from
+    ``full_attention_interval`` alone puts them at 0, 4 ... 36 — the right
+    *count* in the wrong *places*, which produces a believable total while every
+    per-layer residual is compared against the other layer type.
+    """
+    assert hybrid_spec.n_full_attention_layers == 10
+    assert hybrid_spec.n_linear_attention_layers == 30
+    assert [i for i in range(40) if hybrid_spec.is_full_attention(i)] == list(range(3, 40, 4))
+
+
+def test_interval_fallback_is_phased_to_end_on_a_full_attention_layer():
+    """Without an explicit schedule the interval must still land layer 39."""
+    s = HybridMoEModelSpec(n_layers=40, layer_types=(), full_attention_interval=4)
+    assert [i for i in range(40) if s.is_full_attention(i)] == list(range(3, 40, 4))
+
+
+def test_head_dim_is_read_rather_than_divided(hybrid_spec):
+    """``head_dim`` is 256 against a 2048 hidden size, so the query projection
+    *widens* to 4096. Deriving it as ``hidden / n_heads`` gives 128 and halves
+    every attention projection."""
+    assert hybrid_spec.head_dim == 256
+    assert hybrid_spec.q_dim == 4096
+    assert hybrid_spec.q_dim > hybrid_spec.hidden
+
+
+def test_partial_rotary_factor_is_honoured(hybrid_spec):
+    """Only a quarter of each head rotates; charging the whole head is 4x."""
+    assert hybrid_spec.rope_dim == 64
+
+
+def test_state_dtype_is_independent_of_the_model_dtype(hybrid_spec):
+    """fp32 state under a bf16 model. Collapsing them halves the term that
+    dominates the linear layers at low batch."""
+    assert hybrid_spec.weight_dtype == "bf16"
+    assert hybrid_spec.ssm_state_dtype == "fp32"
+
+
+# ── the observable cross-check ─────────────────────────────────────────────
+
+
+def test_page_arithmetic_reproduces_the_engines_own_padding(hybrid_spec):
+    """vLLM equalises the attention and mamba page sizes and logs what it did:
+
+        Setting attention block size to 1056 tokens ...
+        Padding mamba page size by 0.76%
+
+    Both numbers follow from the config, so reproducing them checks the KV and
+    state arithmetic against something outside this repository. This is the
+    tightest external check the family has.
+    """
+    attn = attention_page_bytes(hybrid_spec, 1056)
+    mamba = mamba_page_bytes(hybrid_spec)
+    assert attn == pytest.approx(2_162_688)
+    assert mamba == pytest.approx(2_146_304)
+    assert attn / mamba - 1 == pytest.approx(0.0076, abs=5e-5)
+
+
+def test_predicted_weights_land_near_the_published_checkpoint(hybrid_spec):
+    """66.97 GiB on disk (71.9 GB). The residual is norms, biases and per-tensor
+    metadata this does not enumerate — the same class of gap as the sparse-MoE
+    graph's -2.4%."""
+    assert hybrid_model_weight_bytes(hybrid_spec) / 71.9e9 == pytest.approx(1.0, abs=0.06)
+
+
+# ── the asymptotics that separate the two layer types ──────────────────────
+
+
+def test_only_full_attention_layers_contribute_to_per_token_kv(hybrid_spec):
+    """Thirty of forty layers keep no KV cache. Counting them would inflate the
+    per-token rate 4x and cap concurrency far below what the hardware allows."""
+    per_layer = 2 * hybrid_spec.kv_dim * 2  # K and V, bf16
+    assert hybrid_kv_bytes_per_token(hybrid_spec) == pytest.approx(10 * per_layer)
+    assert hybrid_kv_bytes_per_token(hybrid_spec) == pytest.approx(20 * 1024)
+
+
+def test_linear_attention_state_is_flat_in_context():
+    """The defining property. If this ever scales with ``kv_cache_len`` the
+    family has collapsed back into a KV-cached model and every long-context
+    conclusion drawn from it is wrong."""
+    hybrid_spec = HybridMoEModelSpec()
+    short = predict_hybrid_graph(hybrid_spec, H200, BatchConfig(batch=4, kv_cache_len=1024))
+    long = predict_hybrid_graph(hybrid_spec, H200, BatchConfig(batch=4, kv_cache_len=131072))
+
+    def lin_bytes(g):
+        return sum(n.prediction.bytes for n in g.nodes if n.op == "linattn_recurrent")
+
+    assert lin_bytes(short) == pytest.approx(lin_bytes(long))
+
+
+def test_full_attention_traffic_does_grow_with_context():
+    """The counterpart: if the ten attention layers were also flat, the graph
+    would predict a model with no context cost at all."""
+    hybrid_spec = HybridMoEModelSpec()
+    short = predict_hybrid_graph(hybrid_spec, H200, BatchConfig(batch=4, kv_cache_len=1024))
+    long = predict_hybrid_graph(hybrid_spec, H200, BatchConfig(batch=4, kv_cache_len=131072))
+
+    def attn_bytes(g):
+        return sum(n.prediction.bytes for n in g.nodes if n.op == "attn_score_value")
+
+    assert attn_bytes(long) > 100 * attn_bytes(short)
+
+
+def test_expert_weight_traffic_saturates_with_batch(catalogued):
+    """The set-union term. FLOPs scale linearly with batch; weight traffic
+    saturates at ``num_experts``, which is why MoE decode is bandwidth-bound at
+    low batch and only becomes compute-bound well past the knee.
+
+    Uses the catalogued checkpoint rather than the reference default: the
+    numbers below (a knee near 32, a 32x ceiling) are properties of top-8-of-256
+    routing, and asserting them against a spec that happens to be top-2-of-8
+    would be checking arithmetic rather than the model.
+    """
+    hybrid_spec = catalogued
+
+    def routed(b):
+        g = predict_hybrid_graph(hybrid_spec, H200, BatchConfig(batch=b, kv_cache_len=1024))
+        ns = [n for n in g.nodes if n.op == "moe_routed"]
+        return sum(n.prediction.flops for n in ns), sum(n.prediction.bytes for n in ns)
+
+    f1, b1 = routed(1)
+    f64, b64 = routed(64)
+    f1024, b1024 = routed(1024)
+
+    # FLOPs are exactly linear in batch.
+    assert f64 / f1 == pytest.approx(64, rel=0.01)
+    assert f1024 / f1 == pytest.approx(1024, rel=0.01)
+
+    # Bytes are strictly sublinear, and the gap widens with batch. The knee sits
+    # near ``num_experts / top_k`` == 32, so batch 64 is only just past it and
+    # still grows fast; by 1024 every expert is awake and the term is pinned.
+    assert b64 / b1 < 0.6 * (f64 / f1)
+    assert b1024 / b1 < 0.05 * (f1024 / f1)
+
+    # Saturation ceiling. The *weight* component caps at 32x its batch-1 value
+    # (all 256 experts awake against 8), but the node's byte total also carries
+    # activation traffic, which is honestly linear in batch and does not
+    # saturate. So the node total may exceed 32x while the term this test is
+    # about does not — checked against ``distinct_experts`` directly, since that
+    # is where the ceiling actually lives.
+    from gitm.planner.roofline import distinct_experts
+
+    assert distinct_experts(1024, 256, 8) / distinct_experts(1, 256, 8) <= 256 / 8
+    assert b1024 / b1 < 40
+
+
+# ── graph shape ────────────────────────────────────────────────────────────
+
+
+def test_each_layer_emits_the_nodes_for_its_own_kind(hybrid_spec):
+    g = predict_hybrid_graph(hybrid_spec, H200, BatchConfig(batch=2, kv_cache_len=512))
+    by_layer: dict[int, set[str]] = {}
+    for n in g.nodes:
+        if n.layer is not None:
+            by_layer.setdefault(n.layer, set()).add(n.op)
+
+    assert "attn_score_value" in by_layer[3]
+    assert "linattn_recurrent" not in by_layer[3]
+    assert "linattn_recurrent" in by_layer[0]
+    assert "attn_score_value" not in by_layer[0]
+    # The MoE runs on every layer regardless of attention kind.
+    assert all("moe_routed" in ops for ops in by_layer.values())
+
+
+def test_shared_expert_is_priced_when_declared(hybrid_spec):
+    """Every token pays it on top of its eight routed experts; omitting it
+    under-counts activated FFN width by an eighth."""
+    g = predict_hybrid_graph(hybrid_spec, H200, BatchConfig(batch=1))
+    assert sum(1 for n in g.nodes if n.op == "moe_shared") == hybrid_spec.n_layers
+
+
+def test_shared_expert_absent_when_the_config_does_not_declare_one():
+    s = HybridMoEModelSpec(shared_expert_intermediate_size=0)
+    g = predict_hybrid_graph(s, H200, BatchConfig(batch=1))
+    assert not any(n.op == "moe_shared" for n in g.nodes)
+
+
+def test_mtp_head_is_opt_in(hybrid_spec):
+    """The checkpoint declares one, but vLLM builds it only under a speculative
+    config. A node no kernel can match reads as a permanently negative residual
+    for an op that never ran — worse than an absent node."""
+    default = predict_hybrid_graph(hybrid_spec, H200, BatchConfig(batch=1))
+    with_mtp = predict_hybrid_graph(hybrid_spec, H200, BatchConfig(batch=1), with_mtp=True)
+    assert max(n.layer for n in default.nodes if n.layer is not None) == 39
+    assert max(n.layer for n in with_mtp.nodes if n.layer is not None) == 40
+
+
+def test_lm_head_is_emitted_once_and_unlayered(hybrid_spec):
+    g = predict_hybrid_graph(hybrid_spec, H200, BatchConfig(batch=1))
+    heads = [n for n in g.nodes if n.op == "lm_head"]
+    assert len(heads) == 1
+    assert heads[0].layer is None
+
+
+# ── sharding ───────────────────────────────────────────────────────────────
+
+
+def test_tensor_parallelism_divides_the_projections(hybrid_spec):
+    b = BatchConfig(batch=8, kv_cache_len=4096)
+    one = predict_hybrid_graph(hybrid_spec, H200, b, ShardingConfig(tp=1))
+    two = predict_hybrid_graph(hybrid_spec, H200, b, ShardingConfig(tp=2))
+
+    def proj(g):
+        return sum(n.prediction.flops for n in g.nodes if n.op == "linattn_in_proj")
+
+    assert proj(two) == pytest.approx(proj(one) / 2)
+
+
+def test_sharded_graph_emits_the_collective_it_pays_for(hybrid_spec):
+    g = predict_hybrid_graph(hybrid_spec, H200, BatchConfig(batch=8), ShardingConfig(tp=2))
+    assert any(n.op == "tp_all_reduce" for n in g.nodes)
+    assert not g.has_unpriced_collectives
+
+
+def test_indivisible_sharding_is_refused_rather_than_floored(hybrid_spec):
+    """Head counts floor-divide throughout, so an indivisible split prices a
+    whole path at zero work — a cheap, confident, completely wrong graph."""
+    with pytest.raises(ValueError, match="does not divide"):
+        predict_hybrid_graph(hybrid_spec, H200, BatchConfig(), ShardingConfig(tp=3))
+
+
+def test_indivisible_linear_head_split_is_refused_too():
+    s = HybridMoEModelSpec(n_heads=16, linear_num_value_heads=6)
+    with pytest.raises(ValueError, match="linear-attention value heads"):
+        predict_hybrid_graph(s, H200, BatchConfig(), ShardingConfig(tp=4))
+
+
+# ── degenerate inputs ──────────────────────────────────────────────────────
+
+
+def test_zero_layers_is_refused():
+    with pytest.raises(ValueError, match="n_layers"):
+        predict_hybrid_graph(HybridMoEModelSpec(n_layers=0), H200, BatchConfig())
+
+
+def test_rotary_wider_than_the_head_is_refused():
+    with pytest.raises(ValueError, match="rotary"):
+        predict_hybrid_graph(
+            HybridMoEModelSpec(partial_rotary_factor=2.0), H200, BatchConfig()
+        )
+
+
+def test_empty_context_does_not_collapse_the_graph(hybrid_spec):
+    """A step with nothing cached still runs every projection and every expert.
+    A zero total here would mean the graph silently priced the model at nothing."""
+    g = predict_hybrid_graph(hybrid_spec, H200, BatchConfig(batch=1, kv_cache_len=0))
+    assert g.total_pred_s > 0
+    assert all(n.prediction.t_pred_s >= 0 for n in g.nodes)
+
+
+def test_no_node_predicts_zero_time(hybrid_spec):
+    """Every emitted node represents a kernel that runs. A zero-time node is a
+    term that silently dropped out of the model — the failure mode that only
+    shows up as an unexplained residual much later."""
+    g = predict_hybrid_graph(hybrid_spec, H200, BatchConfig(batch=8, kv_cache_len=4096))
+    zero = {n.op for n in g.nodes if n.prediction.t_pred_s <= 0}
+    assert zero == set()
+
+
+# ── dispatch ───────────────────────────────────────────────────────────────
+
+
+def test_detector_accepts_a_mixed_layer_schedule():
+    assert is_hybrid_moe_config(QWEN36)
+
+
+def test_detector_rejects_a_uniform_moe():
+    """Routed experts alone describe a Mixtral, which the dense graph prices."""
+    cfg = {"num_experts": 8, "num_experts_per_tok": 2, "num_hidden_layers": 32}
+    assert not is_hybrid_moe_config(cfg)
+
+
+def test_detector_rejects_a_pure_linear_model():
+    """Linear attention alone describes a Mamba — no experts, no dispatch here."""
+    cfg = {"layer_types": ["linear_attention"] * 48, "num_hidden_layers": 48}
+    assert not is_hybrid_moe_config(cfg)
+
+
+def test_registry_routes_qwen_to_the_hybrid_family():
+    from gitm.planner.registry import detect_family, predict_for_config
+
+    assert detect_family(QWEN36) == "hybrid"
+    g, family = predict_for_config(QWEN36, H200, BatchConfig(batch=4))
+    assert family == "hybrid"
+    assert any(n.op == "linattn_recurrent" for n in g.nodes)
+
+
+def test_registry_still_routes_deepseek_to_the_sparse_moe_family():
+    """The narrowing order must not have stolen the family it was added beside."""
+    from gitm.planner.registry import detect_family
+
+    cfg = {
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 6,
+        "index_topk": 512,
+        "num_hidden_layers": 43,
+    }
+    assert detect_family(cfg) == "sparse_moe"
+
+
+def test_registry_refuses_the_dense_family_rather_than_guessing():
+    from gitm.planner.registry import predict_for_config
+
+    with pytest.raises(NotImplementedError, match="dense graph"):
+        predict_for_config({"num_hidden_layers": 32, "hidden_size": 4096})
+
+# ── Checkpoint shapes as data: gitm/planner/models/*.yaml ─────────────────────
+#
+# Checkpoint shapes loaded from YAML rather than baked into dataclass defaults.
+#
+# The defect this replaces: the spec's defaults *were* one particular checkpoint,
+# so constructing a spec with no arguments silently described that model and every
+# derived figure came out plausible while answering a question nobody asked. The
+# same class of error as a hardware catalogue miss resolving to A100 defaults —
+# not an exception, just a confident wrong answer.
+#
+# So the tests here are mostly about the ways a catalogue can lie: a typo that
+# loads as a default, a layer schedule that does not cover the model, an entry
+# that has drifted from the checkpoint it claims to describe.
+
+
+
+# ── the defaults must not be a real checkpoint ─────────────────────────────
+
+
+def test_bare_construction_is_obviously_not_a_deployment():
+    """The regression this file exists for.
+
+    A bare spec must be small enough that anyone reading a derived figure sees
+    immediately that it describes nothing real. A plausible-looking default is
+    worse than an absurd one: it survives review.
+    """
+    from gitm.planner.hybrid_graph import model_weight_bytes as hybrid_model_weight_bytes
+
+    d = HybridMoEModelSpec()
+    assert hybrid_model_weight_bytes(d) < 1e9        # under a gigabyte
+    assert d.n_layers < 10
+    assert "reference" in d.name
+
+
+def test_defaults_do_not_match_any_catalogued_checkpoint():
+    """Stronger than a size bound: no field-by-field match with a real entry."""
+    d = HybridMoEModelSpec()
+    for entry in available():
+        hybrid_spec = load_spec(entry)
+        assert (hybrid_spec.hidden, hybrid_spec.n_layers, hybrid_spec.num_experts) != (
+            d.hidden, d.n_layers, d.num_experts
+        ), f"reference defaults have drifted onto catalogue entry {entry!r}"
+
+
+# ── loading ────────────────────────────────────────────────────────────────
+
+
+def test_the_qwen_entry_is_present_and_declares_its_family():
+    assert "qwen3.6-35b-a3b" in available()
+    entry = load_entry("qwen3.6-35b-a3b")
+    assert entry["family"] == "hybrid"
+    assert entry["name"] == "Qwen/Qwen3.6-35B-A3B"
+
+
+def test_an_entry_carries_its_own_provenance():
+    """A fitted constant that reads like a transcribed one is how an estimate
+    becomes a fact. The entry has to say which is which."""
+    entry = load_entry("qwen3.6-35b-a3b")
+    prov = entry["provenance"]
+    assert any(e["field"] == "conv_dim" for e in prov["estimated"])
+    assert prov["verified"] and prov["unmodelled"]
+
+
+def test_predict_returns_a_graph_and_its_family():
+    g, family = predict("qwen3.6-35b-a3b", H200, BatchConfig(batch=4, kv_cache_len=512))
+    assert family == "hybrid"
+    assert any(n.op == "linattn_recurrent" for n in g.nodes)
+
+
+def test_an_unknown_name_lists_what_is_available():
+    with pytest.raises(FileNotFoundError, match="qwen3.6-35b-a3b"):
+        load_spec("no-such-model")
+
+
+def test_a_path_to_a_yaml_file_is_accepted(tmp_path):
+    p = tmp_path / "tiny.yaml"
+    p.write_text(textwrap.dedent("""
+        name: tiny
+        family: hybrid
+        spec:
+          hidden: 128
+          n_layers: 2
+    """))
+    assert load_spec(p).hidden == 128
+
+
+# ── validation ─────────────────────────────────────────────────────────────
+
+
+def test_an_unknown_field_is_an_error_not_a_shrug(tmp_path):
+    """A mistyped key would otherwise be dropped silently, leaving the spec
+    holding a reference default while the file appears to set it — which is the
+    original defect wearing a different hat."""
+    p = tmp_path / "typo.yaml"
+    p.write_text(textwrap.dedent("""
+        name: typo
+        family: hybrid
+        spec:
+          hidden: 2048
+          num_expert: 256
+    """))
+    with pytest.raises(ValueError, match="unknown spec field"):
+        load_spec(p)
+
+
+def test_an_unknown_family_is_refused(tmp_path):
+    p = tmp_path / "bad.yaml"
+    p.write_text("name: x\nfamily: transformer\nspec: {hidden: 8}\n")
+    with pytest.raises(ValueError, match="family must be one of"):
+        load_spec(p)
+
+
+def test_a_missing_spec_block_is_refused(tmp_path):
+    p = tmp_path / "empty.yaml"
+    p.write_text("name: x\nfamily: hybrid\n")
+    with pytest.raises(ValueError, match="missing a 'spec'"):
+        load_spec(p)
+
+
+# ── the layer schedule ─────────────────────────────────────────────────────
+
+
+def test_the_compact_pattern_expands_to_the_full_schedule():
+    """Forty entries written out is unambiguous but unreadable, and an
+    unreadable schedule is one nobody checks."""
+    hybrid_spec = load_spec("qwen3.6-35b-a3b")
+    assert len(hybrid_spec.layer_types) == 40
+    assert [i for i in range(40) if hybrid_spec.is_full_attention(i)] == list(range(3, 40, 4))
+
+
+def test_a_pattern_that_does_not_tile_the_model_is_refused(tmp_path):
+    """Silently truncating would leave the trailing layers taking the last
+    entry's kind — a schedule that covers the model in appearance only."""
+    p = tmp_path / "short.yaml"
+    p.write_text(textwrap.dedent("""
+        name: short
+        family: hybrid
+        spec:
+          n_layers: 40
+          layer_types:
+            pattern: [linear_attention, full_attention]
+            repeat: 3
+    """))
+    with pytest.raises(ValueError, match="expands to 6 entries but n_layers is 40"):
+        load_spec(p)
+
+
+def test_a_plain_list_is_still_accepted(tmp_path):
+    p = tmp_path / "plain.yaml"
+    p.write_text(textwrap.dedent("""
+        name: plain
+        family: hybrid
+        spec:
+          n_layers: 2
+          layer_types: [linear_attention, full_attention]
+    """))
+    assert load_spec(p).n_full_attention_layers == 1
+
+
+def test_a_malformed_pattern_is_refused(tmp_path):
+    p = tmp_path / "malformed.yaml"
+    p.write_text(textwrap.dedent("""
+        name: malformed
+        family: hybrid
+        spec:
+          n_layers: 4
+          layer_types:
+            pattern: []
+            repeat: 2
+    """))
+    with pytest.raises(ValueError, match="non-empty list"):
+        load_spec(p)
+
+
+# ── the config reader refuses to substitute ────────────────────────────────
+
+
+@pytest.mark.parametrize("missing", [
+    "hidden_size", "num_hidden_layers", "vocab_size", "num_attention_heads",
+    "num_experts", "num_experts_per_tok", "moe_intermediate_size",
+    "linear_num_value_heads", "linear_value_head_dim",
+])
+def test_a_config_missing_a_required_shape_raises(missing):
+    """Substituting another checkpoint's value is how a graph ends up
+    confidently describing a model it never read."""
+    text = {
+        "hidden_size": 2048, "num_hidden_layers": 40, "vocab_size": 248320,
+        "num_attention_heads": 16, "num_key_value_heads": 2, "head_dim": 256,
+        "num_experts": 256, "num_experts_per_tok": 8, "moe_intermediate_size": 512,
+        "linear_num_value_heads": 32, "linear_value_head_dim": 128,
+    }
+    del text[missing]
+    with pytest.raises(ValueError, match=missing):
+        hybrid_spec_from_hf_config({"text_config": text})
+
+
+def test_head_dim_falls_back_to_the_huggingface_convention():
+    """Omitting ``head_dim`` is legitimate and means ``hidden / n_heads``. That
+    is a function of *this* config, unlike a constant lifted from another
+    checkpoint — but it is also the division that is wrong for models which
+    widen the query projection, so the distinction is worth keeping visible."""
+    hybrid_spec = hybrid_spec_from_hf_config({"text_config": {
+        "hidden_size": 2048, "num_hidden_layers": 4, "vocab_size": 1000,
+        "num_attention_heads": 16, "num_experts": 8, "num_experts_per_tok": 2,
+        "moe_intermediate_size": 256, "linear_num_value_heads": 8,
+        "linear_value_head_dim": 64,
+    }})
+    assert hybrid_spec.head_dim == 128

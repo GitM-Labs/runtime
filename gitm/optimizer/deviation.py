@@ -41,57 +41,93 @@ from gitm.tracer.schema import KernelEvent, Trace
 # kernel is `flash_fwd_splitkv_kernel` (`flash_attn` alone misses it), and
 # vLLM's `reshape_and_cache_flash_kernel`/`_compute_slot_mapping_kernel`
 # weren't covered before.
-_OP_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
-    # ── sparse-MoE / compressed-attention ops, first because their vocabularies
-    # are subsets of the generic ones below: `moe_align_block_size` contains
-    # "moe" but is routing, not an expert GEMM; `shared_expert` contains
-    # "expert" but is unconditional work with a completely different cost curve;
-    # and the indexer must never fall through to a bare "index" rule, which is
-    # how it currently gets misfiled as elementwise in the coarse taxonomy.
+_OP_RULES: dict[str, tuple[str, ...]] = {
+    # ── collectives, first of all ────────────────────────────────────────────
+    # NCCL names every kernel `ncclDevKernel_<Op>`, so a generic "nccl" needle
+    # would swallow the all-to-all — and expert-parallel dispatch is the one
+    # collective whose cost a MoE deployment exists to trade against, so it must
+    # not disappear into a bucket labelled all-reduce.
+    "moe_all_to_all": ("alltoall", "all_to_all", "_a2a", "dispatch_combine"),
+    "tp_all_reduce": ("nccl", "allreduce", "all_reduce", "custom_ar", "cross_device",
+                      "one_shot", "two_shot", "reduce_scatter", "all_gather"),
+
+    # ── gated DeltaNet / linear attention (hybrid checkpoints) ───────────────
+    # High because these names are unambiguous and long, and because the generic
+    # attention needles below must never claim them: a GDN layer keeps a
+    # fixed-size recurrent state rather than a KV cache, so folding it into
+    # `attn_score_value` would compare a constant-traffic op against a prediction
+    # that grows with context and report the difference as a deviation.
     #
-    # Needles are deliberately narrow ("indexer", not "index") — a loose needle
-    # here silently reattributes ordinary gather/scatter work to attention, and
-    # a wrong attribution is worse than an unmodeled one because it is invisible.
-    # Collectives first of all. NCCL names every kernel `ncclDevKernel_<Op>`, so
-    # a generic "nccl" needle would swallow the all-to-all — and expert-parallel
-    # dispatch is the one collective whose cost a MoE deployment exists to
-    # trade against, so it must not disappear into a bucket labelled all-reduce.
-    (("alltoall", "all_to_all", "_a2a", "dispatch_combine"), "moe_all_to_all"),
-    (("nccl", "allreduce", "all_reduce", "custom_ar", "cross_device",
-      "one_shot", "two_shot", "reduce_scatter", "all_gather"), "tp_all_reduce"),
-    (("indexer", "lightning_index", "index_topk", "topk_indices"), "attn_index_score"),
-    (("shared_expert", "moe_shared"), "moe_shared"),
-    (("moe_align", "topk_softmax", "router", "routing", "sinkhorn",
-      "expert_bias"), "moe_router"),
-    (("moe", "expert", "grouped_gemm", "group_gemm", "groupedgemm"), "moe_routed"),
-    (("dspark",), "dspark"),
-    (("flash_mla", "mla_sparse", "sparse_mla", "cutlass_mla",
-      "sparse_fwd"), "attn_score_value"),
-    (("flash_attn", "flashattn", "flash_fwd", "paged_attention", "paged_attn", "fmha",
-      "attention", "attn_score", "reshape_and_cache", "slot_mapping"), "attn_score_value"),
-    (("q_a_proj", "q_lora", "q_down"), "attn_q_a"),
-    (("q_b_proj", "q_up"), "attn_q_b"),
+    # The convolution is its own entry because its own kernel runs
+    # (`causal_conv1d_update`); merging it into the recurrent entry would leave
+    # that kernel permanently unattributed.
+    "linattn_conv": ("causal_conv1d", "post_conv"),
+    "linattn_in_proj": ("in_proj_qkvz", "in_proj_ba", "qkvz"),
+    # `deltarule` carries no underscore on purpose: the CuTeDSL path is
+    # `_FullyFusedDeltaRuleSm90`, and CamelCase lowercases to a single token, so
+    # every underscored delta needle misses the SM90 fast path entirely.
+    "linattn_recurrent": ("fused_recurrent", "gated_delta", "delta_rule", "deltarule",
+                          "deltanet", "chunk_fwd", "chunk_scaled_dot", "recompute_w_u",
+                          "solve_tril", "wy_fast", "linear_attn"),
+
+    # ── sparse-MoE / compressed attention ────────────────────────────────────
+    # Before the generic entries below, because their vocabularies are subsets of
+    # them: `moe_align_block_size` contains "moe" but is routing, not an expert
+    # GEMM; `shared_expert` contains "expert" but is unconditional work with a
+    # completely different cost curve; and the indexer must never fall through to
+    # a bare "index" rule, which is how it gets misfiled as elementwise in the
+    # coarse taxonomy.
+    "attn_index_score": ("indexer", "lightning_index", "index_topk", "topk_indices"),
+    "moe_shared": ("shared_expert", "moe_shared"),
+    # `topkGating` is vLLM's fused routing kernel. Without it the generic "moe"
+    # needle below claims it as an expert GEMM, which puts routing cost — cheap,
+    # and bound by something else entirely — inside the entry whose weight
+    # traffic dominates the step.
+    "moe_router": ("moe_align", "topk_softmax", "topkgating", "gating", "router",
+                   "routing", "sinkhorn", "expert_bias"),
+    "moe_routed": ("moe", "expert", "grouped_gemm", "group_gemm", "groupedgemm"),
+    "dspark": ("dspark",),
+
+    # ── softmax attention ────────────────────────────────────────────────────
+    # MLA and generic FlashAttention needles share one entry: they resolve to the
+    # same op and nothing sits between them, so the two tuples that used to be
+    # separate are merged here with no change in behaviour.
+    "attn_score_value": ("flash_mla", "mla_sparse", "sparse_mla", "cutlass_mla",
+                         "sparse_fwd", "flash_attn", "flashattn", "flash_fwd",
+                         "paged_attention", "paged_attn", "fmha", "attention",
+                         "attn_score", "reshape_and_cache", "slot_mapping"),
+    # Norm + rotary + cache insert. Every graph family emits this as *one* node
+    # because vLLM runs it as one fused kernel; without an entry the kernel stayed
+    # unmodeled on both the sparse-MoE and hybrid paths even though the node
+    # existed to receive it. "mrope" is the multimodal variant these hybrid
+    # checkpoints use (`_triton_mrope_forward`).
+    "attn_qnorm_rope_insert": ("qnorm", "q_norm", "qk_norm", "mrope", "rope", "rotary"),
+
+    # ── projections ──────────────────────────────────────────────────────────
+    "attn_q_a": ("q_a_proj", "q_lora", "q_down"),
+    "attn_q_b": ("q_b_proj", "q_up"),
     # `kv_b_proj` is absent on purpose: in the absorbed decode form it is folded
     # into the query and output projections, so there is no node to map it to and
     # a guess would attribute real work to the wrong op.
-    (("kv_a_proj", "kv_lora", "kv_down", "compress_kv"), "attn_kv_a"),
-    (("qkv",), "qkv_proj"),
-    (("o_proj", "out_proj", "attn_out"), "attn_out_proj"),
-    (("gate_up", "gate_proj", "up_proj", "swiglu", "silu_and_mul"), "mlp_gate_up"),
-    (("down_proj", "mlp_down"), "mlp_down"),
-    (("lm_head", "logits", "vocab_proj", "embed"), "lm_head"),
-)
+    "attn_kv_a": ("kv_a_proj", "kv_lora", "kv_down", "compress_kv"),
+    "qkv_proj": ("qkv",),
+    "attn_out_proj": ("o_proj", "out_proj", "attn_out"),
+    "mlp_gate_up": ("gate_up", "gate_proj", "up_proj", "swiglu", "silu_and_mul"),
+    "mlp_down": ("down_proj", "mlp_down"),
+    "lm_head": ("lm_head", "logits", "vocab_proj", "embed"),
+}
 
 
 def classify_op(kernel_name: str) -> str | None:
     """Map a raw kernel name to a predicted-graph op, or ``None`` if unmodeled.
 
-    Case-insensitive substring match, first rule wins. ``None`` = the kernel maps
-    to no op in the predicted graph (a norm/activation/copy, or a bare GEMM whose
-    name doesn't carry its projection) → treated as unmodeled work.
+    Case-insensitive substring match, first entry wins — see the ordering note on
+    :data:`_OP_RULES`. ``None`` = the kernel maps to no op in the predicted graph
+    (a norm/activation/copy, or a bare GEMM whose name doesn't carry its
+    projection) → treated as unmodeled work.
     """
     n = kernel_name.lower()
-    for needles, op in _OP_RULES:
+    for op, needles in _OP_RULES.items():
         if any(k in n for k in needles):
             return op
     return None
@@ -231,3 +267,212 @@ def write_deviation_jsonl(reduced: Trace, path: str | Path) -> None:
     no drift) and round-trips through the same loaders.
     """
     write_trace_jsonl(path, reduced)
+
+def stream_observed(path: str | Path) -> tuple[dict[str, list], int, int, int]:
+    """``(per_op, n_kernels, total_ns, span_ns)`` from a trace, without loading it.
+
+    ``per_op`` maps a predicted-op name to ``[count, total_ns]``, with
+    ``"<unmodeled>"`` collecting every kernel that classifies to no node. The
+    NVTX range identity wins when present, exactly as in
+    :func:`deviation_summary`, so the two agree on what a kernel is.
+    """
+    import json
+
+    per_op: dict[str, list] = {}
+    n = total = 0
+    t_min: int | None = None
+    t_max: int | None = None
+    cache: dict[str, str | None] = {}
+
+    with Path(path).open(encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("kind") != "kernel":
+                continue
+            start, end = d.get("start_ns"), d.get("end_ns")
+            if start is None or end is None:
+                continue
+            name = d.get("name") or ""
+            op = d.get("range_op")
+            if not op:
+                if name not in cache:
+                    cache[name] = classify_op(name)
+                op = cache[name]
+            slot = per_op.setdefault(op or "<unmodeled>", [0, 0])
+            dur = max(0, end - start)
+            slot[0] += 1
+            slot[1] += dur
+            n += 1
+            total += dur
+            t_min = start if t_min is None or start < t_min else t_min
+            t_max = end if t_max is None or end > t_max else t_max
+
+    span = (t_max - t_min) if (t_min is not None and t_max is not None) else 0
+    return per_op, n, total, span
+
+
+def predicted_per_op(graph: Graph) -> dict[str, float]:
+    """Predicted seconds per op, summed over layers — the shape ``stream_observed``
+    produces, so the two can be differenced directly."""
+    out: dict[str, float] = {}
+    for node in graph.nodes:
+        out[node.op] = out.get(node.op, 0.0) + node.prediction.t_pred_s
+    return out
+
+
+def render_deviation(
+    per_op: dict[str, list],
+    pred: dict[str, float] | None,
+    *,
+    n_kernels: int,
+    total_ns: int,
+    span_ns: int,
+    steps: int | None,
+    band: float,
+) -> str:
+    """The op-level subtraction as a table.
+
+    Two categories that must not be conflated. A **modelled** op reports observed
+    against floor as a ratio; above 1 is the implementation leaving something on
+    the table, which is normal, and only its size is interesting. **Unmodelled**
+    work is not a deviation at all — it is the graph's coverage gap, and reading
+    it as headroom is the error this separation exists to prevent.
+    """
+    obs_s = total_ns / 1e9
+    busy = f" over a {span_ns / 1e9:.1f} s window ({total_ns / span_ns:.1%} busy)" if span_ns else ""
+    out = [f"observed  {n_kernels:,} kernels, {obs_s:.3f} s device time{busy}"]
+    if steps:
+        out.append(f"window    {steps:,} steps -> {obs_s / steps * 1e3:.3f} ms/step observed")
+    out.append("")
+
+    if pred is None:
+        out.append(f"  {'op':24s} {'kernels':>12s} {'time_s':>9s} {'share':>7s}")
+        for op, (c, ns) in sorted(per_op.items(), key=lambda kv: -kv[1][1]):
+            out.append(f"  {op:24s} {c:12,} {ns / 1e9:9.3f} {ns / total_ns:6.1%}")
+        return "\n".join(out)
+
+    scale = steps or 1
+    out.append(f"  {'op':24s} {'obs_ms':>9s} {'floor_ms':>9s} {'ratio':>7s} "
+               f"{'kernels':>11s}  verdict")
+    for op, (count, ns) in sorted(per_op.items(), key=lambda kv: -kv[1][1]):
+        obs_ms = ns / 1e6
+        if op == "<unmodeled>":
+            out.append(f"  {op:24s} {obs_ms:9.1f} {'-':>9s} {'-':>7s} {count:11,}  "
+                       "not in the graph")
+            continue
+        floor_ms = pred.get(op, 0.0) * scale * 1e3
+        if floor_ms <= 0:
+            out.append(f"  {op:24s} {obs_ms:9.1f} {'-':>9s} {'-':>7s} {count:11,}  "
+                       "observed but not predicted")
+            continue
+        ratio = obs_ms / floor_ms
+        verdict = "within band" if ratio <= 1.0 + band else f"{ratio:.1f}x over floor"
+        out.append(f"  {op:24s} {obs_ms:9.1f} {floor_ms:9.1f} {ratio:7.2f} "
+                   f"{count:11,}  {verdict}")
+
+    missing = sorted(set(pred) - set(per_op))
+    if missing:
+        out.append("")
+        out.append(f"  predicted but never observed: {', '.join(missing)}")
+        out.append("    Either the op did not run, or no kernel name classifies to it —")
+        out.append("    the second is a taxonomy gap, not a finding about the model.")
+
+    unmod = per_op.get("<unmodeled>", [0, 0])[1]
+    if unmod:
+        out.append("")
+        out.append(f"  unmodeled work is {unmod / total_ns:.1%} of device time: the graph's")
+        out.append("  coverage gap, not headroom. The floor never claimed to predict it.")
+    return "\n".join(out)
+
+
+def add_deviate_arguments(ap):
+    ap.add_argument("trace", type=Path, help="A captured trace.jsonl.")
+    ap.add_argument("--model", default=None,
+                    help="Catalogue entry name or config.json. Required unless --no-graph.")
+    ap.add_argument("--gpu", default=None, help="SKU to price the floor against.")
+    ap.add_argument("--batch", type=int, default=1, help="Sequences per decode step.")
+    ap.add_argument("--kv-len", type=int, default=4096, help="Tokens cached per sequence.")
+    ap.add_argument("--steps", type=int, default=None,
+                    help="Decode steps in the window; scales the floor so observed and "
+                         "predicted are directly comparable.")
+    ap.add_argument("--tp", type=int, default=1)
+    ap.add_argument("--ep", type=int, default=1)
+    ap.add_argument("--no-graph", action="store_true",
+                    help="Report observed op totals only, with no prediction.")
+    ap.add_argument("--json", dest="as_json", action="store_true")
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    import json
+
+    from gitm.planner.roofline import BatchConfig, ShardingConfig
+
+    ap = add_deviate_arguments(argparse.ArgumentParser(
+        prog="gitm deviate",
+        description="Subtract a predicted graph from a captured trace.",
+    ))
+    args = ap.parse_args(argv)
+
+    if not args.trace.is_file():
+        print(f"cannot read trace: {args.trace}")
+        return 2
+    if not args.model and not args.no_graph:
+        ap.error("--model is required unless --no-graph")
+
+    per_op, n_kernels, total_ns, span_ns = stream_observed(args.trace)
+    if not n_kernels:
+        print(f"no kernel records in {args.trace} — nothing to subtract.")
+        return 1
+
+    pred: dict[str, float] | None = None
+    if not args.no_graph:
+        from gitm.planner.registry import _hardware, _load, _predict
+
+        try:
+            spec, family, _note = _load(args.model)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"cannot build a graph: {e}")
+            return 2
+        if family == "dense" or spec is None:
+            print(f"cannot build a graph: {args.model} resolves to the dense family.")
+            return 2
+        try:
+            g = _predict(spec, family, _hardware(args.gpu),
+                         BatchConfig(batch=args.batch, kv_cache_len=args.kv_len),
+                         ShardingConfig(tp=args.tp, ep=args.ep))
+        except ValueError as e:
+            print(f"cannot build a graph: {e}")
+            return 2
+        pred = predicted_per_op(g)
+
+    band = next((i.band_width for i in INVARIANTS if i.id == "kernel_time"), 0.4)
+
+    if args.as_json:
+        scale = args.steps or 1
+        print(json.dumps({
+            "trace": str(args.trace),
+            "n_kernels": n_kernels,
+            "device_time_s": total_ns / 1e9,
+            "window_s": span_ns / 1e9,
+            "steps": args.steps,
+            "band_width": band,
+            "ops": {
+                op: {
+                    "kernels": c,
+                    "observed_s": ns / 1e9,
+                    "floor_s": (pred.get(op, 0.0) * scale)
+                    if pred and op != "<unmodeled>" else None,
+                }
+                for op, (c, ns) in sorted(per_op.items(), key=lambda kv: -kv[1][1])
+            },
+        }, indent=2))
+        return 0
+
+    print(render_deviation(per_op, pred, n_kernels=n_kernels, total_ns=total_ns,
+                           span_ns=span_ns, steps=args.steps, band=band))
+    return 0
