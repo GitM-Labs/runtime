@@ -140,6 +140,14 @@ def _parser() -> argparse.ArgumentParser:
         "--pid", type=int, default=None, help="Explicit target PID (else resolved locally)."
     )
     attach.add_argument(
+        "--duration", type=float, default=30.0,
+        help="Seconds to hold the telemetry window open (non-dry-run).",
+    )
+    attach.add_argument(
+        "--out", default=None,
+        help="Output dir for the merged trace (default $GITM_SCRATCH/traces/attach-<ts>).",
+    )
+    attach.add_argument(
         "--dry-run",
         action="store_true",
         help="Plan the attach without touching the live process.",
@@ -337,7 +345,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "attach":
         from gitm.deploy import attach_job
 
-        plan = attach_job(args.job, workload=args.workload, dry_run=args.dry_run, pid=args.pid)
+        plan = attach_job(
+            args.job,
+            workload=args.workload,
+            dry_run=args.dry_run,
+            pid=args.pid,
+            duration_s=args.duration,
+            out=args.out,
+        )
         print(json.dumps(plan, indent=2))
         # no_target is an operator-actionable miss, not a crash — signal it.
         return 0 if plan.get("status") in {"attached", "planned"} else 4
