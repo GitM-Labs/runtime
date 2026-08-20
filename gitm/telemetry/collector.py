@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import threading
 import time
+import warnings
 from dataclasses import dataclass, field
 
 from gitm.telemetry.backends import Backend, discover_backends
@@ -33,7 +34,18 @@ class Collector:
 
     def __init__(self, cfg: CollectorConfig) -> None:
         self._cfg = cfg
-        self._backends: list[Backend] = cfg.backends if cfg.backends is not None else discover_backends()
+        self.diagnostics: list[str] = []
+        self._diagnostic_keys: set[str] = set()
+        discovery_diagnostics: list[str] = []
+        self._backends: list[Backend] = (
+            cfg.backends
+            if cfg.backends is not None
+            else discover_backends(diagnostics=discovery_diagnostics)
+        )
+        for i, diagnostic in enumerate(discovery_diagnostics):
+            self._record_failure(f"backend-discovery:{i}", diagnostic)
+        if not self._backends and not discovery_diagnostics:
+            self._record_failure("backend-discovery", "no live GPU telemetry backend found")
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -50,13 +62,22 @@ class Collector:
         for s in self._cfg.sinks:
             try:
                 s.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._record_failure(type(s).__name__, f"sink close failed: {exc}")
         for b in self._backends:
             try:
                 b.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._record_failure(type(b).__name__, f"backend close failed: {exc}")
+
+    def _record_failure(self, key: str, detail: str) -> None:
+        """Record and warn once per failing component/path."""
+        if key in self._diagnostic_keys:
+            return
+        self._diagnostic_keys.add(key)
+        message = f"telemetry degraded [{key}]: {detail}"
+        self.diagnostics.append(message)
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
 
     def __enter__(self) -> Collector:
         self.start()
@@ -72,12 +93,25 @@ class Collector:
                 for idx in range(backend.device_count()):
                     try:
                         sample = backend.sample(idx, labels=self._cfg.labels)
-                    except Exception:
+                    except Exception as exc:
+                        self._record_failure(
+                            f"sample:{type(backend).__name__}:{idx}",
+                            f"sample failed ({type(exc).__name__}: {exc})",
+                        )
                         continue
+                    for diagnostic in sample.diagnostics:
+                        self._record_failure(
+                            f"sample-field:{type(backend).__name__}:{idx}:{diagnostic}",
+                            diagnostic,
+                        )
                     for sink in self._cfg.sinks:
                         try:
                             sink.emit(sample)
-                        except Exception:
+                        except Exception as exc:
+                            self._record_failure(
+                                f"sink:{type(sink).__name__}",
+                                f"emit failed ({type(exc).__name__}: {exc})",
+                            )
                             continue
             next_tick += self._cfg.interval_s
             sleep_for = max(0.0, next_tick - time.monotonic())

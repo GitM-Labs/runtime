@@ -14,6 +14,7 @@ hooks) — which is why the live applicator only hot-swaps reversible knobs.
 from __future__ import annotations
 
 import signal
+import warnings
 from collections.abc import Callable
 from typing import Any
 
@@ -35,6 +36,8 @@ class FailOpenGuard:
         #: Names whose revert raised during :meth:`fire`. A non-empty list means
         #: fail-open did NOT fully clean up — the workload may still be mutated.
         self.failures: list[str] = []
+        self.audit_failures: list[str] = []
+        self.signal_failures: list[str] = []
 
     def register(self, name: str, revert_fn: Callable[[], None], *, cause: str = "") -> None:
         """Register a revert to run if we exit before it is disarmed."""
@@ -74,8 +77,10 @@ class FailOpenGuard:
             return
         try:
             self._audit.record(event, name, cause, **detail)
-        except Exception:
-            pass
+        except Exception as exc:
+            message = f"audit sink failed while recording {event} for {name}: {exc}"
+            self.audit_failures.append(message)
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
 
     def _signal_handler(self, signum: int, frame: Any) -> None:
         self.fire()
@@ -86,14 +91,18 @@ class FailOpenGuard:
     def __enter__(self) -> FailOpenGuard:
         self._fired = False
         self.failures = []
+        self.audit_failures = []
+        self.signal_failures = []
         if self._install:
             for sig in (signal.SIGTERM, signal.SIGINT):
                 try:
                     self._prev_handlers[sig] = signal.getsignal(sig)
                     signal.signal(sig, self._signal_handler)
-                except (ValueError, OSError):
+                except (ValueError, OSError) as exc:
                     # not in the main thread (e.g. tests) — context exit still covers us
-                    pass
+                    message = f"signal handler installation unavailable for {sig}: {exc}"
+                    self.signal_failures.append(message)
+                    warnings.warn(message, RuntimeWarning, stacklevel=2)
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
@@ -101,6 +110,8 @@ class FailOpenGuard:
         for sig, prev in self._prev_handlers.items():
             try:
                 signal.signal(sig, prev)
-            except (ValueError, OSError):
-                pass
+            except (ValueError, OSError) as exc:
+                message = f"signal handler restoration failed for {sig}: {exc}"
+                self.signal_failures.append(message)
+                warnings.warn(message, RuntimeWarning, stacklevel=2)
         self._prev_handlers.clear()

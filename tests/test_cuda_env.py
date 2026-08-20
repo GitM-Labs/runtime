@@ -79,6 +79,13 @@ def test_require_compatible_raises_before_an_expensive_build(host):
         cuda_env.require_compatible()
 
 
+def test_require_compatible_refuses_missing_driver(host):
+    host(driver=None)
+
+    with pytest.raises(RuntimeError, match="no NVIDIA driver detected"):
+        cuda_env.require_compatible()
+
+
 def test_require_compatible_is_silent_when_the_stack_fits(host):
     host(driver=(13, 0), torch=(13, 0), vllm=13)
     cuda_env.require_compatible()  # must not raise

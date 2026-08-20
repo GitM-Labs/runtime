@@ -51,6 +51,15 @@ def test_decode_kernel_anonymous_name():
     assert ev.name == "<anonymous>"
 
 
+def test_decode_kernel_warns_when_shape_or_name_is_missing():
+    from gitm.tracer._cupti_decode import decode_kernel
+
+    with pytest.warns(RuntimeWarning, match="kernel grid dimensions unavailable"):
+        decode_kernel(_kernel_rec(grid=None))
+    with pytest.warns(RuntimeWarning, match="kernel name unavailable"):
+        decode_kernel(_kernel_rec(name=None))
+
+
 # --- decode: memcpy copy-kind mapping ---------------------------------------
 
 

@@ -33,10 +33,7 @@ class CuptiBackend:
             )
 
     def device_count(self) -> int:
-        try:
-            return int(self._shim.device_count())
-        except Exception:
-            return 0
+        return int(self._shim.device_count())
 
     def start(self) -> None:
         self._shim.start()

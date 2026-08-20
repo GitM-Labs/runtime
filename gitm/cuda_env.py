@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -255,13 +256,28 @@ def check() -> list[Problem]:
     return problems
 
 
+def unverified_cuda_components() -> list[str]:
+    """CUDA build identities that could not be observed on this installation."""
+    missing: list[str] = []
+    if torch_cuda() is None:
+        missing.append("PyTorch CUDA build")
+    if vllm_cuda_major() is None:
+        missing.append("vLLM CUDA build")
+    return missing
+
+
 def require_compatible() -> None:
     """Raise before an expensive build if the stack can't run on this driver.
     Called by the vLLM workload factory. Without it the failure surfaces ~90s in,
     inside ``torch._C._cuda_init()``, after the weights are already downloaded.
     """
     driver = driver_cuda()
-    if driver is not None and stack_for(driver) is None:
+    if driver is None:
+        raise RuntimeError(
+            "no NVIDIA driver detected; refusing to build a GPU workload on an "
+            "unverified CPU-only or driver-inaccessible host"
+        )
+    if stack_for(driver) is None:
         raise RuntimeError(
             f"unsupported host: this driver supports only CUDA {driver[0]}.{driver[1]}, "
             f"and vLLM's wheels are CUDA {max(SUPPORTED_STACKS)} builds. No torch "
@@ -270,14 +286,22 @@ def require_compatible() -> None:
         )
 
     problems = check()
-    if not problems:
-        return
-    raise RuntimeError(
-        "CUDA stack is incompatible with this host's driver:\n\n"
-        + "\n\n".join(str(p) for p in problems)
-        + "\n\nThe driver belongs to the host and cannot be changed from inside the "
-        "container. Run python -m gitm.cuda_env to re-check."
-    )
+    if problems:
+        raise RuntimeError(
+            "CUDA stack is incompatible with this host's driver:\n\n"
+            + "\n\n".join(str(p) for p in problems)
+            + "\n\nThe driver belongs to the host and cannot be changed from inside the "
+            "container. Run python -m gitm.cuda_env to re-check."
+        )
+    unverified = unverified_cuda_components()
+    if unverified:
+        warnings.warn(
+            f"driver CUDA {driver[0]}.{driver[1]} detected, but "
+            f"{' and '.join(unverified)} could not be verified; "
+            "stack compatibility is unknown",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -323,13 +347,23 @@ def main(argv: list[str] | None = None) -> int:
     if stack.note:
         print(f"NOTE: {stack.note}")
     problems = check()
-    if not problems:
+    unverified = unverified_cuda_components()
+    if not problems and not unverified:
         print("OK — every component runs on this driver.")
         return 0
-    print()
-    for p in problems:
-        print(p)
-    return 1
+    if problems:
+        print()
+        for p in problems:
+            print(p)
+        return 1
+    if unverified:
+        print(
+            "UNVERIFIED — "
+            + " and ".join(unverified)
+            + " could not be read; stack compatibility is unknown."
+        )
+        return 2
+    raise AssertionError("unreachable CUDA diagnostic state")
 
 
 if __name__ == "__main__":
