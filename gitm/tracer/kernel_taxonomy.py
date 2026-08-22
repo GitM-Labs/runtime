@@ -74,11 +74,18 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     #
     # The short causal convolution belongs here too: it is part of the GDN layer,
     # not a separate mechanism, and it has no other home in this vocabulary.
+    # "linear_attention" is listed alongside "linear_attn" because the short
+    # string is NOT a prefix of the long one ("...attn" vs "...atten"), and
+    # vLLM's splitting op is spelled `vllm::linear_attention`. "gdn" likewise:
+    # `vllm::qwen_gdn_attention_core` contains "attention" and would otherwise be
+    # claimed by the softmax-attention rule below — a misfile, which is worse
+    # than `other` because it inflates a bucket that gets trusted.
     ("linear_attn", ("delta_rule", "gated_delta", "deltanet", "deltarule",
-                     "fused_recurrent", "linear_attn", "solve_tril", "wy_fast",
-                     "local_cumsum", "chunk_o", "chunk_h", "chunk_fwd",
-                     "chunk_scaled_dot", "recompute_w_u", "causal_conv1d",
-                     "post_conv", "selective_scan", "mamba")),
+                     "fused_recurrent", "linear_attn", "linear_attention", "gdn",
+                     "solve_tril", "wy_fast", "local_cumsum", "chunk_o", "chunk_h",
+                     "chunk_fwd", "chunk_scaled_dot", "recompute_w_u",
+                     "causal_conv1d", "post_conv", "short_conv",
+                     "selective_scan", "mamba")),
     # Sparse/compressed attention needles ride in this bucket rather than a
     # separate one: they are attention by cost and by what a lever would target.
     # The indexer needles are load-bearing — a "lightning_indexer" kernel matches

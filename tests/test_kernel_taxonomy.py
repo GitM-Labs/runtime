@@ -397,3 +397,50 @@ def test_a_fused_kernel_lands_in_one_coarse_bucket_by_rule_order():
     name = "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert"
     assert classify_kernel(name) == "quant"
     assert classify_op(name) == "attn_qnorm_rope_insert"
+
+
+# ── the same model on a different GPU picks different kernels ───────────────
+#
+# vLLM selects backends per SKU. The identical build and checkpoint chose
+# FLASH_ATTN + Triton MoE on an H200 and FLASHINFER + TrtLlmBf16Experts on a
+# B200. So a rule set validated on one machine can lose whole subsystems on
+# another, silently, and the trace still looks complete.
+#
+# These names are taken from real vLLM startup logs on both machines.
+
+
+@pytest.mark.parametrize("name", [
+    "flashinfer::BatchPrefillWithPagedKVCacheKernel",     # B200: FLASHINFER
+    "flashinfer::BatchDecodeWithPagedKVCacheKernel",
+    "_ZN5flash24flash_fwd_splitkv_kernelI23Flash_fwd_E",  # H200: FLASH_ATTN
+    "cutlass___call___vllm_flash_attn_cute_flash_fwd_sm100FlashAttentionForwardSm100",
+])
+def test_both_attention_backends_classify(name):
+    assert classify_kernel(name) == "attention"
+    assert classify_op(name) == "attn_score_value"
+
+
+@pytest.mark.parametrize("name", [
+    "vllm::linear_attention",
+    "vllm::qwen_gdn_attention_core",
+    "vllm::mamba_mixer2",
+    "vllm::short_conv",
+])
+def test_torch_compile_split_ops_are_linear_attention_not_softmax(name):
+    """These carry "attention" in their names and would be claimed by the
+    softmax rule. That is a misfile, not a gap: a GDN layer's traffic is
+    constant in context while `attn_score_value` is predicted to grow with it,
+    so every long-context step would report a deviation that isn't there.
+
+    `linear_attn` does not match `linear_attention` — the short needle ends
+    "attn", the long name has "atten". Same trap as `sample` vs `sampling`.
+    """
+    assert classify_kernel(name) == "linear_attn"
+    assert classify_op(name) == "linattn_recurrent"
+
+
+def test_a_short_needle_is_not_assumed_to_prefix_its_longer_form():
+    """Guards the class of bug directly, so a future edit that drops the
+    explicit long form fails here rather than on a pod."""
+    assert "linear_attn" not in "vllm::linear_attention"
+    assert "sample" not in "TopKTopPSamplingFromProbKernel".lower()
