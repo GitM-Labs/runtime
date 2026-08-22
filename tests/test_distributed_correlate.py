@@ -13,6 +13,8 @@ partitioned path does not.
 
 from __future__ import annotations
 
+import pytest
+
 from gitm.distributed.correlate import (
     correlate_by_rank,
     correlate_kernels_to_ranges,
@@ -230,3 +232,206 @@ def test_distributed_package_has_no_outward_gitm_dependencies():
             offenders[path.name] = found
 
     assert offenders == {}, f"outward gitm imports in gitm/distributed: {offenders}"
+
+
+# ── the correlation index scales ────────────────────────────────────────────
+#
+# Containment used to be a nested scan: every marker examined for every kernel.
+# At the shapes a real capture produces — 9.5M kernels against ~800k markers when
+# instrumented per layer per op — that is 7.8e12 comparisons, roughly a day of
+# CPU, so correlation was unusable exactly where it was most needed. The sweep
+# below is O((n+m) log(n+m)).
+#
+# A faster algorithm that answers differently is worse than a slow one, so the
+# first test here is differential against the original definition.
+
+
+def _brute_force_enclosing(markers: list[dict], rt: dict) -> dict | None:
+    """The original semantics, kept as the oracle: smallest-span marker on the
+    same thread whose window fully contains the runtime window."""
+    best, best_span = None, None
+    for m in markers:
+        if m.get("thread_id") != rt.get("thread_id"):
+            continue
+        if m["start_ns"] <= rt["start_ns"] and rt["end_ns"] <= m["end_ns"]:
+            span = m["end_ns"] - m["start_ns"]
+            if best_span is None or span < best_span:
+                best, best_span = m, span
+    return best
+
+
+def _nested_capture(seed: int, n_threads: int = 3, n_steps: int = 12):
+    """A properly nested push/pop capture, the shape real NVTX instrumentation
+    produces: an outer layer range with op ranges inside it."""
+    import random
+
+    rng = random.Random(seed)
+    markers: list[dict] = []
+    runtimes: list[dict] = []
+    cid = 0
+    for thread in range(n_threads):
+        t = rng.randint(0, 1000)
+        for step in range(n_steps):
+            layer = step % 4
+            outer_start = t
+            inner: list[dict] = []
+            for op in ("qkv_proj", "attn_score_value", "moe_routed"):
+                op_start = t
+                t += rng.randint(5, 40)
+                # Launches inside this op range. Some deliberately outlive it —
+                # an async launch can end after its range is popped, and those
+                # must fall through to the enclosing layer range.
+                for _ in range(rng.randint(1, 3)):
+                    cid += 1
+                    s = rng.randint(op_start, t)
+                    # >= 1 ns: a cudaLaunchKernel call is never instantaneous,
+                    # and a zero-width window landing exactly on a range boundary
+                    # is contained by both the closing and the opening range. That
+                    # ambiguity is resolved deliberately, and separately, by
+                    # test_a_launch_on_a_range_boundary_belongs_to_the_opening_range.
+                    e = s + rng.randint(1, 30)
+                    runtimes.append({"kind": "runtime", "correlation_id": cid,
+                                     "start_ns": s, "end_ns": e, "thread_id": thread})
+                inner.append({"kind": "marker", "name": f"L{layer}/{op}",
+                              "start_ns": op_start, "end_ns": t, "thread_id": thread})
+                t += rng.randint(0, 5)
+            markers.extend(inner)
+            markers.append({"kind": "marker", "name": f"L{layer}/layer",
+                            "start_ns": outer_start, "end_ns": t, "thread_id": thread})
+            t += rng.randint(1, 20)
+    return markers, runtimes
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_sweep_matches_the_brute_force_definition(seed):
+    """Differential: same answer as the nested scan it replaces, on nested
+    ranges, multiple threads, and launches that outlive their range."""
+    from gitm.distributed.correlate import _innermost_enclosing
+
+    markers, runtimes = _nested_capture(seed)
+    got = _innermost_enclosing(markers, runtimes)
+
+    for rt in runtimes:
+        expected = _brute_force_enclosing(markers, rt)
+        actual = got.get(id(rt))
+        if expected is None:
+            assert actual is None, rt
+        else:
+            # Ties on span are legitimate; compare the resolved identity.
+            assert actual is not None, rt
+            assert (actual["name"], actual["start_ns"], actual["end_ns"]) == (
+                expected["name"], expected["start_ns"], expected["end_ns"]
+            ), rt
+
+
+def test_a_launch_outliving_its_range_falls_through_to_the_enclosing_one():
+    """An asynchronous launch can end after the range that issued it is popped.
+    The innermost range that *fully contains* it is then the outer one, and
+    stopping at the top of the stack would return no range at all."""
+    from gitm.distributed.correlate import _innermost_enclosing
+
+    outer = {"kind": "marker", "name": "L0/layer", "start_ns": 0, "end_ns": 100,
+             "thread_id": 1}
+    inner = {"kind": "marker", "name": "L0/qkv_proj", "start_ns": 10, "end_ns": 20,
+             "thread_id": 1}
+    rt = {"kind": "runtime", "correlation_id": 1, "start_ns": 12, "end_ns": 60,
+          "thread_id": 1}
+
+    got = _innermost_enclosing([outer, inner], [rt])
+    assert got[id(rt)]["name"] == "L0/layer"
+
+
+def test_threads_never_borrow_each_others_ranges():
+    from gitm.distributed.correlate import _innermost_enclosing
+
+    m = {"kind": "marker", "name": "L0/moe_routed", "start_ns": 0, "end_ns": 100,
+         "thread_id": 1}
+    rt = {"kind": "runtime", "correlation_id": 1, "start_ns": 10, "end_ns": 20,
+          "thread_id": 2}
+    assert _innermost_enclosing([m], [rt]) == {}
+
+
+def test_a_range_closing_exactly_at_a_launch_does_not_contain_it():
+    """Tie-breaking at equal timestamps is semantic. A range whose end coincides
+    with a launch's start cannot contain a launch of non-zero duration."""
+    from gitm.distributed.correlate import _innermost_enclosing
+
+    m = {"kind": "marker", "name": "L0/a", "start_ns": 0, "end_ns": 10, "thread_id": 1}
+    rt = {"kind": "runtime", "correlation_id": 1, "start_ns": 10, "end_ns": 20,
+          "thread_id": 1}
+    assert _innermost_enclosing([m], [rt]) == {}
+
+
+def test_a_range_opening_exactly_at_a_launch_does_contain_it():
+    from gitm.distributed.correlate import _innermost_enclosing
+
+    m = {"kind": "marker", "name": "L0/a", "start_ns": 10, "end_ns": 30, "thread_id": 1}
+    rt = {"kind": "runtime", "correlation_id": 1, "start_ns": 10, "end_ns": 20,
+          "thread_id": 1}
+    assert _innermost_enclosing([m], [rt])[id(rt)] is m
+
+
+def test_crossed_ranges_do_not_desynchronise_the_stack():
+    """A malformed capture — ranges that overlap without nesting — must degrade
+    to a wrong answer for the crossed pair only, not corrupt every attribution
+    after it. Popping by identity rather than from the top is what bounds it."""
+    from gitm.distributed.correlate import _innermost_enclosing
+
+    a = {"kind": "marker", "name": "L0/a", "start_ns": 0, "end_ns": 50, "thread_id": 1}
+    b = {"kind": "marker", "name": "L0/b", "start_ns": 20, "end_ns": 80, "thread_id": 1}
+    later = {"kind": "marker", "name": "L1/c", "start_ns": 100, "end_ns": 200,
+             "thread_id": 1}
+    rt = {"kind": "runtime", "correlation_id": 1, "start_ns": 120, "end_ns": 130,
+          "thread_id": 1}
+
+    got = _innermost_enclosing([a, b, later], [rt])
+    assert got[id(rt)] is later
+
+
+def test_correlation_is_linearithmic_not_quadratic():
+    """Doubling both inputs must not quadruple the work. Measured in comparisons
+    rather than wall time so the assertion does not depend on machine load."""
+    from gitm.distributed.correlate import _innermost_enclosing
+
+    def call_count(steps):
+        markers, runtimes = _nested_capture(seed=1, n_threads=1, n_steps=steps)
+        n = [0]
+        orig = dict.get
+
+        class Counting(dict):
+            def __getitem__(self, k):
+                n[0] += 1
+                return super().__getitem__(k)
+
+        markers = [Counting(m) for m in markers]
+        runtimes = [Counting(r) for r in runtimes]
+        _innermost_enclosing(markers, runtimes)
+        del orig
+        return n[0]
+
+    small = call_count(50)
+    large = call_count(200)
+    # 4x the input. Quadratic would be ~16x; linearithmic is a little over 4x.
+    assert large < 6 * small, f"{small} -> {large} looks superlinear"
+
+
+def test_a_launch_on_a_range_boundary_belongs_to_the_opening_range():
+    """The one place the sweep deliberately differs from "smallest enclosing span".
+
+    When one range closes and the next opens at the same instant, a launch whose
+    window touches that instant is contained by both. Span alone would pick
+    whichever happened to be shorter, which carries no meaning. The sweep picks
+    the range that just opened, because NVTX pops before it pushes: a call
+    observed at that timestamp was issued after the pop.
+    """
+    from gitm.distributed.correlate import _innermost_enclosing
+
+    closing = {"kind": "marker", "name": "L1/attn_score_value",
+               "start_ns": 1577, "end_ns": 1601, "thread_id": 1}
+    opening = {"kind": "marker", "name": "L1/moe_routed",
+               "start_ns": 1601, "end_ns": 1638, "thread_id": 1}
+    rt = {"kind": "runtime", "correlation_id": 1, "start_ns": 1601, "end_ns": 1601,
+          "thread_id": 1}
+
+    got = _innermost_enclosing([closing, opening], [rt])
+    assert got[id(rt)]["name"] == "L1/moe_routed"

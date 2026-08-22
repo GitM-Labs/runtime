@@ -66,9 +66,20 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
     # `deltarule` carries no underscore on purpose: the CuTeDSL path is
     # `_FullyFusedDeltaRuleSm90`, and CamelCase lowercases to a single token, so
     # every underscored delta needle misses the SM90 fast path entirely.
+    # "linear_attention" is listed separately from "linear_attn": the shorter
+    # string is NOT a prefix of the longer one ("...att**n**" vs "...att**e**n"),
+    # so the needle written for one misses the other entirely. vLLM's
+    # torch.compile splitting op is `vllm::linear_attention`, and on a B200 run
+    # every GDN layer fell through to the softmax-attention rule because of it.
+    #
+    # "gdn" is load-bearing for the same reason: `vllm::qwen_gdn_attention_core`
+    # contains "attention", so without an earlier claim it is misfiled as
+    # `attn_score_value` — a constant-traffic op compared against a prediction
+    # that grows with context, reporting a false deviation on every long step.
     "linattn_recurrent": ("fused_recurrent", "gated_delta", "delta_rule", "deltarule",
                           "deltanet", "chunk_fwd", "chunk_scaled_dot", "recompute_w_u",
-                          "solve_tril", "wy_fast", "linear_attn"),
+                          "solve_tril", "wy_fast", "linear_attn", "linear_attention",
+                          "gdn", "mamba_mixer", "short_conv"),
 
     # ── sparse-MoE / compressed attention ────────────────────────────────────
     # Before the generic entries below, because their vocabularies are subsets of
@@ -92,10 +103,16 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
     # MLA and generic FlashAttention needles share one entry: they resolve to the
     # same op and nothing sits between them, so the two tuples that used to be
     # separate are merged here with no change in behaviour.
+    # The FlashInfer names are here as well as in the coarse taxonomy: which
+    # attention backend vLLM selects is a per-SKU decision (FLASH_ATTN on the
+    # H200, FLASHINFER on the B200 in the same vLLM build), so a rule set that
+    # covers only one of them silently loses the whole attention path on the
+    # other machine.
     "attn_score_value": ("flash_mla", "mla_sparse", "sparse_mla", "cutlass_mla",
                          "sparse_fwd", "flash_attn", "flashattn", "flash_fwd",
                          "paged_attention", "paged_attn", "fmha", "attention",
-                         "attn_score", "reshape_and_cache", "slot_mapping"),
+                         "attn_score", "reshape_and_cache", "slot_mapping",
+                         "batchprefill", "batchdecode", "pagedkv"),
     # Norm + rotary + cache insert. Every graph family emits this as *one* node
     # because vLLM runs it as one fused kernel; without an entry the kernel stayed
     # unmodeled on both the sparse-MoE and hybrid paths even though the node

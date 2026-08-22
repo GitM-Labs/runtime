@@ -103,6 +103,8 @@ def correlate_kernels_to_ranges(records: list[dict]) -> list[dict]:
         elif kind == "marker":
             markers.append(r)
 
+    enclosing = _innermost_enclosing(markers, runtime_by_corr.values())
+
     out: list[dict] = []
     for k in kernels:
         enriched = dict(k)
@@ -111,22 +113,95 @@ def correlate_kernels_to_ranges(records: list[dict]) -> list[dict]:
 
         rt = runtime_by_corr.get(k.get("correlation_id"))
         if rt is not None:
-            best: dict | None = None
-            best_span: int | None = None
-            for m in markers:
-                if m.get("thread_id") != rt.get("thread_id"):
-                    continue
-                if m["start_ns"] <= rt["start_ns"] and rt["end_ns"] <= m["end_ns"]:
-                    span = m["end_ns"] - m["start_ns"]
-                    if best_span is None or span < best_span:
-                        best, best_span = m, span
-            if best is not None:
-                op, layer = parse_range_name(best["name"])
+            m = enclosing.get(id(rt))
+            if m is not None:
+                op, layer = parse_range_name(m["name"])
                 enriched["range_op"] = op
                 enriched["range_layer"] = layer
 
         out.append(enriched)
 
+    return out
+
+
+# Event phases for the sweep below. Ordering at equal timestamps is semantic, not
+# cosmetic: a range that opens exactly at a launch's start does contain it, and a
+# range that closes exactly at that instant does not.
+_PHASE_OPEN, _PHASE_QUERY, _PHASE_CLOSE = 0, 1, 2
+
+
+def _innermost_enclosing(markers, runtimes) -> dict[int, dict]:
+    """``{id(runtime_record): innermost marker fully containing it}``.
+
+    Replaces a nested scan of every marker per kernel. That scan is O(k·m), and
+    the shapes are not small: a 4,096-step capture instrumented at
+    ``L{layer}/{op}`` granularity emits on the order of 800k markers against 9.5M
+    kernels, which is 7.8e12 comparisons — about a day of CPU. This is
+    O((n+m) log(n+m)), ~2.4e8 operations on the same input.
+
+    The algorithm is a per-thread sweep. NVTX ranges on a single thread are
+    pushed and popped as a stack, so at any instant the open ranges *are* a
+    stack, ordered outermost to innermost. Walking events in time order and
+    maintaining that stack means the innermost range containing a launch is at
+    or near its top.
+
+    "Near", not "at": containment requires the marker to cover the launch's
+    ``end`` as well as its ``start``, and an asynchronous launch can outlive the
+    range that issued it. So the stack is walked down from the top until a range
+    covers the whole window. Nesting depth is a handful, so this is effectively
+    constant per query rather than a second linear scan.
+
+    Threads are handled separately throughout. A launch on one thread must never
+    be attributed to a range pushed on another; grouping first also keeps each
+    stack a genuine stack, which interleaved threads would not be.
+    """
+    by_thread_markers: dict[object, list[dict]] = {}
+    for m in markers:
+        by_thread_markers.setdefault(m.get("thread_id"), []).append(m)
+
+    by_thread_runtimes: dict[object, list[dict]] = {}
+    for rt in runtimes:
+        by_thread_runtimes.setdefault(rt.get("thread_id"), []).append(rt)
+
+    out: dict[int, dict] = {}
+    for thread, thread_markers in by_thread_markers.items():
+        queries = by_thread_runtimes.get(thread)
+        if not queries:
+            continue
+
+        # Third sort key breaks timestamp ties so the stack reflects nesting.
+        # An op range opened by the same instrumentation call as its enclosing
+        # layer range shares its start exactly; without this the outer can land
+        # on top of the inner and every launch inside resolves to the layer
+        # instead of the op. Opens are ordered by descending end (outermost
+        # first, since it closes last); closes by descending start (innermost
+        # first, since it opened last).
+        events: list[tuple[int, int, int, dict]] = []
+        for m in thread_markers:
+            events.append((m["start_ns"], _PHASE_OPEN, -m["end_ns"], m))
+            events.append((m["end_ns"], _PHASE_CLOSE, -m["start_ns"], m))
+        for rt in queries:
+            events.append((rt["start_ns"], _PHASE_QUERY, 0, rt))
+        events.sort(key=lambda e: e[:3])
+
+        stack: list[dict] = []
+        for _t, phase, _tie, payload in events:
+            if phase == _PHASE_OPEN:
+                stack.append(payload)
+            elif phase == _PHASE_CLOSE:
+                # Pop by identity rather than blindly: a malformed capture with
+                # crossed ranges would otherwise desynchronise the stack and
+                # mis-attribute everything after it.
+                for i in range(len(stack) - 1, -1, -1):
+                    if stack[i] is payload:
+                        del stack[i]
+                        break
+            else:
+                end = payload["end_ns"]
+                for i in range(len(stack) - 1, -1, -1):
+                    if stack[i]["end_ns"] >= end:
+                        out[id(payload)] = stack[i]
+                        break
     return out
 
 

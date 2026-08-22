@@ -101,3 +101,112 @@ def test_multiple_kernels_preserve_order_and_independent_matches():
     assert [o["name"] for o in out] == ["first", "second"]
     assert out[0]["range_op"] == "qkv_proj"
     assert out[1]["range_op"] == "attn_out_proj"
+
+
+# ── NVTX marker pairing ─────────────────────────────────────────────────────
+#
+# CUpti_ActivityMarker2 carries one timestamp, so a range arrives as two records
+# sharing a marker_id, and the header states the name is NULL on the end. The C
+# side stays stateless and emits both halves; pair_markers is where they become
+# the {name, start_ns, end_ns, thread_id} range correlate.py documents.
+
+
+def _start(mid, name, t, thread=7):
+    return {"kind": "marker", "name": name, "timestamp_ns": t,
+            "marker_id": mid, "marker_flags": 0, "thread_id": thread}
+
+
+def _end(mid, t, thread=7):
+    return {"kind": "marker", "name": "", "timestamp_ns": t,
+            "marker_id": mid, "marker_flags": 1, "thread_id": thread}
+
+
+def test_a_push_and_pop_become_one_range():
+    from gitm.tracer._cupti_decode import pair_markers
+
+    got = pair_markers([_start(1, "L0/qkv_proj", 100), _end(1, 120)])
+    assert got == [{"kind": "marker", "name": "L0/qkv_proj",
+                    "start_ns": 100, "end_ns": 120, "thread_id": 7}]
+
+
+def test_the_name_comes_from_the_start_half():
+    """The end record's name is NULL by CUPTI's contract. Taking the name from
+    whichever half arrived last would produce anonymous ranges."""
+    from gitm.tracer._cupti_decode import pair_markers
+
+    (range_,) = pair_markers([_start(1, "L3/moe_routed", 10), _end(1, 20)])
+    assert range_["name"] == "L3/moe_routed"
+
+
+def test_an_unclosed_range_is_dropped_not_extended():
+    """A capture killed mid-step leaves a start with no end — the common case,
+    not a corner one. Closing it at the capture's end would produce a range that
+    appears to contain every launch after it and would silently claim them all."""
+    from gitm.tracer._cupti_decode import pair_markers
+
+    assert pair_markers([_start(1, "L0/a", 10)]) == []
+
+
+def test_an_unopened_end_is_dropped():
+    from gitm.tracer._cupti_decode import pair_markers
+
+    assert pair_markers([_end(1, 10)]) == []
+
+
+def test_ranges_pair_within_a_thread_not_across_them():
+    """A marker id reused on another thread would otherwise splice two ranges
+    into one window spanning both."""
+    from gitm.tracer._cupti_decode import pair_markers
+
+    got = pair_markers([
+        _start(1, "L0/a", 10, thread=1), _start(1, "L0/b", 12, thread=2),
+        _end(1, 20, thread=2), _end(1, 30, thread=1),
+    ])
+    by_thread = {r["thread_id"]: (r["name"], r["start_ns"], r["end_ns"]) for r in got}
+    assert by_thread == {1: ("L0/a", 10, 30), 2: ("L0/b", 12, 20)}
+
+
+def test_nested_ranges_survive_pairing():
+    from gitm.tracer._cupti_decode import pair_markers
+
+    got = pair_markers([
+        _start(1, "L0/layer", 0), _start(2, "L0/qkv_proj", 10),
+        _end(2, 20), _end(1, 100),
+    ])
+    assert {(r["name"], r["start_ns"], r["end_ns"]) for r in got} == {
+        ("L0/layer", 0, 100), ("L0/qkv_proj", 10, 20),
+    }
+
+
+def test_non_marker_records_pass_through_in_order():
+    from gitm.tracer._cupti_decode import pair_markers
+
+    k = {"kind": "kernel", "name": "x", "start_ns": 1, "end_ns": 2}
+    rt = {"kind": "runtime", "start_ns": 1, "end_ns": 2, "correlation_id": 9,
+          "thread_id": 7}
+    assert pair_markers([k, rt]) == [k, rt]
+
+
+def test_an_anonymous_gemm_resolves_to_layer_and_op_through_the_full_chain():
+    """The acceptance criterion for the whole NVTX path.
+
+    `nvjet_sm90_tst_*` is cuBLAS's JIT GEMM family; its name carries no
+    projection, so classify_op declines it and always will. Correlation recovers
+    the identity that name matching cannot.
+    """
+    from gitm.optimizer.deviation import classify_op
+    from gitm.tracer._cupti_decode import decode_records
+
+    name = "nvjet_sm90_tst_128x8_64x12_4x1_v_bz_TNT"
+    assert classify_op(name) is None  # unattributable by name, by construction
+
+    events = decode_records([
+        _start(1, "L0/qkv_proj", 100),
+        {"kind": "runtime", "start_ns": 105, "end_ns": 108,
+         "correlation_id": 42, "thread_id": 7},
+        _end(1, 120),
+        {"kind": "kernel", "name": name, "start_ns": 200, "end_ns": 900,
+         "device_id": 0, "context_id": 1, "stream_id": 7, "correlation_id": 42},
+    ])
+    (kernel,) = [e for e in events if e.kind == "kernel"]
+    assert (kernel.range_op, kernel.range_layer) == ("qkv_proj", 0)

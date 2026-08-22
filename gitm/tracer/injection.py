@@ -34,6 +34,10 @@ from gitm.tracer.schema import TraceEvent
 
 ENV_LIB = "CUDA_INJECTION64_PATH"
 ENV_OUT = "GITM_TRACE_OUT"
+#: Turns on RUNTIME/DRIVER/MARKER collection in the collector (cupti_core.c).
+ENV_NVTX = "GITM_TRACE_NVTX"
+#: Read by NVTX itself, not by us and not by the CUDA driver — see run_env().
+ENV_NVTX_INJECT = "NVTX_INJECTION64_PATH"
 ENV_SETTLE = "GITM_TRACE_SETTLE_S"
 
 LIB_NAME = "libgitm_inject.so"
@@ -63,9 +67,42 @@ def active() -> bool:
     return bool(lib) and Path(lib).name == LIB_NAME and bool(os.environ.get(ENV_OUT))
 
 
-def run_env(out_path: str | Path) -> dict[str, str]:
-    """The environment a traced run needs, ready to export."""
-    return {ENV_LIB: str(lib_path()), ENV_OUT: str(Path(out_path).resolve())}
+def libcupti_path() -> Path | None:
+    """The libcupti the shim was linked against, or ``None`` if none was found.
+
+    Reuses the build's own resolution so the library NVTX is pointed at is the
+    same one CUPTI is collecting through. Two different libcupti majors in one
+    process is not a configuration that works.
+    """
+    from gitm.tracer._cupti.build import _cuda_home, _pick_libcupti
+
+    d, major = _pick_libcupti(_cuda_home())
+    if d is None or major is None:
+        return None
+    so = d / f"libcupti.so.{major}"
+    return so if so.exists() else None
+
+
+def run_env(out_path: str | Path, *, nvtx: bool = False) -> dict[str, str]:
+    """The environment a traced run needs, ready to export.
+
+    ``nvtx`` additionally turns on the correlation records that resolve an
+    anonymous GEMM to a layer and an op. It sets two variables, and the second
+    is the one nobody guesses: **NVTX and CUDA injection are separate
+    mechanisms.** ``CUDA_INJECTION64_PATH`` is read by the CUDA driver and is
+    how our collector gets loaded; NVTX is header-only and consults
+    ``NVTX_INJECTION64_PATH`` to decide which tool receives push/pop. Enabling
+    ``CUPTI_ACTIVITY_KIND_MARKER`` gives CUPTI somewhere to put ranges but does
+    not make NVTX hand them over — verified on a B200, where markers stayed at
+    zero until this was set.
+    """
+    env = {ENV_LIB: str(lib_path()), ENV_OUT: str(Path(out_path).resolve())}
+    if nvtx:
+        env[ENV_NVTX] = "1"
+        cupti = libcupti_path()
+        if cupti is not None:
+            env[ENV_NVTX_INJECT] = str(cupti)
+    return env
 
 
 def _out_base() -> Path:

@@ -85,7 +85,27 @@ static PyObject *rec_to_dict(const gitm_record *r) {
             "end_ns", (unsigned long long)r->end_ns,
             "device_id", r->device_id, "context_id", r->context_id,
             "stream_id", r->stream_id, "correlation_id", r->correlation_id);
+    } else if (r->kind == GITM_REC_RUNTIME) {
+        return Py_BuildValue(
+            "{s:s, s:K, s:K, s:I, s:I}",
+            "kind", "runtime",
+            "start_ns", (unsigned long long)r->start_ns,
+            "end_ns", (unsigned long long)r->end_ns,
+            "correlation_id", r->correlation_id, "thread_id", r->thread_id);
+    } else if (r->kind == GITM_REC_MARKER) {
+        /* Half a range. `marker_id` pairs it with its counterpart and
+         * `marker_flags` says which half; the name is present only on the start.
+         * _cupti_decode.pair_markers joins them. */
+        return Py_BuildValue(
+            "{s:s, s:s, s:K, s:I, s:i, s:I}",
+            "kind", "marker", "name", r->name,
+            "timestamp_ns", (unsigned long long)r->start_ns,
+            "marker_id", r->marker_id, "marker_flags", r->marker_flags,
+            "thread_id", r->thread_id);
     } else {
+        /* GITM_REC_SYNC. Explicit rather than a fallthrough: this used to be a
+         * bare else, which would have emitted every runtime and marker record
+         * as a sync record — a corrupt trace with no error anywhere. */
         return Py_BuildValue(
             "{s:s, s:i, s:K, s:K, s:I, s:I, s:I, s:I}",
             "kind", "sync", "sync_type", r->sync_type,

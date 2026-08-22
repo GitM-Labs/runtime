@@ -158,6 +158,53 @@ def decode_record(d: dict) -> TraceEvent | None:
     return fn(d) if fn else None
 
 
+#: ``marker_flags`` values, mirroring GITM_MARKER_START/END in cupti_core.h.
+MARKER_START, MARKER_END = 0, 1
+
+
+def pair_markers(records: list[dict]) -> list[dict]:
+    """Join NVTX push/pop halves into whole ranges.
+
+    ``CUpti_ActivityMarker2`` carries a single ``timestamp``, so a range arrives
+    as two records sharing a ``marker_id`` — and the header is explicit that the
+    name "will be NULL for an end marker". The C side stays stateless and emits
+    both halves; this is where they become the
+    ``{kind, name, start_ns, end_ns, thread_id}`` range that
+    :mod:`gitm.distributed.correlate` documents as its input.
+
+    Non-marker records pass through untouched and in order. Unpaired halves are
+    dropped rather than repaired: a start without an end has no window, and
+    inventing one — closing it at the capture's end, say — would produce a range
+    that appears to contain every launch after it and would silently claim them
+    all. A capture killed mid-step leaves exactly that, so this is the common
+    case, not a corner one.
+    """
+    starts: dict[tuple, dict] = {}
+    out: list[dict] = []
+    for r in records:
+        if r.get("kind") != "marker":
+            out.append(r)
+            continue
+        # marker_id is unique per process, but pair within a thread anyway: an
+        # id reused across threads would otherwise splice two ranges into one
+        # spanning window.
+        key = (r.get("thread_id"), r.get("marker_id"))
+        if r.get("marker_flags") == MARKER_END:
+            start = starts.pop(key, None)
+            if start is None:
+                continue  # end without a start: nothing to bound
+            out.append({
+                "kind": "marker",
+                "name": start.get("name") or "",
+                "start_ns": int(start["timestamp_ns"]),
+                "end_ns": int(r["timestamp_ns"]),
+                "thread_id": r.get("thread_id"),
+            })
+        else:
+            starts[key] = r
+    return out
+
+
 def decode_records(records: list[dict]) -> list[TraceEvent]:
     """Decode a shim record batch, dropping unmodeled kinds, sorted by start.
 
@@ -172,7 +219,8 @@ def decode_records(records: list[dict]) -> list[TraceEvent]:
     Sorting by ``start_ns`` gives a stable timeline regardless of the order
     CUPTI flushed buffers (concurrent kernels on multiple streams interleave).
     """
-    enriched_kernels = iter(correlate_kernels_to_ranges(records))
+    correlated = correlate_kernels_to_ranges(pair_markers(records))
+    enriched_kernels = iter(correlated)
     events: list[TraceEvent] = []
     for d in records:
         if d.get("kind") == "kernel":

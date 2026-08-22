@@ -107,7 +107,27 @@ static void file_sink(const gitm_record *r, void *user) {
                 r->copy_kind, (unsigned long long)r->bytes,
                 (unsigned long long)r->start_ns, (unsigned long long)r->end_ns,
                 r->device_id, r->context_id, r->stream_id, r->correlation_id);
+    } else if (r->kind == GITM_REC_RUNTIME) {
+        fprintf(g_fp,
+                "{\"kind\":\"runtime\",\"start_ns\":%llu,\"end_ns\":%llu,"
+                "\"correlation_id\":%u,\"thread_id\":%u}\n",
+                (unsigned long long)r->start_ns, (unsigned long long)r->end_ns,
+                r->correlation_id, r->thread_id);
+    } else if (r->kind == GITM_REC_MARKER) {
+        /* Half a range. `marker_id` pairs it with its counterpart and
+         * `marker_flags` says which half; the name is present only on the start.
+         * _cupti_decode.pair_markers joins them. */
+        fputs("{\"kind\":\"marker\",\"name\":", g_fp);
+        write_json_string(g_fp, r->name);
+        fprintf(g_fp,
+                ",\"timestamp_ns\":%llu,\"marker_id\":%u,\"marker_flags\":%d,"
+                "\"thread_id\":%u}\n",
+                (unsigned long long)r->start_ns, r->marker_id, r->marker_flags,
+                r->thread_id);
     } else {
+        /* GITM_REC_SYNC. Explicit rather than a fallthrough: this used to be a
+         * bare else, which would have written every runtime and marker record
+         * as a sync record — a corrupt trace with no error anywhere. */
         fprintf(g_fp,
                 "{\"kind\":\"sync\",\"sync_type\":%d,"
                 "\"start_ns\":%llu,\"end_ns\":%llu,\"device_id\":%u,\"context_id\":%u,"

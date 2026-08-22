@@ -38,6 +38,23 @@
 #define GITM_REC_KERNEL 0
 #define GITM_REC_MEMCPY 1
 #define GITM_REC_SYNC 2
+/* The correlation chain. A kernel carries only a correlation_id; recovering the
+ * op and layer it belongs to needs the host-side launch that issued it (RUNTIME)
+ * and the innermost NVTX range enclosing that launch (MARKER). See
+ * gitm/distributed/correlate.py for the three-record contract.
+ *
+ * Both are OFF unless GITM_TRACE_NVTX is set: RUNTIME emits one record per CUDA
+ * API call, which on a decode step is a multiple of the kernel count, and the
+ * pair roughly triples buffer pressure. Correlation is worth that; ordinary
+ * capture is not. */
+#define GITM_REC_RUNTIME 3
+#define GITM_REC_MARKER 4
+
+/* CUpti_ActivityMarker2 arrives as two records per range — a START and an END
+ * sharing an `id`. Pairing them needs state; the C side stays stateless and
+ * emits both, and _cupti_decode.py joins them on marker_id. */
+#define GITM_MARKER_START 0
+#define GITM_MARKER_END 1
 
 /** Normalized record - only the fields GITM consumes.
  * Field-for-field contract documented in gitm/tracer/_cupti_decode.py
@@ -59,7 +76,19 @@ typedef struct {
     int      copy_kind;
     uint64_t bytes;
     int      sync_type;
+    /* Correlation. `thread_id` is the host thread that made the call, and is the
+     * secondary key range containment is matched on — a kernel launched from one
+     * thread must never be attributed to a range pushed on another. Both fields
+     * are zero on kernel/memcpy/sync records. */
+    uint32_t thread_id;
+    uint32_t marker_id;
+    int      marker_flags;
 } gitm_record;
+
+/** Whether RUNTIME/MARKER collection is on (GITM_TRACE_NVTX). Exposed so both
+ * sinks and the build can report the mode a capture actually ran in — a trace
+ * without correlation records looks identical to one whose ranges never fired. */
+int gitm_nvtx_enabled(void);
 
 /** Called once per decoded record, under the core's lock. */
 typedef void (*gitm_sink_fn)(const gitm_record *rec, void *user);
