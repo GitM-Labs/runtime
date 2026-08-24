@@ -25,11 +25,12 @@ honest "no engine stats" outcome, never fabricated numbers.
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -547,3 +548,187 @@ def sample_scheduler_stats(
         yield sampler
     finally:
         sampler.stop()
+
+
+# ── NVTX model instrumentation ──────────────────────────────────────────────
+#
+# `gitm.distributed.correlate` can resolve a kernel to an `L{layer}/{op}` 
+# range, but only if something pushes those ranges; this is what pushes them.
+_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?=\.|$)")
+
+#: Leaf module name -> predicted-graph op.
+#: The values are the op vocabulary of `gitm.optimizer.deviation._OP_RULES`, not
+#: a private naming scheme. A correlated kernel and a name-classified one must
+#: land on the same node, or residuals would be split across two spellings of
+#: one op and each half would look healthier than the whole.
+_MODULE_OPS: dict[str, str] = {
+    # attention projections
+    "qkv_proj": "qkv_proj",
+    "q_proj": "qkv_proj",
+    "k_proj": "qkv_proj",
+    "v_proj": "qkv_proj",
+    "o_proj": "attn_out_proj",
+    "out_proj": "attn_out_proj",
+    "rotary_emb": "attn_qnorm_rope_insert",
+    # gated DeltaNet / Mamba-style linear attention
+    "in_proj_qkvz": "linattn_in_proj",
+    "in_proj_ba": "linattn_in_proj",
+    "in_proj": "linattn_in_proj",
+    "conv1d": "linattn_conv",
+    # mixture of experts
+    "gate": "moe_router",
+    "experts": "moe_routed",
+    "shared_expert": "moe_shared",
+    "shared_experts": "moe_shared",
+    # dense FFN, for non-MoE checkpoints
+    "gate_up_proj": "mlp_gate_up",
+    "down_proj": "mlp_down",
+    "lm_head": "lm_head",
+}
+
+#: Container modules, hooked *in addition* to their children.
+#:
+#: A block's range encloses its children's, and the correlation sweep selects the
+#: innermost — so a kernel inside `qkv_proj` gets `qkv_proj`, while the attention
+#: kernel itself, which is not a named submodule at all, still lands somewhere
+#: rather than nowhere. That fallback is most of the value: FlashAttention and
+#: the GDN recurrence are launched from inside the block's own forward, so
+#: without the enclosing range they would be unattributed.
+_CONTAINER_OPS: dict[str, str] = {
+    "self_attn": "attn_score_value",
+    "attn": "attn_score_value",
+    "linear_attn": "linattn_recurrent",
+    "mamba": "linattn_recurrent",
+    "mixer": "linattn_recurrent",
+}
+
+
+def op_for_module(qualname: str) -> tuple[str, int | None] | None:
+    """``(op, layer)`` for a module path, or ``None`` if it maps to no op.
+
+    ``"model.layers.3.self_attn.qkv_proj"`` yields ``("qkv_proj", 3)``. The layer
+    index is read from the path rather than from a counter, so a model whose
+    blocks are built out of order — or shared across a draft head — is still
+    labelled by where it actually sits.
+    """
+    if not qualname:
+        return None
+    leaf = qualname.rsplit(".", 1)[-1]
+    op = _MODULE_OPS.get(leaf) or _CONTAINER_OPS.get(leaf)
+    if op is None:
+        return None
+    m = _LAYER_RE.search(qualname)
+    return op, (int(m.group(1)) if m else None)
+
+
+def range_name(op: str, layer: int | None) -> str:
+    """``"L3/qkv_proj"``, or bare ``"lm_head"`` for an unlayered op.
+
+    Must round-trip through :func:`gitm.distributed.correlate.parse_range_name`;
+    a range whose name does not parse resolves to an op nobody predicted.
+    """
+    return f"L{layer}/{op}" if layer is not None else op
+
+
+@dataclass
+class Instrumentation:
+    """Handles for the hooks attached to a model, and what they cover."""
+
+    handles: list[Any] = field(default_factory=list)
+    ranges: list[str] = field(default_factory=list)
+
+    @property
+    def n_modules(self) -> int:
+        return len(self.ranges)
+
+    @property
+    def ops(self) -> set[str]:
+        from gitm.distributed.correlate import parse_range_name
+
+        return {parse_range_name(r)[0] for r in self.ranges}
+
+    def remove(self) -> None:
+        for h in self.handles:
+            try:
+                h.remove()
+            except Exception:  # a handle whose module is gone is not an error
+                pass
+        self.handles.clear()
+
+
+def instrument_model(model: Any, *, push: Any = None, pop: Any = None) -> Instrumentation:
+    """Attach NVTX push/pop hooks to every module that maps to a graph op.
+
+    ``push``/``pop`` default to ``torch.cuda.nvtx``; they are injectable so the
+    naming can be tested without a GPU.
+
+    This only works in eager mode. Forward hooks are Python, and CUDA-graph
+    replay executes no Python — so under vLLM's default
+    ``cudagraph_mode=FULL_AND_PIECEWISE`` the ranges are pushed while the graph
+    is captured and never again during replay. Under ``torch.compile`` a hook
+    additionally forces a graph break, changing the very timings being measured.
+    Correlation is therefore an ``--enforce-eager`` instrument. What it produces
+    is still useful against graph-mode traces indirectly: run it once eagerly to
+    learn which kernel names belong to which ops, then apply that mapping by
+    name.
+
+    Pops are registered with ``always_call`` where torch supports it. Without
+    it, a forward that raises would skip its pop and leave the NVTX stack
+    permanently one deep, so every subsequent range on that thread would nest
+    inside a dead one and the innermost-enclosing search would return it forever.
+    """
+    if push is None or pop is None:
+        import torch  # deferred: this module is importable on a box without torch
+
+        push = push or torch.cuda.nvtx.range_push
+        pop = pop or torch.cuda.nvtx.range_pop
+
+    inst = Instrumentation()
+    named = getattr(model, "named_modules", None)
+    if named is None:
+        return inst
+
+    for qualname, module in named():
+        mapped = op_for_module(qualname)
+        if mapped is None:
+            continue
+        name = range_name(*mapped)
+
+        def _pre(_m, _args, _name=name):
+            push(_name)
+
+        def _post(_m, _args, _output, **_kw):
+            pop()
+
+        try:
+            inst.handles.append(module.register_forward_pre_hook(_pre))
+            try:
+                inst.handles.append(
+                    module.register_forward_hook(_post, always_call=True)
+                )
+            except TypeError:
+                # torch < 2.1 has no always_call. Accept the weaker guarantee
+                # rather than skipping the pop entirely — an unbalanced stack on
+                # an exception is bad, but no ranges at all is worse.
+                inst.handles.append(module.register_forward_hook(_post))
+        except Exception:
+            continue  # a module that refuses hooks is skipped, not fatal
+        inst.ranges.append(name)
+
+    return inst
+
+
+def model_from_engine(engine: Any) -> Any | None:
+    """Best-effort dig for the ``nn.Module`` inside a vLLM engine.
+
+    Every path here has been a real location across vLLM versions, which is why
+    there is a list rather than one attribute chain.
+    """
+    return _first_attr(
+        engine,
+        "model_executor.driver_worker.model_runner.model",
+        "model_executor.driver_worker.worker.model_runner.model",
+        "engine.model_executor.driver_worker.model_runner.model",
+        "model_runner.model",
+        "model",
+    )

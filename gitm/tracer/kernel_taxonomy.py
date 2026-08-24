@@ -6,13 +6,13 @@ kernels, FlashAttention, NCCL's all-reduces and vLLM's own CUDA kernels. The ope
 question is never "were they captured" but "can we *see* them in what came back",
 and that question has three failure modes this module is built to answer:
 
-* **unnamed work** — a bucket breakdown where ``other`` dominates means the trace is
+* unnamed work — a bucket breakdown where ``other`` dominates means the trace is
   full of kernels no rule recognises, and any conclusion drawn per-op is guesswork.
-* **truncated names** — the collector's name field is bounded (``NAME_MAX``).
+* truncated names** — the collector's name field is bounded (``NAME_MAX``).
   Mangled cutlass/MoE template instantiations run long, and two different kernels
   truncated to the same 255 bytes become one identity. That is silent: the trace
   looks complete and the distinct expert GEMMs have merged.
-* **missing device time** — kernels that ran but were never attributed (CUDA-graph
+* missing device time — kernels that ran but were never attributed (CUDA-graph
   replay is the usual cause) leave the GPU looking idle while throughput says
   otherwise. ``gpu_active_share`` is the number that exposes it.
 

@@ -9,7 +9,7 @@ For each op we compute:
 with a vendor-specific efficiency band ``(eff_lo, eff_hi)``: a kernel within
 that band is "as expected". Residuals outside the band drive attribution.
 
-**The peak must match the op's dtype.** A checkpoint that runs fp8 linears and
+The peak must match the op's dtype. A checkpoint that runs fp8 linears and
 fp4 experts priced against a bf16 peak understates its own ceiling by 2-4x, and
 an understated ceiling reads as recoverable headroom that isn't there — the one
 error the headroom report exists to avoid making. ``roofline`` therefore resolves
@@ -35,8 +35,8 @@ _WEIGHT_BYTES: dict[str, float] = {
     "mxfp4": 0.5 + 1.0 / 32,
     # NVFP4: one e4m3 (1 byte) scale per 16 values.
     "nvfp4": 0.5 + 1.0 / 16,
+    "fp4" :  0.5 + 1.0 / 32,
 }
-_WEIGHT_BYTES["fp4"] = _WEIGHT_BYTES["mxfp4"]
 
 
 def weight_bytes(dtype: str) -> float:
@@ -168,9 +168,9 @@ class ModelSpec:
         few full-attention layers among many linear-attention ones. The two have
         fundamentally different memory behaviour at decode:
 
-        * **full attention** re-reads a KV cache that grows with context, so its
+        * full attention** re-reads a KV cache that grows with context, so its
           traffic scales with ``kv_cache_len``;
-        * **linear attention** carries a fixed-size recurrent state per sequence,
+        * linear attention carries a fixed-size recurrent state per sequence,
           so its traffic is *constant* in sequence length.
 
         Modeling every layer as full attention overstates KV traffic by the ratio
