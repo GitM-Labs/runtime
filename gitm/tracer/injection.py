@@ -261,6 +261,20 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
             if not isinstance(rec, dict):
                 dropped_lines += 1
                 continue
+            # Correlation records (runtime/driver launches and NVTX marker
+            # halves) are consumed by decode_records to build the range index and
+            # are never emitted as events.
+            # A marker carries ``timestamp_ns``, not ``start_ns``. Requiring
+            # the latter counted every marker as malformed and discarded it
+            # before correlation ever saw one the trace still decoded, with
+            # ``range_op`` null on every kernel and no error anywhere.
+            # They must NOT be windowed. A range that opens before the window
+            # still encloses launches inside it, and pairing needs both halves;
+            # dropping either end silently un-attributes everything it covered.
+            if rec.get("kind") in ("marker", "runtime"):
+                records.append(rec)
+                continue
+
             ts = rec.get("start_ns")
             if not isinstance(ts, int):
                 dropped_lines += 1
@@ -279,10 +293,14 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
             stacklevel=2,
         )
     events = decode_records(records)
-    if len(events) < len(records):
+    # Correlation records are consumed, not lost: decode_records folds them into
+    # range_op/range_layer on the kernels. Counting them as dropped would report
+    # millions of missing records on a correlated capture and read as data loss.
+    n_correlation = sum(1 for r in records if r.get("kind") in ("marker", "runtime"))
+    unmodeled = len(records) - n_correlation - len(events)
+    if unmodeled > 0:
         warnings.warn(
-            f"injected trace coverage: dropped {len(records) - len(events)} unmodeled "
-            "activity record(s)",
+            f"injected trace coverage: dropped {unmodeled} unmodeled activity record(s)",
             RuntimeWarning,
             stacklevel=2,
         )

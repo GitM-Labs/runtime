@@ -228,3 +228,105 @@ def test_set_decode_run_defaults_fills_env_and_respects_exports(tmp_path, monkey
     assert env["GITM_VLLM_MAX_TOKENS"] == "2048"
     assert env["CUDA_INJECTION64_PATH"].endswith(injection.LIB_NAME)
     assert (tmp_path / "t.jsonl").parent.exists()
+
+
+# ── correlation records must survive read_shards ────────────────────────────
+#
+# The bug this guards: a marker carries `timestamp_ns`, not `start_ns`. The
+# window filter required `start_ns`, so every marker was counted as malformed and
+# discarded before correlation ever saw one. The capture still succeeded, the
+# trace still decoded, and every kernel came back with `range_op` null — no error
+# anywhere. On a real H200 run that silently threw away 502,491 markers.
+
+
+def _corr_shard(tmp_path, monkeypatch, lines):
+    import json as _json
+
+    base = tmp_path / "trace.jsonl"
+    (tmp_path / "trace.jsonl.999").write_text(
+        "\n".join(_json.dumps(r) for r in lines) + "\n"
+    )
+    monkeypatch.setenv("GITM_TRACE_OUT", str(base))
+    return base
+
+
+def _corr_kernel(t, cid, name="nvjet_sm90_tst_128x8_TNT"):
+    return {"kind": "kernel", "name": name, "start_ns": t, "end_ns": t + 100,
+            "device_id": 0, "context_id": 1, "stream_id": 7, "correlation_id": cid,
+            "grid": [1, 1, 1], "block": [1, 1, 1], "static_shared_mem": 0,
+            "dynamic_shared_mem": 0, "registers_per_thread": 32}
+
+
+def test_markers_are_not_discarded_as_malformed(tmp_path, monkeypatch):
+    from gitm.tracer import injection
+
+    _corr_shard(tmp_path, monkeypatch, [
+        {"kind": "marker", "name": "L3/qkv_proj", "timestamp_ns": 1000,
+         "marker_id": 1, "marker_flags": 0, "thread_id": 7},
+        {"kind": "runtime", "start_ns": 1010, "end_ns": 1020,
+         "correlation_id": 42, "thread_id": 7},
+        {"kind": "marker", "name": "", "timestamp_ns": 1100,
+         "marker_id": 1, "marker_flags": 1, "thread_id": 7},
+        _corr_kernel(2000, 42),
+    ])
+    events = injection.read_shards()
+    kernels = [e for e in events if e.kind == "kernel"]
+    assert len(kernels) == 1
+    assert (kernels[0].range_op, kernels[0].range_layer) == ("qkv_proj", 3)
+
+
+def test_a_range_opening_before_the_window_still_attributes(tmp_path, monkeypatch):
+    """Windowing correlation records breaks pairing and un-attributes silently.
+
+    A range pushed before the capture window opened still encloses launches
+    inside it — vLLM pushes a layer range and the kernels arrive later. Dropping
+    the start half leaves an end with nothing to pair to, so the range vanishes
+    and every kernel it covered comes back unattributed.
+    """
+    from gitm.tracer import injection
+
+    _corr_shard(tmp_path, monkeypatch, [
+        {"kind": "marker", "name": "L1/moe_routed", "timestamp_ns": 10,
+         "marker_id": 1, "marker_flags": 0, "thread_id": 7},      # before window
+        {"kind": "runtime", "start_ns": 20, "end_ns": 30,
+         "correlation_id": 42, "thread_id": 7},                    # before window
+        {"kind": "marker", "name": "", "timestamp_ns": 9000,
+         "marker_id": 1, "marker_flags": 1, "thread_id": 7},
+        _corr_kernel(5000, 42),                                         # inside window
+    ])
+    events = injection.read_shards(1000, 8000)
+    (kernel,) = [e for e in events if e.kind == "kernel"]
+    assert (kernel.range_op, kernel.range_layer) == ("moe_routed", 1)
+
+
+def test_kernels_outside_the_window_are_still_dropped(tmp_path, monkeypatch):
+    """Exempting correlation records must not exempt the events themselves —
+    the window filter exists because the collector runs for the process's whole
+    life, and weight loading would otherwise dominate the trace."""
+    from gitm.tracer import injection
+
+    _corr_shard(tmp_path, monkeypatch, [
+        _corr_kernel(10, 1), _corr_kernel(5000, 2), _corr_kernel(90000, 3),
+    ])
+    events = injection.read_shards(1000, 8000)
+    assert [e.start_ns for e in events if e.kind == "kernel"] == [5000]
+
+
+def test_a_truncated_final_line_is_still_reported(tmp_path, monkeypatch):
+    """The genuine malformed case must not be masked by the marker exemption."""
+    import warnings as _w
+
+    from gitm.tracer import injection
+
+    base = tmp_path / "trace.jsonl"
+    (tmp_path / "trace.jsonl.999").write_text(
+        '{"kind":"kernel","name":"a","start_ns":1,"end_ns":2,"device_id":0,'
+        '"context_id":1,"stream_id":7,"correlation_id":1,"grid":[1,1,1],'
+        '"block":[1,1,1],"static_shared_mem":0,"dynamic_shared_mem":0,'
+        '"registers_per_thread":1}\n{"kind":"kernel","name":"trunc\n'
+    )
+    monkeypatch.setenv("GITM_TRACE_OUT", str(base))
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        injection.read_shards()
+    assert any("malformed or incomplete" in str(c.message) for c in caught)

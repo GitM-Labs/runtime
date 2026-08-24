@@ -19,6 +19,7 @@ dist/
 .venv/
 venv/
 .env
+vllm/
 
 # Profiler artifacts. nsys exports its report as SQLite and these land wherever
 # the command was run; they are large, binary, and never source. The importer's
