@@ -24,6 +24,7 @@ Dict contract (the shim emits exactly these shapes):
 
 from __future__ import annotations
 
+import re
 import warnings
 from typing import Literal
 
@@ -161,6 +162,44 @@ def decode_record(d: dict) -> TraceEvent | None:
 #: ``marker_flags`` values, mirroring GITM_MARKER_START/END in cupti_core.h.
 MARKER_START, MARKER_END = 0, 1
 
+#: vLLM's ``--enable-layerwise-nvtx-tracing`` names each range with the repr of a
+_VLLM_MODULE_RE = re.compile(r"'Module':\s*'([^']*)'")
+
+
+def normalize_range_name(name: str) -> str:
+    """Rewrite a collector range name into the ``L{layer}/{op}`` form.
+
+    Passes through anything already in that form, so ranges pushed by
+    :func:`gitm.tracer.vllm_stats.instrument_model`. vLLM's own
+    instrumentation is translated through the same module-path table those hooks
+    use, which is what lets either source feed one correlation path.
+    """
+    if not name or not name.startswith("{"):
+        return name
+    m = _VLLM_MODULE_RE.search(name)
+    if not m:
+        return name
+
+    from gitm.tracer.vllm_stats import op_for_module, range_name
+
+    path = m.group(1)
+    mapped = op_for_module(path)
+    if mapped is not None:
+        return range_name(*mapped)
+
+    leaf = path.rsplit(".", 1)[-1] or path
+    layer = _LAYER_IN_PATH.search(path)
+    if layer is None:
+        return leaf
+    # The block itself: its leaf is the index, so `layers.1` would read `L1/1`.
+    # Name it for what it is — the range enclosing everything in that block.
+    if leaf == layer.group(1):
+        leaf = "layer"
+    return f"L{layer.group(1)}/{leaf}"
+
+
+_LAYER_IN_PATH = re.compile(r"(?:^|\.)layers\.(\d+)(?=\.|$)")
+
 
 def pair_markers(records: list[dict]) -> list[dict]:
     """Join NVTX push/pop halves into whole ranges.
@@ -195,7 +234,7 @@ def pair_markers(records: list[dict]) -> list[dict]:
                 continue  # end without a start: nothing to bound
             out.append({
                 "kind": "marker",
-                "name": start.get("name") or "",
+                "name": normalize_range_name(start.get("name") or ""),
                 "start_ns": int(start["timestamp_ns"]),
                 "end_ns": int(r["timestamp_ns"]),
                 "thread_id": r.get("thread_id"),

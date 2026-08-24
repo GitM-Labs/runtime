@@ -210,3 +210,102 @@ def test_an_anonymous_gemm_resolves_to_layer_and_op_through_the_full_chain():
     ])
     (kernel,) = [e for e in events if e.kind == "kernel"]
     assert (kernel.range_op, kernel.range_layer) == ("qkv_proj", 0)
+
+
+# ── vLLM's own layerwise NVTX instrumentation ───────────────────────────────
+#
+# `--enable-layerwise-nvtx-tracing` emits a range per module, named with the
+# repr of a dict rather than a bare string:
+#
+#   {'Module': 'Qwen3_5Moe...model.layers.1.mlp.experts', 'Outputs': [[7, 2048]]}
+#
+# Captured from a real H200 run. This is strictly better than instrumenting the
+# model ourselves — it runs inside EngineCore with no plugin, and it covers every
+# module rather than the ones our table happens to name. All we owe it is a
+# translation into the range vocabulary correlation already speaks.
+
+_QWEN = "Qwen3_5MoeForConditionalGeneration.language_model.model.layers"
+
+
+def _vllm_range(path: str, extra: str = "'Outputs': [[7, 2048]]") -> str:
+    return f"{{'Module': '{path}', {extra}}}"
+
+
+def test_vllm_module_paths_map_to_graph_ops():
+    from gitm.tracer._cupti_decode import normalize_range_name
+
+    assert normalize_range_name(_vllm_range(f"{_QWEN}.1.mlp.experts")) == "L1/moe_routed"
+    assert normalize_range_name(_vllm_range(f"{_QWEN}.3.self_attn.qkv_proj")) == "L3/qkv_proj"
+    assert normalize_range_name(_vllm_range(f"{_QWEN}.0.linear_attn")) == "L0/linattn_recurrent"
+
+
+def test_an_unmapped_module_keeps_its_own_name_rather_than_being_dropped():
+    """Dropping it would leave every kernel inside that module unattributed.
+    Keeping it surfaces the op as observed-but-not-predicted, which is a visible
+    gap rather than a silent one."""
+    from gitm.tracer._cupti_decode import normalize_range_name
+
+    assert normalize_range_name(_vllm_range(f"{_QWEN}.2.input_layernorm")) == "L2/input_layernorm"
+
+
+def test_the_block_range_is_named_layer_not_its_index():
+    """`layers.1` has the index as its leaf, so the naive reading is `L1/1`."""
+    from gitm.tracer._cupti_decode import normalize_range_name
+
+    assert normalize_range_name(_vllm_range(f"{_QWEN}.1")) == "L1/layer"
+
+
+def test_ranges_from_our_own_hooks_pass_through_untouched():
+    """Both instrumentation sources must feed one correlation path."""
+    from gitm.tracer._cupti_decode import normalize_range_name
+
+    assert normalize_range_name("L3/qkv_proj") == "L3/qkv_proj"
+    assert normalize_range_name("lm_head") == "lm_head"
+    assert normalize_range_name("") == ""
+
+
+def test_a_malformed_dict_name_is_left_alone():
+    from gitm.tracer._cupti_decode import normalize_range_name
+
+    assert normalize_range_name("{'Outputs': [[7, 2048]]}") == "{'Outputs': [[7, 2048]]}"
+
+
+def test_truncation_loses_the_shapes_not_the_module_path():
+    """These names run long and the collector cuts at GITM_NAME_MAX. The module
+    path arrives first, so a truncated name still identifies its op."""
+    from gitm.tracer._cupti_decode import normalize_range_name
+
+    full = _vllm_range(f"{_QWEN}.7.mlp.experts", "'Outputs': [[7, 2048]], 'Extra': [[1")
+    assert normalize_range_name(full[:120]) == "L7/moe_routed"
+
+
+def test_an_anonymous_gemm_resolves_through_vllms_own_ranges():
+    """The acceptance criterion, using vLLM's instrumentation rather than ours.
+
+    Nested exactly as the H200 capture showed: the block range encloses the mlp
+    range, which encloses experts. Innermost wins.
+    """
+    from gitm.optimizer.deviation import classify_op
+    from gitm.tracer._cupti_decode import decode_records
+
+    def mk(mid, path, t, flags=0):
+        return {"kind": "marker", "name": _vllm_range(path) if path else "",
+                "timestamp_ns": t, "marker_id": mid, "marker_flags": flags,
+                "thread_id": 7}
+
+    name = "nvjet_sm90_tst_128x8_64x12_4x1_v_bz_TNT"
+    assert classify_op(name) is None
+
+    events = decode_records([
+        mk(1, f"{_QWEN}.1", 100),
+        mk(2, f"{_QWEN}.1.mlp", 105),
+        mk(3, f"{_QWEN}.1.mlp.experts", 110),
+        {"kind": "runtime", "start_ns": 112, "end_ns": 114,
+         "correlation_id": 9, "thread_id": 7},
+        mk(3, None, 120, 1), mk(2, None, 130, 1), mk(1, None, 200, 1),
+        {"kind": "kernel", "name": name, "start_ns": 300, "end_ns": 900,
+         "device_id": 0, "context_id": 1, "stream_id": 7, "correlation_id": 9,
+         "grid": [1, 1, 1], "block": [1, 1, 1]},
+    ])
+    (kernel,) = [e for e in events if e.kind == "kernel"]
+    assert (kernel.range_op, kernel.range_layer) == ("moe_routed", 1)

@@ -230,3 +230,16 @@ def test_a_model_without_named_modules_is_not_an_error():
     from gitm.tracer.vllm_stats import instrument_model
 
     assert instrument_model(object(), push=lambda n: None, pop=lambda: None).ranges == []
+
+
+def test_vllm_spells_the_shared_expert_with_a_leading_underscore():
+    """Observed on an H200 capture: `mlp.experts._shared_experts`.
+
+    Without this the shared expert lands on an op name no predicted node carries,
+    so its time reads as unpredicted work while `moe_shared` looks like it never
+    ran — one op appearing twice, each half looking healthier than the whole.
+    """
+    from gitm.tracer.vllm_stats import op_for_module
+
+    assert op_for_module("model.layers.2.mlp.experts._shared_experts") == ("moe_shared", 2)
+    assert op_for_module("model.layers.2.mlp.shared_expert") == ("moe_shared", 2)

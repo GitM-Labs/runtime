@@ -552,7 +552,7 @@ def sample_scheduler_stats(
 
 # ── NVTX model instrumentation ──────────────────────────────────────────────
 #
-# `gitm.distributed.correlate` can resolve a kernel to an `L{layer}/{op}` 
+# `gitm.distributed.correlate` can resolve a kernel to an `L{layer}/{op}`
 # range, but only if something pushes those ranges; this is what pushes them.
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?=\.|$)")
 
@@ -580,6 +580,9 @@ _MODULE_OPS: dict[str, str] = {
     "experts": "moe_routed",
     "shared_expert": "moe_shared",
     "shared_experts": "moe_shared",
+    # vLLM 0.27 nests it as `mlp.experts._shared_experts`, with a leading _
+    "_shared_experts": "moe_shared",
+    "_shared_expert": "moe_shared",
     # dense FFN, for non-MoE checkpoints
     "gate_up_proj": "mlp_gate_up",
     "down_proj": "mlp_down",
