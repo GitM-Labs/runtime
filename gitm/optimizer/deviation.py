@@ -31,7 +31,7 @@ from gitm.tracer.schema import KernelEvent, Trace
 # substring. None = no modeled op (norms, activations, copies, launch overhead)
 # — unmodeled work, kept as departures.
 #
-# The projection GEMMs (qkv/out/gate_up/down/lm_head) only classify when the
+# The projection GEMMs (qkv/out/gate_up/gate_down/lm_head) only classify when the
 # kernel name carries a projection tag; a bare cuBLAS/cutlass GEMM (e.g.
 # `ampere_fp16_s16816gemm_*`) carries none and stays unmodeled — confirmed
 # against a real vLLM/L4/CUPTI trace, where these are ~35% of launches and
@@ -415,6 +415,16 @@ def add_deviate_arguments(ap):
     ap.add_argument("--steps", type=int, default=None,
                     help="Decode steps in the window; scales the floor so observed and "
                          "predicted are directly comparable.")
+    # ── prefill ──────────────────────────────────────────────────────────────
+    # Zero means a pure decode step, which is what every caller wanted before
+    # prefill was modelled. A step is a *chunk*, bounded by
+    # --max-num-batched-tokens (8192 by default), not by prompt length.
+    ap.add_argument("--prefill-tokens", type=int, default=0,
+                    help="Query tokens being prefilled this step. 0 = pure decode.")
+    ap.add_argument("--prefill-context", type=int, default=0,
+                    help="Context already cached before this chunk (0 for a first chunk).")
+    ap.add_argument("--prefill-requests", type=int, default=1,
+                    help="How many prompts those tokens belong to — sets lm_head rows.")
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--ep", type=int, default=1)
     ap.add_argument("--no-graph", action="store_true",
@@ -460,7 +470,10 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         try:
             g = _predict(spec, family, _hardware(args.gpu),
-                         BatchConfig(batch=args.batch, kv_cache_len=args.kv_len),
+                         BatchConfig(batch=args.batch, kv_cache_len=args.kv_len,
+                                     prefill_tokens=args.prefill_tokens,
+                                     prefill_context=args.prefill_context,
+                                     prefill_requests=args.prefill_requests),
                          ShardingConfig(tp=args.tp, ep=args.ep))
         except ValueError as e:
             print(f"cannot build a graph: {e}")

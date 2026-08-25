@@ -1324,3 +1324,159 @@ def test_head_dim_falls_back_to_the_huggingface_convention():
         "linear_value_head_dim": 64,
     }})
     assert hybrid_spec.head_dim == 128
+
+
+# ── prefill ─────────────────────────────────────────────────────────────────
+#
+# Prefill is not decode with a larger batch. Three things change in kind:
+#
+#   * attention becomes quadratic within the chunk, so its FLOPs stop tracking
+#     `rows x kv_len`;
+#   * gated DeltaNet switches algorithm entirely, from a per-token recurrent scan
+#     to a chunked matmul form that touches the state once per chunk;
+#   * only the last token of a prompt needs logits, so lm_head does not scale
+#     with the chunk at all.
+#
+# Get any of them wrong and the prediction is off by the chunk width, which at
+# 8192 tokens is three orders of magnitude.
+
+
+def _pre(P, ctx=0, reqs=1, **kw):
+    return BatchConfig(batch=0, kv_cache_len=0, prefill_tokens=P,
+                       prefill_context=ctx, prefill_requests=reqs, **kw)
+
+
+def _totals(g):
+    return (sum(n.prediction.flops for n in g.nodes),
+            sum(n.prediction.bytes for n in g.nodes))
+
+
+def test_a_default_batchconfig_is_still_a_pure_decode_step():
+    """Every existing caller predates prefill and must be unaffected."""
+    b = BatchConfig(batch=8, kv_cache_len=1024)
+    assert not b.is_prefill
+    assert b.attention_qk_pairs == 8 * 1024
+    assert b.logits_rows == 8
+
+
+def test_prefill_attention_is_quadratic_in_the_chunk():
+    """P tokens attend to prior context *and* to their own causal prefix. The
+    second term is what makes prefill compute-bound; omitting it would price an
+    8192-token chunk as if it were 8192 independent decode queries."""
+    b = _pre(8192, ctx=0)
+    assert b.attention_qk_pairs == 8192 * 8193 / 2
+
+    with_ctx = _pre(8192, ctx=4096)
+    assert with_ctx.attention_qk_pairs == 8192 * 4096 + 8192 * 8193 / 2
+
+
+def test_lm_head_charges_one_row_per_prompt_not_one_per_token():
+    """The largest overcount available here: a 248k-row vocabulary projection
+    against 8192 rows instead of 1."""
+    assert _pre(8192, reqs=1).logits_rows == 1
+    assert _pre(8192, reqs=4).logits_rows == 4
+    # A mixed step bills its decode positions too.
+    assert BatchConfig(batch=8, prefill_tokens=512, prefill_requests=2).logits_rows == 10
+
+
+def test_prefill_flips_the_step_from_memory_bound_to_compute_bound(hybrid_spec):
+    """The qualitative result. Decode reads weights to serve a handful of tokens;
+    prefill reuses each weight across the whole chunk, so arithmetic intensity
+    crosses the hardware ridge and the binding constraint changes."""
+    def bound_counts(bc):
+        g = predict_hybrid_graph(hybrid_spec, H200, bc)
+        return sum(1 for n in g.nodes if n.prediction.bound == "compute"), len(g.nodes)
+
+    dec_compute, _ = bound_counts(BatchConfig(batch=8, kv_cache_len=1024))
+    pre_compute, total = bound_counts(_pre(8192))
+    assert dec_compute == 0
+    assert pre_compute > total / 2
+
+
+def test_prefill_amortises_weight_traffic_across_the_chunk(hybrid_spec):
+    """Bytes are dominated by weights, which are read once however wide the step.
+    So 16x the tokens must cost far less than 16x the bytes."""
+    _, b512 = _totals(predict_hybrid_graph(hybrid_spec, H200, _pre(512)))
+    _, b8192 = _totals(predict_hybrid_graph(hybrid_spec, H200, _pre(8192)))
+    assert b8192 / b512 < 2.0
+
+
+def test_gdn_state_traffic_scales_with_chunks_not_tokens(hybrid_spec):
+    """The chunked delta rule touches the recurrent state once per ``GDN_CHUNK``
+    tokens, not once per token. Modelling prefill as a wide decode would
+    overstate this node's bytes 64x and make the thirty GDN layers look like a
+    bottleneck they are not — which is exactly what a first pass produced."""
+    from gitm.planner.hybrid_graph import GDN_CHUNK
+
+    def state_bytes(bc):
+        g = predict_hybrid_graph(hybrid_spec, H200, bc)
+        return sum(n.prediction.bytes for n in g.nodes if n.op == "linattn_recurrent")
+
+    b1, b2 = state_bytes(_pre(GDN_CHUNK * 8)), state_bytes(_pre(GDN_CHUNK * 16))
+    assert 1.5 < b2 / b1 < 2.5          # doubles with chunk count
+
+    # And a single chunk costs about what one decode step's state read costs.
+    one_chunk = state_bytes(_pre(GDN_CHUNK))
+    one_step = state_bytes(BatchConfig(batch=1, kv_cache_len=0))
+    assert 0.5 < one_chunk / one_step < 3.0
+
+
+def test_gdn_arithmetic_prices_against_the_activation_peak_not_the_state_dtype(
+    hybrid_spec,
+):
+    """`ssm_state_dtype` is fp32 and governs how the state is *stored*. The
+    arithmetic is tensor-core matmuls in the model dtype. Passing fp32 as the op
+    dtype selects the fp32 FLOP peak, which the SKU catalogue does not populate,
+    so it falls back to an A100's 19.5 TF/s against an H200's 989 — a 50x penalty
+    that made this node read as 57% of a prefill step instead of ~14%."""
+    g = predict_hybrid_graph(hybrid_spec, H200, _pre(8192))
+    node = next(n for n in g.nodes if n.op == "linattn_recurrent")
+    assert node.prediction.peak_flops_per_s == H200.peak_flops_bf16_per_s
+    assert not node.prediction.peak_is_fallback
+
+
+def test_a_mixed_step_costs_both_phases(hybrid_spec):
+    """Chunked prefill routinely runs both in one fused forward. Their costs are
+    additive within an op, so the graph keeps one node per op per layer and
+    residuals stay comparable with a decode-only capture."""
+    dec = predict_hybrid_graph(hybrid_spec, H200, BatchConfig(batch=8, kv_cache_len=1024))
+    mix = predict_hybrid_graph(
+        hybrid_spec, H200,
+        BatchConfig(batch=8, kv_cache_len=1024, prefill_tokens=512, prefill_requests=1),
+    )
+    assert len(mix.nodes) == len(dec.nodes)
+    assert _totals(mix)[0] > _totals(dec)[0]
+
+
+def test_per_token_cost_falls_sharply_with_chunk_width(hybrid_spec):
+    """The reason prefill is batched at all."""
+    def per_token(P):
+        return predict_hybrid_graph(hybrid_spec, H200, _pre(P)).total_pred_s / P
+
+    assert per_token(8192) < per_token(512) / 4
+
+
+def test_every_gdn_projection_scales_with_prefill_tokens(hybrid_spec):
+    """The projections and the convolution process every query token regardless
+    of phase — only the recurrent state's *algorithm* differs.
+
+    A first pass converted the recurrent node alone and left the projections on
+    `positions`, so a pure prefill step (positions == 0) gave `linattn_in_proj`
+    zero FLOPs. It showed as arithmetic intensity 0.0 and 1% of the step, when it
+    is in fact 27% and compute-bound.
+    """
+    g = predict_hybrid_graph(hybrid_spec, H200, _pre(8192))
+    for op in ("linattn_in_proj", "linattn_conv", "attn_out_proj"):
+        flops = sum(n.prediction.flops for n in g.nodes if n.op == op)
+        assert flops > 0, f"{op} has no arithmetic on a pure prefill step"
+
+
+def test_a_pure_prefill_step_reports_prefill_throughput(capsys):
+    """Dividing by a zero decode batch printed `0 tok/s at batch 0`."""
+    from gitm.planner.registry import main
+
+    main(["qwen3.6-35b-a3b", "--gpu", "H200", "--prefill-tokens", "8192",
+          "--batch", "0", "--kv-len", "0"])
+    out = capsys.readouterr().out
+    assert "prefilling 8,192 tokens" in out
+    assert "0 tok/s at batch 0" not in out

@@ -389,6 +389,9 @@ def main(argv: list[str] | None = None) -> int:
         for name, flag in (
             ("model", "--model"), ("gpu", "--gpu"), ("batch", "--batch"),
             ("kv_len", "--kv-len"), ("steps", "--steps"), ("tp", "--tp"), ("ep", "--ep"),
+            ("prefill_tokens", "--prefill-tokens"),
+            ("prefill_context", "--prefill-context"),
+            ("prefill_requests", "--prefill-requests"),
         ):
             val = getattr(args, name, None)
             if val is not None:
@@ -406,6 +409,9 @@ def main(argv: list[str] | None = None) -> int:
                 plan_argv.append("--" + ("json" if flag == "as_json" else flag))
         for name, flag in (
             ("gpu", "--gpu"), ("batch", "--batch"), ("kv_len", "--kv-len"),
+            ("prefill_tokens", "--prefill-tokens"),
+            ("prefill_context", "--prefill-context"),
+            ("prefill_requests", "--prefill-requests"),
             ("tp", "--tp"), ("ep", "--ep"), ("dp", "--dp"), ("sweep", "--sweep"),
         ):
             val = getattr(args, name, None)

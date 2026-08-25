@@ -336,3 +336,52 @@ def test_preflight_fails_closed_without_a_gpu():
     start a server that cannot possibly work."""
     dev = sc.Devices(indices=[], count=0, source="nvidia-smi unavailable")
     assert sc.check_gpus(2, dev)[0].status == "fail"
+
+
+# ── the port must be free before launching ──────────────────────────────────
+#
+# `--keep-server` makes a leftover server the expected state between captures,
+# and the failure it produces is the most confusing on this path: the new server
+# cannot bind and dies, /health answers instantly from the OLD one, every request
+# succeeds against it, and the capture arms an output path nobody is writing to.
+# The run reports success and returns an empty trace, with a warning blaming
+# CUDA-graph replay. Observed twice on a real H200 pod, ~7 minutes wasted each.
+
+
+def test_a_free_port_passes(monkeypatch):
+    from gitm.serve import discover, vllm
+
+    monkeypatch.setattr(discover, "pid_listening_on", lambda *a, **k: None)
+    (check,) = vllm.check_port_free(8000)
+    assert check.status == "pass"
+
+
+def test_an_occupied_port_fails_and_names_the_process(monkeypatch):
+    from gitm.serve import discover, vllm
+
+    monkeypatch.setattr(discover, "pid_listening_on", lambda *a, **k: 17295)
+    monkeypatch.setattr(discover, "read_cmdline",
+                        lambda *a, **k: ["vllm", "serve", "Qwen/Qwen3.6-35B-A3B"])
+    (check,) = vllm.check_port_free(8000)
+
+    assert check.status == "fail"
+    assert "17295" in check.detail
+    # The remedy has to be in the message: the symptom points at CUDA graphs, so
+    # nobody reading the failure would otherwise think to look for a live server.
+    assert "kill -INT -17295" in check.detail
+    assert "gitm capture attach" in check.detail
+
+
+def test_the_check_is_wired_into_preflight(monkeypatch):
+    from gitm.serve import discover, vllm
+
+    monkeypatch.setattr(discover, "pid_listening_on", lambda *a, **k: 999)
+    monkeypatch.setattr(discover, "read_cmdline", lambda *a, **k: ["vllm"])
+    devices = vllm.Devices(indices=[0], count=1, source="test")
+
+    names = {c.name for c in vllm.preflight([], devices, 1, skip_args=True, port=8000)}
+    assert "port" in names
+    # Omitting the port must keep the old behaviour rather than silently passing.
+    assert "port" not in {
+        c.name for c in vllm.preflight([], devices, 1, skip_args=True)
+    }
