@@ -510,7 +510,20 @@ class ShardingConfig:
 
 @dataclass(frozen=True)
 class BatchConfig:
-    """Decode batch shape — prompt length already paid; we predict per-step."""
+    """The shape of one engine step.
+
+    Defaults describe a pure decode step, which is what every caller wanted
+    before prefill was modelled. Setting ``prefill_tokens`` adds the other phase;
+    under chunked prefill a single step routinely carries both, and vLLM fuses
+    them into one forward pass, so their costs are additive within an op rather
+    than separate nodes.
+
+    The prefill fields mirror ``vllm.v1.metrics.perf.ExecutionContext``
+    deliberately. That shape was arrived at independently and its byte and FLOP
+    totals agree with this planner to 3% on a real H200 capture, so matching it
+    means a measured step can parameterise a prediction directly instead of
+    being approximated by a batch size somebody chose.
+    """
 
     batch: int = 1
     prompt_len: int = 128
@@ -521,10 +534,56 @@ class BatchConfig:
     speculative_tokens: int = 0
     acceptance_rate: float = 0.0
 
+    # --- prefill (0 => a pure decode step, i.e. previous behaviour) ----------
+    #: Query tokens being prefilled this step. Bounded by
+    #: ``--max-num-batched-tokens`` (8192 by default), not by prompt length: a
+    #: long prompt is split across steps.
+    prefill_tokens: int = 0
+    #: Sum over prefilling requests of the context already cached *before* this
+    #: chunk. Non-zero only for the second and later chunks of a split prompt.
+    prefill_context: int = 0
+    #: How many distinct requests those tokens belong to. Needed because only the
+    #: final token of a prompt needs logits — charging ``lm_head`` for every
+    #: prefill token overstates it by the chunk size, which at 8192 tokens and a
+    #: 248k vocabulary is the largest single error available to make here.
+    prefill_requests: int = 1
+
+    @property
+    def is_prefill(self) -> bool:
+        return self.prefill_tokens > 0
+
     @property
     def positions_per_step(self) -> int:
         """Sequence positions the model actually computes in one step."""
         return self.batch * (1 + max(0, self.speculative_tokens))
+
+    @property
+    def logits_rows(self) -> int:
+        """Rows the vocabulary projection actually computes.
+
+        One per prefilling request plus every decode position — vLLM's
+        ``num_logits_tokens``. A prefill chunk of 8192 tokens produces one row,
+        not 8192.
+        """
+        return (self.prefill_requests if self.is_prefill else 0) + self.positions_per_step
+
+    @property
+    def attention_qk_pairs(self) -> float:
+        """Query-key pairs the attention core evaluates this step.
+
+        Decode contributes ``batch x kv_len``: one query against the whole cache.
+
+        Prefill contributes ``P x C + P(P+1)/2``: every chunk token attends to
+        all previously cached context, plus a causal prefix within the chunk.
+        The second term is the quadratic one, and it is why prefill is compute-
+        bound where decode is memory-bound — at 8192 tokens it is 33.6M pairs
+        against a decode step's 8192.
+        """
+        pairs = float(self.positions_per_step * self.kv_cache_len)
+        if self.is_prefill:
+            p = self.prefill_tokens
+            pairs += p * self.prefill_context + p * (p + 1) / 2.0
+        return pairs
 
     @property
     def tokens_per_step(self) -> float:

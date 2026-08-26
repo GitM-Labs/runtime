@@ -263,4 +263,7 @@ def test_flags_survive_the_cli_hand_off(capsys):
                      "--kv-len", "2048", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["hardware"] == "H200"
-    assert payload["batch"] == {"batch": 4, "kv_cache_len": 2048}
+    assert payload["batch"]["batch"] == 4
+    assert payload["batch"]["kv_cache_len"] == 2048
+    # Unset prefill flags must render a pure decode step, not an implicit prefill.
+    assert payload["batch"]["prefill_tokens"] == 0

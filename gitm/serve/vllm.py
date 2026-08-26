@@ -1,11 +1,11 @@
 """Traced ``vllm serve`` run — launch the OpenAI server, drive load, keep the CUPTI trace.
 
-This is the *launch* half of vLLM kernel capture; :mod:`gitm.serve.attach` is the
+This is the launch half of vLLM kernel capture; :mod:`gitm.serve.attach` is the
 half that adopts a server someone else already started. Both end in the same
 artifacts, because the only difference between them is who owns the process.
 
 The in-process vLLM path (``gitm run --workload vllm-decode``) builds an ``LLM``
-and calls ``generate``. An OpenAI *server* is a different shape: it is a long-lived
+and calls ``generate``. An OpenAI server is a different shape: it is a long-lived
 process that must be up, warm, and past CUDA-graph capture before any measurement is
 meaningful, and the load has to arrive over HTTP. This module is that shape, reusing
 the tracer unchanged:
@@ -370,8 +370,39 @@ def check_world(tp: int, dp: int, devices: Devices) -> list[Check]:
     return [Check("world-size", "pass", f"TP={tp} x DP={dp} = {world} GPUs")]
 
 
+def check_port_free(port: int) -> list[Check]:
+    """Refuse to launch when something already holds the serving port.
+
+    ``--keep-server`` makes a leftover server the expected state between
+    captures, and the resulting failure is the most confusing this path
+    produces: the new ``vllm serve`` cannot bind and dies, ``/health`` answers
+    instantly from the **old** server, every request succeeds against it, and the
+    capture arms an output path whose collector nobody is watching. The run
+    reports success, drives real traffic, and returns an empty trace — with a
+    warning blaming CUDA-graph replay, which is the wrong lead entirely.
+
+    ``healthy after 0.0s`` is the fingerprint: a cold engine cannot become
+    healthy in under a second.
+    """
+    from gitm.serve import discover
+
+    pid = discover.pid_listening_on(port)
+    if pid is None:
+        return [Check("port", "pass", f"{port} is free")]
+    cmd = " ".join(discover.read_cmdline(pid)[:3]) or "unknown"
+    return [Check(
+        "port", "fail",
+        f"port {port} is already held by PID {pid} ({cmd}).\n"
+        f"A previous --keep-server run is still up. Its /health would answer this "
+        f"one's probe, so the capture would record nothing while the requests went "
+        f"to the old server.\n"
+        f"Stop it first:  kill -INT -{pid}\n"
+        f"Or attach to it instead:  gitm capture attach --port {port}"
+    )]
+
+
 def preflight(serve_argv: list[str], devices: Devices, tp: int,
-              *, skip_args: bool = False) -> list[Check]:
+              *, skip_args: bool = False, port: int | None = None) -> list[Check]:
     checks: list[Check] = []
     checks += check_gpus(tp, devices)
     checks += check_world(tp, resolve_dp(serve_argv), devices)
@@ -379,6 +410,8 @@ def preflight(serve_argv: list[str], devices: Devices, tp: int,
     checks += check_driver_stack()
     checks += check_injection_lib()
     checks += check_cupti_clock()
+    if port is not None:
+        checks += check_port_free(port)
     if not skip_args:
         checks += check_serve_args(serve_argv)
     return checks
@@ -640,7 +673,12 @@ def launch_and_capture(args, serve_argv: list[str] | None = None):
     print(f"==> {devices.count} GPU(s) via {devices.source} -> "
           f"TP={tp} x DP={resolve_dp(serve_argv)}")
     print("==> preflight")
-    checks = [] if args.skip_preflight else preflight(serve_argv, devices, tp, skip_args=False)
+    # The port the server will actually bind: an explicit --port in the serve
+    # command wins over this path's own flag, and checking the wrong one would
+    # pass while the real port is occupied.
+    bind_port = int(_arg_of(serve_argv, "--port") or args.port)
+    checks = ([] if args.skip_preflight
+              else preflight(serve_argv, devices, tp, skip_args=False, port=bind_port))
     print_checks(checks)
     write_preflight(out_dir, checks)
     if any(c.status == "fail" for c in checks):

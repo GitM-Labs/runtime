@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -17,6 +18,15 @@ from gitm.planner.roofline import (
 
 FULL_ATTENTION = "full_attention"
 LINEAR_ATTENTION = "linear_attention"
+
+#: Chunk width the chunked gated-delta-rule kernels tile prefill with.
+#:
+#: A kernel property, not a model property — it comes from the
+#: flash-linear-attention implementation vLLM ships, not from ``config.json`` —
+#: which is why it lives here rather than on the spec. It sets the trade the
+#: chunked form makes: arithmetic rises with C while state traffic falls by C,
+#: so a wrong value moves this node's bytes proportionally.
+GDN_CHUNK = 64
 
 
 @dataclass(frozen=True)
@@ -306,10 +316,17 @@ def _linear(rows: float, k: int, n: int, act_b: float, w_b: float) -> tuple[floa
 
 
 def _emit_full_attention(
-    add, spec: HybridMoEModelSpec, *, positions: float, sequences: int,
-    kv_len: int, tp: int, aw: float, ww: float,
+    add, spec: HybridMoEModelSpec, *, rows: float, cache_entries: float,
+    qk_pairs: float, tp: int, aw: float, ww: float,
 ) -> None:
-    """Softmax attention over a growing KV cache — the 10-layer minority."""
+    """Softmax attention over a growing KV cache — the 10-layer minority.
+
+    ``rows`` is every query token the step computes, decode positions and
+    prefill chunk together; ``qk_pairs`` is how many query-key products the core
+    evaluates, which is *not* ``rows x kv_len`` once prefill is involved (see
+    :attr:`BatchConfig.attention_qk_pairs`); ``cache_entries`` is how many cached
+    positions are read, counted once per sequence rather than once per row.
+    """
     heads = max(1, spec.n_heads // tp)
     kv_heads = max(1, spec.num_kv_heads // tp)
     gate = spec.q_dim if spec.attn_output_gate else 0
@@ -318,41 +335,42 @@ def _emit_full_attention(
     # they are one node. Splitting them would put four predicted kernels where
     # one runs and leave three permanently unmatched.
     out_width = (spec.q_dim + gate) // tp + 2 * (spec.kv_dim // max(1, tp))
-    f, b = _linear(positions, spec.hidden, out_width, aw, ww)
+    f, b = _linear(rows, spec.hidden, out_width, aw, ww)
     add("qkv_proj", f, b, spec.weight_dtype)
 
     # QK-norm plus *partial* RoPE. Only ``partial_rotary_factor`` of each head
     # rotates; charging the whole head is a 4x overcount on this family.
-    normed = positions * (heads * spec.head_dim + kv_heads * spec.head_dim)
-    roped = positions * (heads + kv_heads) * spec.rope_dim
+    normed = rows * (heads * spec.head_dim + kv_heads * spec.head_dim)
+    roped = rows * (heads + kv_heads) * spec.rope_dim
     add(
         "attn_qnorm_rope_insert",
         3.0 * normed + 6.0 * roped,
-        2.0 * normed * aw + 2.0 * roped * aw + positions * 2.0 * kv_heads
+        2.0 * normed * aw + 2.0 * roped * aw + rows * 2.0 * kv_heads
         * spec.head_dim * weight_bytes(spec.kv_dtype),
         spec.act_dtype,
     )
 
-    # The core. Traffic is the cache read: one entry per cached token per KV
-    # head, read once per *sequence* rather than once per position — which is
-    # what makes multi-position steps amortise cache traffic.
+    # The core. FLOPs follow the query-key pairs — quadratic within a prefill
+    # chunk, linear at decode. Traffic follows the cached entries read, which is
+    # what makes a wide step amortise cache reads across many queries and is the
+    # reason prefill flips this node from memory-bound to compute-bound.
     kw = weight_bytes(spec.kv_dtype)
-    qk = 2.0 * positions * heads * spec.head_dim * kv_len
-    pv = 2.0 * positions * heads * spec.head_dim * kv_len
+    qk = 2.0 * qk_pairs * heads * spec.head_dim
+    pv = 2.0 * qk_pairs * heads * spec.head_dim
     add(
         "attn_score_value",
         qk + pv,
-        sequences * kv_len * 2.0 * kv_heads * spec.head_dim * kw,
+        cache_entries * 2.0 * kv_heads * spec.head_dim * kw,
         spec.weight_dtype,
     )
 
-    f, b = _linear(positions, spec.q_dim // tp, spec.hidden, aw, ww)
+    f, b = _linear(rows, spec.q_dim // tp, spec.hidden, aw, ww)
     add("attn_out_proj", f, b, spec.weight_dtype)
 
 
 def _emit_linear_attention(
     add, spec: HybridMoEModelSpec, *, positions: float, sequences: int,
-    tp: int, aw: float, ww: float,
+    prefill_tokens: float, prefill_requests: int, tp: int, aw: float, ww: float,
 ) -> None:
     """Gated DeltaNet — the 30-layer majority, flat in context length.
 
@@ -367,10 +385,15 @@ def _emit_linear_attention(
     v = spec.linear_value_dim // tp
     sw = weight_bytes(spec.ssm_state_dtype)
 
+    # Every query token flows through the projections and the convolution,
+    # whichever phase produced it. Only the recurrent state below distinguishes
+    # them, because only its *algorithm* differs.
+    rows = positions + prefill_tokens
+
     # q, k, v and the output gate z, plus the two per-head scalars (beta, alpha)
     # that gate the delta rule. vLLM fuses these into in_proj_qkvz / in_proj_ba.
     scalars = 2 * (spec.linear_num_value_heads // max(1, tp))
-    f, b = _linear(positions, spec.hidden, q + k + 2 * v + scalars, aw, ww)
+    f, b = _linear(rows, spec.hidden, q + k + 2 * v + scalars, aw, ww)
     add("linattn_in_proj", f, b, spec.weight_dtype)
 
     # Short causal convolution. The state is ``k-1`` previous inputs per channel,
@@ -381,31 +404,65 @@ def _emit_linear_attention(
     conv_state = conv_ch * max(0, spec.linear_conv_kernel_dim - 1)
     add(
         "linattn_conv",
-        2.0 * positions * conv_ch * spec.linear_conv_kernel_dim,
-        2.0 * sequences * conv_state * sw + 2.0 * positions * conv_ch * aw,
+        2.0 * rows * conv_ch * spec.linear_conv_kernel_dim,
+        2.0 * sequences * conv_state * sw + 2.0 * rows * conv_ch * aw,
         spec.act_dtype,
         estimated=True,  # conv_dim is fitted; see HybridMoEModelSpec.conv_dim
     )
 
     # The delta-rule state update. **This is the node that makes the family
-    # different.** A ``[key_head_dim, value_head_dim]`` matrix per head is read,
-    # updated and written back every step, per sequence — and its size does not
-    # depend on how much context the sequence has accumulated. At batch 1 this is
-    # the largest single memory term in a linear layer; at large batch it scales
-    # with sequences while the MoE weight term saturates, so the two swap places.
+    # different**, and it is also the one op whose *algorithm* changes between
+    # phases rather than just its size.
+    #
+    # Decode runs the recurrent form (`fused_recurrent_gated_delta_rule`): one
+    # sequential step per token, reading and writing the whole
+    # ``[key_head_dim, value_head_dim]`` state per head per sequence. Its size
+    # does not depend on accumulated context, which is what makes this family
+    # cheap at long context.
+    #
+    # Prefill runs the *chunked* form — `chunk_scaled_dot_kkt_fwd`,
+    # `solve_tril`, `recompute_w_u`, `chunk_gated_delta_rule_fwd_h`,
+    # `chunk_fwd_o`, all of which appear in real captures. It rewrites the scan
+    # as matrix products over chunks of ``GDN_CHUNK``:
+    #
+    #   * intra-chunk: K K^T then A V, costing ``2 P C (d_k + d_v)`` per head
+    #   * inter-chunk: the state read-out and rank-C update, ``4 P d_k d_v``
+    #   * the state is touched once per *chunk*, not once per token
+    #
+    # That last point is the whole reason prefill is not simply P decode steps:
+    # state traffic falls by a factor of C (64x here). Modelling prefill as a
+    # wide decode would overstate this node's bytes by that factor and make the
+    # thirty GDN layers look like the bottleneck they are not.
     heads = max(1, spec.linear_num_value_heads // tp)
-    state_elems = heads * spec.linear_key_head_dim * spec.linear_value_head_dim
+    d_k, d_v = spec.linear_key_head_dim, spec.linear_value_head_dim
+    state_elems = heads * d_k * d_v
+
+    flops = 4.0 * positions * state_elems          # decode: per-token scan
+    # decode touches the state once per sequence; prefill once per chunk
+    state_touches = float(sequences)
+    if prefill_tokens > 0:
+        c = float(GDN_CHUNK)
+        flops += heads * (2.0 * prefill_tokens * c * (d_k + d_v)
+                          + 4.0 * prefill_tokens * d_k * d_v)
+        state_touches += prefill_requests * math.ceil(prefill_tokens / c)
+
     add(
         "linattn_recurrent",
-        # outer-product update plus the query read-out, per position per head
-        4.0 * positions * state_elems,
+        flops,
         # read the state, write it back; fp32 while the model is bf16
-        2.0 * sequences * state_elems * sw
-        + positions * (q + k + 2 * v) * aw,
-        spec.ssm_state_dtype,
+        2.0 * state_touches * state_elems * sw
+        + (positions + prefill_tokens) * (q + k + 2 * v) * aw,
+        # The *activation* dtype, not the state dtype. `ssm_state_dtype` governs
+        # how the state is stored — it is already applied to the byte term above
+        # via `sw` — but the arithmetic is tensor-core matmuls in the model
+        # dtype. Passing fp32 here selects the fp32 FLOP peak, which the SKU
+        # catalogue does not populate, so it falls back to the A100 dataclass
+        # default of 19.5 TF/s against an H200's 989. That 50x penalty made this
+        # node read as 57% of a prefill step when it is nearer 5%.
+        spec.act_dtype,
     )
 
-    f, b = _linear(positions, v, spec.hidden, aw, ww)
+    f, b = _linear(rows, v, spec.hidden, aw, ww)
     add("attn_out_proj", f, b, spec.weight_dtype)
 
 
@@ -459,6 +516,7 @@ def _emit_layer(
     sequences: int,
     kv_len: int,
     sh: ShardingConfig,
+    batch: BatchConfig,
     prefix: str = "",
 ) -> None:
     """Append one block's predicted nodes to ``g``.
@@ -468,6 +526,11 @@ def _emit_layer(
     They differ under speculative decoding, and the difference is why multi-token
     verification helps a memory-bound decode: the state is read once however many
     positions ride on it.
+
+    ``batch`` carries the prefill half of the step. Under chunked prefill one
+    step routinely runs both phases in a single fused forward, so their costs are
+    summed within each op rather than emitted as separate nodes — one node per op
+    per layer keeps residuals comparable with a decode-only capture.
     """
     aw = weight_bytes(spec.act_dtype)
     ww = weight_bytes(spec.weight_dtype)
@@ -488,17 +551,29 @@ def _emit_layer(
             )
         )
 
+    # Every query token the step pushes through the projections and the FFN:
+    # decode positions plus whatever prefill chunk rides along with them.
+    rows = positions + batch.prefill_tokens
+
     if spec.is_full_attention(layer):
+        # Cached entries read, counted once per sequence rather than once per
+        # row. Prefill re-reads its own chunk as it is written, which is why the
+        # chunk appears here as well as its prior context.
+        cache_entries = float(sequences * kv_len)
+        if batch.is_prefill:
+            cache_entries += batch.prefill_context + batch.prefill_tokens
         _emit_full_attention(
-            add, spec, positions=positions, sequences=sequences,
-            kv_len=kv_len, tp=tp, aw=aw, ww=ww,
+            add, spec, rows=rows, cache_entries=cache_entries,
+            qk_pairs=batch.attention_qk_pairs, tp=tp, aw=aw, ww=ww,
         )
     else:
         _emit_linear_attention(
-            add, spec, positions=positions, sequences=sequences, tp=tp, aw=aw, ww=ww,
+            add, spec, positions=positions, sequences=sequences,
+            prefill_tokens=batch.prefill_tokens,
+            prefill_requests=batch.prefill_requests, tp=tp, aw=aw, ww=ww,
         )
 
-    _emit_moe(add, spec, positions=positions, sh=sh, aw=aw, ww=ww)
+    _emit_moe(add, spec, positions=rows, sh=sh, aw=aw, ww=ww)
 
     if tp > 1:
         # Priced against the interconnect, not HBM. Bandwidth-only, so optimistic
@@ -511,7 +586,7 @@ def _emit_layer(
                 name, layer,
                 roofline(
                     name, 0.0,
-                    2.0 * (2.0 * (tp - 1) / tp) * positions * spec.hidden * aw,
+                    2.0 * (2.0 * (tp - 1) / tp) * rows * spec.hidden * aw,
                     link, spec.act_dtype, estimated=True,
                 ),
             )
@@ -568,6 +643,7 @@ def predict_hybrid_graph(
         _emit_layer(
             g, spec, hw, layer,
             positions=positions, sequences=sequences, kv_len=kv_len, sh=sh,
+            batch=batch,
         )
 
     if with_mtp:
@@ -578,11 +654,18 @@ def predict_hybrid_graph(
             _emit_layer(
                 g, spec, hw, spec.n_layers + i,
                 positions=sequences, sequences=sequences, kv_len=kv_len, sh=sh,
+                # The draft head runs one position per sequence and never
+                # prefills: it proposes tokens, it does not ingest a prompt.
+                batch=replace(batch, prefill_tokens=0),
             )
 
     aw = weight_bytes(spec.act_dtype)
     ww = weight_bytes(spec.weight_dtype)
-    f, b = _linear(positions, spec.hidden, spec.vocab // max(1, sh.tp), aw, ww)
+    # Only the final token of a prompt needs logits, so an 8192-token prefill
+    # chunk contributes ONE row here, not 8192. Charging every prefill token
+    # against a 248k-row vocabulary projection is the single largest overcount
+    # available on this path — it would make lm_head dominate a prefill step.
+    f, b = _linear(batch.logits_rows, spec.hidden, spec.vocab // max(1, sh.tp), aw, ww)
     g.nodes.append(
         PredictedNode("lm_head", None, roofline("lm_head", f, b, hw, spec.weight_dtype))
     )

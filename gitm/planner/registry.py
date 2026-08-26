@@ -92,6 +92,16 @@ def add_plan_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--batch", type=int, default=1, help="Sequences per decode step.")
     ap.add_argument("--kv-len", type=int, default=4096,
                     help="Tokens already cached when the step runs.")
+    # ── prefill ──────────────────────────────────────────────────────────────
+    # Zero means a pure decode step, which is what every caller wanted before
+    # prefill was modelled. A step is a *chunk*, bounded by
+    # --max-num-batched-tokens (8192 by default), not by prompt length.
+    ap.add_argument("--prefill-tokens", type=int, default=0,
+                    help="Query tokens being prefilled this step. 0 = pure decode.")
+    ap.add_argument("--prefill-context", type=int, default=0,
+                    help="Context already cached before this chunk (0 for a first chunk).")
+    ap.add_argument("--prefill-requests", type=int, default=1,
+                    help="How many prompts those tokens belong to — sets lm_head rows.")
     ap.add_argument("--tp", type=int, default=1, help="Tensor-parallel size.")
     ap.add_argument("--ep", type=int, default=1, help="Expert-parallel size.")
     ap.add_argument("--dp", type=int, default=1, help="Data-parallel size.")
@@ -193,8 +203,12 @@ def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
     n_compute = sum(1 for n in g.nodes if n.prediction.bound == "compute")
     out += [
         "",
-        f"  floor {total * 1e3:.3f} ms/step   "
-        f"{g.batch.batch / total:,.0f} tok/s at batch {g.batch.batch}",
+        f"  floor {total * 1e3:.3f} ms/step   " + (
+            f"{g.batch.prefill_tokens / total:,.0f} tok/s "
+            f"prefilling {g.batch.prefill_tokens:,} tokens"
+            if g.batch.is_prefill
+            else f"{g.batch.batch / total:,.0f} tok/s at batch {g.batch.batch}"
+        ),
         f"  {len(g.nodes)} nodes, {n_compute} compute-bound",
     ]
     if g.has_unpriced_collectives:
@@ -269,7 +283,11 @@ def main(argv: list[str] | None = None) -> int:
                   f"{b / g.total_pred_s:12,.0f} {cb:9d}/{len(g.nodes)}")
         return 0
 
-    batch = BatchConfig(batch=args.batch, kv_cache_len=args.kv_len)
+    batch = BatchConfig(
+        batch=args.batch, kv_cache_len=args.kv_len,
+        prefill_tokens=args.prefill_tokens, prefill_context=args.prefill_context,
+        prefill_requests=args.prefill_requests,
+    )
     try:
         g = _predict(spec, family, hw, batch, sharding)
     except ValueError as e:
@@ -282,7 +300,10 @@ def main(argv: list[str] | None = None) -> int:
             "family": family,
             "hardware": hw.name,
             "sharding": {"tp": args.tp, "ep": args.ep, "dp": args.dp},
-            "batch": {"batch": args.batch, "kv_cache_len": args.kv_len},
+            "batch": {"batch": args.batch, "kv_cache_len": args.kv_len,
+                      "prefill_tokens": args.prefill_tokens,
+                      "prefill_context": args.prefill_context,
+                      "prefill_requests": args.prefill_requests},
             "total_pred_s": g.total_pred_s,
             "has_unpriced_collectives": g.has_unpriced_collectives,
             "has_fallback_peaks": g.has_fallback_peaks,
