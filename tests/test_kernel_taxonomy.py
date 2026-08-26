@@ -444,3 +444,42 @@ def test_a_short_needle_is_not_assumed_to_prefix_its_longer_form():
     explicit long form fails here rather than on a pod."""
     assert "linear_attn" not in "vllm::linear_attention"
     assert "sample" not in "TopKTopPSamplingFromProbKernel".lower()
+
+
+# ── torch.compile / Inductor kernels ────────────────────────────────────────
+#
+# A vocabulary that exists only under compilation, so it is absent from every
+# eager capture and then arrives all at once. On an H200 graph-mode run it was
+# 1.4% of device time sitting in `other`, which had been empty in all four
+# preceding eager captures.
+#
+# `poi` is pointwise, `red` is a reduction. Inductor names a kernel after the ops
+# it fused when it can — `mul_sigmoid_view` is legible — and gives it a serial
+# number when it cannot.
+
+
+@pytest.mark.parametrize("name", [
+    "triton_poi_fused_5",
+    "triton_poi_fused_2",
+    "triton_red_fused_3",
+    "batch_memcpy_kernel",
+    "_ZN2at6native40_GLOBAL__N__f1f992fe_8_Shape_cu30CatArrayBatchedCopy",
+])
+def test_inductor_and_copy_kernels_are_elementwise(name):
+    assert classify_kernel(name) == "elementwise"
+
+
+def test_a_fused_gate_is_an_activation():
+    """`triton_poi_fused_mul_sigmoid_*` is x*sigmoid(x) — SiLU in the MLP, and
+    the output gate in a GDN layer. Indistinguishable by name; both are gated
+    activations, so the coarse bucket is right either way."""
+    assert classify_kernel("triton_poi_fused_mul_sigmoid_view_0") == "activation"
+
+
+def test_an_anonymous_reduction_is_not_guessed_to_be_a_norm():
+    """`triton_red_fused_3` could be an RMSNorm or a plain sum. Filing it as
+    `norm` would inflate a bucket that gets trusted; `elementwise` is the honest
+    answer, and correlation is the only thing that can do better."""
+    assert classify_kernel("triton_red_fused_3") == "elementwise"
+    # A norm that still names itself is unaffected.
+    assert classify_kernel("layer_norm_fwd_kernel") == "norm"

@@ -331,6 +331,76 @@ def stream_observed(path: str | Path) -> tuple[dict[str, list], int, int, int]:
     return per_op, n, total, span
 
 
+def stream_by_phase(path: str | Path) -> dict[str, dict[str, list]]:
+    """``{phase: {op: [count, ns]}}`` for a trace, streamed.
+
+    ``phase`` is ``"prefill"``, ``"decode"`` or ``"unknown"``. The last is the
+    majority on a real capture — MoE, the GEMMs, norms and elementwise work run
+    identical kernels in both phases, and that is roughly three quarters of
+    device time. Reporting it as its own column is the point: a split that
+    quietly folded it into one side would misattribute most of the trace.
+    """
+    import json
+
+    from gitm.tracer.kernel_taxonomy import classify_phase
+
+    out: dict[str, dict[str, list]] = {}
+    op_cache: dict[str, str | None] = {}
+    ph_cache: dict[str, str | None] = {}
+
+    with Path(path).open(encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("kind") != "kernel":
+                continue
+            start, end = d.get("start_ns"), d.get("end_ns")
+            if start is None or end is None:
+                continue
+            name = d.get("name") or ""
+            if name not in ph_cache:
+                ph_cache[name] = classify_phase(name)
+                op_cache[name] = classify_op(name)
+            phase = ph_cache[name] or "unknown"
+            op = d.get("range_op") or op_cache[name] or "<unmodeled>"
+            slot = out.setdefault(phase, {}).setdefault(op, [0, 0])
+            slot[0] += 1
+            slot[1] += max(0, end - start)
+    return out
+
+
+def render_by_phase(by_phase: dict[str, dict[str, list]]) -> str:
+    """Prefill and decode side by side, with the unattributable remainder named."""
+    totals = {ph: sum(v[1] for v in ops.values()) for ph, ops in by_phase.items()}
+    grand = sum(totals.values()) or 1
+
+    out = [f"  {'phase':9s} {'ms':>10s} {'share':>7s} {'kernels':>11s}"]
+    for ph in ("prefill", "decode", "unknown"):
+        if ph not in totals:
+            continue
+        n = sum(v[0] for v in by_phase[ph].values())
+        out.append(f"  {ph:9s} {totals[ph] / 1e6:10.1f} {totals[ph] / grand:7.1%} {n:11,}")
+
+    for ph in ("prefill", "decode"):
+        ops = by_phase.get(ph)
+        if not ops:
+            continue
+        out.append(f"\n  {ph} ops")
+        for op, (n, ns) in sorted(ops.items(), key=lambda kv: -kv[1][1])[:8]:
+            out.append(f"    {op:24s} {ns / 1e6:9.1f} ms {n:10,}")
+
+    if "unknown" in totals:
+        out.append(
+            f"\n  {totals['unknown'] / grand:.0%} of device time runs identical kernels in "
+            "both phases\n  (MoE, GEMMs, norms, elementwise) and cannot be split by name. "
+            "Splitting it\n  needs the per-range tensor shapes vLLM's NVTX carries, which "
+            "requires --enforce-eager."
+        )
+    return "\n".join(out)
+
+
 def predicted_per_op(graph: Graph) -> dict[str, float]:
     """Predicted seconds per op, summed over layers — the shape ``stream_observed``
     produces, so the two can be differenced directly."""
@@ -429,6 +499,9 @@ def add_deviate_arguments(ap):
     ap.add_argument("--ep", type=int, default=1)
     ap.add_argument("--no-graph", action="store_true",
                     help="Report observed op totals only, with no prediction.")
+    ap.add_argument("--by-phase", dest="by_phase", action="store_true",
+                    help="Split kernels into prefill and decode instead of comparing "
+                         "against a predicted floor.")
     ap.add_argument("--json", dest="as_json", action="store_true")
     return ap
 
@@ -448,8 +521,14 @@ def main(argv: list[str] | None = None) -> int:
     if not args.trace.is_file():
         print(f"cannot read trace: {args.trace}")
         return 2
-    if not args.model and not args.no_graph:
-        ap.error("--model is required unless --no-graph")
+    # --by-phase reports what ran, not how it compares to a floor, so it needs no
+    # model — and requiring one would make the cheapest view the most awkward.
+    if not args.model and not args.no_graph and not args.by_phase:
+        ap.error("--model is required unless --no-graph or --by-phase")
+
+    if args.by_phase:
+        print(render_by_phase(stream_by_phase(args.trace)))
+        return 0
 
     per_op, n_kernels, total_ns, span_ns = stream_observed(args.trace)
     if not n_kernels:

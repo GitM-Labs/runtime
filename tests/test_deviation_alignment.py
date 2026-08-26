@@ -414,3 +414,88 @@ def test_every_needle_is_reachable():
             if classify_op(f"kernel_{needle}_fwd") != op:
                 unreachable.append((op, needle, classify_op(f"kernel_{needle}_fwd")))
     assert unreachable == [], f"needles shadowed by an earlier entry: {unreachable}"
+
+
+# ── prefill vs decode ───────────────────────────────────────────────────────
+#
+# The two phases run *different kernels* for the ops whose algorithm differs, and
+# identical kernels for everything else. So a name splits some of a trace and
+# none of the rest, and the report has to say which — on a real H200 capture the
+# unsplittable majority is about three quarters of device time.
+
+
+def test_the_gdn_convolution_names_its_own_phase():
+    """`_fwd` processes a whole sequence, `_update` one token. The cleanest
+    discriminator available, and it survives backend changes because it is the
+    same kernel family either way."""
+    from gitm.tracer.kernel_taxonomy import classify_phase
+
+    assert classify_phase("_causal_conv1d_fwd_kernel") == "prefill"
+    assert classify_phase("_causal_conv1d_update_kernel") == "decode"
+
+
+def test_both_gdn_prefill_backends_are_recognised():
+    """vLLM picks per SKU: the FlashInfer CuTeDSL kernel on this H200, the Triton
+    `chunk_*` family elsewhere. Listing only one silently drops prefill on the
+    other machine — which is exactly what a first pass did, reporting zero
+    prefill kernels on a trace that plainly contained them."""
+    from gitm.tracer.kernel_taxonomy import classify_phase
+
+    assert classify_phase(
+        "kernel_cutlass_flashinfergdn_delta_rule_sm90_FullyFusedDeltaRuleSm90_obj"
+    ) == "prefill"
+    assert classify_phase("chunk_gated_delta_rule_fwd_kernel_h_blockdim64") == "prefill"
+    assert classify_phase("solve_tril_16x16_kernel") == "prefill"
+
+
+def test_flashinfer_ships_separate_prefill_and_decode_attention():
+    from gitm.tracer.kernel_taxonomy import classify_phase
+
+    assert classify_phase("flashinfer::BatchPrefillWithPagedKVCacheKernel") == "prefill"
+    assert classify_phase("flashinfer::BatchDecodeWithPagedKVCacheKernel") == "decode"
+
+
+def test_the_recurrent_decode_kernel_is_not_claimed_by_a_prefill_needle():
+    """`fused_recurrent_gated_delta_rule_packed_decode_kernel` contains
+    `delta_rule`, which the chunked prefill needles are close to. Decode is
+    tested first for exactly this reason."""
+    from gitm.tracer.kernel_taxonomy import classify_phase
+
+    assert classify_phase(
+        "fused_recurrent_gated_delta_rule_packed_decode_kernel"
+    ) == "decode"
+
+
+def test_shared_kernels_report_no_phase_rather_than_a_guess():
+    """MoE and the GEMMs are byte-identical in both phases. Attributing them to
+    either side would misattribute the majority of a trace."""
+    from gitm.tracer.kernel_taxonomy import classify_phase
+
+    assert classify_phase("fused_moe_kernel") is None
+    assert classify_phase("nvjet_sm90_tst_128x8_64x12_4x1_v_bz_TNT") is None
+    assert classify_phase("") is None
+
+
+def test_by_phase_reports_the_share_it_cannot_split(tmp_path, capsys):
+    from gitm.optimizer.deviation import main
+
+    p = _write_trace(tmp_path / "t.jsonl", [
+        ("_causal_conv1d_fwd_kernel", 20_000, 4),
+        ("_causal_conv1d_update_kernel", 3_000, 300),
+        ("fused_moe_kernel", 27_000, 400),
+    ])
+    assert main([str(p), "--by-phase"]) == 0
+    out = capsys.readouterr().out
+
+    assert "prefill" in out and "decode" in out and "unknown" in out
+    # The unsplittable share must be stated, not folded into one side.
+    assert "cannot be split by name" in out
+
+
+def test_by_phase_needs_no_predicted_graph(tmp_path):
+    """It reports what ran, not how it compares to a floor. Requiring --model
+    would make the cheapest view the most awkward to reach."""
+    from gitm.optimizer.deviation import main
+
+    p = _write_trace(tmp_path / "t.jsonl", [("_causal_conv1d_fwd_kernel", 1000, 2)])
+    assert main([str(p), "--by-phase"]) == 0
