@@ -487,9 +487,12 @@ def test_by_phase_reports_the_share_it_cannot_split(tmp_path, capsys):
     assert main([str(p), "--by-phase"]) == 0
     out = capsys.readouterr().out
 
-    assert "prefill" in out and "decode" in out and "unknown" in out
-    # The unsplittable share must be stated, not folded into one side.
-    assert "cannot be split by name" in out
+    assert "prefill" in out and "decode" in out
+    # Kernels that name no phase inherit one from their neighbours, so nothing is
+    # left unattributed — but the report must say how much of the split is
+    # inference rather than presenting it as measured.
+    assert "phase named by the kernel itself" in out
+    assert "inferred from the nearest anchor" in out
 
 
 def test_by_phase_needs_no_predicted_graph(tmp_path):
@@ -499,3 +502,103 @@ def test_by_phase_needs_no_predicted_graph(tmp_path):
 
     p = _write_trace(tmp_path / "t.jsonl", [("_causal_conv1d_fwd_kernel", 1000, 2)])
     assert main([str(p), "--by-phase"]) == 0
+
+
+# ── phase propagation ───────────────────────────────────────────────────────
+#
+# Only ~23% of a real capture names its own phase. The rest — MoE, GEMMs, norms,
+# elementwise — is byte-identical in both. But kernels execute in time order and
+# gated DeltaNet runs in 30 of Qwen3.6's 40 layers, so kernels that DO name a
+# phase land every few microseconds. An untagged kernel between two that agree
+# was launched by the same engine step.
+#
+# The assumption fails where a step genuinely mixes phases, which chunked prefill
+# does routinely. That is why the gap statistic is reported rather than assumed:
+# microseconds means same step, milliseconds means the inference jumped one.
+
+
+def _interleaved(path, steps, prefill=False):
+    """A trace shaped like a real one: each step emits its layers in order."""
+    import json
+
+    gdn = "_causal_conv1d_fwd_kernel" if prefill else "_causal_conv1d_update_kernel"
+    with open(path, "w", encoding="utf-8") as fh:
+        t = 0
+        for _ in range(steps):
+            for name, dur in ((gdn, 300), ("fused_moe_kernel", 2000),
+                              ("nvjet_sm90_tst_128x8_TNT", 400)):
+                fh.write(json.dumps({
+                    "kind": "kernel", "name": name, "start_ns": t, "end_ns": t + dur,
+                    "stream_id": 7, "device_id": 0,
+                }) + "\n")
+                t += dur + 100
+    return path
+
+
+def test_untagged_kernels_inherit_the_phase_of_their_neighbours(tmp_path):
+    from gitm.optimizer.deviation import stream_by_phase
+
+    by_phase, stats = stream_by_phase(_interleaved(tmp_path / "d.jsonl", 40))
+    assert set(by_phase) == {"decode"}
+    assert "moe" in by_phase["decode"]      # named no phase, inherited one
+    assert "gemm" in by_phase["decode"]
+    assert stats["n_unknown"] == 0
+    assert stats["n_inferred"] > stats["n_direct"]
+
+
+def test_the_gap_statistic_says_whether_to_believe_the_inference(tmp_path):
+    """Interleaved kernels sit microseconds from an anchor. Kernels batched by
+    name — or a step that genuinely mixed phases — sit milliseconds away, and the
+    report has to distinguish those rather than presenting both as equal."""
+    from gitm.optimizer.deviation import stream_by_phase
+
+    _, tight = stream_by_phase(_interleaved(tmp_path / "tight.jsonl", 40))
+    assert tight["gap_max_ns"] < 100_000          # under 100 us: same step
+
+    _, loose = stream_by_phase(_write_trace(tmp_path / "loose.jsonl", [
+        ("_causal_conv1d_update_kernel", 300, 2),
+        ("fused_moe_kernel", 2_000_000, 40),      # a long contiguous run
+    ]))
+    assert loose["gap_max_ns"] > 1_000_000        # over 1 ms: crossed a boundary
+
+
+def test_a_kernel_that_names_its_phase_is_never_overridden_by_inference(tmp_path):
+    """Direct evidence outranks a neighbour. A prefill conv surrounded by decode
+    kernels stays prefill — that is what a mixed step looks like."""
+    from gitm.optimizer.deviation import stream_by_phase
+
+    p = _write_trace(tmp_path / "m.jsonl", [
+        ("_causal_conv1d_update_kernel", 300, 5),
+        ("_causal_conv1d_fwd_kernel", 300, 1),
+        ("_causal_conv1d_update_kernel", 300, 5),
+    ])
+    by_phase, stats = stream_by_phase(p)
+    assert by_phase["prefill"]["linear_attn"][0] == 1
+    assert by_phase["decode"]["linear_attn"][0] == 10
+    assert stats["n_inferred"] == 0
+
+
+def test_propagation_can_be_turned_off(tmp_path):
+    from gitm.optimizer.deviation import stream_by_phase
+
+    by_phase, stats = stream_by_phase(
+        _interleaved(tmp_path / "d.jsonl", 10), propagate=False
+    )
+    assert "unknown" in by_phase
+    assert stats["n_inferred"] == 0
+
+
+def test_anchors_are_found_whatever_the_json_spacing(tmp_path):
+    """`json.dumps` spaces after the colon, pydantic does not. A prefilter that
+    matched only one spelling found zero anchors and silently disabled
+    propagation — no error, just every kernel reported as unknown."""
+    import json
+
+    from gitm.optimizer.deviation import phase_anchors
+
+    p = tmp_path / "spaced.jsonl"
+    p.write_text(json.dumps({
+        "kind": "kernel", "name": "_causal_conv1d_update_kernel",
+        "start_ns": 1, "end_ns": 2,
+    }) + "\n")
+    assert len(phase_anchors(p)) == 1

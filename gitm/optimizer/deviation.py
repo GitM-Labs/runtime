@@ -331,22 +331,76 @@ def stream_observed(path: str | Path) -> tuple[dict[str, list], int, int, int]:
     return per_op, n, total, span
 
 
-def stream_by_phase(path: str | Path) -> dict[str, dict[str, list]]:
-    """``{phase: {op: [count, ns]}}`` for a trace, streamed.
+def phase_anchors(path: str | Path) -> list[tuple[int, str]]:
+    """``[(start_ns, phase)]`` for every kernel that names its own phase, sorted.
 
-    ``phase`` is ``"prefill"``, ``"decode"`` or ``"unknown"``. The last is the
-    majority on a real capture — MoE, the GEMMs, norms and elementwise work run
-    identical kernels in both phases, and that is roughly three quarters of
-    device time. Reporting it as its own column is the point: a split that
-    quietly folded it into one side would misattribute most of the trace.
+    These are the fixed points the rest of the timeline is inferred from. Gated
+    DeltaNet runs in 30 of Qwen3.6's 40 layers and its kernels differ by phase,
+    so anchors land every few microseconds — dense enough that most untagged
+    kernels sit between two that agree.
     """
     import json
 
     from gitm.tracer.kernel_taxonomy import classify_phase
 
-    out: dict[str, dict[str, list]] = {}
-    op_cache: dict[str, str | None] = {}
+    cache: dict[str, str | None] = {}
+    out: list[tuple[int, str]] = []
+    with Path(path).open(encoding="utf-8") as fh:
+        for line in fh:
+            # Cheap reject before paying for json.loads. Deliberately not
+            # '"kind":"kernel"' — pydantic writes compact JSON but json.dumps
+            # spaces after the colon, and a prefilter that silently matches only
+            # one spelling finds zero anchors and disables propagation without
+            # any error.
+            if '"kernel"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            name, start = d.get("name") or "", d.get("start_ns")
+            if start is None:
+                continue
+            if name not in cache:
+                cache[name] = classify_phase(name)
+            if cache[name]:
+                out.append((int(start), cache[name]))
+    out.sort()
+    return out
+
+
+def stream_by_phase(path: str | Path, *, propagate: bool = True):
+    """``(by_phase, stats)`` — kernels bucketed by phase and taxonomy.
+
+    ``by_phase`` is ``{phase: {bucket: [count, ns]}}``. ``stats`` reports how the
+    phase was decided, which is the part that governs how much to trust it.
+
+    Only some kernels name their phase; MoE, the GEMMs, norms and elementwise
+    work are byte-identical in both and are roughly three quarters of device
+    time. With ``propagate`` those inherit the phase of the nearest kernel that
+    *does* name one, on the reasoning that kernels adjacent in time belong to the
+    same engine step.
+
+    The assumption fails where a step genuinely mixes phases — chunked prefill
+    schedules a prefill chunk alongside decode requests — so ``stats`` carries
+    the median and worst distance to an anchor. A few microseconds means the
+    neighbours are in the same step; milliseconds means the inference spans a
+    step boundary and should not be believed.
+    """
+    import bisect
+    import json
+    import statistics
+
+    from gitm.tracer.kernel_taxonomy import classify_kernel, classify_phase
+
+    anchors = phase_anchors(path) if propagate else []
+    times = [a[0] for a in anchors]
+
+    by_phase: dict[str, dict[str, list]] = {}
     ph_cache: dict[str, str | None] = {}
+    bk_cache: dict[str, str] = {}
+    gaps: list[int] = []
+    n_direct = n_inferred = n_unknown = 0
 
     with Path(path).open(encoding="utf-8") as fh:
         for line in fh:
@@ -362,18 +416,40 @@ def stream_by_phase(path: str | Path) -> dict[str, dict[str, list]]:
             name = d.get("name") or ""
             if name not in ph_cache:
                 ph_cache[name] = classify_phase(name)
-                op_cache[name] = classify_op(name)
-            phase = ph_cache[name] or "unknown"
-            op = d.get("range_op") or op_cache[name] or "<unmodeled>"
-            slot = out.setdefault(phase, {}).setdefault(op, [0, 0])
+                bk_cache[name] = classify_kernel(name)
+
+            phase = ph_cache[name]
+            if phase is not None:
+                n_direct += 1
+            elif times:
+                i = bisect.bisect_left(times, start)
+                cands = [j for j in (i - 1, i) if 0 <= j < len(times)]
+                j = min(cands, key=lambda j: abs(times[j] - start))
+                phase = anchors[j][1]
+                gaps.append(abs(times[j] - start))
+                n_inferred += 1
+            else:
+                phase = "unknown"
+                n_unknown += 1
+
+            slot = by_phase.setdefault(phase, {}).setdefault(bk_cache[name], [0, 0])
             slot[0] += 1
             slot[1] += max(0, end - start)
-    return out
+
+    stats = {
+        "n_direct": n_direct,
+        "n_inferred": n_inferred,
+        "n_unknown": n_unknown,
+        "n_anchors": len(anchors),
+        "gap_median_ns": int(statistics.median(gaps)) if gaps else 0,
+        "gap_max_ns": max(gaps) if gaps else 0,
+    }
+    return by_phase, stats
 
 
-def render_by_phase(by_phase: dict[str, dict[str, list]]) -> str:
-    """Prefill and decode side by side, with the unattributable remainder named."""
-    totals = {ph: sum(v[1] for v in ops.values()) for ph, ops in by_phase.items()}
+def render_by_phase(by_phase, stats) -> str:
+    """Prefill and decode side by side, bucketed, with the inference qualified."""
+    totals = {ph: sum(v[1] for v in b.values()) for ph, b in by_phase.items()}
     grand = sum(totals.values()) or 1
 
     out = [f"  {'phase':9s} {'ms':>10s} {'share':>7s} {'kernels':>11s}"]
@@ -383,20 +459,31 @@ def render_by_phase(by_phase: dict[str, dict[str, list]]) -> str:
         n = sum(v[0] for v in by_phase[ph].values())
         out.append(f"  {ph:9s} {totals[ph] / 1e6:10.1f} {totals[ph] / grand:7.1%} {n:11,}")
 
-    for ph in ("prefill", "decode"):
-        ops = by_phase.get(ph)
-        if not ops:
+    for ph in ("prefill", "decode", "unknown"):
+        buckets = by_phase.get(ph)
+        if not buckets:
             continue
-        out.append(f"\n  {ph} ops")
-        for op, (n, ns) in sorted(ops.items(), key=lambda kv: -kv[1][1])[:8]:
-            out.append(f"    {op:24s} {ns / 1e6:9.1f} ms {n:10,}")
+        out.append(f"\n  {ph}")
+        sub = totals[ph] or 1
+        for bk, (n, ns) in sorted(buckets.items(), key=lambda kv: -kv[1][1]):
+            out.append(f"    {bk:14s} {ns / 1e6:9.1f} ms {ns / sub:7.1%} {n:10,}")
 
-    if "unknown" in totals:
+    total_k = stats["n_direct"] + stats["n_inferred"] + stats["n_unknown"]
+    if total_k:
         out.append(
-            f"\n  {totals['unknown'] / grand:.0%} of device time runs identical kernels in "
-            "both phases\n  (MoE, GEMMs, norms, elementwise) and cannot be split by name. "
-            "Splitting it\n  needs the per-range tensor shapes vLLM's NVTX carries, which "
-            "requires --enforce-eager."
+            f"\n  phase named by the kernel itself: {stats['n_direct'] / total_k:.1%} "
+            f"({stats['n_anchors']:,} anchors)"
+        )
+    if stats["n_inferred"]:
+        out.append(
+            f"  inferred from the nearest anchor:  {stats['n_inferred'] / total_k:.1%}, "
+            f"median gap {stats['gap_median_ns'] / 1e3:.1f} us, "
+            f"worst {stats['gap_max_ns'] / 1e6:.2f} ms"
+        )
+        out.append(
+            "    A gap of microseconds means the neighbour is in the same engine step.\n"
+            "    Milliseconds means the inference crossed a step boundary — under chunked\n"
+            "    prefill a single step mixes both phases, and no name can separate those."
         )
     return "\n".join(out)
 
@@ -527,7 +614,7 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--model is required unless --no-graph or --by-phase")
 
     if args.by_phase:
-        print(render_by_phase(stream_by_phase(args.trace)))
+        print(render_by_phase(*stream_by_phase(args.trace)))
         return 0
 
     per_op, n_kernels, total_ns, span_ns = stream_observed(args.trace)
