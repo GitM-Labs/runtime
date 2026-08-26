@@ -4,7 +4,7 @@ The native shim (``gitm/tracer/_cupti/cupti_shim.c``) does the unsafe work —
 buffer management, walking records with ``cuptiActivityGetNextRecord``, reading
 fields off the real CUPTI structs (layout resolved by the compiler against the
 installed ``cupti_activity.h``, never hand-guessed). It hands Python a flat list
-of plain dicts. *This* module turns those dicts into validated
+of plain dicts. This module turns those dicts into validated
 :class:`~gitm.tracer.schema.KernelEvent` / ``MemcpyEvent`` / ``SyncEvent``.
 
 Keeping the boundary at dicts means all the interpretation logic — enum

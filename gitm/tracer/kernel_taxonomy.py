@@ -123,7 +123,12 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("norm", ("rms_norm", "rmsnorm", "layer_norm", "layernorm", "fused_add_rms",
               "l2norm", "l2_norm")),
     ("rope", ("rope", "rotary")),
-    ("activation", ("silu", "gelu", "swiglu", "act_and_mul", "relu")),
+    # "sigmoid" catches Inductor's fused gates — `triton_poi_fused_mul_sigmoid_*`
+    # is x*sigmoid(x), which is SiLU in the MLP and the output gate in a GDN
+    # layer. The two are indistinguishable by name; both are gated activations,
+    # so the coarse bucket is right either way and the distinction, if it is ever
+    # needed, has to come from correlation.
+    ("activation", ("silu", "gelu", "swiglu", "act_and_mul", "relu", "sigmoid")),
     # "sampling" and the unpunctuated "topk"/"topp" are load-bearing: FlashInfer
     # names its sampler `TopKTopPSamplingFromProbKernel`, and neither "sample"
     # (not a substring of "sampling") nor "top_k" (not a substring of "TopKTopP")
@@ -133,9 +138,20 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # loose needles here cannot reach it.
     ("sampling", ("sample", "sampling", "argmax", "top_k", "top_p", "topk", "topp",
                   "softmax", "penalt", "logits", "logprob", "multinomial", "gumbel")),
+    # Inductor kernels appear only under torch.compile, so they are absent from
+    # every eager capture and then arrive as a whole new vocabulary. `poi` is
+    # pointwise and `red` is a reduction; both are generic by construction.
+    #
+    # `triton_red_*` is deliberately filed here rather than under `norm`. A
+    # reduction with no op list in its name could be an RMSNorm or a plain sum,
+    # and guessing would inflate a bucket that gets trusted. Like the bare
+    # cuBLAS GEMMs, these carry no semantic content and are only resolvable by
+    # correlation — which is the argument for learning the mapping eagerly and
+    # applying it to compiled traces.
     ("elementwise", ("elementwise", "vectorized", "fill", "copy", "cat_", "concat",
                      "index", "transpose", "gather", "scatter", "reduce", "cast",
-                     "arange", "zero", "memset", "unrolled")),
+                     "arange", "zero", "memset", "unrolled",
+                     "triton_poi", "triton_red", "memcpy", "catarray")),
 )
 
 
@@ -148,6 +164,51 @@ def classify_kernel(name: str) -> str:
         if any(k in n for k in needles):
             return bucket
     return "other"
+
+
+# ── phase ───────────────────────────────────────────────────────────────────
+#
+# Prefill and decode run *different kernels* for the ops whose algorithm differs
+# between them, and identical kernels for everything else. So a name tells you
+# the phase for some of a trace and nothing for the rest, and the split has to
+# report its own coverage rather than silently attributing the remainder.
+#
+# What names the phase:
+#
+#   * the gated-DeltaNet convolution, which spells it out: `_fwd` for a whole
+#     sequence, `_update` for one token;
+#   * the delta rule itself — a per-token recurrent scan at decode, a chunked
+#     matmul form at prefill. Which prefill kernel appears depends on the
+#     backend: `_FullyFusedDeltaRuleSm90` on the FlashInfer GDN path, the Triton
+#     `chunk_*` family otherwise. Both are listed because vLLM picks per SKU.
+#   * FlashInfer attention, which ships separate BatchPrefill and BatchDecode
+#     entry points.
+#
+# What does not: every MoE kernel, every GEMM, every norm and elementwise op.
+# On a real H200 capture that is roughly three quarters of device time, so
+# `unknown` is the honest majority and not a defect to tune away.
+_PHASE_DECODE = (
+    "causal_conv1d_update", "fused_recurrent", "batchdecode", "_decode_kernel",
+)
+_PHASE_PREFILL = (
+    "causal_conv1d_fwd", "post_conv", "fullyfuseddeltarule", "deltarulesm",
+    "chunk_scaled_dot", "solve_tril", "recompute_w_u", "chunk_fwd", "chunk_gated",
+    "batchprefill",
+)
+
+
+def classify_phase(name: str) -> str | None:
+    """``"prefill"`` | ``"decode"``, or ``None`` when the name does not say.
+
+    Decode is tested first: its needles are the more specific of the two, and
+    `causal_conv1d_update` must not be claimed by a looser prefill rule.
+    """
+    n = (name or "").lower()
+    if any(k in n for k in _PHASE_DECODE):
+        return "decode"
+    if any(k in n for k in _PHASE_PREFILL):
+        return "prefill"
+    return None
 
 
 @dataclass
@@ -187,9 +248,17 @@ class KernelBreakdown:
         out: list[str] = []
         if self.n_kernels == 0:
             out.append(
-                "no positive-duration kernels captured. The usual cause is decode running as "
-                "CUDA-graph replay that this CUPTI does not attribute — re-run with "
-                "--enforce-eager to confirm."
+                "no positive-duration kernels captured. Check the injection "
+                "environment first: CUDA_INJECTION64_PATH must be set before the "
+                "traced process starts CUDA, and the arm marker must exist while "
+                "the window is open. A server left up from a previous run is the "
+                "common cause — the requests go to it while this capture arms a "
+                "path nobody is writing to.\n"
+                "NOT CUDA-graph replay: CUPTI records graph-launched kernels and "
+                "tags them with graphId. Measured on an H200, an identical "
+                "workload produced 165k kernels under full CUDA graphs against "
+                "397k in eager mode — fewer because Inductor fuses them, not "
+                "because they went unrecorded."
             )
             if self.n_invalid_duration:
                 out.append(
@@ -214,10 +283,12 @@ class KernelBreakdown:
             )
         if self.gpu_active_share is not None and self.gpu_active_share < 0.2:
             out.append(
-                f"GPU active only {self.gpu_active_share:.1%} of the window. Either the "
-                f"load left the engine idle, or kernels ran without being attributed "
-                f"(CUDA-graph replay). Compare against the served throughput before "
-                f"trusting any per-kernel share below."
+                f"GPU active only {self.gpu_active_share:.1%} of the window. The load "
+                f"left the device idle for most of it — under --enforce-eager that is "
+                f"normally host dispatch rather than anything the kernels did. Measured "
+                f"on an H200: 7.5% active eager, 46.5% for the same workload under CUDA "
+                f"graphs, with TPOT falling 14x. Compare against the served throughput "
+                f"before trusting any per-kernel share below."
             )
         if self.n_truncated_names:
             out.append(

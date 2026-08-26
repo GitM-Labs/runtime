@@ -30,16 +30,12 @@ _NOISE = {
     "types", "common", "native", "operator", "policy", "dispatch", "agent",
 }
 
-
-
 def kernel_family(name: str) -> str:
     """Collapse a mangled CUDA kernel name to a stable ``lib.func`` family."""
     lib = ("cub" if "cub" in name else "cudf" if "cudf" in name
             else "thrust" if "thrust" in name else "k")
     toks = [t for t in re.findall(r"[a-z][a-z_]{3,}", name) if t not in _NOISE and t != lib]
     return f"{lib}.{toks[0] if toks else 'anon'}"
-
-
 
 def _percentile(sorted_xs: list[int], q: float) -> float:
     if not sorted_xs:
@@ -48,10 +44,6 @@ def _percentile(sorted_xs: list[int], q: float) -> float:
         return float(sorted_xs[0])
     idx = round((q / 100.0) * (len(sorted_xs) - 1))
     return float(sorted_xs[idx])
-
-
-
-
 
 
 @dataclass

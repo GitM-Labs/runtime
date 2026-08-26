@@ -383,9 +383,10 @@ def main(argv: list[str] | None = None) -> int:
         from gitm.optimizer.deviation import main as deviate_main
 
         dev_argv: list[str] = [str(args.trace)]
-        for flag in ("no_graph", "as_json"):
+        for flag, spelling in (("no_graph", "--no-graph"), ("by_phase", "--by-phase"),
+                               ("as_json", "--json")):
             if getattr(args, flag, False):
-                dev_argv.append("--" + ("json" if flag == "as_json" else "no-graph"))
+                dev_argv.append(spelling)
         for name, flag in (
             ("model", "--model"), ("gpu", "--gpu"), ("batch", "--batch"),
             ("kv_len", "--kv-len"), ("steps", "--steps"), ("tp", "--tp"), ("ep", "--ep"),
