@@ -385,3 +385,60 @@ def test_the_check_is_wired_into_preflight(monkeypatch):
     assert "port" not in {
         c.name for c in vllm.preflight([], devices, 1, skip_args=True)
     }
+
+
+def test_no_trace_and_nvtx_are_rejected_before_anything_launches():
+    """Both flags set is not a config with a sensible reading: --nvtx asks for
+    correlation records that only the collector --no-trace turns off can produce.
+    Rejected ahead of preflight so it costs no GPU probe, and rejected rather than
+    silently resolved — either resolution produces a run whose serving_summary
+    claims an arm it did not measure, which is the one failure an overhead A/B
+    cannot survive."""
+    import argparse
+
+    from gitm.serve.vllm import add_serve_arguments, launch_and_capture
+
+    args = add_serve_arguments(argparse.ArgumentParser()).parse_args(["--no-trace", "--nvtx"])
+    rc, result = launch_and_capture(args)
+    assert rc == 2
+    assert result is None
+
+
+def test_no_trace_clears_an_inherited_injection_path():
+    """The driver reads CUDA_INJECTION64_PATH out of the inherited environment, so a
+    stale export would attach the collector to the arm whose purpose is to have none.
+    That arm still serves and still reports a throughput number, so the corrupted
+    baseline lands on top of the traced arms and reads as "collection is free"."""
+    from gitm.serve.vllm import apply_tracing_env
+    from gitm.tracer import injection
+
+    env = {
+        injection.ENV_LIB: "/stale/libgitm_inject.so",
+        injection.ENV_OUT: "/stale/trace.jsonl",
+        injection.ENV_NVTX: "1",
+        injection.ENV_NVTX_INJECT: "/stale/libcupti.so.12",
+        "UNRELATED": "kept",
+    }
+    apply_tracing_env(env, "/tmp/t.jsonl", nvtx=False, no_trace=True)
+
+    for var in (injection.ENV_LIB, injection.ENV_OUT,
+                injection.ENV_NVTX, injection.ENV_NVTX_INJECT):
+        assert var not in env
+    assert env["UNRELATED"] == "kept"
+
+
+def test_the_traced_arms_differ_only_by_the_nvtx_variables():
+    """cupti and cupti+nvtx must be the same collector on the same output path — if
+    they differed anywhere else the delta between them would not be the NVTX cost."""
+    from gitm.serve.vllm import apply_tracing_env
+    from gitm.tracer import injection
+
+    plain: dict[str, str] = {}
+    correlated: dict[str, str] = {}
+    apply_tracing_env(plain, "/tmp/t.jsonl", nvtx=False, no_trace=False)
+    apply_tracing_env(correlated, "/tmp/t.jsonl", nvtx=True, no_trace=False)
+
+    assert plain[injection.ENV_LIB] == correlated[injection.ENV_LIB]
+    assert plain[injection.ENV_OUT] == correlated[injection.ENV_OUT]
+    assert injection.ENV_NVTX not in plain
+    assert correlated[injection.ENV_NVTX] == "1"
