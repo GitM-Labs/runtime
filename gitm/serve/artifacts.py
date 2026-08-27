@@ -33,7 +33,7 @@ class CaptureResult:
     trace_path: Path
     n_events: int
     n_kernels: int
-    status: str  # "ok" | "no_kernels" | "no_traffic"
+    status: str  # "ok" | "untraced" | "no_kernels" | "no_traffic"
     breakdown: Any = None
     warnings: list[str] = field(default_factory=list)
 
@@ -81,6 +81,31 @@ def write_capture_artifacts(
     from gitm.tracer.kernel_taxonomy import summarize_kernels
 
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ``trace`` is None when the run was deliberately untraced (`--no-trace`), the
+    # baseline arm of a tracing-overhead measurement. That arm's entire product is
+    # serving_summary.json, and it is produced only after the workload has already
+    # run — so raising here does not fail the run early, it discards a completed
+    # measurement. Everything that does not depend on a trace still gets written.
+    if trace is None:
+        if serving_summary is not None:
+            (out_dir / "serving_summary.json").write_text(
+                json.dumps(serving_summary, indent=2)
+            )
+        if checks is not None:
+            manifest = {**manifest, "preflight": [asdict(c) for c in checks]}
+        (out_dir / "run_manifest.json").write_text(
+            json.dumps({**manifest, "trace": None}, indent=2)
+        )
+        return CaptureResult(
+            out_dir=out_dir,
+            trace_path=trace_path,
+            n_events=0,
+            n_kernels=0,
+            status="untraced" if had_traffic else "no_traffic",
+            breakdown=None,
+        )
+
     kernels = [e for e in trace.events if getattr(e, "kind", None) == "kernel"]
 
     breakdown = summarize_kernels(kernels, window_ns=trace.duration_ns)
@@ -129,6 +154,12 @@ def write_capture_artifacts(
 def print_result(result: CaptureResult) -> None:
     """Operator-facing tail of a capture: what landed, and what to distrust."""
     from gitm.tracer.kernel_taxonomy import format_breakdown
+
+    if result.breakdown is None:
+        # Untraced run. Say so rather than printing an empty breakdown, which is
+        # indistinguishable from a collector that saw nothing.
+        print("    no trace (tracing was off for this run)")
+        return
 
     print(
         f"    trace: {result.n_events} events, {result.n_kernels} kernels "

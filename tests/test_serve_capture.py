@@ -442,3 +442,52 @@ def test_the_traced_arms_differ_only_by_the_nvtx_variables():
     assert plain[injection.ENV_OUT] == correlated[injection.ENV_OUT]
     assert injection.ENV_NVTX not in plain
     assert correlated[injection.ENV_NVTX] == "1"
+
+
+def test_an_untraced_run_still_writes_its_serving_summary(tmp_path):
+    """The baseline arm of an overhead measurement produces no trace by design, and
+    its serving_summary IS the measurement. It is written only after the workload has
+    finished, so raising on the missing trace does not fail the run early — it throws
+    away a completed measurement that cost a server startup to take."""
+    from gitm.serve.artifacts import write_capture_artifacts
+
+    result = write_capture_artifacts(
+        tmp_path,
+        trace=None,
+        trace_path=tmp_path / "trace.jsonl",
+        manifest={"workload_id": "vllm-serve"},
+        serving_summary={"tracing": "off", "client": {"output_tokens_per_s": 1234.5}},
+        had_traffic=True,
+    )
+
+    summary = json.loads((tmp_path / "serving_summary.json").read_text())
+    assert summary["client"]["output_tokens_per_s"] == 1234.5
+    assert json.loads((tmp_path / "run_manifest.json").read_text())["trace"] is None
+    assert result.status == "untraced"
+    assert result.breakdown is None
+
+
+def test_untraced_is_not_confused_with_a_collector_that_saw_nothing(tmp_path):
+    """`no_kernels` means the collector was asked and came back empty — a failure to
+    chase, and an exit code of 1. `untraced` means it was never asked. Collapsing them
+    would make --no-trace fail the loop it exists to run."""
+    from gitm.serve.artifacts import write_capture_artifacts
+
+    result = write_capture_artifacts(
+        tmp_path, trace=None, trace_path=tmp_path / "t.jsonl",
+        manifest={}, serving_summary={"tracing": "off"}, had_traffic=True,
+    )
+    assert result.status != "no_kernels"
+
+
+def test_an_untraced_run_with_no_traffic_still_reports_the_traffic_failure(tmp_path):
+    """Tracing being off must not mask an empty window — a baseline arm where every
+    request failed is not a baseline, and silently returning 'untraced' would let it
+    into the comparison."""
+    from gitm.serve.artifacts import write_capture_artifacts
+
+    result = write_capture_artifacts(
+        tmp_path, trace=None, trace_path=tmp_path / "t.jsonl",
+        manifest={}, serving_summary={"tracing": "off"}, had_traffic=False,
+    )
+    assert result.status == "no_traffic"
