@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 # Must track GITM_NAME_MAX in gitm/tracer/_cupti/cupti_core.h. A name of exactly
 # this length was almost certainly cut off — the collector copies at most NAME_MAX
 # bytes, so a full-length name is the fingerprint of truncation, not a coincidence.
-NAME_MAX = 255
+NAME_MAX = 1023
 
 # Ordered: first match wins, case-insensitive substring against the (mangled) name.
 # Order is load-bearing where vocabularies overlap:
@@ -295,7 +295,9 @@ class KernelBreakdown:
                 f"{self.n_truncated_names} records ({self.n_distinct_truncated} distinct) "
                 f"have names at the {NAME_MAX}-byte cap and are truncated. Long mangled "
                 f"cutlass/MoE template names collide once cut, so distinct kernels may "
-                f"be merged here. Raise GITM_NAME_MAX in cupti_core.h to separate them."
+                f"be merged here. Raise GITM_NAME_MAX in cupti_core.h, rebuild, and "
+                f"re-capture to separate them — the bytes were dropped at collection "
+                f"time and no re-read of this trace recovers them."
             )
         if self.other_share > 0.25:
             out.append(
