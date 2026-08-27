@@ -1154,6 +1154,10 @@ def test_defaults_do_not_match_any_catalogued_checkpoint():
     """Stronger than a size bound: no field-by-field match with a real entry."""
     d = HybridMoEModelSpec()
     for entry in available():
+        # Only hybrid entries are HybridMoEModelSpecs; other families (glm_moe_dsa,
+        # sparse_moe) have their own reference-default tests and their own fields.
+        if load_entry(entry).get("family") != "hybrid":
+            continue
         hybrid_spec = load_spec(entry)
         assert (hybrid_spec.hidden, hybrid_spec.n_layers, hybrid_spec.num_experts) != (
             d.hidden, d.n_layers, d.num_experts

@@ -9,7 +9,7 @@ import yaml
 CATALOGUE_DIR = Path(__file__).resolve().parent / "models"
 
 #: Families a catalogue entry may declare, and the spec each one builds.
-_FAMILIES = ("hybrid", "sparse_moe")
+_FAMILIES = ("hybrid", "sparse_moe", "glm_moe_dsa")
 
 
 def available() -> list[str]:
@@ -102,6 +102,8 @@ def load_spec(name_or_path: str | Path):
 
     if family == "hybrid":
         from gitm.planner.hybrid_graph import HybridMoEModelSpec as cls
+    elif family == "glm_moe_dsa":
+        from gitm.planner.glm_graph import GlmMoeDsaModelSpec as cls  # type: ignore[assignment]
     else:
         from gitm.planner.roofline import SparseMoEModelSpec as cls  # type: ignore[assignment]
 
@@ -110,7 +112,10 @@ def load_spec(name_or_path: str | Path):
         raw["layer_types"] = _expand_layer_types(
             raw["layer_types"], int(raw.get("n_layers", 0))
         )
-    for key in ("compress_ratios", "dspark_layer_ids"):
+    # Per-layer schedule lists that must reach the frozen dataclass as tuples. A
+    # list would make the spec unhashable; a dropped tuple-coercion here is how a
+    # schedule silently arrives as the wrong type.
+    for key in ("compress_ratios", "dspark_layer_ids", "indexer_types", "mlp_layer_types"):
         if key in raw and isinstance(raw[key], list):
             raw[key] = tuple(raw[key])
 
@@ -141,6 +146,11 @@ def predict(
         from gitm.planner.hybrid_graph import predict_hybrid_graph
 
         return predict_hybrid_graph(spec, hw, batch, sharding, **kwargs), family
+
+    if family == "glm_moe_dsa":
+        from gitm.planner.glm_graph import predict_glm_graph
+
+        return predict_glm_graph(spec, hw, batch, sharding, **kwargs), family
 
     from gitm.planner.moe_graph import predict_moe_graph
 

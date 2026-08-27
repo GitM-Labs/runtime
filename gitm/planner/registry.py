@@ -10,12 +10,20 @@ from gitm.planner.roofline import BatchConfig, HardwareSpec, ShardingConfig
 
 
 def detect_family(cfg: dict[str, Any]) -> str:
-    """``"hybrid"`` | ``"sparse_moe"`` | ``"dense"`` for a HuggingFace config."""
+    """``"hybrid"`` | ``"glm_moe_dsa"`` | ``"sparse_moe"`` | ``"dense"`` for a config."""
+    from gitm.planner.glm_graph import is_glm_moe_dsa_config
     from gitm.planner.hybrid_graph import is_hybrid_moe_config
     from gitm.planner.moe_graph import is_sparse_moe_config
 
+    # The hybrid guard reads ``num_experts``; GLM and V4 both spell it
+    # ``n_routed_experts``, so they fall through it. GLM must be tested *before*
+    # sparse_moe: both carry ``index_topk`` + ``n_routed_experts``, so the
+    # structural sparse-MoE test would claim GLM first — the model_type check is
+    # the clean separator and has to win.
     if is_hybrid_moe_config(cfg):
         return "hybrid"
+    if is_glm_moe_dsa_config(cfg):
+        return "glm_moe_dsa"
     if is_sparse_moe_config(cfg):
         return "sparse_moe"
     return "dense"
@@ -28,6 +36,10 @@ def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None):
         from gitm.planner.hybrid_graph import spec_from_hf_config as _hybrid
 
         return _hybrid(cfg, name=name)
+    if family == "glm_moe_dsa":
+        from gitm.planner.glm_graph import spec_from_hf_config as _glm
+
+        return _glm(cfg, name=name)
     if family == "sparse_moe":
         from gitm.planner.moe_graph import spec_from_hf_config as _sparse
 
@@ -61,15 +73,21 @@ def predict_for_config(
         from gitm.planner.hybrid_graph import spec_from_hf_config as _hybrid
 
         return predict_hybrid_graph(_hybrid(cfg, name=name), hw, batch, sharding), family
+    if family == "glm_moe_dsa":
+        from gitm.planner.glm_graph import predict_glm_graph
+        from gitm.planner.glm_graph import spec_from_hf_config as _glm
+
+        return predict_glm_graph(_glm(cfg, name=name), hw, batch, sharding), family
     if family == "sparse_moe":
         from gitm.planner.moe_graph import predict_moe_graph
         from gitm.planner.moe_graph import spec_from_hf_config as _sparse
 
         return predict_moe_graph(_sparse(cfg, name=name), hw, batch, sharding), family
     raise NotImplementedError(
-        f"{name or 'this checkpoint'} is neither a hybrid linear-attention MoE nor a "
-        "DeepSeek-V4-class sparse-MoE checkpoint. The dense graph models it, but has "
-        "no config reader — construct a ModelSpec and call predict_graph directly."
+        f"{name or 'this checkpoint'} is neither a hybrid linear-attention MoE, a "
+        "GLM-5.2-class glm_moe_dsa, nor a DeepSeek-V4-class sparse-MoE checkpoint. The "
+        "dense graph models it, but has no config reader — construct a ModelSpec and "
+        "call predict_graph directly."
     )
 
 
@@ -160,6 +178,10 @@ def _predict(spec, family: str, hw, batch, sharding):
         from gitm.planner.hybrid_graph import predict_hybrid_graph
 
         return predict_hybrid_graph(spec, hw, batch, sharding)
+    if family == "glm_moe_dsa":
+        from gitm.planner.glm_graph import predict_glm_graph
+
+        return predict_glm_graph(spec, hw, batch, sharding)
     from gitm.planner.moe_graph import predict_moe_graph
 
     return predict_moe_graph(spec, hw, batch, sharding)
