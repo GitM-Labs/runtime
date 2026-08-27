@@ -33,7 +33,12 @@
 #include <cupti.h>
 #include <stdint.h>
 
-#define GITM_NAME_MAX 255
+/* CuTeDSL and CUTLASS encode tensor layouts into the symbol, so a single 
+ * FlashInfer GDN or grouped-GEMM instantiation runs hundred characters and two
+ * variants differ only in a late template argument are identical under a short cap
+ * they merge into one identity in KernelBreakdown and their time is pooled.
+ */
+#define GITM_NAME_MAX 1023
 
 #define GITM_REC_KERNEL 0
 #define GITM_REC_MEMCPY 1

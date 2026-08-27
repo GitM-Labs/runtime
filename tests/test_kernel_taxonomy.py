@@ -155,6 +155,25 @@ def test_truncated_names_are_flagged():
     assert any("truncated" in w for w in bd.warnings())
 
 
+def test_name_max_matches_the_collector_that_produced_the_names():
+    """NAME_MAX mirrors GITM_NAME_MAX across a language boundary, bound by nothing
+    but a comment. Truncation is detected as `len(name) >= NAME_MAX`, so if the C
+    cap is raised alone the detector compares against a bound no name can reach and
+    silently reports zero truncation forever; raised on the Python side alone it
+    flags every name as clean while they are still being cut. Neither shows up as a
+    failure anywhere else — the trace stays well-formed and merged kernels keep
+    pooling their time under one identity."""
+    import re
+    from pathlib import Path
+
+    from gitm.tracer import _cupti
+
+    header = (Path(_cupti.__file__).parent / "cupti_core.h").read_text()
+    match = re.search(r"^#define\s+GITM_NAME_MAX\s+(\d+)\s*$", header, re.M)
+    assert match, "GITM_NAME_MAX not found in cupti_core.h"
+    assert int(match.group(1)) == NAME_MAX
+
+
 def test_empty_trace_warns_about_graph_replay_and_stops_there():
     bd = summarize_kernels([], window_ns=1000)
     warnings = bd.warnings()
