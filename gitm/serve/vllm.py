@@ -37,6 +37,7 @@ cannot run it).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import random
@@ -617,6 +618,23 @@ def add_serve_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="tensor-parallel size (default: every visible GPU)")
     ap.add_argument("--dry-run", action="store_true", help="preflight only; never starts a server")
     ap.add_argument("--skip-preflight", action="store_true")
+    ap.add_argument("--no-trace", action="store_true",
+                    help="run the identical server and workload with CUPTI collection "
+                         "off, writing no trace. This is the baseline arm of a tracing-"
+                         "overhead measurement: same client, same warmup, same seed, "
+                         "same summary format, so the only difference against a normal "
+                         "run is the collector. Comparing against a separately-driven "
+                         "vllm serve would confound the tracer's cost with a different "
+                         "request stream.")
+    ap.add_argument("--nvtx", action="store_true",
+                    help="collect the NVTX correlation chain, which resolves an "
+                         "anonymous GEMM to a layer and an op. Adds vLLM's "
+                         "--enable-layerwise-nvtx-tracing (emits the ranges) and turns "
+                         "on RUNTIME/DRIVER/MARKER collection (records them). Both "
+                         "halves are required and neither errors alone: ranges nobody "
+                         "collects and collection with no ranges each produce a clean "
+                         "trace with range_op null on every kernel. Costs throughput — "
+                         "capture the same workload with and without to quantify it.")
     ap.add_argument("--keep-server", action="store_true",
                     help="leave the server up after capture — the handoff into "
                          "`gitm capture attach` for further windows")
@@ -638,6 +656,31 @@ def main(argv: list[str] | None = None) -> int:
     return rc
 
 
+def apply_tracing_env(env, trace_path, *, nvtx: bool, no_trace: bool) -> None:
+    """Put ``env`` into the tracing arm this run is supposed to be.
+
+    Separate from :func:`launch_and_capture` because it is the whole difference
+    between the arms of an overhead measurement, and it is the part that fails
+    silently: every arm launches, serves and reports a throughput number whether or
+    not the collector is in the state it claims.
+
+    A no-trace arm *clears* the variables rather than merely not setting them. The
+    CUDA driver reads ``CUDA_INJECTION64_PATH`` out of the inherited environment, so
+    one left exported in this shell from an earlier run — which is exactly how the
+    first NVTX captures were taken — would attach the collector to the one arm whose
+    purpose is to have no collector. The baseline would land on top of the traced
+    arms, and the reading of that is "collection is free".
+    """
+    from gitm.tracer import injection
+
+    if no_trace:
+        for var in (injection.ENV_LIB, injection.ENV_OUT,
+                    injection.ENV_NVTX, injection.ENV_NVTX_INJECT):
+            env.pop(var, None)
+        return
+    env.update(injection.run_env(trace_path, nvtx=nvtx))
+
+
 def launch_and_capture(args, serve_argv: list[str] | None = None):
     """Launch ``vllm serve`` under the collector, capture a window, tear it down.
 
@@ -647,6 +690,15 @@ def launch_and_capture(args, serve_argv: list[str] | None = None):
     """
     from gitm._paths import traces_dir
     from gitm.serve.artifacts import print_result, write_capture_artifacts, write_preflight
+
+    nvtx = bool(getattr(args, "nvtx", False))
+    no_trace = bool(getattr(args, "no_trace", False))
+    # Checked before preflight, not after: these are contradictory on their face and
+    # there is no reason to spend a GPU probe discovering it.
+    if no_trace and nvtx:
+        print("--no-trace and --nvtx are contradictory: NVTX correlation records are "
+              "collected by the tracer --no-trace disables.")
+        return 2, None
 
     serve_argv = list(serve_argv) if serve_argv else list(DEFAULT_SERVE_ARGV)
 
@@ -688,11 +740,32 @@ def launch_and_capture(args, serve_argv: list[str] | None = None):
         print("\ndry run — preflight only, nothing launched.")
         return 0, None
 
-    os.environ.update(injection.run_env(trace_path))
-    print(f"==> {injection.ENV_LIB}={os.environ[injection.ENV_LIB]}")
+    apply_tracing_env(os.environ, trace_path, nvtx=nvtx, no_trace=no_trace)
+    if no_trace:
+        print("==> tracing OFF (baseline arm): no CUPTI collection, no trace written")
+    else:
+        print(f"==> {injection.ENV_LIB}={os.environ[injection.ENV_LIB]}")
+    if nvtx:
+        # Report the NVTX injection path rather than assuming it. run_env sets it
+        # only when a libcupti was resolved, and a missing one is the failure that
+        # produces a trace full of markerless kernels with no error anywhere.
+        inject = os.environ.get(injection.ENV_NVTX_INJECT)
+        print(f"==> {injection.ENV_NVTX}=1")
+        if inject:
+            print(f"==> {injection.ENV_NVTX_INJECT}={inject}")
+        else:
+            print(f"!!! {injection.ENV_NVTX_INJECT} unresolved — NVTX will hand no "
+                  "ranges to CUPTI and every kernel will come back unattributed")
 
     base = f"http://{args.host}:{args.port}"
     cmd = list(serve_argv)
+    # The other half of --nvtx. Ours makes CUPTI collect markers; this makes vLLM
+    # push them. Not added when the caller already passed it after `--`, and not
+    # added without --nvtx: pushing ranges nobody collects costs throughput for
+    # nothing, which would silently contaminate the without-NVTX arm of an
+    # overhead measurement.
+    if nvtx and "--enable-layerwise-nvtx-tracing" not in cmd:
+        cmd += ["--enable-layerwise-nvtx-tracing"]
     if not _arg_of(cmd, "--port"):
         cmd += ["--port", str(args.port)]
     if not _arg_of(cmd, "--host"):
@@ -735,8 +808,15 @@ def launch_and_capture(args, serve_argv: list[str] | None = None):
 
         from gitm.tracer import capture
 
+        # nullcontext, not capture-with-nothing-enabled: capture() falls back to the
+        # in-process shim when injection is inactive, which would register CUPTI
+        # callbacks in this process. The parent runs no kernels so the trace would be
+        # empty either way, but the baseline arm must not have CUPTI initialized in it
+        # at all — otherwise it is not a baseline.
+        window = (contextlib.nullcontext() if no_trace
+                  else capture(trace_path, workload_id=WORKLOAD_ID, fingerprint=model))
         wall0 = time.time()
-        with capture(trace_path, workload_id=WORKLOAD_ID, fingerprint=model) as trace:
+        with window as trace:
             records, failures = drive_load(
                 base, model, prompts,
                 concurrency=args.concurrency, max_tokens=args.output_tokens,
@@ -768,6 +848,11 @@ def launch_and_capture(args, serve_argv: list[str] | None = None):
         had_traffic=bool(records),
         serving_summary={
             "mode": "drive",
+            # Which tracing arm this run is. Without it the result directories are
+            # indistinguishable, and an A/B on tracing overhead is only as good as
+            # knowing which side each number came from.
+            "tracing": "off" if no_trace else ("cupti+nvtx" if nvtx else "cupti"),
+            "nvtx": nvtx,
             "wall_s": wall,
             # Client-side wall clock, NOT vLLM's RequestOutput.metrics: the server path
             # never hands those to an HTTP client. It therefore includes network and

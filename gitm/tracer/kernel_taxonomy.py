@@ -10,7 +10,7 @@ and that question has three failure modes this module is built to answer:
   full of kernels no rule recognises, and any conclusion drawn per-op is guesswork.
 * truncated names** — the collector's name field is bounded (``NAME_MAX``).
   Mangled cutlass/MoE template instantiations run long, and two different kernels
-  truncated to the same 255 bytes become one identity. That is silent: the trace
+  truncated to the same ``NAME_MAX`` bytes become one identity. That is silent: the trace
   looks complete and the distinct expert GEMMs have merged.
 * missing device time — kernels that ran but were never attributed (CUDA-graph
   replay is the usual cause) leave the GPU looking idle while throughput says
