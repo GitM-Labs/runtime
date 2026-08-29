@@ -13,11 +13,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define BUF_SIZE (8 * 1024 * 1024)   /* 8 MiB activity buffers */
-#define BUF_ALIGN 8
-
-#define ALIGN_BUFFER(p, a) \
-    (((uintptr_t)(p) % (a)) ? ((p) + (a) - ((uintptr_t)(p) % (a))) : (p))
+#define BUF_SIZE (32 * 1024 * 1024)   /* 32 MiB activity buffers */
+#define BUF_ALIGN 32
 
 static gitm_sink_fn   g_sink = NULL;
 static void          *g_sink_user = NULL;
@@ -194,9 +191,14 @@ static void ingest(CUpti_Activity *rec) {
 
 static void CUPTIAPI buffer_requested(uint8_t **buffer, size_t *size,
                                       size_t *maxNumRecords) {
-    uint8_t *raw = (uint8_t *)malloc(BUF_SIZE + BUF_ALIGN);
-    *buffer = (uint8_t *)ALIGN_BUFFER(raw, BUF_ALIGN);
-    *size = BUF_SIZE;
+    void *p = NULL;
+    if (posix_memalign(&p, BUF_ALIGN, BUF_SIZE) != 0) p = NULL;
+    *buffer = (uint8_t *)p;
+    /* Zero on failure, not BUF_SIZE. Reporting a size for a NULL buffer invites
+     * CUPTI to write into it; the previous code passed the allocation straight
+     * through and would have handed over NULL with a 32 MiB size attached. An
+     * allocation failure should cost records, not the traced process. */
+    *size = p ? BUF_SIZE : 0;
     *maxNumRecords = 0;  /* fill as many as fit */
 }
 
@@ -218,7 +220,7 @@ static void CUPTIAPI buffer_completed(CUcontext ctx, uint32_t streamId,
         }
     }
     pthread_mutex_unlock(&g_lock);
-    free(buffer);  /* matches malloc in buffer_requested (aligned within) */
+    free(buffer);  /* posix_memalign's pointer — free() takes it directly */
 }
 
 CUptiResult gitm_cupti_start(void) {
