@@ -66,8 +66,16 @@ _QUANT_PEAKS: dict[str, dict[str, float]] = {
     # Hopper has fp8 tensor cores; it has no fp4 path (MXFP4 runs dequantised
     # through Marlin, which is why an fp4 checkpoint traced on H100/H200 prices
     # against fp8 and still shows a compute-bound expert GEMM).
-    "H100": {"fp8": 1979e12},
-    "H200": {"fp8": 1979e12},
+    #
+    # ``fp32`` is the *vector* (non-tensor-core) rate, and it is here because
+    # mixed-precision checkpoints run a genuinely fp32 op: the MoE router casts
+    # to float before scoring. Without an entry the router prices against the
+    # A100 dataclass default of 19.5 TF/s, and unlike a missing fp8 peak this one
+    # is NOT flagged — ``resolve_peak`` returns the fp32 field directly, so
+    # ``peak_is_fallback`` stays False and the wrong ceiling looks measured. On
+    # H200 the difference is 3.4x on that node.
+    "H100": {"fp8": 1979e12, "fp32": 67e12},
+    "H200": {"fp8": 1979e12, "fp32": 67e12},
 }
 
 
@@ -162,8 +170,11 @@ def hardware_spec_for(peak: HardwarePeak | None) -> HardwareSpec:
     ``peak_flops`` covers fp16/bf16; fp8/fp4 come from ``_QUANT_PEAKS`` when the
     SKU has them, and stay ``0.0`` otherwise so ``resolve_peak`` can fall back
     and mark the prediction rather than pricing an fp4 GEMM at the bf16 rate.
-    fp32 peak isn't in the catalogue and stays at the dataclass default since
-    nothing currently predicts fp32 kernels.
+    fp32 comes from the same table where the SKU has a figure; where it does not,
+    it stays at the dataclass default (A100's 19.5 TF/s), which is low for any
+    newer part. This matters now that a checkpoint can declare an fp32 op — the
+    MoE router's ``.float()`` cast — because a missing fp32 peak is *not* flagged
+    the way a missing fp8 one is.
     """
     if peak is None:
         return HardwareSpec()
@@ -174,6 +185,9 @@ def hardware_spec_for(peak: HardwarePeak | None) -> HardwareSpec:
         peak_flops_bf16_per_s=peak.peak_flops,
         peak_flops_fp8_per_s=quant.get("fp8", 0.0),
         peak_flops_fp4_per_s=quant.get("fp4", 0.0),
+        # Falls back to the dataclass default when the SKU has no figure, which
+        # is A100's 19.5 TF/s — correct for A100 and low for everything newer.
+        peak_flops_fp32_per_s=quant.get("fp32", HardwareSpec.peak_flops_fp32_per_s),
         peak_mem_bw_bytes_per_s=peak.peak_bw_bytes_s,
         interconnect_bw_bytes_per_s=interconnect_bw_for_sku(peak.name),
     )

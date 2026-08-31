@@ -99,6 +99,20 @@ class PredictedNode:
     # Streams the planner expects to run on — used by the stream-concurrency
     # invariant.
     expected_stream_id: int = 0
+    #: Indices into :attr:`Graph.nodes` this node cannot start before.
+    #:
+    #: Populated **only where the edge is genuinely required**, not everywhere an
+    #: order happens to exist. The graph is otherwise a sum, and a sum is already
+    #: a fully-serial lower bound; adding edges everywhere would restate that at
+    #: greater cost. What edges buy is the ability to tell two *different* kinds
+    #: of serialisation apart — a speculative draft chain, where stage *i+1*
+    #: genuinely cannot begin before stage *i*, versus a run of all-reduces that
+    #: merely happen to be listed in order. Both show up as the same positive
+    #: residual today, and one is recoverable while the other is not.
+    #:
+    #: This is not a scheduler and does not try to be one. It records the edges
+    #: somebody has evidence for; everything else stays unconstrained.
+    depends_on: tuple[int, ...] = ()
 
 
 @dataclass
@@ -118,6 +132,37 @@ class Graph:
     @property
     def total_pred_s(self) -> float:
         return sum(n.prediction.t_pred_s for n in self.nodes)
+
+    @property
+    def serial_chain_s(self) -> float:
+        """Longest chain of nodes joined by a declared dependency edge.
+
+        **This is a floor on the serial part, not an estimate of the step.**
+        Edges are declared only where there is evidence for them, so a node with
+        no edges is *unconstrained*, not known-parallel — and reading this as a
+        whole-step time would treat every unedged node as infinitely
+        overlappable. On a MiMo step with MTP it returns ~0.08 ms against a
+        ~4 ms step: the claim is "at least 0.08 ms of this step cannot be
+        overlapped away", not "this step could take 0.08 ms".
+
+        What it buys is the discriminator §6.1 needs. A speculative draft chain
+        is genuinely serial — stage *i+1* cannot begin before stage *i* — while a
+        run of all-reduces merely happens to be emitted in order. Both show up as
+        the same positive residual today. Time inside this chain is
+        architectural; time outside it is a scheduling question.
+
+        ``0.0`` when no edges are declared, which is every graph that has not
+        opted in.
+        """
+        if not any(n.depends_on for n in self.nodes):
+            return 0.0
+        longest = [0.0] * len(self.nodes)
+        for i, n in enumerate(self.nodes):
+            # Nodes are appended in emission order, so every dependency index is
+            # < i and ``longest`` is already final for it.
+            base = max((longest[d] for d in n.depends_on if 0 <= d < i), default=0.0)
+            longest[i] = base + n.prediction.t_pred_s
+        return max(longest, default=0.0)
 
     @property
     def has_unpriced_collectives(self) -> bool:
