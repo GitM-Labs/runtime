@@ -502,3 +502,44 @@ def test_an_anonymous_reduction_is_not_guessed_to_be_a_norm():
     assert classify_kernel("triton_red_fused_3") == "elementwise"
     # A norm that still names itself is unaffected.
     assert classify_kernel("layer_norm_fwd_kernel") == "norm"
+
+
+# --- speculative decoding ---------------------------------------------------
+
+
+def test_spec_decode_scaffolding_is_its_own_bucket():
+    """Real kernel names from vllm/v1/spec_decode/utils.py and
+    vllm/v1/sample/rejection_sampler.py. Six of these lose a collision with an
+    earlier rule and land in a WRONG bucket rather than in `other`, which is the
+    worse failure: `other` is visible, a misfile silently inflates a bucket that
+    gets trusted."""
+    for name in ("eagle_step_slot_mapping_metadata_kernel",
+                 "eagle_prepare_inputs_padded_kernel",
+                 "eagle_prepare_next_token_padded_kernel",
+                 "copy_and_expand_eagle_inputs_kernel",
+                 "copy_and_expand_dflash_inputs_kernel",
+                 "rejection_greedy_sample_kernel",
+                 "rejection_random_sample_kernel",
+                 "sample_recovered_tokens_kernel",
+                 "expand_kernel"):
+        assert classify_kernel(name) == "spec_decode", name
+
+
+def test_eagle_slot_mapping_does_not_inflate_kv_cache():
+    """`eagle_step_slot_mapping_metadata_kernel` contains "slot_mapping". Filed as
+    kv_cache it would be read as real KV traffic, and KV traffic is a number levers
+    get chosen on."""
+    assert classify_kernel("eagle_step_slot_mapping_metadata_kernel") == "spec_decode"
+    assert classify_kernel("reshape_and_cache_flash_kernel") == "kv_cache"
+    assert classify_kernel("copy_blocks_kernel") == "kv_cache"
+
+
+def test_verification_is_not_pooled_with_ordinary_sampling():
+    """Rejection sampling is what a speculative step pays to verify a draft; top-k/
+    top-p is what every step pays regardless. Pooling them makes the question a
+    spec-decode capture exists to answer — is verification worth the steps it saves
+    — unanswerable from the breakdown."""
+    assert classify_kernel("rejection_greedy_sample_kernel") == "spec_decode"
+    assert classify_kernel("sample_recovered_tokens_kernel") == "spec_decode"
+    assert classify_kernel("TopKTopPSamplingFromProbKernel") == "sampling"
+    assert classify_kernel("top_p_sampling_cumsum_kernel") == "sampling"

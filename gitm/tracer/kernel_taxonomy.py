@@ -53,6 +53,29 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("collective", ("nccl", "all_reduce", "allreduce", "reduce_scatter", "reducescatter",
                     "all_gather", "allgather", "custom_ar", "cross_device", "one_shot",
                     "two_shot")),
+    # Speculative decoding: drafting scaffolding and rejection sampling.
+    #
+    #   * `eagle_step_slot_mapping_metadata_kernel` contains "slot_mapping" and
+    #     would inflate `kv_cache` — a bucket that gets read as real KV traffic;
+    #   * `rejection_*_sample_kernel` and `sample_recovered_tokens_kernel` contain
+    #     "sample" and would vanish into `sampling`, which is exactly the cost a
+    #     spec-decode capture exists to isolate — verification is not sampling;
+    #   * `copy_and_expand_*_inputs_kernel` contains "copy" and would land in
+    #     `elementwise`.
+    #
+    # A separate bucket rather than folding into `sampling`: the reason to trace a
+    # speculative run at all is to weigh what verification costs against the steps
+    # it saves, and a number pooled with ordinary sampling cannot answer that.
+    #
+    # This catches the scaffolding only. The draft head itself — EAGLE/MTP's
+    # small transformer, Medusa's ResBlock heads — runs ordinary GEMM, attention
+    # and norm kernels that are indistinguishable by name from the target model's,
+    # so drafting's compute cost lands in those buckets and cannot be separated
+    # here. Medusa in particular ships no distinctive kernel of its own. Splitting
+    # draft from target needs the NVTX layer index, where the draft's layers fall
+    # outside the target's range.
+    ("spec_decode", ("eagle", "rejection_", "sample_recovered", "copy_and_expand",
+                     "expand_kernel")),
     # Linear / recurrent attention, kept separate from softmax attention. Hybrid
     # models (Qwen3-Next-style Gated DeltaNet, Mamba, RWKV) run mostly these and only
     # a few full-attention layers, so folding them together hides the split that
