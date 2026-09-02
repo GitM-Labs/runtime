@@ -1,0 +1,306 @@
+# zai-org/GLM-5.2-FP8 — the vendor's recommended deployment shape.
+# Source: https://huggingface.co/zai-org/GLM-5.2-FP8/blob/main/config.json
+#         https://huggingface.co/zai-org/GLM-5.2/blob/main/config.json
+# Read from config.json and model.safetensors.index.json only — no traces.
+#
+# Identical architecture to `glm-5.2`; the difference is precision, and precision
+# is the difference between a model that fits one 8xH200 node and one that does
+# not. 753.33 GB on disk against the bf16 release's 1.507 TB.
+
+name: zai-org/GLM-5.2-FP8
+family: glm_moe_dsa
+description: >
+  GLM-5.2 quantised to FP8 e4m3 with 128x128 weight blocks — 78 layers, hidden
+  6144, 256 routed experts top-8, MLA + DeepSeek Sparse Attention with
+  IndexShare (21 of 78 layers compute the index). The backbone GEMMs, the dense
+  FFN, the shared expert and all routed experts are fp8; lm_head, embed_tokens,
+  the MTP eh_proj and the lightning indexer stay bf16; the router is fp32. This
+  is the entry to plan against — the vendor recommends it and it is what fits
+  8xH200.
+
+spec:
+  hidden: 6144
+  n_layers: 78
+  vocab: 154880
+
+  # MLA attention. head_dim (192) is the nope width; q_head_dim widens to
+  # 192+64=256, and v_head_dim (256) differs from it — score and value reads use
+  # different per-head widths. num_key_value_heads is 64 in the config but is a
+  # red herring: the cache holds one kv_lora_rank latent per token, shared across
+  # all 64 query heads, so KV traffic derives from kv_lora_rank, never 64*head_dim.
+  n_heads: 64
+  q_lora_rank: 2048
+  kv_lora_rank: 512
+  qk_nope_head_dim: 192
+  qk_rope_head_dim: 64
+  v_head_dim: 256
+
+  # DeepSeek Sparse Attention indexer. index_topk_freq 4 is the IndexShare period:
+  # one 'full' layer computes the top-2048 selection, the next three reuse it.
+  index_n_heads: 32
+  index_head_dim: 128
+  index_topk: 2048
+  index_topk_freq: 4
+  # Read verbatim from the checkpoint (period-4 past the 3-layer 'full' prefix).
+  # The 'shared' layers physically carry no indexer weights — proven, not fitted.
+  indexer_types:
+    - full
+    - full
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+
+  # Mixture of experts. moe_intermediate_size 2048 per expert; the first 3 layers
+  # are dense FFN (intermediate_size 12288) with no router or experts.
+  n_routed_experts: 256
+  n_shared_experts: 1
+  num_experts_per_tok: 8
+  moe_intermediate_size: 2048
+  intermediate_size: 12288
+  first_k_dense_replace: 3
+  routed_scaling_factor: 2.5
+  mlp_layer_types:
+    - dense
+    - dense
+    - dense
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+    - sparse
+
+  # Multi-token prediction. One MTP module, invoked once per drafted token; the
+  # vendor recipe runs it 5 deep (--speculative-config.num_speculative_tokens 5).
+  # index_share_for_mtp_iteration: the draft reuses the main model's selection,
+  # and the weight map agrees — the MTP block carries no indexer tensors.
+  num_nextn_predict_layers: 1
+  index_share_for_mtp_iteration: true
+
+  # FP8 e4m3, 128x128 block-scaled, dynamic activation scaling.
+  weight_dtype: fp8
+  expert_dtype: fp8
+  act_dtype: bf16
+  # A serving choice, not a model fact — but it is the one the vendor recipe
+  # makes (`--kv-cache-dtype fp8`), and it halves the latent half of every cached
+  # entry. The decoupled RoPE key stays bf16 either way; kv_entry_bytes prices
+  # the two halves separately for exactly this reason.
+  kv_dtype: fp8
+
+  # The ops the quantiser skipped, from quantization_config.modules_to_not_convert,
+  # plus the router's own dtype from the base config. Without these the indexer —
+  # the one attention node whose cost grows with context — is priced at half its
+  # real weight traffic, and lm_head at half of 154,880 x 6,144.
+  op_dtype_overrides:
+    - [attn_index_proj, bf16]
+    - [lm_head, bf16]
+    - [mtp_eh_proj, bf16]
+    - [moe_router, fp32]
+
+provenance:
+  verified:
+    - claim: predicted weight bytes match the published FP8 checkpoint
+      detail: >
+        model.safetensors totals 753,329,940,480 B (753.33 GB) across 141 shards.
+        model_weight_bytes predicts 755.9 GB — +0.34%, and the same spec at bf16
+        predicts 1.5079 TB against the bf16 release's 1,506,659,919,872 B (+0.08%).
+        Two checkpoints at two precisions agreeing to under half a percent is a
+        stronger check on the shape arithmetic than either one alone.
+    - claim: the unquantised op list is read, not assumed
+      detail: >
+        quantization_config.modules_to_not_convert names lm_head, embed_tokens,
+        eh_proj, enorm/hnorm, every layernorm, mlp.gate (+ e_score_correction_bias)
+        and the indexer's projections and k_norm. o_proj is absent from that list —
+        it IS quantised here, the opposite of the fp8-backbone checkpoints that
+        keep the output projection wide.
+    - claim: the router is fp32 on every variant
+      detail: >
+        moe_router_dtype "float32" is a field of the base GLM-5.2 config, not of
+        the quantisation config, so it is a model fact and applies to the bf16
+        release too.
+    - claim: IndexShare is read from the weight map
+      detail: >
+        Indexer tensors (*.indexer.wq_b / .wk / .weights_proj / .k_norm) exist on
+        exactly the 21 layers whose indexer_types is 'full' and on none of the 57
+        'shared' layers — nor on the MTP block, which is what
+        index_share_for_mtp_iteration=true predicts.
+
+  estimated:
+    - field: kv_dtype
+      value: fp8
+      detail: >
+        A deployment choice, taken from the vendor's own vLLM recipe
+        (`--kv-cache-dtype fp8`), not from the checkpoint. Set it back to bf16 to
+        price the conservative cache; on this architecture that moves the latent
+        half of a 576-element entry, not the RoPE half.
+    - field: MLA absorption (attn_kv_b vs attn_out_proj width)
+      value: unabsorbed — kv_b runs as its own GEMM, o_proj narrow
+      detail: >
+        Modelled unabsorbed: attn_kv_b reconstructs per-head K/V from the latent
+        and attn_out_proj is n_heads*v_head_dim -> hidden (16384->6144). An engine
+        that absorbs MLA folds W^UK into the query and W^UV into the output,
+        dropping attn_kv_b and doubling attn_out_proj's input width to
+        n_heads*kv_lora_rank (32768->6144). Same resident weights either way; the
+        two readings move attn_out_proj by 2x, so it re-ranks the attention side.
+    - field: expert-parallel imbalance
+      value: 1.0 (perfect balance)
+      detail: >
+        Trace-calibrated by design. Declared rather than fitted while the
+        no-traces constraint holds; real skew moves less weight traffic than
+        predicted (fewer distinct experts) but lengthens the grouped-GEMM tail.
+
+  unmodelled:
+    - Absorbed-MLA decode. See the estimated entry above; it is the one open
+      question that re-ranks the attention side by 2x in either direction.
+    - Acceptance rate under MTP. The graph prices D drafts and a 1+D verify; what
+      fraction is kept is a serving observable, carried in BatchConfig rather than
+      predicted here.
+    - index_topk_freq as a *temporal* reuse across decode steps. Modelled as the
+      spatial layer-group period, which the weight map proves; any additional
+      step-to-step reuse would only reduce indexer cost further.
+    - Expert-capacity padding. If the grouped-GEMM backend pads to a fixed
+      capacity to keep static shapes, every step reads all 256 experts and the
+      distinct_experts union term is an underestimate at low batch — the fork to
+      settle with one D2H count.

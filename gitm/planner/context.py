@@ -71,6 +71,42 @@ _QUANT_PEAKS: dict[str, dict[str, float]] = {
 }
 
 
+# CUDA-core FP32 peaks (FLOP/s), same substring keys. Not a tensor-core rate:
+# an fp32 op in a graph is there because the *model* asked for fp32 — a MoE router
+# under ``moe_router_dtype: "float32"``, a softmax accumulation — and those run on
+# the FP32 pipe, not on the tensor cores. Vendor "TF32 tensor core" figures are an
+# order of magnitude higher and pricing a router against one would make the node
+# disappear from the table.
+#
+# A SKU absent here keeps the dataclass default (an A100's 19.5 TF/s), which is
+# low for anything newer and so under-reports rather than over-reports headroom —
+# but on an H200 it is 3.4x low, which is enough to move a small fp32 node's bound
+# label, so the SKUs this planner actually targets are listed.
+_FP32_PEAKS: dict[str, float] = {
+    "GB300": 80e12,
+    "B300": 80e12,
+    "GB200": 80e12,
+    "B200": 80e12,
+    "H100": 67e12,
+    "H200": 67e12,
+    "A100": 19.5e12,
+    "L40": 90e12,
+    "L4": 30e12,
+    "T4": 8.1e12,
+    "V100": 15.7e12,
+}
+
+
+def fp32_peak_for_sku(sku: str | None) -> float:
+    """CUDA-core FP32 peak for a SKU (substring match), else ``0.0``."""
+    if not sku:
+        return 0.0
+    for key, peak in _FP32_PEAKS.items():
+        if key.lower() in sku.lower():
+            return peak
+    return 0.0
+
+
 # Per-GPU bidirectional NVLink bandwidth (bytes/s), same substring keys. Used to
 # price the collectives a sharded graph emits. A SKU absent here leaves the spec
 # at 0.0, which makes the sharded planner report collectives as unpriced instead
@@ -162,16 +198,20 @@ def hardware_spec_for(peak: HardwarePeak | None) -> HardwareSpec:
     ``peak_flops`` covers fp16/bf16; fp8/fp4 come from ``_QUANT_PEAKS`` when the
     SKU has them, and stay ``0.0`` otherwise so ``resolve_peak`` can fall back
     and mark the prediction rather than pricing an fp4 GEMM at the bf16 rate.
-    fp32 peak isn't in the catalogue and stays at the dataclass default since
-    nothing currently predicts fp32 kernels.
+    The fp32 peak comes from ``_FP32_PEAKS`` — the CUDA-core rate, since a model
+    that declares an fp32 op (a MoE router under ``moe_router_dtype``) runs it on
+    that pipe. A SKU without an entry keeps the dataclass default.
     """
     if peak is None:
         return HardwareSpec()
     quant = quant_peaks_for_sku(peak.name)
+    fp32 = fp32_peak_for_sku(peak.name)
+    defaults = HardwareSpec()
     return HardwareSpec(
         name=peak.name,
         peak_flops_fp16_per_s=peak.peak_flops,
         peak_flops_bf16_per_s=peak.peak_flops,
+        peak_flops_fp32_per_s=fp32 or defaults.peak_flops_fp32_per_s,
         peak_flops_fp8_per_s=quant.get("fp8", 0.0),
         peak_flops_fp4_per_s=quant.get("fp4", 0.0),
         peak_mem_bw_bytes_per_s=peak.peak_bw_bytes_s,

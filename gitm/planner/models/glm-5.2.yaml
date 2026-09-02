@@ -126,17 +126,30 @@ spec:
   first_k_dense_replace: 3
   routed_scaling_factor: 2.5
 
-  # Multi-token prediction. index_share_for_mtp_iteration: the draft reuses the
-  # main model's index rather than recomputing it.
+  # Multi-token prediction. One MTP module, invoked once per drafted token
+  # (EAGLE-style); the vendor recipe runs it 5 deep. index_share_for_mtp_iteration:
+  # the draft reuses the main model's selection, and the weight map agrees — the
+  # MTP block carries no indexer tensors, exactly like the 57 'shared' layers.
   num_nextn_predict_layers: 1
   index_share_for_mtp_iteration: true
 
-  # bf16 checkpoint — no quantization_config published. fp8/fp4 is a serving
-  # decision, applied at deploy time, not a model fact.
+  # The bf16 release: no quantization_config, and 1.507 TB on disk matches an
+  # all-bf16 read. This is the model fact. It is NOT the deployment shape — the
+  # vendor ships and recommends zai-org/GLM-5.2-FP8 (753.33 GB), which is the
+  # `glm-5.2-fp8` entry beside this one and the one to plan against. Keep this
+  # entry for what it answers: what the unquantised model costs, and therefore
+  # what quantisation is actually worth.
   weight_dtype: bf16
   expert_dtype: bf16
   kv_dtype: bf16
   act_dtype: bf16
+
+  # fp32 even here. moe_router_dtype is a field of the base config, not of any
+  # quantisation config, so the router's precision is a property of the model and
+  # not of the deployment — the one op that does not follow weight_dtype on an
+  # otherwise uniformly-bf16 checkpoint.
+  op_dtype_overrides:
+    - [moe_router, fp32]
 
 provenance:
   verified:
@@ -178,11 +191,9 @@ provenance:
         settle against a capture: does the engine run absorbed MLA?
 
   unmodelled:
-    - Prefill. Decode only, as with every other graph family. Chunked prefill runs
-      a different indexer path (score-and-select over the whole prompt) with
-      different asymptotics.
     - index_topk_freq as a *temporal* reuse across decode steps. Modelled here as
       the spatial layer-group period (which the weight map proves); any additional
       step-to-step reuse would only reduce indexer cost further.
-    - Serving quantisation (fp8 KV cache, fp8/fp4 experts). Priced at bf16 — the
-      published checkpoint's precision. A quantised deploy is a separate spec.
+    - Absorbed-MLA decode. See the estimated entry above.
+    - Acceptance rate under MTP. The graph prices D drafts and a 1+D verify; the
+      fraction kept is a serving observable, not a config-derivable one.

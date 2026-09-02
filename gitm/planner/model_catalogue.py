@@ -118,6 +118,15 @@ def load_spec(name_or_path: str | Path):
     for key in ("compress_ratios", "dspark_layer_ids", "indexer_types", "mlp_layer_types"):
         if key in raw and isinstance(raw[key], list):
             raw[key] = tuple(raw[key])
+    # Nested one level: ``op_dtype_overrides`` is a list of ``[op, dtype]`` pairs
+    # in YAML and must reach the frozen spec as a tuple of tuples. Coercing only
+    # the outer list would leave inner lists inside a frozen dataclass — hashable
+    # in appearance, not in fact.
+    if isinstance(raw.get("op_dtype_overrides"), list):
+        raw["op_dtype_overrides"] = tuple(
+            tuple(pair) if isinstance(pair, list) else pair
+            for pair in raw["op_dtype_overrides"]
+        )
 
     unknown = set(raw) - known
     if unknown:

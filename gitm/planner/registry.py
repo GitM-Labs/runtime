@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -120,6 +121,9 @@ def add_plan_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="Context already cached before this chunk (0 for a first chunk).")
     ap.add_argument("--prefill-requests", type=int, default=1,
                     help="How many prompts those tokens belong to — sets lm_head rows.")
+    ap.add_argument("--spec-tokens", type=int, default=0,
+                    help="Speculative (MTP) draft tokens per step. Adds a D-deep "
+                         "draft chain and makes the backbone a 1+D-row verify.")
     ap.add_argument("--tp", type=int, default=1, help="Tensor-parallel size.")
     ap.add_argument("--ep", type=int, default=1, help="Expert-parallel size.")
     ap.add_argument("--dp", type=int, default=1, help="Data-parallel size.")
@@ -189,6 +193,7 @@ def _predict(spec, family: str, hw, batch, sharding):
 
 def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
     agg: dict[str, list[float]] = {}
+    bounds: dict[str, Counter[str]] = {}
     for n in g.nodes:
         p = n.prediction
         a = agg.setdefault(n.op, [0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -198,10 +203,20 @@ def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
         a[3] += p.t_memory_s
         a[4] += p.flops
         a[5] += p.bytes
+        bounds.setdefault(n.op, Counter())[p.bound] += 1
 
     total = g.total_pred_s
-    ridge = (hw.peak_flops_bf16_per_s / hw.peak_mem_bw_bytes_per_s
-             if hw.peak_mem_bw_bytes_per_s else 0.0)
+    # One ridge per *dtype in the graph*, not one for the model. A checkpoint that
+    # runs fp8 GEMMs against a bf16 ridge is measured against a ceiling half its
+    # own: on an H200 that is 412 FLOP/byte answering to 206, which moves the
+    # bound label of every op sitting between them.
+    dtypes = {n.prediction.peak_dtype: n.prediction.peak_flops_per_s for n in g.nodes}
+    ridges = {
+        d: peak / hw.peak_mem_bw_bytes_per_s
+        for d, peak in sorted(dtypes.items())
+        if peak > 0 and hw.peak_mem_bw_bytes_per_s
+    }
+    ridge_line = " · ".join(f"{d} {r:.0f}" for d, r in ridges.items()) or "unpriced"
 
     out = [
         f"model     {getattr(spec, 'name', '?')}  [{family}]",
@@ -209,20 +224,29 @@ def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
         f"hardware  {hw.name}  "
         f"{hw.peak_flops_bf16_per_s / 1e12:.0f} TFLOP/s bf16, "
         f"{hw.peak_mem_bw_bytes_per_s / 1e12:.2f} TB/s",
-        f"ridge     {ridge:.0f} FLOP/byte — a node below this is memory-bound",
+        f"ridge     {ridge_line} FLOP/byte — a node below its own dtype's "
+        "ridge is memory-bound",
         "",
         f"  {'op':24s} {'xN':>4s} {'t_pred':>9s} {'share':>7s} "
         f"{'t_comp':>9s} {'t_mem':>9s} {'AI':>7s}  bound",
     ]
     for op, (n, tp, tc, tm, fl, by) in sorted(agg.items(), key=lambda kv: -kv[1][1]):
         ai = fl / by if by else 0.0
-        bound = "compute" if tc >= tm else "memory"
+        # The node's own label, not a recomputed compute-vs-memory one. The
+        # roofline has three bounds and the third — ``launch`` — is the whole
+        # low-batch story on a sparse model: hundreds of pointwise and routing
+        # kernels whose wall time is the launch, not the bytes. Recomputing here
+        # silently relabelled every one of them as memory-bound.
+        bound = bounds[op].most_common(1)[0][0]
+        if len(bounds[op]) > 1:
+            bound = f"{bound}*"  # the op's instances do not agree
         out.append(
             f"  {op:24s} {int(n):4d} {tp * 1e3:8.3f}m {tp / total:6.1%} "
             f"{tc * 1e3:8.3f}m {tm * 1e3:8.3f}m {ai:7.1f}  {bound}"
         )
 
     n_compute = sum(1 for n in g.nodes if n.prediction.bound == "compute")
+    n_launch = sum(1 for n in g.nodes if n.prediction.bound == "launch")
     out += [
         "",
         f"  floor {total * 1e3:.3f} ms/step   " + (
@@ -231,8 +255,12 @@ def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
             if g.batch.is_prefill
             else f"{g.batch.batch / total:,.0f} tok/s at batch {g.batch.batch}"
         ),
-        f"  {len(g.nodes)} nodes, {n_compute} compute-bound",
+        f"  {len(g.nodes)} nodes, {n_compute} compute-bound, "
+        f"{n_launch} launch-bound",
     ]
+    if any(b for b in bounds.values() if len(b) > 1):
+        out.append("  * this op's instances do not share a bound — the label is "
+                   "the majority one")
     if g.has_unpriced_collectives:
         out.append("  ! collectives unpriced — this SKU has no interconnect bandwidth "
                    "in the catalogue")
@@ -298,7 +326,9 @@ def main(argv: list[str] | None = None) -> int:
               f"kv_len={args.kv_len}, TP={args.tp} EP={args.ep}")
         print(f"  {'batch':>7s} {'ms/step':>10s} {'tok/s':>12s} {'compute-bound':>14s}")
         for b in sizes:
-            g = _predict(spec, family, hw, BatchConfig(batch=b, kv_cache_len=args.kv_len),
+            g = _predict(spec, family, hw,
+                         BatchConfig(batch=b, kv_cache_len=args.kv_len,
+                                     speculative_tokens=args.spec_tokens),
                          sharding)
             cb = sum(1 for n in g.nodes if n.prediction.bound == "compute")
             print(f"  {b:7d} {g.total_pred_s * 1e3:9.3f} "
@@ -307,6 +337,7 @@ def main(argv: list[str] | None = None) -> int:
 
     batch = BatchConfig(
         batch=args.batch, kv_cache_len=args.kv_len,
+        speculative_tokens=args.spec_tokens,
         prefill_tokens=args.prefill_tokens, prefill_context=args.prefill_context,
         prefill_requests=args.prefill_requests,
     )
@@ -323,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
             "hardware": hw.name,
             "sharding": {"tp": args.tp, "ep": args.ep, "dp": args.dp},
             "batch": {"batch": args.batch, "kv_cache_len": args.kv_len,
+                      "speculative_tokens": args.spec_tokens,
                       "prefill_tokens": args.prefill_tokens,
                       "prefill_context": args.prefill_context,
                       "prefill_requests": args.prefill_requests},
