@@ -95,6 +95,19 @@ from gitm.planner.roofline import (
     weight_bytes,
 )
 
+
+def _canon(dtype: str) -> str:
+    """Canonical dtype name, so ``"e4m3"`` and ``"fp8"`` answer the same question."""
+    d = dtype.lower()
+    if d in ("fp8", "e4m3", "e5m2"):
+        return "fp8"
+    if d in ("bf16", "fp16", "float16", "half"):
+        return "fp16"
+    if d in ("fp32", "float32", "tf32"):
+        return "fp32"
+    return d
+
+
 FULL_INDEXER = "full"
 SHARED_INDEXER = "shared"
 DENSE_MLP = "dense"
@@ -466,6 +479,23 @@ def _linear(rows: float, k: int, n: int, act_b: float, w_b: float) -> tuple[floa
     return 2.0 * rows * k * n, act_b * rows * k + w_b * k * n + act_b * rows * n
 
 
+def _pointwise(rows: float, elems: float, act_b: float, *, ops: float = 1.0) -> tuple[float, float]:
+    """(flops, bytes) for an elementwise kernel over ``rows x elems``.
+
+    Read once, written once — the traffic that makes a norm or a residual add
+    cost anything at all. ``ops`` is arithmetic per element (a residual add is 1,
+    an RMSNorm is ~3 counting the reduction and the rescale).
+
+    These nodes are individually a rounding error and collectively the low-batch
+    story: at batch 1 there is no useful arithmetic and no useful bandwidth in any
+    of them, so each one costs exactly one kernel launch and the step is the sum
+    of its launches. A graph that folds them into the GEMM they precede cannot
+    show that, and will report a decode step as memory-bound when it is not.
+    """
+    n = rows * elems
+    return ops * n, 2.0 * n * act_b
+
+
 def _emit_layer(
     g: Graph,
     spec: GlmMoeDsaModelSpec,
@@ -535,7 +565,30 @@ def _emit_layer(
         """Bytes per stored weight for ``op``, after any precision override."""
         return weight_bytes(spec.dtype_for(op, default))
 
+    def add_pointwise(op: str, elems: float, *, ops: float = 1.0) -> None:
+        f_p, b_p = _pointwise(rows, elems, aw, ops=ops)
+        add(op, f_p, b_p, spec.act_dtype)
+
+    def add_act_quant(op: str, elems: float, gemm_op: str) -> None:
+        """Dynamic FP8 activation scaling ahead of a quantised GEMM.
+
+        GLM-5.2-FP8 declares ``activation_scheme: "dynamic"``, so the activation
+        is quantised at run time — a pointwise pass plus a per-row reduction for
+        the scale, as its own kernel, once per group of fp8 GEMMs that share an
+        input. Emitted only where the consuming GEMM is actually fp8: on the bf16
+        checkpoint there is nothing to quantise and the kernel does not exist,
+        which is the sort of difference a single model-wide dtype cannot express.
+        """
+        if _canon(spec.dtype_for(gemm_op, wd)) != "fp8":
+            return
+        # Read the bf16 activation, write the fp8 one plus its scales.
+        add(op, 2.0 * rows * elems,
+            rows * elems * (aw + 1.0) + rows * 4.0, spec.act_dtype)
+
     # ── MLA attention: low-rank query, compressed KV latent ──────────────────
+    add_pointwise("input_layernorm", h, ops=3.0)
+    add_act_quant("act_quant_attn", h, "attn_q_a")
+
     # q_a and kv_a are replicated across TP ranks: they produce the shared latent,
     # which has nothing to split when there is one KV latent. Every rank pays them
     # in full, so TP's speedup on attention is strictly less than ``tp``.
@@ -653,17 +706,22 @@ def _emit_layer(
     add("attn_out_proj", f, b, wd)
 
     _emit_collective(g, spec, hw, layer, "tp_all_reduce_attn", rows, sh, prefix)
+    add_pointwise("attn_residual", h)
+    add_pointwise("post_attention_layernorm", h, ops=3.0)
 
     # ── FFN: dense on the leading layers, mixture on the rest ────────────────
     if not spec.is_sparse_mlp(layer):
         # Dense FFN (first_k_dense_replace). gate+up then down over the wide
         # intermediate. Canonical dense-graph names so residuals stay comparable.
         inter = spec.intermediate_size
+        add_act_quant("act_quant_mlp", h, "mlp_gate_up")
         f_gu, b_gu = _linear(rows, h, 2 * inter // tp, aw, w_bytes("mlp_gate_up", wd))
         add("mlp_gate_up", f_gu, b_gu, wd)
+        add_pointwise("mlp_silu", inter / tp, ops=4.0)
         f_d, b_d = _linear(rows, inter // tp, h, aw, w_bytes("mlp_down", wd))
         add("mlp_down", f_d, b_d, wd)
         _emit_collective(g, spec, hw, layer, "tp_all_reduce_mlp", rows, sh, prefix)
+        add_pointwise("mlp_residual", h)
         return
 
     # Router is replicated: every rank scores every expert to know what to keep.
@@ -672,16 +730,23 @@ def _emit_layer(
     f, b = _linear(rows, h, spec.n_routed_experts, aw, w_bytes("moe_router", wd))
     add("moe_router", f, b, wd)
 
-    # Sigmoid scoring, the noaux_tc bias correction, top-8 and the renorm. Almost
-    # no bytes and almost no arithmetic — but it is the **only data-dependent
-    # shape in the step**, so it is the node that decides whether the step can be
-    # CUDA-graph captured at all. Kept as its own node for that reason alone.
+    # Sigmoid scoring and the noaux_tc bias correction — a plain pointwise pass
+    # over the [rows, 256] score matrix.
+    add_pointwise("moe_sigmoid_bias", spec.n_routed_experts, ops=3.0)
+
+    # The top-8 selection and renorm. Almost no bytes and almost no arithmetic —
+    # but it is the **only data-dependent shape in the step**, and therefore the
+    # node that decides whether the step can be CUDA-graph captured at all. Split
+    # from the sigmoid above for exactly that reason: they are the same size and
+    # the same cost, and only one of them is a hazard.
     add(
         "moe_topk",
-        3.0 * rows * spec.n_routed_experts,
-        2.0 * rows * spec.n_routed_experts * aw,
+        0.0,
+        rows * (spec.n_routed_experts + 2.0 * spec.top_k) * aw,
         spec.act_dtype,
     )
+
+    add_act_quant("act_quant_moe", h, "moe_routed")
 
     inter = spec.moe_intermediate_size
     per_expert_weights = 3.0 * h * inter
@@ -725,6 +790,10 @@ def _emit_layer(
         ed,
     )
 
+    # SwiGLU between the gate/up and down grouped GEMMs. Its own kernel in every
+    # grouped-GEMM backend this targets, over the expanded ``rows x top_k`` tensor.
+    add_pointwise("moe_silu", spec.top_k * inter / es, ops=4.0)
+
     # Weighted scatter-add back to ``rows x hidden``, including the
     # routed_scaling_factor multiply.
     add(
@@ -738,6 +807,7 @@ def _emit_layer(
         g, spec, hw, layer, "tp_all_reduce_mlp", rows, sh, prefix,
         dispatches_experts=True,
     )
+    add_pointwise("mlp_residual", h)
 
 
 def _emit_collective(
@@ -857,11 +927,35 @@ def predict_glm_graph(
         raise ValueError("n_layers must be positive — an empty model predicts nothing")
 
     g = Graph(model=spec, hw=hw, batch=batch, sharding=sh)  # type: ignore[arg-type]
+    aw = weight_bytes(spec.act_dtype)
+    rows = float(batch.positions_per_step + batch.prefill_tokens)
+
+    # Prologue: one gather from the untied input embedding. No FLOPs, and the
+    # bytes are the rows it touches, not the 1.9 GB table — an index_select reads
+    # what it selects.
+    g.nodes.append(
+        PredictedNode(
+            "embed_tokens", None,
+            roofline("embed_tokens", 0.0, rows * spec.hidden * aw, hw,
+                     spec.act_dtype, serial_launches=1),
+        )
+    )
 
     for layer in range(spec.n_layers):
         _emit_layer(g, spec, hw, layer, batch=batch, sh=sh)
 
-    aw = weight_bytes(spec.act_dtype)
+    # Epilogue: the final norm runs over every row that needs logits, not every
+    # row in the step — the same count lm_head uses, and at prefill that is one
+    # row per prompt rather than the whole chunk.
+    logit_rows = float(batch.logits_rows)
+    f_n, b_n = _pointwise(logit_rows, spec.hidden, aw, ops=3.0)
+    g.nodes.append(
+        PredictedNode(
+            "final_norm", None,
+            roofline("final_norm", f_n, b_n, hw, spec.act_dtype, serial_launches=1),
+        )
+    )
+
     lm_w = weight_bytes(spec.dtype_for("lm_head", spec.weight_dtype))
     lm_dtype = spec.dtype_for("lm_head", spec.weight_dtype)
 
@@ -875,6 +969,26 @@ def predict_glm_graph(
         )
 
     add_lm_head(batch.logits_rows, None)
+
+    # The vocabulary projection is sharded across TP ranks, so the ranks must
+    # gather each other's slices before sampling. FP32 logits, full vocabulary —
+    # 19.8 MB at 32 rows, which is small in bytes and is one more unavoidable
+    # collective on the critical path between the last layer and the sample.
+    if sh.tp > 1:
+        link = replace(hw, peak_mem_bw_bytes_per_s=hw.interconnect_bw_bytes_per_s)
+        priced = hw.interconnect_bw_bytes_per_s > 0
+        g.nodes.append(
+            PredictedNode(
+                "logits_all_gather", None,
+                roofline(
+                    "logits_all_gather", 0.0,
+                    batch.logits_rows * spec.vocab * 4.0 * (sh.tp - 1) / sh.tp,
+                    link, "fp32", estimated=True,
+                    serial_launches=1 if priced else 0,
+                ),
+                expected_stream_id=1,
+            )
+        )
 
     # ── the draft chain ──────────────────────────────────────────────────────
     # The MTP module is invoked once per drafted token, serially. Each stage sees
@@ -905,6 +1019,17 @@ def predict_glm_graph(
                 g, spec, hw, spec.n_layers + stage,
                 batch=draft_batch, sh=sh,
                 force_full_indexer=not spec.index_share_for_mtp_iteration,
+            )
+            # ``enorm`` and ``hnorm``: the MTP block normalises the embedding and
+            # the carried hidden state separately before fusing them. Two kernels,
+            # bf16 on the FP8 checkpoint, and they sit inside the serial chain.
+            f_n2, b_n2 = _pointwise(draft_batch.batch, 2.0 * spec.hidden, aw, ops=3.0)
+            g.nodes.append(
+                PredictedNode(
+                    "mtp_norms", spec.n_layers + stage,
+                    roofline("mtp_norms", f_n2, b_n2, hw, spec.act_dtype,
+                             serial_launches=2),
+                )
             )
             # ``eh_proj``: the [2*hidden, hidden] fusion of the previous hidden
             # state with the embedding of the token just drafted. bf16 on the FP8

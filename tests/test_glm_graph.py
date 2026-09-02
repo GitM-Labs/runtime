@@ -404,6 +404,83 @@ def test_a_pure_prefill_step_runs_no_draft_head():
     assert len(_ops(g, "lm_head")) == 1
 
 
+#: The node a GLM-5.2 MoE layer lowers to, in issue order. Pinned because the
+#: design note's whole low-batch argument is a claim about *how many kernels* a
+#: layer is, not just how many bytes it moves — and a graph that quietly folds the
+#: pointwise work into the GEMM it precedes reports a decode step as memory-bound
+#: when it is launch-bound.
+MOE_LAYER_NODES = (
+    "input_layernorm", "act_quant_attn",
+    "attn_q_a", "attn_q_b", "attn_kv_a", "attn_kv_b",
+    "attn_score_value", "attn_qnorm_rope_insert", "attn_out_proj",
+    "tp_all_reduce_attn", "attn_residual", "post_attention_layernorm",
+    "moe_router", "moe_sigmoid_bias", "moe_topk", "act_quant_moe",
+    "moe_shared", "moe_permute", "moe_routed", "moe_silu", "moe_combine",
+    "moe_all_to_all", "tp_all_reduce_mlp", "mlp_residual",
+)
+
+
+def test_layer_lowers_to_the_documented_node_sequence():
+    # The FP8 entry, because two of the 24 nodes are the dynamic activation
+    # quantisation the bf16 checkpoint does not run.
+    spec = load_spec("glm-5.2-fp8")
+    g = predict_glm_graph(
+        spec, batch=BatchConfig(batch=32, kv_cache_len=8192),
+        sharding=ShardingConfig(tp=8, ep=8),
+    )
+    shared = tuple(n.op for n in g.nodes if n.layer == 5)  # Ls,sh
+    assert shared == MOE_LAYER_NODES
+
+    # A full-indexer layer is the same sequence with two nodes inserted.
+    full = tuple(n.op for n in g.nodes if n.layer == 6)  # Ls,f
+    assert len(full) == len(shared) + 2
+    assert "attn_index_proj" in full and "attn_index_score" in full
+
+    # A dense layer swaps the whole mixture for three nodes, and so is the only
+    # block in the model with no data-dependent shape and no expert traffic.
+    dense = tuple(n.op for n in g.nodes if n.layer == 0)  # Ld,f
+    assert {"act_quant_mlp", "mlp_gate_up", "mlp_silu", "mlp_down"} <= set(dense)
+    assert "moe_topk" not in dense and "moe_all_to_all" not in dense
+
+
+def test_prologue_and_epilogue_are_nodes():
+    """The step does not begin at layer 0 or end at the last one.
+
+    A gather, a final norm, the vocabulary projection and — under TP — the logits
+    all-gather that has to complete before anything can be sampled.
+    """
+    spec = _spec()
+    g = predict_glm_graph(
+        spec, batch=BatchConfig(batch=32, kv_cache_len=8192),
+        sharding=ShardingConfig(tp=8),
+    )
+    ends = [n.op for n in g.nodes if n.layer is None]
+    assert ends == ["embed_tokens", "final_norm", "lm_head", "logits_all_gather"]
+    # Without TP there is nothing to gather.
+    solo = predict_glm_graph(spec, batch=BatchConfig(batch=32, kv_cache_len=8192))
+    assert "logits_all_gather" not in [n.op for n in solo.nodes]
+
+
+def test_act_quant_exists_only_where_a_gemm_is_actually_fp8():
+    """Dynamic activation scaling is a kernel the bf16 checkpoint does not run.
+
+    ``activation_scheme: "dynamic"`` means the activation is quantised at run
+    time, once per group of fp8 GEMMs sharing an input. On the unquantised
+    checkpoint there is nothing to quantise — the sort of difference a single
+    model-wide dtype cannot express.
+    """
+    bf16 = _spec()
+    fp8 = replace(
+        bf16, weight_dtype="fp8", expert_dtype="fp8",
+        op_dtype_overrides=(("lm_head", "bf16"), ("moe_router", "fp32")),
+    )
+    batch = BatchConfig(batch=32, kv_cache_len=8192)
+    assert not _ops(predict_glm_graph(bf16, batch=batch), "act_quant_attn")
+    assert len(_ops(predict_glm_graph(fp8, batch=batch), "act_quant_attn")) == (
+        fp8.n_layers + fp8.num_nextn_predict_layers
+    )
+
+
 def test_detect_family_routes_glm_before_sparse_moe():
     """Both families carry index_topk + n_routed_experts; model_type must win."""
     assert detect_family(GLM_CONFIG) == "glm_moe_dsa"

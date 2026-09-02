@@ -242,8 +242,8 @@ flowchart TD
 tokens issues `8P` token→expert assignments. Once `8P ≫ 256` — P above a few
 hundred — every expert receives at least one token, so **every layer reads its
 entire expert bank**, 1.26 GB per rank per layer at EP8, **constant in P**. That is
-95.7 GB per pass, 29 % of all prefill traffic. But it is not the top line: **the EP
-all-to-all is**, at 105.7 GB and 48 % of predicted prefill time. Three quarters of
+95.7 GB per pass, 23 % of all prefill traffic. But it is not the top line: **the EP
+all-to-all is**, at 105.7 GB and 45 % of predicted prefill time. Three quarters of
 prefill cost is the MoE path, and under expert parallelism most of that is *wire*,
 not DRAM.
 
@@ -296,7 +296,7 @@ vocabulary weights *every step* rather than once per request.
         │                                            in the graph. Blocks CUDA-graph
         │                                            capture. §5 rank 2.
    EP dispatch a2a ─▶ permute ─▶ grouped GEMM fp8 ×2 ─▶ SiLU ─▶ grouped GEMM fp8
-        │             163/256 experts woken at B=32 · 771 MB/layer · 86 % of DRAM
+        │             163/256 experts woken at B=32 · 771 MB/layer · 85 % of DRAM
    scatter-add ×2.5 ─▶ EP combine a2a ─▶ all_reduce #2
         ▼
    … ×78 layers, then:
@@ -335,10 +335,10 @@ never read.
 flowchart LR
   subgraph V["VANILLA DECODE"]
     direction TB
-    v1["1 row per seq"] --> v2["78 layers + 1 MTP<br/>1,294 nodes"] --> v3["lm_head"] --> v4["sample"]
+    v1["1 row per seq"] --> v2["78 layers + 1 MTP<br/>1,927 nodes"] --> v3["lm_head"] --> v4["sample"]
     v4 --> v5(("1 token"))
   end
-  subgraph D["DRAFT — 5 SERIAL stages, 90 nodes"]
+  subgraph D["DRAFT — 5 SERIAL stages, 135 nodes"]
     direction TB
     d0["h at last accepted pos<br/>+ its token"] --> eh["eh_proj [12288→6144] BF16"]
     eh --> d1["MTP block<br/>MLA+DSA (shared index) + FULL MoE"]
@@ -347,7 +347,7 @@ flowchart LR
   end
   subgraph W["VERIFY = decode at 1+D rows"]
     direction TB
-    w1["6 rows per seq"] --> w2["THE SAME 78 layers<br/>THE SAME 1,276 nodes"]
+    w1["6 rows per seq"] --> w2["THE SAME 78 layers<br/>THE SAME 1,900 nodes"]
     w2 --> w3["lm_head, 6 rows"] --> w4["compare vs draft"]
     w4 --> w5(("1..6 accepted"))
   end
@@ -357,8 +357,8 @@ flowchart LR
 ```
 
 **Verify is not a new graph.** It is the decode graph with the row dimension
-multiplied by `1+D`. The only genuinely new subgraph is the draft chain — 90 nodes
-against the backbone's 1,276.
+multiplied by `1+D`. The only genuinely new subgraph is the draft chain — 135 nodes
+against the backbone's 1,900.
 
 **The dependency point:** the loop is strictly serial and now has `D+1` sampling
 points instead of one. Nothing in stage `k` can start before stage `k-1`'s token id
@@ -387,16 +387,29 @@ argued rather than looked up.
 
 ### 3.1 Prologue and epilogue
 
-| id  | operator          | kernel class              | shape                          | FLOPs    | bytes         | stream  | conf   |
-| --- | ----------------- | ------------------------- | ------------------------------ | -------- | ------------- | ------- | ------ |
-| D0  | `embed_tokens`    | gather (index_select)     | `[32] → [32,6144]`             | 0 F      | 393 kB        | compute | high   |
-| E0  | final norm        | fused RMSNorm             | `[32,6144]` **every sequence** | 590 kF   | 786 kB        | compute | high   |
-| E1  | `lm_head`         | GEMM (BF16), tall-skinny  | `[32,6144] × [6144,19360]`     | 7.61 GF  | **239.5 MB**/rank | memory | high |
-| E2  | sample + D2H      | argmax/top-p + host copy  | `[32,154880] → [32]`           | —        | small         | compute | high   |
+The step does not begin at layer 0 or end at layer 77. Four nodes bracket it, and
+two of them are on the critical path between the last layer and the sample.
 
-`lm_head` is TP-sharded on the vocabulary, so per rank it is 239.5 MB of the 1.903 GB
-whole-model matrix. It is 0.6 % of a decode step and **0.02 %** of a prefill one —
-the epilogue is nearly free in prefill and is not in decode.
+| id  | operator            | kernel class              | shape                          | FLOPs    | bytes         | stream | bound  |
+| --- | ------------------- | ------------------------- | ------------------------------ | -------- | ------------- | ------ | ------ |
+| D0  | `embed_tokens`      | gather (index_select)     | `[32] → [32,6144]`             | 0 F      | 0.393 MB      | compute | launch |
+| E0  | `final_norm`        | fused RMSNorm             | `[32,6144]`, **logits rows only** | 0.6 MF | 0.786 MB   | compute | launch |
+| E1  | `lm_head`           | GEMM (BF16), tall-skinny  | `[32,6144] × [6144,19360]`     | 7.61 GF  | **239.5 MB**  | compute | memory |
+| E2  | `logits_all_gather` | collective (all-gather)   | `[32,19360] → [32,154880]` fp32 | 0 F     | **17.3 MB**   | comm   | memory |
+
+Three things worth naming:
+
+- **D0 reads what it selects, not the table.** An `index_select` over a 1.9 GB
+  embedding costs 393 kB at 32 rows. The resident 1.9 GB matters for the fit math
+  (§1), not for the step.
+- **E0 runs over `logits_rows`, not over every row in the step.** At decode those
+  are the same number; at prefill they are 1 per prompt against a 8,192-token
+  chunk, and charging the chunk would make the epilogue the largest thing in a
+  prefill step.
+- **E2 exists because E1 is vocabulary-sharded.** 17.3 MB of fp32 logits gathered
+  across 8 ranks before anything can be sampled — small in bytes, unavoidable in
+  position, and the second-most-expensive single node in a decode step after the
+  expert bank (19.3 µs).
 
 ### 3.2 What prefill changes
 
@@ -428,11 +441,11 @@ against P = 1 decode row per sequence:
 
 | Prefill, P=8192, C=0, TP8/EP8, per rank | value |
 | --- | --- |
-| predicted floor | **243.1 ms** for the chunk (33.7 k tok/s) |
-| bytes moved | **330.6 GB** |
-| FLOPs | **118.3 TF** |
-| whole-pass AI | **358** — below the fp8 ridge of 412, so **memory-bound overall** |
-| facets | compute 666 n / 86.3 ms / 35.5 % · memory 535 n / 156.6 ms / 64.4 % · launch 75 n / 0.1 ms |
+| predicted floor | **262.4 ms** for the chunk (31.2 k tok/s) |
+| bytes moved | **422.6 GB** |
+| FLOPs | **118.4 TF** |
+| whole-pass AI | **280** — below the fp8 ridge of 412, so **memory-bound overall** |
+| facets | compute 666 n / 86.3 ms / 32.9 % · memory 1,082 n / 175.7 ms / 67.0 % · launch 152 n / 0.3 ms |
 
 > ⚠ **The prefill rows overturn the dense-model intuition, and the reversal is
 > worth keeping visible.** Dense intuition says prefill is compute-bound. It is
@@ -448,12 +461,12 @@ against P = 1 decode row per sequence:
 
 | chunking            | bytes       | floor      |
 | ------------------- | ----------- | ---------- |
-| 1 × 8,192           | **331 GB**  | 243 ms     |
-| 2 × 4,096           | 426 GB      | 259 ms     |
-| 8 × 1,024           | 996 GB      | 374 ms     |
-| 64 × 128            | **6,221 GB**| **1,499 ms** |
+| 1 × 8,192           | **423 GB**  | 262 ms     |
+| 2 × 4,096           | 518 GB      | 278 ms     |
+| 8 × 1,024           | 1,088 GB    | 394 ms     |
+| 64 × 128            | **6,313 GB**| **1,579 ms** |
 
-**18.8× the bytes for identical FLOPs.** The expert bank is read per *chunk*, not per
+**14.9× the bytes for identical FLOPs.** The expert bank is read per *chunk*, not per
 token — so a small `--max-num-batched-tokens`, chosen to protect decode latency,
 is paid for here at a rate nothing in a per-token cost model shows.
 
@@ -463,42 +476,42 @@ At B=32, S=8192, D=5 (the vendor recipe's `num_speculative_tokens`):
 
 | pass                   | nodes     | bytes        | floor         |
 | ---------------------- | --------- | ------------ | ------------- |
-| vanilla decode (D=0)   | 1,294     | 68.22 GB     | 15.887 ms     |
-| — of which the draft   | 18        | 1.26 GB      | 0.285 ms      |
-| draft chain, D=5       | 90        | **6.31 GB**  | 1.423 ms      |
-| verify, 192 rows       | 1,276     | 104.2 GB     | 25.756 ms     |
-| **MTP step total**     | **1,366** | **110.5 GB** | **27.179 ms** |
+| vanilla decode (D=0)   | 1,927     | 68.61 GB     | 17.173 ms     |
+| — of which the draft   | 27        | 1.27 GB      | 0.305 ms      |
+| draft chain, D=5       | 135       | **6.34 GB**  | 1.523 ms      |
+| verify, 192 rows       | 1,900     | 106.4 GB     | 27.118 ms     |
+| **MTP step total**     | **2,035** | **112.8 GB** | **28.641 ms** |
 
-**Cost ratio 1.71× for up to 6 tokens.** Where the extra 42.3 GB goes:
+**Cost ratio 1.67× for up to 6 tokens.** Where the extra 44.2 GB goes:
 
-- **The verify pass, +36.0 GB.** Almost all of it is one line: expert weights go
+- **The verify pass, +37.8 GB.** Almost all of it is one line: expert weights go
   from 163 distinct experts at 32 rows to 256 at 192 rows — **the union saturates**,
   so 6× the rows costs 1.57× the expert bytes. KV read does **not** move at all
   (0.43 GB either way, because it is read per *sequence*, not per row), and verify
   `lm_head` does not move either (239.5 MB regardless of rows).
-- **The draft chain, +5.05 GB.** And this is where GLM differs from a dense-draft
-  model: **the draft is 5.2 % of the MTP step, not 1–2 %**, because each of its 5
+- **The draft chain, +5.07 GB.** And this is where GLM differs from a dense-draft
+  model: **the draft is 5.3 % of the MTP step, not 1–2 %**, because each of its 5
   stages draws on a full 256-expert bank. Its cost is linear in D with no
   saturation to help it — 32 rows wakes ~163 experts every stage, five times over.
 
-**So ~85 % of the price of speculation is the MoE expert bank** — charged because
+**So ~86 % of the price of speculation is the MoE expert bank** — charged because
 more rows and more stages touch more experts, not because more work is done per
 token.
 
-**Break-even.** The step costs 1.71×; it produces up to 6 tokens instead of 1, so
-acceptance α must exceed `(1.71 − 1)/5 = 0.142` to pay. Predicted throughput:
+**Break-even.** The step costs 1.67×; it produces up to 6 tokens instead of 1, so
+acceptance α must exceed `(1.67 − 1)/5 = 0.134` to pay. Predicted throughput:
 
 | α    | 0.0   | 0.5   | 0.7   | 0.9   |
 | ---- | ----- | ----- | ----- | ----- |
-| tok/s| 1,177 | 4,121 | 5,298 | **6,476** |
+| tok/s| 1,117 | 3,911 | 5,028 | **6,145** |
 
-against 2,014 tok/s with MTP off. The vendor claims the GLM-5.2 MTP layer raises
+against 1,863 tok/s with MTP off. The vendor claims the GLM-5.2 MTP layer raises
 accepted length by up to 20 % over its predecessor, which puts the operating point
 well past break-even — but **α is a serving observable and this graph does not
 predict it.** It prices the cost and leaves the payoff to a measurement (§6.2, C4).
 
 ⚑ **All of this assumes the step is memory-bound.** At B ≤ 8 it is not (§4.1), and
-in the launch regime the draft's 90 extra launches are pure cost against a step
+in the launch regime the draft's 135 extra launches are pure cost against a step
 that was never moving bytes. The sign of the MTP decision flips with batch.
 
 ### 3.4 Predicted synchronization points
@@ -515,7 +528,7 @@ that was never moving bytes. The sign of the MTP decision flips with batch.
 | S8     | KV rollback                 | discard rejected rows                                              | **low** on mechanism       | pointer rewind (free) or real memmove (not free) — the trace tells you which            |
 | S9     | indexer selection handoff   | the `full` layer's top-k must be visible to its 3 `shared` layers   | **low**                    | if it round-trips the host, IndexShare costs a sync it should not — **21 per step**    |
 
-**S5 is the decode-specific one worth chasing.** Decode runs ~1,294 kernels in
+**S5 is the decode-specific one worth chasing.** Decode runs ~1,927 kernels in
 ~16 ms and then hands control back to a Python scheduler. If the scheduler takes
 longer than the step, the GPU idles and no kernel-level work matters.
 
@@ -550,31 +563,37 @@ ridge 412 F/B (fp8) · 206 (bf16) · 14 (fp32) · launch floor 2.0 µs (graph-re
 
  node                     kernel class              bytes      AI    xN     Σ ms   bound   share
  ──────────────────────   ───────────────────────   ────────   ────  ───   ─────   ──────  ────────────────────────
- moe_routed               grouped GEMM fp8 ×3       771.1 MB    3.1   76   12.208  memory  ██████████████████████ 76.8%
- attn_score_value         paged decode attention     42.0 MB   12.8   79    0.690  memory  █ 4.3%
- moe_all_to_all           collective (EP a2a)         5.5 MB     —    76    0.465  comm    █ 2.9%
- attn_q_a                 GEMM fp8, REPLICATED       13.1 MB   61.4   79    0.216  memory  ▏ 1.4%
- attn_out_proj            GEMM fp8, tall-skinny      13.1 MB   61.4   79    0.216  memory  ▏ 1.4%
- attn_q_b                 GEMM fp8, tall-skinny       4.5 MB   60.2   79    0.158  launch  ▏ 1.0%
- attn_kv_a                GEMM fp8 + cache append     4.0 MB   56.8   79    0.158  launch  ▏ 1.0%
- attn_kv_b                GEMM fp8 (unabsorbed)       2.1 MB   56.0   79    0.158  launch  ▏ 1.0%
- attn_qnorm_rope_insert   fused norm+RoPE+insert      0.4 MB    0.9   79    0.158  launch  ▏ 1.0%
- tp_all_reduce_attn       collective NCCL ring        0.7 MB     —    79    0.158  launch  ▏ 1.0%
- tp_all_reduce_mlp        collective NCCL ring        0.7 MB     —    79    0.158  launch  ▏ 1.0%
- moe_router               GEMM **fp32**, replicated   6.7 MB   15.0   76    0.152  launch  ▏ 1.0%
- moe_topk                 sigmoid+bias+top-8          0.03 MB   0.8   76    0.152  launch  ▏ 1.0%  ← the only data-dependent shape
- moe_shared               grouped GEMM fp8            5.5 MB   54.5   76    0.152  launch  ▏ 1.0%
+ moe_routed               grouped GEMM fp8 ×3       771.1 MB    3.1   76   12.208  memory  ████████████████████ 71.1%
+ attn_score_value         paged decode attention     42.0 MB   12.8   79    0.690  memory  █ 4.0%
+ moe_all_to_all           collective (EP a2a)         5.5 MB     —    76    0.465  comm    ▊ 2.7%
+ attn_q_a                 GEMM fp8, REPLICATED       13.1 MB   61.4   79    0.216  memory  ▌ 1.3%
+ attn_out_proj            GEMM fp8, tall-skinny      13.1 MB   61.4   79    0.216  memory  ▌ 1.3%
+ ── 17 nodes at the 2 µs launch floor, 0.158 ms each (0.9%) ────────────────────────────────
+ input_layernorm · act_quant_attn · attn_q_b · attn_kv_a · attn_kv_b ·
+ attn_qnorm_rope_insert · tp_all_reduce_attn · attn_residual ·
+ post_attention_layernorm · moe_router (fp32) · moe_sigmoid_bias ·
+ moe_topk · act_quant_moe · moe_shared · moe_permute · moe_silu ·
+ moe_combine · tp_all_reduce_mlp · mlp_residual
+ ───────────────────────────────────────────────────────────────────────────────────────────
  attn_index_score         index scan + top-k         33.6 MB   64.0   21    0.147  memory  ▏ 0.9%  ← the only term that grows with S
- lm_head                  GEMM bf16, tall-skinny    238.0 MB   32.0    2    0.100  memory  ▏ 0.6%
+ lm_head                  GEMM bf16, tall-skinny    239.5 MB   31.8    2    0.100  memory  ▏ 0.6%
+ mtp_eh_proj              GEMM bf16, REPLICATED     152.2 MB   31.8    1    0.032  memory  ▏ 0.2%
+ logits_all_gather        collective (all-gather)    17.3 MB     —     1    0.019  comm    ▏ 0.1%
  ──────────────────────   ───────────────────────   ────────   ────  ───   ─────   ──────  ────────────────────────
-                                                     1,294 nodes       15.887 ms/step · 2,014 tok/s @ B=32
-                                                     moe_routed alone   12.208 ms  =  76.8% of the step
+                                                     1,927 nodes       17.173 ms/step · 1,863 tok/s @ B=32
+                                                     moe_routed alone   12.208 ms  =  71.1% of the step
 
  facets
-   memory   440 nodes   14.179 ms   89.2%
-   launch   854 nodes    1.708 ms   10.8%   ← 66% of all nodes, an ninth of the time
-   compute    0 nodes    0.000 ms    0.0%   ← the entire roofline claim, one row
+   memory   441 nodes   14.199 ms   82.7%   ← five node types
+   launch  1,486 nodes   2.974 ms   17.3%   ← 77% of all nodes, a sixth of the time
+   compute     0 nodes   0.000 ms    0.0%   ← the entire roofline claim, one row
 ```
+
+**A MoE layer is 24 kernels and two of them cost anything.** `moe_routed` is 73 %
+of the layer's time; `attn_score_value`, `attn_q_a`, `attn_out_proj` and the EP
+all-to-all are most of the rest; the other 19 are at the launch floor. That
+distribution is the model, not an artefact — and it is why every ranked hypothesis
+in §5 is about either the expert bank or the launch count.
 
 Two rows are kept **despite** being small: `moe_topk` because it is the only
 data-dependent shape in the graph and therefore the thing that blocks CUDA-graph
@@ -583,9 +602,9 @@ architecture's whole payoff — and because it does not stay small:
 
 | context S | `attn_index_score` | share of step | step floor |
 | --------- | ------------------ | ------------- | ---------- |
-| 8,192     | 0.147 ms           | 0.9 %         | 15.887 ms  |
-| 131,072   | 2.349 ms           | 13.0 %        | 18.090 ms  |
-| **1,048,576** | **18.795 ms**  | **54.4 %**    | 34.536 ms  |
+| 8,192     | 0.147 ms           | 0.9 %         | 17.173 ms  |
+| 131,072   | 2.349 ms           | 12.1 %        | 19.375 ms  |
+| **1,048,576** | **18.795 ms**  | **52.5 %**    | 35.821 ms  |
 
 **At the model's advertised context the indexer scan is the largest node in the
 step**, and it is the node IndexShare already cut by 3.7×. Everything anyone says
@@ -596,19 +615,19 @@ the step.
 
 | B   | floor      | tok/s | launch nodes | launch time | compute nodes |
 | --- | ---------- | ----- | ------------ | ----------- | ------------- |
-| 1   | 3.303 ms   | 303   | 1,033        | 2.066 ms = **63 %** | 0 |
-| 4   | 4.990 ms   | 802   | 1,033        | 2.066 ms = 41 %     | 0 |
-| 16  | 10.637 ms  | 1,504 | 854          | 1.708 ms = 16 %     | 0 |
-| 32  | 15.887 ms  | 2,014 | 854          | 1.708 ms = 11 %     | 0 |
-| 64  | 21.713 ms  | 2,948 | 778          | 1.556 ms = 7 %      | 76 |
-| 128 | 26.948 ms  | 4,750 | 620          | 1.240 ms = 5 %      | 76 |
-| 256 | 33.583 ms  | 7,623 | 544          | 1.088 ms = 4 %      | 79 |
+| 1   | 4.571 ms   | 219   | 1,666        | 3.334 ms = **73 %** | 0 |
+| 4   | 6.258 ms   | 639   | 1,665        | 3.332 ms = 53 %     | 0 |
+| 16  | 11.913 ms  | 1,343 | 1,486        | 2.974 ms = 25 %     | 0 |
+| 32  | 17.173 ms  | 1,863 | 1,486        | 2.974 ms = 17 %     | 0 |
+| 64  | 23.017 ms  | 2,781 | 1,410        | 2.822 ms = 12 %     | 76 |
+| 128 | 28.291 ms  | 4,524 | 1,252        | 2.506 ms = 9 %      | 76 |
+| 256 | 35.004 ms  | 7,314 | 1,176        | 2.354 ms = 7 %      | 79 |
 
 **Below B≈16 the step is a launch-bound step wearing a memory-bound model's
-clothes.** At B=1, 63 % of the predicted floor is 1,033 kernel launches at 2 µs —
-and that figure already assumes CUDA-graph replay. At the eager 5 µs it is 5.17 ms
-of launches against a 1.24 ms memory term, and the whole low-batch analysis changes
-sign (A4, §5 rank 3).
+clothes.** At B=1, **73 %** of the predicted floor is 1,666 kernel launches at 2 µs
+— and that already assumes CUDA-graph replay. At the eager 5 µs it is 8.33 ms of
+launches against a 1.24 ms memory term: **87 %**, and the whole low-batch analysis
+changes sign (A4, §5 rank 3).
 
 ### 4.2 Prefill and MTP — regions and what flips them
 
@@ -617,23 +636,23 @@ at TP8/EP8, FP8.
 
 | Phase | Region | Bound | Why (point at a number) | Precision / peak | Flip variable |
 |---|---|---|---|---|---|
-| **Pre** | **EP dispatch/combine all-to-all** | **comm — BANDWIDTH** | 1.39 GB/layer × 76 = **105.7 GB**, 117.4 ms = **48.3 % of the step** | BF16 payload | ⚑ **fp8 dispatch halves it**; EP degree; TP-only removes the node and doubles the bank |
-| **Pre** | **MoE expert grouped GEMMs** | compute (AI 485) | 1.26 GB/layer **constant in P**, 95.7 GB/pass = 29 % of traffic | **FP8 block-scaled** | **chunk size** (18.8× across 1→64 chunks); imbalance |
-| **Pre** | **router GEMM** | **compute** | 26 GF/layer at **fp32's 67 TF/s** → 28.8 ms = **11.9 %** | ⚠ **FP32** — see Q3 | ⚑ whether the engine runs the GEMM in fp32 or only accumulates there |
+| **Pre** | **EP dispatch/combine all-to-all** | **comm — BANDWIDTH** | 1.39 GB/layer × 76 = **105.7 GB**, 117.4 ms = **44.8 % of the step** | BF16 payload | ⚑ **fp8 dispatch halves it**; EP degree; TP-only removes the node and doubles the bank |
+| **Pre** | **MoE expert grouped GEMMs** | compute (AI 485) | 1.26 GB/layer **constant in P**, 95.7 GB/pass = 23 % of traffic | **FP8 block-scaled** | **chunk size** (14.9× across 1→64 chunks); imbalance |
+| **Pre** | **router GEMM** | **compute** | 26 GF/layer at **fp32's 67 TF/s** → 28.8 ms = **11.0 %** | ⚠ **FP32** — see Q3 | ⚑ whether the engine runs the GEMM in fp32 or only accumulates there |
 | **Pre** | `all_reduce` ×158 | **comm — BANDWIDTH** | 174 MB each, 27.5 GB/pass = 30.5 ms | BF16 payload | P; below P≈256 flips to latency |
 | **Pre** | projections (`q_a`,`o_proj`,`q_b`,`kv_a`,`kv_b`) | **compute** | AI 1,403 / 963 / 488 vs the fp8 ridge 412 | FP8 e4m3 | prompt length — below P≈512 memory-bound |
 | **Pre** | indexer scan ×21 | **compute** | **5.77 TF** against 22 MB of keys — `O(P·C + P²/2)` × 32 heads. **The quadratic lives here, not in the core** | **BF16** proj, fp8 keys | P **and** C |
 | **Pre** | attention core ×79 | compute, **linear in C** | FLOPs capped at 2,048 keys/query; **bytes are the whole cache once per request** | FP8 KV | ⚑ **`index_topk`**; C. Not P² |
 | **Pre** | permute / combine | memory | 8.5 GB/layer-pass on the `8P`-row expanded tensor, near-zero FLOPs | BF16 activations | top-k; **expert imbalance** |
 | **Pre** | *everything else* — embed gather, norms, `lm_head`, `moe_topk` | memory or launch | each under 1.5 %; `lm_head` reads 239.5 MB for **one row per request** | BF16; FP32 top-k | none of them flips |
-| **Pre** | **whole prefill pass** | **memory** | **AI 358 vs ridge 412**; 64 % memory / 36 % compute | mixed FP8/BF16/FP32 | prompt length; **chunk size**; EP degree |
+| **Pre** | **whole prefill pass** | **memory** | **AI 280 vs ridge 412**; 67 % memory / 33 % compute | mixed FP8/BF16/FP32 | prompt length; **chunk size**; EP degree |
 | **MTP** | verify expert GEMMs | **memory** | 256 distinct experts at 192 rows vs 163 at 32 — **+57 %/layer, ~85 % of MTP's cost** | FP8 block-scaled | `B(1+D)` vs E=256; **D**; imbalance |
 | **MTP** | draft expert GEMMs ×D | **memory** | the MTP block carries a **full 256-expert bank**; 5 stages × 163 experts, **linear in D, no saturation** | FP8 block-scaled | **D**; batch |
 | **MTP** | draft `lm_head` ×5 | memory | 239.5 MB × 5 = **1.20 GB = 19 % of the draft's bytes** | **BF16** | sharded sampling; draft vocab |
 | **MTP** | draft `eh_proj` ×5 | memory | `[12288,6144]` BF16, **replicated per rank** | **BF16** — in `modules_to_not_convert` | whether it is TP-sharded |
 | **MTP** | verify attention | **memory, unchanged** | 0.43 GB — read **per sequence, not per row**; 1+D rows share one block table | FP8 KV | seq length; explicitly *not* D |
 | **MTP** | accept/reject + KV rollback | launch + **host sync** | tiny tensors, but a data-dependent host-visible seq length (S7) | n/a | pointer rewind vs memmove |
-| **MTP** | **whole MTP step** | ⚑ **memory above B≈16, launch below — and the two regimes disagree about whether MTP helps** | **1.71×** cost for ≤6 tokens at B=32; break-even α = **0.142** | mixed | **graph capture**; batch; α; D |
+| **MTP** | **whole MTP step** | ⚑ **memory above B≈16, launch below — and the two regimes disagree about whether MTP helps** | **1.67×** cost for ≤6 tokens at B=32; break-even α = **0.134** | mixed | **graph capture**; batch; α; D |
 
 **Hardware sensitivity:** nothing flips between H200 SXM and H20 on the compute
 rows — but H20's much lower FP8 peak moves every prefill projection further into
@@ -647,9 +666,9 @@ compute-bound, and its bandwidth moves the decode floor directly.
 | indexer scan          | **compute** (5.77 TF / 22 MB)        | **memory** (AI 64)                             | the query count collapses; the key set does not                   |
 | attention core        | compute, **whole cache** in bytes    | **launch/memory**, one 2,048-window            | 8,192 queries' selections union to everything; one query's do not |
 | `all_reduce` ×158     | **comm-bandwidth** (30.5 ms wire)    | **comm-latency** (0.16 ms floor, 0.8 µs wire)  | payload 174 MB vs 688 kB                                          |
-| EP all-to-all         | **the top line** (48.3 %)            | 3.0 %                                          | payload scales with rows; the ring latency does not               |
+| EP all-to-all         | **the top line** (44.8 %)            | 3.0 %                                          | payload scales with rows; the ring latency does not               |
 | `lm_head`             | memory, 1 row per **request**        | memory, **every row every step**               | the epilogue is free in prefill and is not in decode              |
-| `moe_router` (fp32)   | **compute** (11.9 % of prefill)      | launch (1.0 %)                                 | 26 GF/layer against 67 TF/s only matters when P is large          |
+| `moe_router` (fp32)   | **compute** (11.0 % of prefill)      | launch (1.0 %)                                 | 26 GF/layer against 67 TF/s only matters when P is large          |
 
 ### 4.4 Flip-variable index
 
@@ -657,15 +676,15 @@ compute-bound, and its bandwidth moves the decode floor directly.
 | ------------- | ------------- | ----------------------- |
 | **Decode batch B** | every decode GEMM, expert hit-rate, all collectives, the whole-step label (launch below B≈16, memory above), the sign of the MTP decision | expert bytes **sub-linear** in B: 8 experts at B=1, 163 at B=32, 252 at B=128. 303 → 7,623 tok/s across 1→256 |
 | **Sequence length S** | the indexer scan, and **only** the indexer scan | 0.3 % of the step at 8K → 13.0 % at 128K → **54.4 % at 1M**. The attention core does not move at all |
-| **Prompt length P** | every prefill projection (memory→compute above P≈512), the router, the indexer's quadratic, all-reduce (latency→bandwidth above P≈256) | whole-pass AI 358 at P=8k |
-| ⚑ **Chunked prefill / chunk size** | prefill expert GEMMs, permute, and through them the whole prefill label | 8,192 tokens in 1 chunk = **331 GB**; in 64 chunks of 128 = **6,221 GB** for identical FLOPs |
+| **Prompt length P** | every prefill projection (memory→compute above P≈512), the router, the indexer's quadratic, all-reduce (latency→bandwidth above P≈256) | whole-pass AI 280 at P=8k |
+| ⚑ **Chunked prefill / chunk size** | prefill expert GEMMs, permute, and through them the whole prefill label | 8,192 tokens in 1 chunk = **423 GB**; in 64 chunks of 128 = **6,313 GB** for identical FLOPs |
 | ⚑ **CUDA-graph capture** | the whole decode step, the whole MTP step, every launch row | at B=1 it is 63 % of the floor; at 5 µs eager it is 81 %. Decides whether MTP is a 3× win or a net loss |
-| **EP vs TP** | every collective row, every MoE memory row | under EP8 the a2a is **48 % of prefill** but the per-rank bank is **8× smaller**. Since the bank is ~86 % of decode DRAM, this is a **trade, not a cost** |
-| ⚑ **Precision (fp8 vs bf16)** | every weight term, and whether the model fits at all | 1.84× on the decode floor (15.887 ms vs 29.227 ms) and **10.7 → 5.4 H200s** for weights |
+| **EP vs TP** | every collective row, every MoE memory row | under EP8 the a2a is **45 % of prefill** but the per-rank bank is **8× smaller**. Since the bank is ~85 % of decode DRAM, this is a **trade, not a cost** |
+| ⚑ **Precision (fp8 vs bf16)** | every weight term, and whether the model fits at all | 1.76× on the decode floor (17.173 ms vs 30.196 ms) and **10.7 → 5.4 H200s** for weights |
 | ⚑ **KV dtype** | the attention core, and the 1M-context footprint | 55.2 GB vs 99.9 GB per rank at 1M — the difference between fitting and not |
 | ⚑ **Absorbed vs unabsorbed MLA** | `attn_kv_b` + `attn_out_proj` | drops one node and doubles the other's input width: ±2× on 2.4 % of decode, more at prefill |
 | **`index_topk`** | the attention core's FLOPs in both phases; its bytes in neither | 2,048 → 4,096 doubles core FLOPs and changes no byte term |
-| **Draft depth D, acceptance α** | verify expert GEMMs, whole MTP step | 1.71× cost at D=5; break-even α = 0.142; 1,177 → 6,476 tok/s across α |
+| **Draft depth D, acceptance α** | verify expert GEMMs, whole MTP step | 1.67× cost at D=5; break-even α = 0.134; 1,117 → 6,145 tok/s across α |
 | **Expert imbalance** | prefill + decode expert GEMMs, permute, the a2a, grouped-GEMM tail | skew *reduces* bytes while *increasing* tail latency and stalling every other EP rank |
 
 ---
@@ -677,14 +696,14 @@ graph**, to be confirmed against a capture.
 
 | Rank | Region | Prediction | Why | Evidence to inspect | What would prove it wrong |
 |---|---|---|---|---|---|
-| **1** | **EP all-to-all at prefill** | **≥48 % of prefill time is wire, and roughly half of it is recoverable** | 105.7 GB/pass in BF16. An fp8 dispatch halves the payload outright; overlapping dispatch with the shared-expert GEMM hides more | NCCL kernel duration vs payload at prefill (§6.4 row 5); whether dispatch is bf16 | duration ≪ payload/900 GB/s → the engine already fuses or compresses it |
+| **1** | **EP all-to-all at prefill** | **≥45 % of prefill time is wire, and roughly half of it is recoverable** | 105.7 GB/pass in BF16. An fp8 dispatch halves the payload outright; overlapping dispatch with the shared-expert GEMM hides more | NCCL kernel duration vs payload at prefill (§6.4 row 5); whether dispatch is bf16 | duration ≪ payload/900 GB/s → the engine already fuses or compresses it |
 | **2** | **Grouped-GEMM group sizing (the fork)** | either **76 D2H per token** (no graph capture possible) **or** fixed-capacity padding (**all 256 experts read every step**) | The only data-dependent shape in the graph is `moe_topk`. A stack does one or the other — see §5.2 | `cuda_api_sum` D2H count per decode step | 0 D2H **and** MoE bytes that track `distinct_experts(B)` → a device-side path, nothing to recover |
 | **3** | ⚑ **CUDA-graph capture at low batch** | **63 % of the B=1 floor is launch overhead** (81 % at eager 5 µs) | 1,033 nodes × 2 µs = 2.07 ms against a 1.24 ms memory term | `cuda_api_sum` launch count with `--cuda-graph-trace=node`; expect **1** `cudaGraphLaunch` | already captured → this rank is worth nothing, and rank 2's fork is already resolved to "padded" |
 | **4** | **The indexer scan at long context** | at 1M it is **54 % of the step**, and IndexShare's 3.7× is already banked | 90.2 GB/step of index keys at S=1M. Levers: fp8 index keys (2×), temporal reuse across steps, a smaller `index_topk_freq` group | `dram__bytes_read.sum` on the scan vs 90.2 GB; whether keys are fp8 | keys already fp8 and no temporal reuse available → architectural |
-| **5** | **`moe_routed` — the memory-bound heart** | 76.8 % of decode; **EPLB placement and the grouped-GEMM backend are the levers** | Weight traffic scales with *distinct* experts woken, not with FLOPs. Good placement cuts per-rank distinct traffic; DeepGEMM cuts the constant | measured per-rank expert traffic vs `distinct_experts`; **the real EP imbalance** | measured traffic already at the union prediction with balance ≈1.0 → the bank is the bank |
-| **6** | ⚑ **fp32 router at prefill** | **11.9 % of prefill** rests on the reading that the router *GEMM* runs in fp32 | 26 GF/layer at 67 TF/s. If only the softmax/top-k accumulates in fp32 and the GEMM is bf16, this row shrinks ~15× | the engine's router implementation; `cuda_gpu_kern_sum` dtype of the gate GEMM | the GEMM is genuinely fp32 → architectural, and the row stays |
-| **7** | **Decode collective placement** | 158 all-reduces + 76 all-to-alls per step on the compute stream, **latency-bound**, with idle SMs around them | 688 kB payloads: the gap *is* the cost. Nothing prevents other layers' work overlapping | NCCL ranges and stream ids on the timeline (S2/S3) | already on a separate stream with overlap → nothing to recover |
-| **8** | **Chunk size** | a decode-latency-protecting `--max-num-batched-tokens` can cost **18.8× the prefill bytes** | the expert bank is read per chunk | total prefill MoE DRAM ÷ 95.7 GB — the quotient **is** the chunk count | quotient ≈ 1 → prefill is already unchunked |
+| **5** | **`moe_routed` — the memory-bound heart** | 71.1 % of decode; **EPLB placement and the grouped-GEMM backend are the levers** | Weight traffic scales with *distinct* experts woken, not with FLOPs. Good placement cuts per-rank distinct traffic; DeepGEMM cuts the constant | measured per-rank expert traffic vs `distinct_experts`; **the real EP imbalance** | measured traffic already at the union prediction with balance ≈1.0 → the bank is the bank |
+| **6** | ⚑ **fp32 router at prefill** | **11.0 % of prefill** rests on the reading that the router *GEMM* runs in fp32 | 26 GF/layer at 67 TF/s. If only the softmax/top-k accumulates in fp32 and the GEMM is bf16, this row shrinks ~15× | the engine's router implementation; `cuda_gpu_kern_sum` dtype of the gate GEMM | the GEMM is genuinely fp32 → architectural, and the row stays |
+| **7** | **Decode collective placement** | 158 all-reduces + 76 all-to-alls + 1 logits all-gather per step on the compute stream, **latency-bound**, with idle SMs around them | 688 kB payloads: the gap *is* the cost. Nothing prevents other layers' work overlapping | NCCL ranges and stream ids on the timeline (S2/S3) | already on a separate stream with overlap → nothing to recover |
+| **8** | **Chunk size** | a decode-latency-protecting `--max-num-batched-tokens` can cost **14.9× the prefill bytes** | the expert bank is read per chunk | total prefill MoE DRAM ÷ 95.7 GB — the quotient **is** the chunk count | quotient ≈ 1 → prefill is already unchunked |
 | **9** | **`attn_q_a` / `attn_kv_a` replication** | 2.8 % of decode is paid **in full on every rank** and TP does not reduce it | they produce the shared latent, which has nothing to split | per-rank duration of `q_a` vs `q_b` under TP8 | already sharded via DP-attention → the graph is wrong here, not the engine |
 | **10** | **IndexShare selection handoff (S9)** | if the top-k round-trips the host, **21 syncs/step** to save 57 kernels | the selection must reach three downstream layers | D2H count attributable to the indexer region | 0 → device-side, and IndexShare is pure win |
 
@@ -759,12 +778,12 @@ Two worked examples, because the rule is easy to agree with and hard to apply:
 
 - **The draft chain shows five gaps with no kernel spanning them.** Q1: *yes* —
   stage `k` consumes stage `k-1`'s token id. **Architectural.**
-- **The 234 decode collectives sit on the compute stream with idle gaps around
+- **The 235 decode collectives sit on the compute stream with idle gaps around
   them.** Q1: *no* — the output feeds the next layer, but nothing prevents *other*
   layers' work overlapping. Q2: *yes* — stream assignment. **Recoverable** (rank 7).
 
 **The trap runs in both directions.** The accept/reject readback will look alarming
-and is architectural. The 1,294 kernel launches are entirely *expected* from §3 and
+and is architectural. The 1,927 kernel launches are entirely *expected* from §3 and
 are the largest recoverable item at low batch. **Neither surprise nor familiarity
 is evidence.**
 
@@ -816,16 +835,16 @@ Key: **R:** recoverable → the rank it feeds · **A:** architectural, do not ch
 |---|---|---|---|---|
 | **0** | **Launch args, as text** — not a measurement | C6 | chunk size, graph capture, KV dtype, D, TP/EP, absorbed MLA | Resolves or reframes **ranks 1, 2, 3, 6, 8 before a timeline is opened** |
 | **1** | `cuda_api_sum` — **D2H count per decode step** | C1 | **0** in the MoE region | **R:** 76/token → host-resolved group sizes, no graph capture → **rank 2**. **R:** 0 but MoE bytes flat in B → padded capacity → **rank 3** instead (§5.2). **A:** none |
-| **2** | `cuda_api_sum` — **launches per step**, needs `--cuda-graph-trace=node` | C1 | **1** `cudaGraphLaunch` | **R:** ~1,294 individual launches + CPU gaps below B≈16 → **rank 3**. **F1:** count wildly off 1,294 → the lowering in §3 is wrong by an order of magnitude |
-| **3** | `dram__bytes_read.sum` — **MoE region** | C1, C3 | 1.26 GB/layer/rank = **95.7 GB/pass**; **≈86 %** of decode | **R:** prefill total ÷ 95.7 GB > 1 → chunked re-read, and the quotient **is** the chunk count → **rank 8**. **R:** flat in B → padded capacity → **rank 3**. **F2:** much lower → L2 residency, and the central claim of both phases is wrong |
+| **2** | `cuda_api_sum` — **launches per step**, needs `--cuda-graph-trace=node` | C1 | **1** `cudaGraphLaunch` | **R:** ~1,927 individual launches + CPU gaps below B≈16 → **rank 3**. **F1:** count wildly off 1,927 → the lowering in §3 is wrong by an order of magnitude |
+| **3** | `dram__bytes_read.sum` — **MoE region** | C1, C3 | 1.26 GB/layer/rank = **95.7 GB/pass**; **≈85 %** of decode | **R:** prefill total ÷ 95.7 GB > 1 → chunked re-read, and the quotient **is** the chunk count → **rank 8**. **R:** flat in B → padded capacity → **rank 3**. **F2:** much lower → L2 residency, and the central claim of both phases is wrong |
 | **4** | `dram__bytes_read.sum` — **indexer region**, swept in S | C2 | 33.6 MB/layer at 8K → **90.2 GB/step at 1M**, on **21 layers only** | **R:** keys read on 78 layers → IndexShare is not being honoured, a hidden 3.7× → **rank 4**. **R:** 2× the prediction → keys are bf16 where fp8 would do. **A:** growth on 21 layers is the architecture |
-| **5** | **NCCL kernel duration vs payload** | C1, C3, C5 | prefill **∝ payload** (~900 GB/s, 117 ms a2a); decode **flat, ~2 µs × 234** | **R:** prefill a2a at bf16 payload → fp8 dispatch → **rank 1**. **R:** decode collectives on the compute stream with idle SMs → **rank 7**. **A:** the ring latency floor |
+| **5** | **NCCL kernel duration vs payload** | C1, C3, C5 | prefill **∝ payload** (~900 GB/s, 117 ms a2a); decode **flat, ~2 µs × 235** | **R:** prefill a2a at bf16 payload → fp8 dispatch → **rank 1**. **R:** decode collectives on the compute stream with idle SMs → **rank 7**. **A:** the ring latency floor |
 | **6** | **Kernel-name coverage** — every kernel maps to a §3 node | C1 | **complete** | **A/F:** an unmapped kernel block is not headroom, it is a node this graph does not have — and unlike a multimodal model (§2.3) there is no external encoder to explain it away, so it is a **model-validity failure** |
 | **7** | `cuda_gpu_kern_sum` — **attention core duration vs S** | C2 | **flat** from 8K to 1M | **R:** grows with S → `index_topk` is not being applied and the core is reading the whole cache. **A:** flat — that is DSA working |
 | **8** | **Tensor-pipe active %** | C1, C3 | **near-idle at every decode batch**; prefill well below peak with DRAM and NVLink busy | **R:** pipe busy at low batch → something does far more FLOPs than the graph predicts. **A:** near-idle at decode — that is what decode *is* |
 | **9** | **CPU thread sampling, between steps** | C1 | no gap between step *N* and *N*+1 | **R:** CPU-shaped inter-step gap with the scheduler hot → scheduler-bound (S5). **A:** the single sampling D2H |
 | **10** | **`spec_decode` bucket counts + acceptance** | C4 | **D = 5** draft stages, 5 extra `lm_head`-shaped GEMMs, verify KV **flat** as D rises | **R:** KV scales with 1+D → rows treated as sequences; use a multi-query kernel. **R:** one `lm_head` for five stages → the draft samples on a sharded vocab already. **A:** the five serial gaps |
-| **11** | **Router GEMM dtype** | C3 | fp32 if the config is honoured | **R:** bf16 GEMM with fp32 accumulate → **rank 6 evaporates and §4.2's 11.9 % row shrinks 15×.** **A:** genuinely fp32 → it is the model |
+| **11** | **Router GEMM dtype** | C3 | fp32 if the config is honoured | **R:** bf16 GEMM with fp32 accumulate → **rank 6 evaporates and §4.2's 11.0 % row shrinks 15×.** **A:** genuinely fp32 → it is the model |
 
 **Rows 0–3 are the thirty-minute version.**
 
@@ -899,7 +918,7 @@ gitm/planner/model_catalogue.py  nested tuple coercion for op_dtype_overrides
 gitm/planner/models/
   glm-5.2.yaml                   the bf16 model fact + the fp32 router
   glm-5.2-fp8.yaml               NEW — the vendor's recommended deployment
-tests/test_glm_graph.py          23 tests: the fp8 footprint, the precision map, the
+tests/test_glm_graph.py          26 tests: the fp8 footprint, the precision map, the
                                  prefill/decode byte inversion, the D-deep chain, two
                                  collectives, the 32-head index scan, that a pure-prefill
                                  step runs no draft head, and that a launch floor
@@ -919,12 +938,12 @@ docs/glm-5.2/artifacts/*.json    DELETED — 29k lines of node dumps that go sta
 |---|---|---|---|
 | **Q1** | Does the engine run **absorbed** MLA at decode? | drops `attn_kv_b` and **doubles** `attn_out_proj`'s input width (16384→32768). ±2× on the #4 and #8 lines | serving image / C6 |
 | **Q2** | Is the decode step **CUDA-graph captured**? | at B=1 the difference between 1.24 ms and 3.30 ms per step, and it decides whether MTP is a 3× win or a net loss | engine config + `--cuda-graph-trace=node` |
-| **Q3** | Is the **router GEMM** fp32, or only its accumulation? | **11.9 % of prefill.** At bf16 the row shrinks ~15× | the engine's MoE gate implementation |
+| **Q3** | Is the **router GEMM** fp32, or only its accumulation? | **11.0 % of prefill.** At bf16 the row shrinks ~15× | the engine's MoE gate implementation |
 | **Q4** | Is the grouped GEMM **device-sized or host-sized**? | decides **rank 2 *or* rank 3** — the fork in §5.2 | trace D2H count, or the kernel source |
 | **Q5** | Is the **EP dispatch** bf16 or fp8? | **half of 105.7 GB** at prefill — the largest single recoverable number here | serving image / C6 |
 | **Q6** | Is the **IndexShare selection** passed device-side? | 21 syncs/step if not (S9) | trace D2H attribution |
-| **Q7** | Chunked prefill on, at what chunk size? | **up to 18.8× on prefill bytes** | engine launch args (C6) |
-| **Q8** | **α**, the MTP acceptance rate, in production | the entire MTP decision. Break-even is 0.142; the range 0.5→0.9 is 4,121→6,476 tok/s | engine metrics (C4) — **not predictable from a config** |
+| **Q7** | Chunked prefill on, at what chunk size? | **up to 14.9× on prefill bytes** | engine launch args (C6) |
+| **Q8** | **α**, the MTP acceptance rate, in production | the entire MTP decision. Break-even is 0.134; the range 0.5→0.9 is 3,911→6,145 tok/s | engine metrics (C4) — **not predictable from a config** |
 | **Q9** | Are the **index keys** cached in fp8 or bf16? | 2× on 90.2 GB/step at 1M context | C6 / trace |
 | **Q10** | Is `eh_proj` **TP-sharded** in the MTP block? | 151 MB → 19 MB per rank per draft stage | serving image |
 | **Q11** | Does the prefill attention kernel read the selected KV **once per request** or once per query tile? | up to 64× on the prefill core's bytes — the graph takes the optimistic floor | `dram__bytes_read.sum` on the prefill core |
@@ -1005,75 +1024,87 @@ the collectives (**medium**, a TP/EP convention) and the S1 histogram readback
 
 ### A.1 — Archetype `Ls,sh`, 57 layers (shared indexer + MoE)
 
-Read straight off the graph, not retyped: every row is a `PredictedNode` at this
-shape. **Norms are not nodes here** — `input_layernorm` and
-`post_attention_layernorm` are folded into the projection that consumes them and
-into `attn_qnorm_rope_insert`, which is one fused kernel in every serving path this
-targets. That is a modelling choice, and it is the reason a trace will show ~2
-more small kernels per layer than this table has rows.
+Read straight off the graph, in issue order — every row is a `PredictedNode` at
+this shape, and `tests/test_glm_graph.py::test_layer_lowers_to_the_documented_node_sequence`
+pins this exact sequence so the code cannot drift from the table.
 
 | id | operator | kernel class | FLOPs | bytes | dtype | t (µs) | bound |
 |---|---|---|---|---|---|---|---|
-| .1 | `attn_q_a` | GEMM, **replicated** | 805.3 MF | 13.110 MB | FP8 | 2.73 | memory |
-| .2 | `attn_q_b` | GEMM, head-sharded | 268.4 MF | 4.457 MB | FP8 | 2.00 | launch |
-| .3 | `attn_kv_a` | GEMM + cache append | 226.5 MF | 3.990 MB | FP8 | 2.00 | launch |
-| .4 | `attn_kv_b` | GEMM, head-sharded (**unabsorbed**) | 117.4 MF | 2.098 MB | FP8 | 2.00 | launch |
-| .5 | `attn_score_value` | paged decode attn over ≤2048 entries | 536.9 MF | 41.951 MB | FP8 KV | 8.74 | memory |
-| .6 | `attn_qnorm_rope_insert` | fused norm + partial RoPE + insert | 0.4 MF | 0.410 MB | BF16 | 2.00 | launch |
-| .7 | `attn_out_proj` | GEMM, tall-skinny (16384→6144) | 805.3 MF | 13.110 MB | FP8 | 2.73 | memory |
-| .8 | `tp_all_reduce_attn` | NCCL ring | — | 0.688 MB | BF16 | 2.00 | launch |
-| .9 | `moe_router` | GEMM, **replicated** | 100.7 MF | 6.701 MB | **FP32** | 2.00 | launch |
-| .10 | `moe_topk` | sigmoid + bias + top-8 + renorm | 0.02 MF | 0.033 MB | BF16 | 2.00 | launch ← **the only data-dependent shape** |
-| .11 | `moe_shared` | grouped GEMM ×3, always on | 302.0 MF | 5.539 MB | FP8 | 2.00 | launch |
-| .12 | `moe_permute` | gather into expert-major order | 0 F | 0.442 MB | BF16 | 2.00 | launch |
-| .13 | `moe_routed` | grouped GEMM ×3, **163 distinct of 256** | 2,415.9 MF | **771.062 MB** | FP8 | **160.64** | **memory** |
-| .14 | `moe_combine` | scatter-add × `routed_scaling 2.5` | 3.1 MF | 0.442 MB | BF16 | 2.00 | launch |
-| .15 | `moe_all_to_all` | EP dispatch + combine | — | 5.505 MB | BF16 | 6.12 | comm |
-| .16 | `tp_all_reduce_mlp` | NCCL ring | — | 0.688 MB | BF16 | 2.00 | launch |
+| .1 | `input_layernorm` | fused RMSNorm | 0.6 MF | 0.786 MB | BF16 | 2.00 | launch |
+| .2 | `act_quant_attn` | dynamic FP8 quant + row reduction | 0.4 MF | 0.590 MB | BF16→FP8 | 2.00 | launch |
+| .3 | `attn_q_a` | GEMM, **replicated** (6144→2048) | 805.3 MF | 13.110 MB | FP8 | 2.73 | memory |
+| .4 | `attn_q_b` | GEMM, head-sharded (2048→2048) | 268.4 MF | 4.457 MB | FP8 | 2.00 | launch |
+| .5 | `attn_kv_a` | GEMM + cache append (6144→576) | 226.5 MF | 3.990 MB | FP8 | 2.00 | launch |
+| .6 | `attn_kv_b` | GEMM, head-sharded (**unabsorbed**) | 117.4 MF | 2.098 MB | FP8 | 2.00 | launch |
+| .7 | `attn_score_value` | paged decode attn over ≤2048 entries | 536.9 MF | 41.951 MB | FP8 KV | 8.74 | memory |
+| .8 | `attn_qnorm_rope_insert` | fused q/kv norm + partial RoPE + insert | 0.4 MF | 0.410 MB | BF16 | 2.00 | launch |
+| .9 | `attn_out_proj` | GEMM, tall-skinny (16384→6144) | 805.3 MF | 13.110 MB | FP8 | 2.73 | memory |
+| .10 | `tp_all_reduce_attn` | NCCL ring | — | 0.688 MB | BF16 | 2.00 | launch |
+| .11 | `attn_residual` | pointwise add | 0.2 MF | 0.786 MB | BF16 | 2.00 | launch |
+| .12 | `post_attention_layernorm` | fused RMSNorm | 0.6 MF | 0.786 MB | BF16 | 2.00 | launch |
+| .13 | `moe_router` | GEMM, **replicated** (6144→256) | 100.7 MF | 6.701 MB | **FP32** | 2.00 | launch |
+| .14 | `moe_sigmoid_bias` | pointwise + `e_score_correction_bias` | 0.02 MF | 0.033 MB | BF16 | 2.00 | launch |
+| .15 | `moe_topk` | **top-8 of 256 + renorm** | 0 F | 0.017 MB | BF16 | 2.00 | launch ← **the only data-dependent shape** |
+| | ⚠ **Blocks CUDA-graph capture. ↯ S1: host readback of the expert histogram? 76 D2H per token if real.** | | | | | | |
+| .16 | `act_quant_moe` | dynamic FP8 quant | 0.4 MF | 0.590 MB | BF16→FP8 | 2.00 | launch |
+| .17 | `moe_shared` | grouped GEMM ×3, always on | 302.0 MF | 5.539 MB | FP8 | 2.00 | launch |
+| .18 | `moe_permute` | gather into expert-major order | 0 F | 0.442 MB | BF16 | 2.00 | launch |
+| .19 | `moe_routed` | grouped GEMM ×3, **163 distinct of 256** | 2,415.9 MF | **771.062 MB** | FP8 | **160.64** | **memory** |
+| .20 | `moe_silu` | SwiGLU over the expanded tensor | 0.3 MF | 0.262 MB | BF16 | 2.00 | launch |
+| .21 | `moe_combine` | scatter-add × `routed_scaling 2.5` | 3.1 MF | 0.442 MB | BF16 | 2.00 | launch |
+| .22 | `moe_all_to_all` | EP dispatch + combine | — | 5.505 MB | BF16 | 6.12 | comm |
+| .23 | `tp_all_reduce_mlp` | NCCL ring | — | 0.688 MB | BF16 | 2.00 | launch |
+| .24 | `mlp_residual` | pointwise add | 0.2 MF | 0.786 MB | BF16 | 2.00 | launch |
 
-**Σ per layer: 5.6 GF, 870.2 MB, 0.203 ms.** `.13` alone is **89 % of the layer's
-bytes and 79 % of its time**, and it is the same 771 MB whether the layer is one of
-57 or one of 75 — which is why every ranked hypothesis in §5 that is not about
-launches is about this row.
+**Σ per layer: 5.6 GF, 874.8 MB, 0.219 ms.**
+
+**Twenty-four kernels, and two of them cost anything.** `.19` alone is **88 % of
+the layer's bytes and 73 % of its time**; `.7`, `.3`, `.9` and `.22` are most of
+the remainder; the other **19 nodes sit at the 2 µs launch floor** — 0.038 ms per
+layer of pure launch, which is 17 % of it. Those 19 rows are why §4.1's launch
+facet exists, and folding any of them into the GEMM it precedes would report this
+layer as more memory-bound than it is.
 
 ### A.2 — Archetype `Ls,f`, 18 layers (full indexer + MoE)
 
-**Delta from A.1: two nodes inserted after `.4`.** Everything else is identical.
+**Delta from A.1: two nodes inserted after `.6`.** Everything else is identical.
 
 | id | operator | kernel class | FLOPs | bytes | dtype | t (µs) | bound |
 |---|---|---|---|---|---|---|---|
-| .4a | `attn_index_proj` | GEMM ×3 — `wq_b` (2048→4096), `wk` (6144→128), `weights_proj` (6144→32), **replicated** | 599.8 MF | 19.937 MB | **BF16** | 4.15 | memory |
-| .4b | `attn_index_score` | index scan over the whole history + top-2048 | 2,147.5 MF | 33.563 MB | FP8 KV | 6.99 | memory |
+| .6a | `attn_index_proj` | GEMM ×3 — `wq_b` (2048→4096), `wk` (6144→128), `weights_proj` (6144→32), **replicated** | 599.8 MF | 19.937 MB | **BF16** | 4.15 | memory |
+| .6b | `attn_index_score` | 32 heads score the whole history + top-2048 | 2,147.5 MF | 33.563 MB | FP8 KV | 6.99 | memory |
 
-`.4a` is BF16 because the indexer is named in `modules_to_not_convert` — at FP8 it
+`.6a` is BF16 because the indexer is named in `modules_to_not_convert` — at FP8 it
 would price at 10.0 MB, and this is the layer type whose cost grows with context.
 
-**`.4b` is the only node in the model that grows with S**, and it does not stay
+**`.6b` is the only node in the model that grows with S**, and it does not stay
 small:
 
-| context S | `.4b` bytes/layer | `.4b` time/layer | Σ over 21 layers | share of step |
+| context S | `.6b` bytes/layer | `.6b` time/layer | Σ over 21 layers | share of step |
 | --------- | ----------------- | ---------------- | ---------------- | ------------- |
 | 8,192     | 33.6 MB           | 6.99 µs          | 0.147 ms         | 0.9 %         |
-| 131,072   | 537.0 MB          | 0.112 ms         | 2.349 ms         | 13.0 %        |
-| 1,048,576 | **4,296.0 MB**    | **0.895 ms**     | **18.795 ms**    | **54.4 %**    |
+| 131,072   | 537.0 MB          | 0.112 ms         | 2.349 ms         | 12.1 %        |
+| 1,048,576 | **4,296.0 MB**    | **0.895 ms**     | **18.795 ms**    | **52.5 %**    |
 
-**Σ per layer at S=8192: 8.3 GF, 923.7 MB, 0.214 ms** — 5 % more than `Ls,sh`, and
+**Σ per layer at S=8192: 8.3 GF, 928.3 MB, 0.230 ms** — 5 % more than `Ls,sh`, and
 that 5 % is the whole price of IndexShare's 21-of-78 schedule at short context.
 
 ### A.3 — Archetype `Ld,f`, 3 layers (full indexer + DENSE FFN)
 
-**Delta from A.2: `.9`–`.15` replaced by two nodes.** No router, no top-k, no
-expert bank — and therefore **no data-dependent shape and no expert-parallel
-traffic** on these three layers. They are the only blocks in the model a CUDA graph
-could capture unconditionally.
+**Delta from A.2: `.13`–`.22` replaced by four nodes.** No router, no sigmoid, no
+top-k, no expert bank, no all-to-all — and therefore **no data-dependent shape and
+no expert-parallel traffic**. These three are the only blocks in the model a CUDA
+graph could capture unconditionally.
 
 | id | operator | kernel class | FLOPs | bytes | dtype | t (µs) | bound |
 |---|---|---|---|---|---|---|---|
-| .9′ | `mlp_gate_up` | GEMM (6144→3072/rank) | 1,208.0 MF | 19.469 MB | FP8 | 4.06 | memory |
-| .10′ | `mlp_down` | GEMM (1536/rank→6144) | 604.0 MF | 9.931 MB | FP8 | 2.07 | memory |
+| .13′ | `act_quant_mlp` | dynamic FP8 quant | 0.4 MF | 0.590 MB | BF16→FP8 | 2.00 | launch |
+| .14′ | `mlp_gate_up` | GEMM (6144→3072/rank) | 1,208.0 MF | 19.469 MB | FP8 | 4.06 | memory |
+| .15′ | `mlp_silu` | SwiGLU | 0.2 MF | 0.197 MB | BF16 | 2.00 | launch |
+| .16′ | `mlp_down` | GEMM (1536/rank→6144) | 604.0 MF | 9.931 MB | FP8 | 2.07 | memory |
 
-**Σ per layer: 5.2 GF, 168.9 MB, 0.050 ms** — **a quarter the time of a MoE layer
-at a fifth the bytes.** Three of 78 layers are 0.9 % of the step.
+**Σ per layer: 7.3 GF, 167.9 MB, 0.057 ms** — **a quarter the time of a MoE layer
+at a fifth the bytes.** Three of 78 layers are 1.0 % of the step.
 
 ### A.4 — MTP draft chain, per stage (×5 at D=5)
 
@@ -1082,24 +1113,39 @@ for the sequence, not for the verify rows.
 
 | id | operator | kernel class | FLOPs | bytes | dtype | t (µs) | bound |
 |---|---|---|---|---|---|---|---|
-| M.1 | `mtp_eh_proj` | GEMM `[12288→6144]`, **replicated** | 4,831.8 MF | **152.175 MB** | **BF16** | 31.70 | memory |
-| M.2–M.17 | the whole `Ls,sh` block (A.1) | as A.1 | 5.6 GF | 870.2 MB | mixed | 203 | memory |
-| M.18 | `lm_head` | GEMM, vocab-sharded `[6144→19360]` | 7,612.7 MF | **239.528 MB** | **BF16** | 49.90 | memory |
-| M.19 | `argmax` + D2H | sampling + host round-trip | — | small | BF16 | — | **sync (S6)** |
+| M.1 | `mtp_norms` | `enorm` + `hnorm`, fused RMSNorm ×2 | 1.2 MF | 1.573 MB | **BF16** | 4.00 | launch |
+| M.2 | `mtp_eh_proj` | GEMM `[12288→6144]`, **replicated** | 4,831.8 MF | **152.175 MB** | **BF16** | 31.70 | memory |
+| M.3–M.26 | the whole `Ls,sh` block (A.1) | as A.1 | 5.6 GF | 874.8 MB | mixed | 219 | memory |
+| M.27 | `lm_head` | GEMM, vocab-sharded `[6144→19360]` | 7,612.7 MF | **239.528 MB** | **BF16** | 49.90 | memory |
+| M.28 | `argmax` + D2H | sampling + host round-trip | — | small | BF16 | — | **sync (S6)** |
 
-**Σ per stage: 18.0 GF, 1,261.9 MB, 0.285 ms — ×5 = 6.31 GB, 1.423 ms.**
+**Σ per stage: 18.0 GF, 1,268.1 MB, 0.305 ms — ×5 = 6.34 GB, 1.523 ms.**
 
 Three things in that table are the whole §3.3 argument:
 
-- **M.2–M.17 is a full MoE block.** The MTP module carries its own 256-expert
+- **M.3–M.26 is a full MoE block.** The MTP module carries its own 256-expert
   `mlp.experts.*` bank in the checkpoint, so 69 % of a draft stage's bytes are
   expert weights it re-reads every stage. There is no saturation to help: 32 rows
   wakes ~163 experts, five times over.
-- **M.1 and M.18 are BF16**, both named in `modules_to_not_convert`, and together
-  they are **31 %** of the stage. `eh_proj` is replicated per rank (Q10); the
-  vocabulary projection is shared with the backbone and gets no cheaper for being
-  a draft.
+- **M.1, M.2 and M.27 are BF16**, all named in `modules_to_not_convert`, and
+  together they are **31 %** of the stage. `eh_proj` is replicated per rank (Q10);
+  the vocabulary projection is shared with the backbone and gets no cheaper for
+  being a draft.
 - **What is absent:** no `attn_index_proj`, no `attn_index_score`. The MTP block
   has no indexer tensors in the weight map, which is
-  `index_share_for_mtp_iteration: true` made visible — and it means the draft
-  inherits the top-2048 selection the backbone already paid for.
+  `index_share_for_mtp_iteration: true` made visible — the draft inherits the
+  top-2048 selection the backbone already paid for.
+
+### A.5 — Node budget for the whole step
+
+| region | ×N | nodes each | Σ nodes | Σ ms | share |
+| ------ | -- | ---------- | ------- | ---- | ----- |
+| prologue + epilogue | 1 | 4 | 4 | 0.073 | 0.4 % |
+| `Ld,f` dense layers | 3 | 20 | 60 | 0.172 | 1.0 % |
+| `Ls,f` full-indexer MoE | 18 | 26 | 468 | 4.142 | 24.1 % |
+| `Ls,sh` shared-indexer MoE | 57 | 24 | 1,368 | 12.481 | 72.7 % |
+| `Lmtp` draft (D=1) | 1 | 27 | 27 | 0.305 | 1.8 % |
+| **total** | | | **1,927** | **17.173** | |
+
+At D=5 the draft region becomes 5 × 27 = 135 nodes and 1.523 ms, and the backbone
+runs at 192 rows instead of 32 — **2,035 nodes, 28.641 ms.**
