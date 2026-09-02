@@ -129,7 +129,12 @@ def test_dense_prefix_runs_ffn_not_mixture():
     # Exactly the 3 dense layers carry an mlp_gate_up/down; the router runs on the
     # 75 sparse layers plus the sparse MTP head.
     assert len(_ops(g, "mlp_gate_up")) == 3
-    assert len(_ops(g, "moe_router")) == spec.n_sparse_mlp_layers + spec.num_nextn_predict_layers
+    # Two per sparse block: the h->256 GEMM, then the fused gating kernel that
+    # scores and selects. Same op name because the trace cannot tell them apart
+    # (see MOE_LAYER_NODES), so the count is doubled, not the node list.
+    assert len(_ops(g, "moe_router")) == 2 * (
+        spec.n_sparse_mlp_layers + spec.num_nextn_predict_layers
+    )
 
 
 def test_precision_is_bf16_no_fp4_leak():
@@ -410,13 +415,13 @@ def test_a_pure_prefill_step_runs_no_draft_head():
 #: pointwise work into the GEMM it precedes reports a decode step as memory-bound
 #: when it is launch-bound.
 MOE_LAYER_NODES = (
-    "input_layernorm", "act_quant_attn",
+    "rms_norm", "act_quant",
     "attn_q_a", "attn_q_b", "attn_kv_a", "attn_kv_b",
     "attn_score_value", "attn_qnorm_rope_insert", "attn_out_proj",
-    "tp_all_reduce_attn", "attn_residual", "post_attention_layernorm",
-    "moe_router", "moe_sigmoid_bias", "moe_topk", "act_quant_moe",
-    "moe_shared", "moe_permute", "moe_routed", "moe_silu", "moe_combine",
-    "moe_all_to_all", "tp_all_reduce_mlp", "mlp_residual",
+    "tp_all_reduce_attn", "rms_norm",
+    "moe_router", "moe_router", "act_quant",
+    "moe_shared", "moe_permute", "moe_routed", "moe_combine",
+    "moe_all_to_all", "tp_all_reduce_mlp",
 )
 
 
@@ -439,8 +444,35 @@ def test_layer_lowers_to_the_documented_node_sequence():
     # A dense layer swaps the whole mixture for three nodes, and so is the only
     # block in the model with no data-dependent shape and no expert traffic.
     dense = tuple(n.op for n in g.nodes if n.layer == 0)  # Ld,f
-    assert {"act_quant_mlp", "mlp_gate_up", "mlp_silu", "mlp_down"} <= set(dense)
-    assert "moe_topk" not in dense and "moe_all_to_all" not in dense
+    assert {"act_quant", "mlp_gate_up", "mlp_down"} <= set(dense)
+    assert "moe_router" not in dense and "moe_all_to_all" not in dense
+
+
+def test_every_emitted_op_name_resolves_from_a_kernel_name():
+    """A node the pairing cannot receive is a prediction that never gets checked.
+
+    ``classify_op`` is the fallback identity for a capture with no NVTX ranges
+    (``docs/kernel_identity.md``), and it matches on the kernel name. An op this
+    graph emits that no kernel name can classify to would sit in the predicted
+    graph permanently unmatched while the real kernel landed as unmodeled — two
+    errors in opposite directions, and the per-op residual diff this whole family
+    exists to support would be quietly decorative.
+
+    Collectives are the documented exception: NCCL kernel names carry no hint of
+    *which* of a layer's two all-reduces they are, so they are matched by the
+    coarse taxonomy rather than by op.
+    """
+    from gitm.optimizer.deviation import _OP_RULES
+
+    g = predict_glm_graph(
+        load_spec("glm-5.2-fp8"),
+        batch=BatchConfig(batch=32, kv_cache_len=8192, speculative_tokens=2),
+        sharding=ShardingConfig(tp=8, ep=8),
+    )
+    collectives = {"tp_all_reduce_attn", "tp_all_reduce_mlp", "moe_all_to_all",
+                   "logits_all_gather"}
+    emitted = {n.op for n in g.nodes} - collectives
+    assert emitted <= set(_OP_RULES), sorted(emitted - set(_OP_RULES))
 
 
 def test_prologue_and_epilogue_are_nodes():
@@ -455,7 +487,7 @@ def test_prologue_and_epilogue_are_nodes():
         sharding=ShardingConfig(tp=8),
     )
     ends = [n.op for n in g.nodes if n.layer is None]
-    assert ends == ["embed_tokens", "final_norm", "lm_head", "logits_all_gather"]
+    assert ends == ["embed_tokens", "rms_norm", "lm_head", "logits_all_gather"]
     # Without TP there is nothing to gather.
     solo = predict_glm_graph(spec, batch=BatchConfig(batch=32, kv_cache_len=8192))
     assert "logits_all_gather" not in [n.op for n in solo.nodes]
@@ -475,10 +507,11 @@ def test_act_quant_exists_only_where_a_gemm_is_actually_fp8():
         op_dtype_overrides=(("lm_head", "bf16"), ("moe_router", "fp32")),
     )
     batch = BatchConfig(batch=32, kv_cache_len=8192)
-    assert not _ops(predict_glm_graph(bf16, batch=batch), "act_quant_attn")
-    assert len(_ops(predict_glm_graph(fp8, batch=batch), "act_quant_attn")) == (
-        fp8.n_layers + fp8.num_nextn_predict_layers
-    )
+    assert not _ops(predict_glm_graph(bf16, batch=batch), "act_quant")
+    # Two per block: one ahead of the attention GEMMs, one ahead of the FFN —
+    # the two groups of fp8 GEMMs, with bf16 work in between.
+    blocks = fp8.n_layers + fp8.num_nextn_predict_layers
+    assert len(_ops(predict_glm_graph(fp8, batch=batch), "act_quant")) == 2 * blocks
 
 
 def test_detect_family_routes_glm_before_sparse_moe():

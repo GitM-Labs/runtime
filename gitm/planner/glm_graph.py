@@ -569,6 +569,26 @@ def _emit_layer(
         f_p, b_p = _pointwise(rows, elems, aw, ops=ops)
         add(op, f_p, b_p, spec.act_dtype)
 
+    def add_rms_norm(*, with_residual: bool) -> None:
+        """One ``rms_norm`` node per norm site — and the residual add is inside it.
+
+        vLLM runs ``RMSNorm.forward(x, residual)`` as a single
+        ``fused_add_rms_norm`` kernel, so a separate residual node would predict a
+        launch that never happens. ``with_residual`` adds the extra read the fused
+        form does, and costs nothing else.
+
+        All three norm sites in a layer share this op name deliberately. They are
+        the *same kernel* in the trace — ``classify_op`` matches on the kernel
+        name, and three distinct op names for one name would leave two of them
+        permanently unmatched while the third absorbed all three sites' time. The
+        position that distinguishes them is carried by ``layer`` and by issue
+        order, which is where it belongs; see ``docs/kernel_identity.md`` on why a
+        name is a guess and an NVTX range is an identity.
+        """
+        elems = h * (2.0 if with_residual else 1.0)
+        f_p, b_p = _pointwise(rows, elems, aw, ops=3.0)
+        add("rms_norm", f_p, b_p, spec.act_dtype)
+
     def add_act_quant(op: str, elems: float, gemm_op: str) -> None:
         """Dynamic FP8 activation scaling ahead of a quantised GEMM.
 
@@ -586,8 +606,8 @@ def _emit_layer(
             rows * elems * (aw + 1.0) + rows * 4.0, spec.act_dtype)
 
     # ── MLA attention: low-rank query, compressed KV latent ──────────────────
-    add_pointwise("input_layernorm", h, ops=3.0)
-    add_act_quant("act_quant_attn", h, "attn_q_a")
+    add_rms_norm(with_residual=layer > 0)
+    add_act_quant("act_quant", h, "attn_q_a")
 
     # q_a and kv_a are replicated across TP ranks: they produce the shared latent,
     # which has nothing to split when there is one KV latent. Every rank pays them
@@ -648,6 +668,15 @@ def _emit_layer(
             wd,
         )
 
+        # The scan's two dtypes are different questions and this node answers
+        # both. Its **bytes** are governed by how the index keys are *stored*
+        # (``kv_dtype`` — fp8 under the vendor recipe's fp8 cache); its **FLOPs**
+        # are governed by what the indexer *computes* in, and the indexer is one
+        # of the modules the quantiser skipped, so that is the projection's dtype.
+        # One field cannot do both: pricing 2.1 GF of bf16 arithmetic against the
+        # fp8 peak halves it, which is invisible at decode (the node is
+        # memory-bound at every context) and doubles the prefill row, where it is
+        # compute-bound.
         add(
             "attn_index_score",
             # Every one of the 32 index heads scores each candidate against the
@@ -661,7 +690,7 @@ def _emit_layer(
             # alongside the KV latent.
             index_scan_entries(batch) * spec.index_head_dim
             * weight_bytes(spec.kv_dtype),
-            spec.kv_dtype,
+            spec.dtype_for("attn_index_proj", wd),
         )
 
     # ── attention core over the selected positions ──────────────────────────
@@ -706,22 +735,23 @@ def _emit_layer(
     add("attn_out_proj", f, b, wd)
 
     _emit_collective(g, spec, hw, layer, "tp_all_reduce_attn", rows, sh, prefix)
-    add_pointwise("attn_residual", h)
-    add_pointwise("post_attention_layernorm", h, ops=3.0)
+    add_rms_norm(with_residual=True)
 
     # ── FFN: dense on the leading layers, mixture on the rest ────────────────
     if not spec.is_sparse_mlp(layer):
         # Dense FFN (first_k_dense_replace). gate+up then down over the wide
         # intermediate. Canonical dense-graph names so residuals stay comparable.
         inter = spec.intermediate_size
-        add_act_quant("act_quant_mlp", h, "mlp_gate_up")
+        add_act_quant("act_quant", h, "mlp_gate_up")
+        # SwiGLU stays inside ``mlp_gate_up``: ``silu_and_mul`` is already one of
+        # that op's needles in ``deviation._OP_RULES``, so a separate node would
+        # be a prediction the pairing has no way to receive.
         f_gu, b_gu = _linear(rows, h, 2 * inter // tp, aw, w_bytes("mlp_gate_up", wd))
-        add("mlp_gate_up", f_gu, b_gu, wd)
-        add_pointwise("mlp_silu", inter / tp, ops=4.0)
+        f_act, b_act = _pointwise(rows, inter / tp, aw, ops=4.0)
+        add("mlp_gate_up", f_gu + f_act, b_gu + b_act, wd)
         f_d, b_d = _linear(rows, inter // tp, h, aw, w_bytes("mlp_down", wd))
         add("mlp_down", f_d, b_d, wd)
         _emit_collective(g, spec, hw, layer, "tp_all_reduce_mlp", rows, sh, prefix)
-        add_pointwise("mlp_residual", h)
         return
 
     # Router is replicated: every rank scores every expert to know what to keep.
@@ -730,23 +760,28 @@ def _emit_layer(
     f, b = _linear(rows, h, spec.n_routed_experts, aw, w_bytes("moe_router", wd))
     add("moe_router", f, b, wd)
 
-    # Sigmoid scoring and the noaux_tc bias correction — a plain pointwise pass
-    # over the [rows, 256] score matrix.
-    add_pointwise("moe_sigmoid_bias", spec.n_routed_experts, ops=3.0)
-
-    # The top-8 selection and renorm. Almost no bytes and almost no arithmetic —
-    # but it is the **only data-dependent shape in the step**, and therefore the
-    # node that decides whether the step can be CUDA-graph captured at all. Split
-    # from the sigmoid above for exactly that reason: they are the same size and
-    # the same cost, and only one of them is a hazard.
+    # Sigmoid scoring, the noaux_tc bias correction, the top-8 selection and the
+    # renorm — vLLM's fused gating kernel (``topk_softmax`` /
+    # ``moe_align_block_size``), a second launch after the router GEMM above.
+    #
+    # It carries the same op name on purpose. Both kernels classify to
+    # ``moe_router`` in ``deviation._OP_RULES``, which is a decision the
+    # dense-MoE and hybrid families already depend on; giving this one a private
+    # name would emit a node no capture can pair against and strand the gating
+    # kernel on the GEMM's row. Two instances of one op, distinguished by issue
+    # order and — where NVTX ranges exist — by identity.
+    #
+    # Kept as its own node regardless of the name it shares: it is the **only
+    # data-dependent shape in the step**, and therefore the node that decides
+    # whether the step can be CUDA-graph captured at all.
     add(
-        "moe_topk",
-        0.0,
-        rows * (spec.n_routed_experts + 2.0 * spec.top_k) * aw,
+        "moe_router",
+        3.0 * rows * spec.n_routed_experts,
+        rows * (2.0 * spec.n_routed_experts + 2.0 * spec.top_k) * aw,
         spec.act_dtype,
     )
 
-    add_act_quant("act_quant_moe", h, "moe_routed")
+    add_act_quant("act_quant", h, "moe_routed")
 
     inter = spec.moe_intermediate_size
     per_expert_weights = 3.0 * h * inter
@@ -782,17 +817,18 @@ def _emit_layer(
         int(rows), spec.n_routed_experts, spec.num_experts_per_tok
     )
     skew = sh.ep_imbalance if sh.ep > 1 else 1.0
+    # SwiGLU is inside this node, not beside it: ``silu_and_mul`` is one of
+    # ``mlp_gate_up``'s needles in ``deviation._OP_RULES``, so a separate SwiGLU
+    # node would be a prediction with no observed kernel to pair against.
+    swiglu_f, swiglu_b = _pointwise(rows, spec.top_k * inter / es, aw, ops=4.0)
     add(
         "moe_routed",
-        per_position_flops * rows * spec.num_experts_per_tok * skew / es,
+        per_position_flops * rows * spec.num_experts_per_tok * skew / es + swiglu_f,
         per_expert_weights * distinct * ew * skew / es
-        + aw * (rows * inter * 2 * spec.num_experts_per_tok / es),
+        + aw * (rows * inter * 2 * spec.num_experts_per_tok / es)
+        + swiglu_b,
         ed,
     )
-
-    # SwiGLU between the gate/up and down grouped GEMMs. Its own kernel in every
-    # grouped-GEMM backend this targets, over the expanded ``rows x top_k`` tensor.
-    add_pointwise("moe_silu", spec.top_k * inter / es, ops=4.0)
 
     # Weighted scatter-add back to ``rows x hidden``, including the
     # routed_scaling_factor multiply.
@@ -807,7 +843,6 @@ def _emit_layer(
         g, spec, hw, layer, "tp_all_reduce_mlp", rows, sh, prefix,
         dispatches_experts=True,
     )
-    add_pointwise("mlp_residual", h)
 
 
 def _emit_collective(
@@ -948,11 +983,11 @@ def predict_glm_graph(
     # row in the step — the same count lm_head uses, and at prefill that is one
     # row per prompt rather than the whole chunk.
     logit_rows = float(batch.logits_rows)
-    f_n, b_n = _pointwise(logit_rows, spec.hidden, aw, ops=3.0)
+    f_n, b_n = _pointwise(logit_rows, 2.0 * spec.hidden, aw, ops=3.0)
     g.nodes.append(
         PredictedNode(
-            "final_norm", None,
-            roofline("final_norm", f_n, b_n, hw, spec.act_dtype, serial_launches=1),
+            "rms_norm", None,
+            roofline("rms_norm", f_n, b_n, hw, spec.act_dtype, serial_launches=1),
         )
     )
 
@@ -1026,8 +1061,8 @@ def predict_glm_graph(
             f_n2, b_n2 = _pointwise(draft_batch.batch, 2.0 * spec.hidden, aw, ops=3.0)
             g.nodes.append(
                 PredictedNode(
-                    "mtp_norms", spec.n_layers + stage,
-                    roofline("mtp_norms", f_n2, b_n2, hw, spec.act_dtype,
+                    "rms_norm", spec.n_layers + stage,
+                    roofline("rms_norm", f_n2, b_n2, hw, spec.act_dtype,
                              serial_launches=2),
                 )
             )

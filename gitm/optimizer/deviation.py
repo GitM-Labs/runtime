@@ -88,6 +88,12 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
     # completely different cost curve; and the indexer must never fall through to
     # a bare "index" rule, which is how it gets misfiled as elementwise in the
     # coarse taxonomy.
+    # The indexer's own projections, before the score entry below — whose
+    # "indexer" needle would otherwise claim ``indexers_proj`` and file a GEMM as
+    # a scan. They are separate kernels with opposite bounds: on GLM-5.2 the
+    # projection is bf16 and flat in context, the scan grows with it.
+    "attn_index_proj": ("indexer_proj", "indexers_proj", "index_proj", "wq_b",
+                        "weights_proj"),
     "attn_index_score": ("indexer", "lightning_index", "index_topk", "topk_indices"),
     "moe_shared": ("shared_expert", "moe_shared"),
     # `topkGating` is vLLM's fused routing kernel. Without it the generic "moe"
@@ -96,6 +102,17 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
     # traffic dominates the step.
     "moe_router": ("moe_align", "topk_softmax", "topkgating", "gating", "router",
                    "routing", "sinkhorn", "expert_bias"),
+    # Dispatch/gather into expert-major order and the weighted scatter back.
+    # Before the generic "moe" needle below, which would claim both as expert
+    # GEMMs — they move real bytes and do no arithmetic, so folding them into the
+    # dominant weight-traffic row hides a term that chunk size and expert
+    # imbalance both move.
+    # Combine first: "unpermute" contains "permute", so the reverse direction has
+    # to be tested before the forward one or every combine kernel files as a
+    # dispatch.
+    "moe_combine": ("moe_sum", "finalize_moe", "unpermute", "scatter_add",
+                    "index_add", "moe_combine"),
+    "moe_permute": ("permute", "expert_sort", "shuffle_rows", "gather_rows"),
     "moe_routed": ("moe", "expert", "grouped_gemm", "group_gemm", "groupedgemm"),
     "dspark": ("dspark",),
 
@@ -120,17 +137,45 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
     # checkpoints use (`_triton_mrope_forward`).
     "attn_qnorm_rope_insert": ("qnorm", "q_norm", "qk_norm", "mrope", "rope", "rotary"),
 
+    # ── pointwise work that is its own kernel ────────────────────────────────
+    # These used to classify as ``None`` — "a norm/activation/copy" — and land as
+    # unmodeled. That was right while no graph emitted them. The GLM-5.2 graph
+    # does, because on a sparse model at low batch the pointwise kernels are the
+    # majority of the launches and a step bounded by its launches cannot be
+    # explained by a graph that only has GEMMs in it.
+    #
+    # ``rms_norm`` covers every norm site in a block. They are one kernel name in
+    # the trace, so they are one op here; which site a given launch belongs to is
+    # recoverable only from an NVTX range (``docs/kernel_identity.md``), never
+    # from the name.
+    "rms_norm": ("rms_norm", "rmsnorm", "layernorm", "layer_norm", "fused_add_rms"),
+    # Dynamic FP8 activation scaling ahead of a quantised GEMM. "dequant" is
+    # excluded on purpose: it is the epilogue of the GEMM, not this kernel.
+    "act_quant": ("scaled_fp8_quant", "per_token_quant", "act_quant",
+                  "quant_fp8", "dynamic_scaled"),
+    # Before ``lm_head``, whose "embed" needle would otherwise claim the input
+    # gather and attribute it to the vocabulary projection.
+    "embed_tokens": ("embedding", "embed_tokens", "index_select"),
+
     # ── projections ──────────────────────────────────────────────────────────
     "attn_q_a": ("q_a_proj", "q_lora", "q_down"),
     "attn_q_b": ("q_b_proj", "q_up"),
-    # `kv_b_proj` is absent on purpose: in the absorbed decode form it is folded
-    # into the query and output projections, so there is no node to map it to and
-    # a guess would attribute real work to the wrong op.
     "attn_kv_a": ("kv_a_proj", "kv_lora", "kv_down", "compress_kv"),
+    # `kv_b_proj` was absent here while the only MLA families modelled the
+    # *absorbed* decode form, where W^UK folds into the query and W^UV into the
+    # output projection and no such kernel is launched. The GLM-5.2 graph models
+    # it unabsorbed, so the kernel exists and has a node to land on. The entry is
+    # safe either way: an absorbed deployment launches nothing these needles
+    # match, so it stays absent rather than mis-attributing.
+    "attn_kv_b": ("kv_b_proj", "kv_up", "w_uk", "w_uv"),
     "qkv_proj": ("qkv",),
     "attn_out_proj": ("o_proj", "out_proj", "attn_out"),
     "mlp_gate_up": ("gate_up", "gate_proj", "up_proj", "swiglu", "silu_and_mul"),
     "mlp_down": ("down_proj", "mlp_down"),
+    # The MTP block's [2h, h] fusion of the carried hidden state with the
+    # embedding of the token just drafted. Before ``lm_head``, which is the other
+    # bf16 GEMM in a draft stage.
+    "mtp_eh_proj": ("eh_proj", "mtp_proj"),
     "lm_head": ("lm_head", "logits", "vocab_proj", "embed"),
 }
 
