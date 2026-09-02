@@ -35,6 +35,19 @@ some bound labels do. Regions whose label would flip are marked ⚑ throughout.
 | Memory               | 141 GB × 8 = 1,128 GB             | one node                                                       |
 | Kernel launch        | ~2 µs graph-replay / ~5 µs eager  | ⚑ the crossover hinge — see §5 rank 3                         |
 
+The recipe, verbatim, because every constant above and every bound label in §4
+assumes it — and because §6.2's C6 ("the engine's launch arguments, as text") is
+worth more than most of the traces:
+
+```bash
+vllm serve zai-org/GLM-5.2-FP8   --kv-cache-dtype fp8   --tensor-parallel-size 8   --speculative-config.method mtp   --speculative-config.num_speculative_tokens 5   --tool-call-parser glm47 --reasoning-parser glm45 --enable-auto-tool-choice
+```
+
+`--enable-expert-parallel` is **not** in it. §4 prices the EP8 shape anyway,
+because it is the shape that makes the `moe_all_to_all` rows exist at all —
+TP8-only removes them and doubles the per-rank expert bank instead. Which of the
+two is running is capture C5, and it re-ranks the largest line in prefill.
+
 ```
 FP8  ridge = 1,979e12 / 4.8e12 = 412 FLOP/byte
 BF16 ridge =   989.5e12 / 4.8e12 = 206 FLOP/byte
@@ -103,6 +116,13 @@ layers, reducing per-token FLOPs by **2.9× at a 1M context length**". That 2.9�
 a whole-model figure; the **3.7×** used throughout this note is the *indexer's
 own* ratio (78 layers ÷ 21), which is the one that matters when ranking the
 indexer against the MoE term. Two denominators, both correct.
+
+**A worked demonstration of why "read verbatim" is not pedantry:** the catalogue
+entry carried this schedule one entry short for a while. Layer 77 fell through to
+the modulo fallback, landed on `shared`, and the total came out 21 full-indexer
+layers — the right answer from evidence that was not there. Nothing failed, and
+the predicted floor was byte-identical before and after the fix. The loader now
+refuses a schedule that does not cover the model exactly.
 
 **The schedule is proven from the weight map, not inferred.** Indexer tensors
 (`*.indexer.wq_b`, `.wk`, `.weights_proj`, `.k_norm`) exist on exactly the 21
@@ -910,7 +930,22 @@ gaps below are narrower because of it.
 | **G7** | **An MTP chain D stages deep, each with its own vocabulary projection** | The graph emitted **one** draft block and **one** `lm_head` for what the vendor recipe runs **five** deep. `lm_head` is 19 % of the draft's bytes, so a D-deep chain was understated by ~5× on its largest term | a stage loop in `predict_glm_graph` driven by `BatchConfig.speculative_tokens`, with `mtp_eh_proj` and an `lm_head` per stage; `--spec-tokens` on the CLI | **yes** |
 | **G8** | **A graph that is only its GEMMs, priced against a bound it cannot express** | The family emitted 16 nodes per layer where a layer lowers to ~20 kernels, and the seven missing ones were all pointwise: the norms, the dynamic fp8 activation scaling, the fused gating, the prologue gather and the epilogue's all-gather. Every one is a rounding error in bytes and **a full kernel launch in time** — so at B=1 the graph reported a step as memory-bound that is 69 % launches. A roofline with a launch bound and a graph with no launches in it cannot both be right | Emit them. `_pointwise`, `add_rms_norm` (with the residual fused in, as vLLM runs it), `add_act_quant` gated on the consuming GEMM actually being fp8, plus `embed_tokens` / `rms_norm` / `logits_all_gather` around the stack. Node names constrained by G9 | **yes** |
 | **G9** | **Op names a capture can actually pair against** | G8's new nodes needed names, and `deviation.classify_op` is a *name guess* (`docs/kernel_identity.md`): a name it cannot classify leaves the predicted node permanently unmatched **and** the real kernel filed as unmodeled — two errors in opposite directions, in the diff the family exists to support. Three norm sites are one kernel name; `silu_and_mul` was already claimed by `mlp_gate_up`; `moe_align`/`topk_softmax` were already claimed by `moe_router`, a decision the dense-MoE and hybrid families depend on | Follow the canonical names rather than redefine them: one `rms_norm` op for all three sites, SwiGLU folded back into the GEMM that owns its needle, gating emitted as a second `moe_router` instance. Then `_OP_RULES` gains only what is genuinely new and unclaimed — `rms_norm`, `act_quant`, `embed_tokens`, `moe_permute`/`moe_combine`, `attn_index_proj`, `attn_kv_b`, `mtp_eh_proj`. A test asserts every op the graph emits resolves | **yes** |
-| **G10** | **Which adjacent nodes may overlap and which may not** | `Graph.total_pred_s` is a sum, not a DAG. GLM puts both kinds of serialisation in one step — the draft chain is genuinely serial, the 158 collectives are not — and **both appear as the same positive residual today**. §6.1 is unanswerable without telling them apart | *Not shipped.* It is a cross-family IR change and it is already sequenced on the roadmap. What this note adds is the requirement, and `expected_stream_id=1` on collectives so the stream-concurrency invariant has something to read | **no — deliberately** |
+| **G10** | **Which adjacent nodes may overlap and which may not** | `Graph.total_pred_s` is a sum, not a DAG. GLM puts both kinds of serialisation in one step — the draft chain is genuinely serial, the 158 collectives are not — and **both appear as the same positive residual today**. §6.1 is unanswerable without telling them apart | *Not shipped.* It is a cross-family IR change and it is already sequenced on the roadmap. What this note adds is the requirement. `expected_stream_id=1` is set on collectives, but note that **nothing reads it today** — `optimizer/monitor.py` tests overlap using the *observed* kernel's stream, so the predicted field is carried by the IR and consumed by no one. It is a hook for the invariant in `docs/invariants.md` §3, not a wiring of it | **no — deliberately** |
+
+**G11 — found, not fixed: the intervention library has no vocabulary for the
+expert term.** `gitm/kernels/library.yaml` scopes each lever with
+`applies_to_kernels`, drawn from a canonical op list (`_decode_step_ops`) that is
+`qkv_proj · attn_score_value · attn_out_proj · mlp_gate_up · mlp_down · lm_head`.
+**`moe_routed` and `moe_shared` are not in it**, and the two entries that mean to
+target expert traffic scope themselves to `[mlp_gate_up, mlp_down]` with the
+comment "the routed-expert GEMMs" — which is true of a dense FFN and not of this
+graph. So §5 rank 5, the lever list on the node that is **74 % of a decode step**,
+cannot be matched by the tooling that is supposed to act on it.
+
+This is **pre-existing and not GLM-specific** — `moe_graph.py` emits the same op
+names, so DeepSeek-V4 has it identically — which is why it is reported here rather
+than fixed on this branch: the fix is a change to a shared vocabulary, and it
+should land where both families' coverage can be checked at once.
 
 ### 7.2 The one that needed more than a table row
 
@@ -1016,7 +1051,8 @@ A.2–A.4 are stated as **deltas** from A.1, because everything not listed is
 byte-for-byte identical.
 
 **Two columns are omitted rather than repeated.** Every node runs on the compute
-stream except the collectives (`expected_stream_id=1`). Confidence is **high**
+stream except the collectives, which the graph marks `expected_stream_id=1` —
+a declaration, not yet a check (§7.1 G10). Confidence is **high**
 throughout — these rows are read from `config.json` and the tensor index — except
 the collectives (**medium**, a TP/EP convention) and the S1 histogram readback
 (**low**, a hypothesis about a stack nobody has opened).

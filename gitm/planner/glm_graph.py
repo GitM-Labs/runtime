@@ -825,8 +825,10 @@ def _emit_collective(
                     name, 0.0, byts, link, spec.act_dtype,
                     estimated=True, serial_launches=1 if priced else 0,
                 ),
-                # Collectives are the one region this graph expects off the
-                # compute stream; the stream-concurrency invariant reads this.
+                # The one region this graph expects off the compute stream.
+                # A declaration, not a check: nothing reads this field today
+                # (monitor.py tests overlap on the *observed* stream), so it is a
+                # hook for the invariant in docs/invariants.md §3, not a wiring.
                 expected_stream_id=1,
             )
         )
