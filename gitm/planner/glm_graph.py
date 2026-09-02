@@ -597,7 +597,12 @@ def _emit_layer(
 
         add(
             "attn_index_score",
-            2.0 * scan_pairs * spec.index_head_dim,
+            # Every one of the 32 index heads scores each candidate against the
+            # single shared 128-d key ``wk`` produces per token — MQA-style, which
+            # is why the key term below is not multiplied by the head count and
+            # this one is. Dropping ``index_n_heads`` here understates the scan 32x
+            # and would leave it looking free at every context.
+            2.0 * scan_pairs * spec.index_n_heads * spec.index_head_dim,
             # Index keys live in the cache: read once per sequence (or per
             # prefilling request), not per position, and replicated across ranks
             # alongside the KV latent.
@@ -887,7 +892,12 @@ def predict_glm_graph(
     # a full ``mlp.experts.*`` bank in the checkpoint, so every draft stage draws on
     # a 256-expert mixture — the draft's cost is dominated by expert weight traffic
     # it pays ``D`` times over, not by its arithmetic.
-    if spec.num_nextn_predict_layers > 0:
+    # Gated on there being decode positions at all: on a pure-prefill step the
+    # draft head does not run — it proposes continuations, and there is nothing yet
+    # to continue. Emitting it anyway put 18 zero-work nodes in the graph whose only
+    # cost was their launches, which is a launch facet made of kernels that never
+    # ran.
+    if spec.num_nextn_predict_layers > 0 and batch.positions_per_step > 0:
         draft_batch = replace(batch, prefill_tokens=0, speculative_tokens=0)
         stages = max(1, batch.speculative_tokens)
         for stage in range(stages):

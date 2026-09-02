@@ -365,6 +365,45 @@ def test_attention_core_flat_indexer_scan_grows_with_context():
     assert all(n.prediction.bound == "launch" for n in short_scan)
 
 
+def test_indexer_scans_with_every_index_head():
+    """32 query heads against one shared key per token — the head count is a factor.
+
+    ``wk`` produces a single 128-d key per token (MQA-style), which is why the key
+    *bytes* carry no head factor and the score *FLOPs* do. Dropping it understates
+    the scan 32x and leaves the one node that grows with context looking free.
+    """
+    spec = _spec()
+    batch = BatchConfig(batch=32, kv_cache_len=8192)
+    g = predict_glm_graph(spec, batch=batch)
+    scan = [n for n in g.nodes if n.op == "attn_index_score"][0]
+    pairs = 32 * 8192
+    assert scan.prediction.flops == pytest.approx(
+        2.0 * pairs * spec.index_n_heads * spec.index_head_dim
+    )
+    # The cached keys are read once per sequence and are NOT per-head.
+    assert scan.prediction.bytes == pytest.approx(pairs * spec.index_head_dim * 2)
+
+
+def test_a_pure_prefill_step_runs_no_draft_head():
+    """The draft proposes continuations; a prefill chunk has nothing to continue.
+
+    Emitting it anyway puts nodes in the graph that never ran, and since a draft
+    stage is almost all launch cost at one row, it shows up as a launch facet made
+    of absent kernels.
+    """
+    spec = _spec()
+    g = predict_glm_graph(
+        spec,
+        batch=BatchConfig(batch=0, kv_cache_len=0, prefill_tokens=8192,
+                          prefill_requests=1),
+    )
+    assert not [n for n in g.nodes if n.layer is not None and n.layer >= spec.n_layers]
+    assert len(_ops(g, "mtp_eh_proj")) == 0
+    # The backbone still runs, and the epilogue still projects one row per prompt.
+    assert len(_ops(g, "attn_q_a")) == spec.n_layers
+    assert len(_ops(g, "lm_head")) == 1
+
+
 def test_detect_family_routes_glm_before_sparse_moe():
     """Both families carry index_topk + n_routed_experts; model_type must win."""
     assert detect_family(GLM_CONFIG) == "glm_moe_dsa"
