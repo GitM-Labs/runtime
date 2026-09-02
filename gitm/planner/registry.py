@@ -124,6 +124,9 @@ def add_plan_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--spec-tokens", type=int, default=0,
                     help="Speculative (MTP) draft tokens per step. Adds a D-deep "
                          "draft chain and makes the backbone a 1+D-row verify.")
+    ap.add_argument("--acceptance-rate", type=float, default=0.0,
+                    help="Fraction of drafted tokens the verifier keeps. Only "
+                         "affects the reported token rate, never the step floor.")
     ap.add_argument("--tp", type=int, default=1, help="Tensor-parallel size.")
     ap.add_argument("--ep", type=int, default=1, help="Expert-parallel size.")
     ap.add_argument("--dp", type=int, default=1, help="Data-parallel size.")
@@ -261,6 +264,31 @@ def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
     if any(b for b in bounds.values() if len(b) > 1):
         out.append("  * this op's instances do not share a bound — the label is "
                    "the majority one")
+    if g.batch.speculative_tokens > 0:
+        # ``tokens_per_step`` counts accepted tokens as ``1 + D*alpha``. A verifier
+        # accepts a *prefix*, so the real expectation is ``sum(alpha**i)`` — smaller
+        # for every alpha < 1, by up to 1.8x at D=5, alpha=0.5. The convention is
+        # shared with every family and not this module's to change, but a rate
+        # printed from it should not be read as achievable.
+        d = g.batch.speculative_tokens
+        a = g.batch.acceptance_rate
+        linear = 1.0 + d * a
+        chain = sum(a ** i for i in range(d + 1))
+        out.append(
+            f"  ! speculative step (D={d}): rates above assume accepted tokens = "
+            f"1+D*alpha. A verifier accepts a prefix, so the expectation is "
+            f"sum(alpha^i)"
+        )
+        if a > 0 and linear > chain:
+            out.append(
+                f"    at alpha={a:g} that is {linear:.2f} vs {chain:.2f} tokens/step "
+                f"— the printed rate is {linear / chain:.2f}x optimistic"
+            )
+        else:
+            out.append(
+                "    set --acceptance-rate to compare the two; break-even is "
+                "higher than the linear form implies"
+            )
     if g.has_unpriced_collectives:
         out.append("  ! collectives unpriced — this SKU has no interconnect bandwidth "
                    "in the catalogue")
@@ -328,7 +356,8 @@ def main(argv: list[str] | None = None) -> int:
         for b in sizes:
             g = _predict(spec, family, hw,
                          BatchConfig(batch=b, kv_cache_len=args.kv_len,
-                                     speculative_tokens=args.spec_tokens),
+                                     speculative_tokens=args.spec_tokens,
+                                     acceptance_rate=args.acceptance_rate),
                          sharding)
             cb = sum(1 for n in g.nodes if n.prediction.bound == "compute")
             print(f"  {b:7d} {g.total_pred_s * 1e3:9.3f} "
@@ -338,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
     batch = BatchConfig(
         batch=args.batch, kv_cache_len=args.kv_len,
         speculative_tokens=args.spec_tokens,
+        acceptance_rate=args.acceptance_rate,
         prefill_tokens=args.prefill_tokens, prefill_context=args.prefill_context,
         prefill_requests=args.prefill_requests,
     )
@@ -355,6 +385,7 @@ def main(argv: list[str] | None = None) -> int:
             "sharding": {"tp": args.tp, "ep": args.ep, "dp": args.dp},
             "batch": {"batch": args.batch, "kv_cache_len": args.kv_len,
                       "speculative_tokens": args.spec_tokens,
+                      "acceptance_rate": args.acceptance_rate,
                       "prefill_tokens": args.prefill_tokens,
                       "prefill_context": args.prefill_context,
                       "prefill_requests": args.prefill_requests},

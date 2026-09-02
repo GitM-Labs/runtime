@@ -224,6 +224,7 @@ flowchart TD
     IX -- "57 layers" --> RE["reuse the group's selection — NO KERNEL"]
     IS --> ATT
     RE --> ATT{"attention core over ≤2048 selected keys<br/>FLOPs capped · BYTES ARE NOT"}
+    ATT -.->|"⚠ bytes = whole cache once per REQUEST;<br/>a tiled kernel re-reads per query block (A9/Q3)"| ATT
     ATT --> AR1{{"o_proj → all_reduce — 174 MB, BANDWIDTH-bound"}}
     AR1 --> G["router GEMM FP32 → fused gating → top-8 of 256<br/>DATA-DEPENDENT SHAPE"]
     G --> A2A{{"EP dispatch all-to-all — 1.39 GB/layer, the largest single term"}}
@@ -429,9 +430,11 @@ change kind. At P = 8,192 in one chunk:
 | bytes | **422 GB** | 517 GB | 1,088 GB | **6,313 GB** |
 | floor | 264 ms | 281 ms | 396 ms | **1,543 ms** |
 
-**14.9× the bytes for identical FLOPs** — the bank is read per *chunk*. A small
-`--max-num-batched-tokens`, chosen to protect decode latency, is paid for here at
-a rate no per-token cost model shows.
+**14.9× the bytes for identical FLOPs** — the bank is read per *chunk*. The rule is
+derivable rather than tuned: the expert bank costs `95.7 GB × ceil(P/C)` per prompt
+whatever C is, so prefill bytes scale as `1/C` until C is small enough that the
+per-chunk activation terms stop mattering. Pick `--max-num-batched-tokens` as large
+as decode latency tolerates; there is no prefill-side reason to make it small.
 
 ### 3.3 MTP — the whole-step economics
 
@@ -442,7 +445,7 @@ At B=32, S=8192, D=5 (the vendor recipe's `num_speculative_tokens`):
 | vanilla decode (D=0)   | 1,614     | 68.60 GB     | 16.551 ms     |
 | — of which the draft   | 23        | 1.27 GB      | 0.297 ms      |
 | draft chain, D=5       | 115       | **6.34 GB**  | 1.483 ms      |
-| verify, 192 rows       | 1,591     | 106.4 GB     | 26.652 ms     |
+| verify, 192 rows (backbone only) | 1,591 | 106.4 GB | 26.652 ms |
 | **MTP step total**     | **1,706** | **112.8 GB** | **28.135 ms** |
 
 The node counts reconcile as `1,614 = 1,591 + 23` and `1,706 = 1,591 + 115`: the
@@ -543,7 +546,11 @@ what they cost.
 | 9 more nodes at the launch floor | <5 MB | — | 79 each | 0.158 each | launch | 1.0 % each |
 | `attn_index_score` | 33.6 MB | 64.0 | 21 | 0.147 | memory | 0.9 % ← the only term that grows with S |
 | `lm_head` · `mtp_eh_proj` · `logits_all_gather` | 239.5 / 152.2 / 17.3 MB | — | 2 / 1 / 1 | 0.100 / 0.032 / 0.019 | memory | 0.9 % total |
-| **1,614 nodes** | **68.60 GB** | | | **16.551** | | **1,933 tok/s** |
+| **1,614 nodes** | **68.60 GB** | | | **16.551** | | **1,933 tok/s** [A8] |
+
+[A8] every MoE byte term here assumes `ep_imbalance = 1.0`; real skew moves less
+weight traffic but lengthens the grouped-GEMM tail, and it is trace-calibrated by
+design rather than predicted.
 
 | facet | nodes | Σ ms | share | |
 | --- | ---: | ---: | ---: | --- |
@@ -597,7 +604,7 @@ at TP8/EP8, FP8.
 | **Pre** | `all_reduce` ×158 | **comm — BANDWIDTH** | 174 MB each, 27.5 GB/pass = 30.5 ms | BF16 payload | P; below P≈256 flips to latency |
 | **Pre** | projections (`q_a`,`o_proj`,`q_b`,`kv_a`,`kv_b`) | **compute** | AI 1,403 / 963 / 488 vs the fp8 ridge 412 | FP8 e4m3 | prompt length — below P≈512 memory-bound |
 | **Pre** | indexer scan ×21 | **compute** | 5.77 TF against 22 MB of keys — `O(P·C + P²/2)` × 32 heads, and **2.2 % of the step**. **The quadratic lives here, not in the core** | **BF16** arithmetic, fp8 keys — two dtypes, one node | P **and** C |
-| **Pre** | attention core ×79 | compute, **linear in C** | FLOPs capped at 2,048 keys/query; **bytes are the whole cache once per request** | FP8 KV | ⚑ **`index_topk`**; C. Not P² |
+| **Pre** | attention core ×79 | compute, **linear in C** | FLOPs capped at 2,048 keys/query; bytes are the whole cache **once per request — an optimistic floor** (A9/Q3): a tiled kernel re-reads per query block, up to C/2048 more | FP8 KV | ⚑ **`index_topk`**; C; ⚠ **per-request vs per-tile** |
 | **Pre** | permute / combine | memory | 8.5 GB/layer-pass on the `8P`-row expanded tensor, near-zero FLOPs | BF16 activations | top-k; **expert imbalance** |
 | **Pre** | *everything else* — embed gather, norms, `lm_head`, gating | memory or launch | each under 1.5 %; `lm_head` reads 239.5 MB for **one row per request** | BF16; FP32 top-k | none of them flips |
 | **Pre** | **whole prefill pass** | **memory** | **AI 281 vs ridge 412**; 66 % memory / 34 % compute | mixed FP8/BF16/FP32 | prompt length; **chunk size**; EP degree |
@@ -685,6 +692,12 @@ remainder is the cost of selecting from an uncompressed history).
 Assume the Nsight Systems / CUPTI trace arrives tomorrow.
 
 ### 6.1 The classification rule — *unexpected ≠ recoverable*
+
+**A precondition, not a footnote.** Steps (1) and (2) below require telling a
+serial gap from a parallelisable one, and today the graph cannot: `total_pred_s`
+is a sum, and `expected_stream_id` is written but read by nothing (§7.1 G10). Until
+a capture carries stream assignment, ranks 1 and 7 are judged from the timeline by
+hand rather than by the rule. That is a gate on §6, not just roadmap work.
 
 Three questions, in order; the first that answers decides it.
 **(1) Is there a producer→consumer edge across the gap?** Yes → **architectural**;

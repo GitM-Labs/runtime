@@ -20,6 +20,8 @@ through:
 
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import tempfile
 from dataclasses import replace
@@ -515,6 +517,32 @@ def test_act_quant_exists_only_where_a_gemm_is_actually_fp8():
     # the two groups of fp8 GEMMs, with bf16 work in between.
     blocks = fp8.n_layers + fp8.num_nextn_predict_layers
     assert len(_ops(predict_glm_graph(fp8, batch=batch), "act_quant")) == 2 * blocks
+
+
+def test_plan_warns_that_a_speculative_rate_is_a_ceiling():
+    """``tokens_per_step`` counts ``1 + D*alpha``; a verifier accepts a prefix.
+
+    The convention is shared with every family and not this branch's to change, so
+    the rate is printed as-is — but a number that is up to 1.8x optimistic at D=5
+    must not leave the CLI unlabelled, or the design note's caveat protects only
+    the readers who found the design note.
+    """
+    from gitm.planner.registry import main
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main(["glm-5.2-fp8", "--gpu", "H200", "--batch", "32", "--kv-len", "8192",
+              "--tp", "8", "--ep", "8", "--spec-tokens", "5",
+              "--acceptance-rate", "0.5"])
+    out = buf.getvalue()
+    assert "speculative step (D=5)" in out
+    assert "1.78x optimistic" in out
+
+    # A non-speculative step says nothing, because nothing is being approximated.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        main(["glm-5.2-fp8", "--gpu", "H200", "--batch", "32", "--kv-len", "8192"])
+    assert "speculative step" not in buf.getvalue()
 
 
 def test_detect_family_routes_glm_before_sparse_moe():
