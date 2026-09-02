@@ -1021,7 +1021,7 @@ def _op_dtype_overrides(
     found: dict[str, str] = {}
 
     skipped = q.get("modules_to_not_convert") or q.get("ignored_layers") or []
-    if isinstance(skipped, (list, tuple)) and weight_dtype != model_dtype:
+    if isinstance(skipped, list | tuple) and weight_dtype != model_dtype:
         for tensor in skipped:
             name = str(tensor).lower()
             for needle, op in _UNQUANTISED_OPS:
