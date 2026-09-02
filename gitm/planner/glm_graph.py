@@ -729,7 +729,10 @@ def _emit_layer(
         spec.act_dtype,
     )
 
-    _emit_collective(g, spec, hw, layer, "tp_all_reduce_mlp", rows, sh, prefix)
+    _emit_collective(
+        g, spec, hw, layer, "tp_all_reduce_mlp", rows, sh, prefix,
+        dispatches_experts=True,
+    )
 
 
 def _emit_collective(
@@ -741,6 +744,8 @@ def _emit_collective(
     rows: float,
     sh: ShardingConfig,
     prefix: str,
+    *,
+    dispatches_experts: bool = False,
 ) -> None:
     """Emit the cross-rank traffic that closes one sub-block.
 
@@ -750,6 +755,12 @@ def _emit_collective(
     decode payloads a collective is bounded by its ring latency rather than by its
     bytes, so the count is the cost. Under expert parallelism the MoE half
     additionally dispatches and combines across expert ranks.
+
+    ``dispatches_experts`` gates the expert-parallel all-to-all. Only a mixture
+    layer dispatches tokens to expert ranks; the three dense-FFN layers compute
+    their whole FFN locally and emit the all-reduce alone. Charging them an
+    all-to-all would put 5.5 MB of wire traffic per layer on a block that has no
+    experts to send anything to.
 
     ``serial_launches`` is withheld when the SKU carries no interconnect
     bandwidth, so an unpriced collective still predicts zero time and
@@ -779,7 +790,7 @@ def _emit_collective(
             )
         )
 
-    if sh.ep > 1 and op == "tp_all_reduce_mlp":
+    if sh.ep > 1 and dispatches_experts:
         off_rank = (sh.ep - 1) / sh.ep
         add_link(
             "moe_all_to_all",

@@ -20,9 +20,9 @@ through:
 
 from __future__ import annotations
 
-import pytest
-
 from dataclasses import replace
+
+import pytest
 
 from gitm.planner.glm_graph import (
     GlmMoeDsaModelSpec,
@@ -290,6 +290,25 @@ def test_two_collectives_per_layer_not_one():
     n_blocks = spec.n_layers + spec.num_nextn_predict_layers
     assert len(_ops(g, "tp_all_reduce_attn")) == n_blocks
     assert len(_ops(g, "tp_all_reduce_mlp")) == n_blocks
+
+
+def test_dense_layers_dispatch_no_experts():
+    """Only a mixture layer sends tokens to expert ranks.
+
+    The three dense-FFN layers compute their whole FFN locally. Charging them an
+    expert-parallel all-to-all puts wire traffic on a block with no experts to
+    send anything to — and on this model that node is half of prefill, so a
+    spurious three layers of it is not a rounding error.
+    """
+    spec = _spec()
+    g = predict_glm_graph(
+        spec, batch=BatchConfig(batch=1, kv_cache_len=4096),
+        sharding=ShardingConfig(tp=8, ep=8),
+    )
+    assert len(_ops(g, "moe_all_to_all")) == (
+        spec.n_sparse_mlp_layers + spec.num_nextn_predict_layers
+    )
+    assert not [n for n in g.nodes if n.op == "moe_all_to_all" and n.layer < 3]
 
 
 def test_unpriced_collectives_stay_visible_under_the_launch_floor():
