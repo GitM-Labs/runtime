@@ -161,12 +161,9 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
     "attn_q_a": ("q_a_proj", "q_lora", "q_down"),
     "attn_q_b": ("q_b_proj", "q_up"),
     "attn_kv_a": ("kv_a_proj", "kv_lora", "kv_down", "compress_kv"),
-    # `kv_b_proj` was absent here while the only MLA families modelled the
-    # *absorbed* decode form, where W^UK folds into the query and W^UV into the
-    # output projection and no such kernel is launched. The GLM-5.2 graph models
-    # it unabsorbed, so the kernel exists and has a node to land on. The entry is
-    # safe either way: an absorbed deployment launches nothing these needles
-    # match, so it stays absent rather than mis-attributing.
+    # Unabsorbed MLA only: the absorbed decode form folds W^UK into the query and
+    # W^UV into the output and launches no such kernel, so these needles match
+    # nothing there and the op stays absent rather than mis-attributing.
     "attn_kv_b": ("kv_b_proj", "kv_up", "w_uk", "w_uv"),
     "qkv_proj": ("qkv",),
     "attn_out_proj": ("o_proj", "out_proj", "attn_out"),
