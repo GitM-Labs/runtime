@@ -224,7 +224,7 @@ flowchart TD
     IX -- "57 layers" --> RE["reuse the group's selection — NO KERNEL"]
     IS --> ATT
     RE --> ATT{"attention core over ≤2048 selected keys<br/>FLOPs capped · BYTES ARE NOT"}
-    ATT -.->|"⚠ bytes = whole cache once per REQUEST;<br/>a tiled kernel re-reads per query block (A9/Q3)"| ATT
+    ATT -.->|"⚠ bytes = whole cache once per REQUEST;<br/>a tiled kernel re-reads per block (A9/Q12) — bounded at 1.1x"| ATT
     ATT --> AR1{{"o_proj → all_reduce — 174 MB, BANDWIDTH-bound"}}
     AR1 --> G["router GEMM FP32 → fused gating → top-8 of 256<br/>DATA-DEPENDENT SHAPE"]
     G --> A2A{{"EP dispatch all-to-all — 1.39 GB/layer, the largest single term"}}
@@ -408,6 +408,12 @@ change kind. At P = 8,192 in one chunk:
 - **The epilogue inverts:** `lm_head` reads 239.5 MB to produce one row per
   *request*, where at decode every row is a last position.
 
+**The chunking is an assumption, and the vendor recipe does not pin it.** Nothing
+in that `vllm serve` line sets `--max-num-batched-tokens`, so the figures below —
+which assume the whole 8,192-token prompt arrives as **one chunk** — are the
+best case. Confirm the engine's actual value (C6); the same prompt at a 2,048
+default costs **707 GB and 319 ms**, not 422 GB and 264 ms.
+
 | Prefill, P=8192, C=0, TP8/EP8, per rank | value |
 | --- | --- |
 | predicted floor | **264.0 ms** for the chunk (31.0 k tok/s) |
@@ -425,10 +431,10 @@ change kind. At P = 8,192 in one chunk:
 
 **Chunk size multiplies the whole MoE term.** The same 8,192 tokens:
 
-| chunking | 1 × 8,192 | 2 × 4,096 | 8 × 1,024 | 64 × 128 |
-| --- | --- | --- | --- | --- |
-| bytes | **422 GB** | 517 GB | 1,088 GB | **6,313 GB** |
-| floor | 264 ms | 281 ms | 396 ms | **1,543 ms** |
+| chunking | 1 × 8,192 | 2 × 4,096 | 4 × 2,048 | 8 × 1,024 | 64 × 128 |
+| --- | --- | --- | --- | --- | --- |
+| bytes | **422 GB** | 517 GB | 707 GB | 1,088 GB | **6,313 GB** |
+| floor | 264 ms | 281 ms | 319 ms | 396 ms | **1,543 ms** |
 
 **14.9× the bytes for identical FLOPs** — the bank is read per *chunk*. The rule is
 derivable rather than tuned: the expert bank costs `95.7 GB × ceil(P/C)` per prompt
@@ -473,16 +479,20 @@ where the verifier accepts a *prefix*: token *k* only counts if 1…*k*−1 were
 accepted, so expected accepted length is `Σ αⁱ` for *i* = 0…D. The difference is
 not small at D=5.
 
-| α | 0.0 | 0.5 | 0.7 | 0.9 | break-even |
+| α | 0.0 † | 0.5 | 0.7 | 0.9 | break-even |
 | --- | --- | --- | --- | --- | --- |
-| linear `1+Dα` (what the graph reports) | 1,137 | 3,981 | 5,118 | **6,256** | α > 0.140 |
-| prefix chain `Σ αⁱ` (what a verifier does) | 1,137 | 2,239 | 3,345 | **5,329** | **α > 0.415** |
+| ~~linear `1+Dα`~~ — **do not use** | 1,137 | ~~3,981~~ | ~~5,118~~ | ~~6,256~~ | ~~α > 0.140~~ |
+| **prefix chain `Σ αⁱ`** — what a verifier does | 1,137 | **2,239** | **3,345** | **5,329** | **α > 0.415** |
 
-against 1,933 tok/s with MTP off. **Read the second row.** The first is what
-`--spec-tokens` prints today, and it overstates throughput by up to 1.8× at α=0.5;
-the honest break-even on this model is nearer **0.42 than 0.14**. Fixing the
-convention is a change to shared `BatchConfig` semantics affecting every family,
-so it is stated here rather than made here.
+against 1,933 tok/s with MTP off. † at α=0 the two agree by construction (one
+accepted token either way), and the 1,137 is the *cost* of drafting for nothing —
+it is below the MTP-off baseline, which is the point of the column.
+
+**The struck row is what `gitm plan --spec-tokens` prints today**, and it
+overstates throughput by up to 1.8×. It is shown only so the discrepancy is
+recognisable in CLI output; the CLI itself now says so. Fixing the convention
+means changing shared `BatchConfig` semantics for every family, so it is stated
+here rather than made here.
 
 Z.ai claims the GLM-5.2 MTP layer raises accepted length up to 20 % over its
 predecessor, which likely clears even the chained bar — but **α is a serving
@@ -496,7 +506,7 @@ that was never moving bytes. The sign of the MTP decision flips with batch.
 
 | #      | Where                       | Kind                                                              | conf                       | Trace signature if real                                                              |
 | ------ | --------------------------- | ----------------------------------------------------------------- | -------------------------- | ------------------------------------------------------------------------------------ |
-| **S1** | after the gating kernel     | host readback of the expert histogram to size the grouped GEMM     | **low**                    | **76 D2H per decoded token** — fatal for graph capture                                |
+| **S1** | after the gating kernel     | host readback of the expert histogram to size the grouped GEMM     | **low**                    | **76 D2H per decoded token** — fatal for graph capture. One count resolves **both** rank 2 and rank 3 (§5.2) |
 | S2     | around each all-reduce      | stream-to-stream event wait                                        | medium                     | 158 event pairs/step; at 688 kB **the gap *is* the cost**                              |
 | S3     | around each EP all-to-all   | dispatch/combine barrier                                           | medium                     | 76 more, and **none on the 3 dense layers**; an imbalanced rank stalls every other one |
 | S4     | sampling / detokenisation   | D2H of sampled ids every step                                      | **high**                   | one D2H + host round-trip per step; unavoidable, but its *placement* decides overlap  |
@@ -548,9 +558,10 @@ what they cost.
 | `lm_head` · `mtp_eh_proj` · `logits_all_gather` | 239.5 / 152.2 / 17.3 MB | — | 2 / 1 / 1 | 0.100 / 0.032 / 0.019 | memory | 0.9 % total |
 | **1,614 nodes** | **68.60 GB** | | | **16.551** | | **1,933 tok/s** [A8] |
 
-[A8] every MoE byte term here assumes `ep_imbalance = 1.0`; real skew moves less
-weight traffic but lengthens the grouped-GEMM tail, and it is trace-calibrated by
-design rather than predicted.
+[A8] every MoE byte term assumes `ep_imbalance = 1.0`. Real skew touches *fewer*
+distinct experts, so the prediction over-states traffic and therefore over-states
+time: **the throughput figures are conservative**, not optimistic. What skew adds
+instead is grouped-GEMM tail latency, which this graph does not model at all.
 
 | facet | nodes | Σ ms | share | |
 | --- | ---: | ---: | ---: | --- |
@@ -604,7 +615,7 @@ at TP8/EP8, FP8.
 | **Pre** | `all_reduce` ×158 | **comm — BANDWIDTH** | 174 MB each, 27.5 GB/pass = 30.5 ms | BF16 payload | P; below P≈256 flips to latency |
 | **Pre** | projections (`q_a`,`o_proj`,`q_b`,`kv_a`,`kv_b`) | **compute** | AI 1,403 / 963 / 488 vs the fp8 ridge 412 | FP8 e4m3 | prompt length — below P≈512 memory-bound |
 | **Pre** | indexer scan ×21 | **compute** | 5.77 TF against 22 MB of keys — `O(P·C + P²/2)` × 32 heads, and **2.2 % of the step**. **The quadratic lives here, not in the core** | **BF16** arithmetic, fp8 keys — two dtypes, one node | P **and** C |
-| **Pre** | attention core ×79 | compute, **linear in C** | FLOPs capped at 2,048 keys/query; bytes are the whole cache **once per request — an optimistic floor** (A9/Q3): a tiled kernel re-reads per query block, up to C/2048 more | FP8 KV | ⚑ **`index_topk`**; C; ⚠ **per-request vs per-tile** |
+| **Pre** | attention core ×79 | compute, **linear in C** | FLOPs capped at 2,048 keys/query; bytes are the whole cache **once per request — an optimistic floor** (A9/Q12), but a bounded one: this node is 0.10 % of prefill bytes, so the worst tiling is 1.1× on the step | FP8 KV | ⚑ **`index_topk`**; C; ⚠ **per-request vs per-tile** |
 | **Pre** | permute / combine | memory | 8.5 GB/layer-pass on the `8P`-row expanded tensor, near-zero FLOPs | BF16 activations | top-k; **expert imbalance** |
 | **Pre** | *everything else* — embed gather, norms, `lm_head`, gating | memory or launch | each under 1.5 %; `lm_head` reads 239.5 MB for **one row per request** | BF16; FP32 top-k | none of them flips |
 | **Pre** | **whole prefill pass** | **memory** | **AI 281 vs ridge 412**; 66 % memory / 34 % compute | mixed FP8/BF16/FP32 | prompt length; **chunk size**; EP degree |
@@ -820,7 +831,7 @@ gaps below are narrower because of it.
 | **G8** | **A graph that is only its GEMMs, priced against a bound it cannot express** | The family emitted 16 nodes per layer where a layer lowers to ~20 kernels, and the seven missing ones were all pointwise: the norms, the dynamic fp8 activation scaling, the fused gating, the prologue gather and the epilogue's all-gather. Every one is a rounding error in bytes and **a full kernel launch in time** — so at B=1 the graph reported a step as memory-bound that is 69 % launches. A roofline with a launch bound and a graph with no launches in it cannot both be right | Emit them. `_pointwise`, `add_rms_norm` (with the residual fused in, as vLLM runs it), `add_act_quant` gated on the consuming GEMM actually being fp8, plus `embed_tokens` / `rms_norm` / `logits_all_gather` around the stack. Node names constrained by G9 | **yes** |
 | **G9** | **Op names a capture can actually pair against** | G8's new nodes needed names, and `deviation.classify_op` is a *name guess* (`docs/kernel_identity.md`): a name it cannot classify leaves the predicted node permanently unmatched **and** the real kernel filed as unmodeled — two errors in opposite directions, in the diff the family exists to support. Three norm sites are one kernel name; `silu_and_mul` was already claimed by `mlp_gate_up`; `moe_align`/`topk_softmax` were already claimed by `moe_router`, a decision the dense-MoE and hybrid families depend on | Follow the canonical names rather than redefine them: one `rms_norm` op for all three sites, SwiGLU folded back into the GEMM that owns its needle, gating emitted as a second `moe_router` instance. Then `_OP_RULES` gains only what is genuinely new and unclaimed — `rms_norm`, `act_quant`, `embed_tokens`, `moe_permute`/`moe_combine`, `attn_index_proj`, `attn_kv_b`, `mtp_eh_proj`. A test asserts every op the graph emits resolves | **yes** |
 | **G11** | **An intervention vocabulary that can name the expert term** | `kernels/library.yaml` scopes every lever with `applies_to_kernels`, drawn from a canonical op list that is `qkv_proj · attn_score_value · attn_out_proj · mlp_gate_up · mlp_down · lm_head`. **`moe_routed` and `moe_shared` are not in it**, so the two entries meant to target expert traffic scope to `[mlp_gate_up, mlp_down]` — true of a dense FFN, false of either MoE family. §5 rank 5 aims levers at **74 % of a decode step** through tooling that cannot match it | Add the two ops to the vocabulary and re-scope those entries. **Pre-existing and not GLM-specific** — `moe_graph.py` emits the same names, so DeepSeek-V4 has it identically | **no** — the fix is a shared-vocabulary change and should land where both families' coverage can be checked at once |
-| **G10** | **Which adjacent nodes may overlap and which may not** | `Graph.total_pred_s` is a sum, not a DAG. GLM puts both kinds of serialisation in one step — the draft chain is genuinely serial, the 158 collectives are not — and **both appear as the same positive residual today**. §6.1 is unanswerable without telling them apart | *Not shipped.* It is a cross-family IR change and it is already sequenced on the roadmap. What this note adds is the requirement. `expected_stream_id=1` is set on collectives, but note that **nothing reads it today** — `optimizer/monitor.py` tests overlap using the *observed* kernel's stream, so the predicted field is carried by the IR and consumed by no one. It is a hook for the invariant in `docs/invariants.md` §3, not a wiring of it | **no — deliberately** |
+| **G10** | **Which adjacent nodes may overlap and which may not** | `Graph.total_pred_s` is a sum, not a DAG. GLM puts both kinds of serialisation in one step — the draft chain is genuinely serial, the 158 collectives are not — and **both appear as the same positive residual today**. §6.1 is unanswerable without telling them apart | *Not shipped.* It is a cross-family IR change and it is already sequenced on the roadmap. What this note adds is the requirement. `expected_stream_id=1` is set on collectives, but note that **nothing reads it today** — `optimizer/monitor.py` tests overlap using the *observed* kernel's stream, so the predicted field is carried by the IR and consumed by no one. It is a hook for the invariant in `docs/invariants.md` §3, not a wiring of it. **And the field defaults to `0`, which is indistinguishable from an explicit "compute stream"** — whoever wires the invariant should make it `int | None` first, or every pre-GLM family silently claims stream 0 | **no — deliberately** |
 
 ### 7.2 The one that needed more than a table row
 
@@ -865,16 +876,16 @@ graph change. The commands at the top of this note regenerate any of them.
 |---|---|---|---|
 | **Q1** | Is expert parallelism actually on? | **Rank 1 exists or it does not.** `--enable-expert-parallel` is absent from the vendor recipe; without it the `moe_all_to_all` rows disappear (44 % of prefill) and the per-rank expert bank doubles instead. Not a refinement — a different graph | engine launch args (C6); capture C5 |
 | **Q2** | Does the engine run **absorbed** MLA at decode? | drops `attn_kv_b` and **doubles** `attn_out_proj`'s input width (16384→32768). ±2× on the #4 and #8 lines | serving image / C6 |
-| **Q3** | Does the prefill attention kernel read the selected KV **once per request**, or once per query tile? | **up to 64× on the prefill core's bytes.** The graph takes the optimistic floor (A9), so a tiled kernel would move the prefill roofline conclusion, not just a row | `dram__bytes_read.sum` on the prefill core |
-| **Q4** | Is the decode step **CUDA-graph captured**? | at B=1 the difference between 1.24 ms and 3.30 ms per step, and it decides whether MTP is a 3× win or a net loss | engine config + `--cuda-graph-trace=node` |
-| **Q5** | Is the **router GEMM** fp32, or only its accumulation? | **11.0 % of prefill.** At bf16 the row shrinks ~15× | the engine's MoE gate implementation |
-| **Q6** | Is the grouped GEMM **device-sized or host-sized**? | decides **rank 2 *or* rank 3** — the fork in §5.2 | trace D2H count, or the kernel source |
-| **Q7** | Is the **EP dispatch** bf16 or fp8? | **half of 105.7 GB** at prefill — the largest single recoverable number here | serving image / C6 |
-| **Q8** | Is the **IndexShare selection** passed device-side? | 21 syncs/step if not (S9) | trace D2H attribution |
-| **Q9** | Chunked prefill on, at what chunk size? | **up to 14.9× on prefill bytes** | engine launch args (C6) |
-| **Q10** | **α**, the MTP acceptance rate, in production | the entire MTP decision. Break-even is **0.415** on a prefix chain (0.140 under the linear convention the graph prints — §3.3); 0.5→0.9 is 2,239→5,329 tok/s | engine metrics (C4) — **not predictable from a config** |
-| **Q11** | Are the **index keys** cached in fp8 or bf16? | 2× on 90.2 GB/step at 1M context | C6 / trace |
-| **Q12** | Is `eh_proj` **TP-sharded** in the MTP block? | 151 MB → 19 MB per rank per draft stage | serving image |
+| **Q3** | Is the decode step **CUDA-graph captured**? | at B=1 the difference between 1.24 ms and 3.30 ms per step, and it decides whether MTP is a 3× win or a net loss | engine config + `--cuda-graph-trace=node` |
+| **Q4** | Is the **router GEMM** fp32, or only its accumulation? | **11.0 % of prefill.** At bf16 the row shrinks ~15× | the engine's MoE gate implementation |
+| **Q5** | Is the grouped GEMM **device-sized or host-sized**? | decides **rank 2 *or* rank 3** — the fork in §5.2 | trace D2H count, or the kernel source |
+| **Q6** | Is the **EP dispatch** bf16 or fp8? | **half of 105.7 GB** at prefill — the largest single recoverable number here | serving image / C6 |
+| **Q7** | Is the **IndexShare selection** passed device-side? | 21 syncs/step if not (S9) | trace D2H attribution |
+| **Q8** | Chunked prefill on, at what chunk size? | **up to 14.9× on prefill bytes** | engine launch args (C6) |
+| **Q9** | **α**, the MTP acceptance rate, in production | the entire MTP decision. Break-even is **0.415** on a prefix chain (0.140 under the linear convention the graph prints — §3.3); 0.5→0.9 is 2,239→5,329 tok/s | engine metrics (C4) — **not predictable from a config** |
+| **Q10** | Are the **index keys** cached in fp8 or bf16? | 2× on 90.2 GB/step at 1M context | C6 / trace |
+| **Q11** | Is `eh_proj` **TP-sharded** in the MTP block? | 151 MB → 19 MB per rank per draft stage | serving image |
+| **Q12** | Does the prefill attention kernel read the selected KV once per request, or once per query tile? | Up to 64× on that node — but **the node is 0.10 % of prefill bytes**, so even a 128-row tiling takes the step from 422 GB to 448 GB. **1.1×, and it does not move the prefill conclusion.** Listed last because it is bounded, not because it is small | `dram__bytes_read.sum` on the prefill core |
 
 
 ### 8.2 Assumptions in force
@@ -889,7 +900,7 @@ graph change. The commands at the top of this note regenerate any of them.
 | **A6** | The serving path uses a grouped GEMM, not a per-expert loop | Architecture rule; the reference implementation is the *semantics*, not the execution | a per-expert kernel launch pattern in the trace |
 | **A7** | 158 collectives per step (2 per layer × 79) | TP convention, now modelled explicitly (G6) | NCCL kernel count per step |
 | **A8** | `ep_imbalance = 1.0` | **Declared, not fitted** — it is trace-calibrated by design and there are no traces | any measured skew |
-| **A9** | The prefill attention core streams the selected cache **once per request** | An optimistic floor (Q3). A tiled kernel re-reads per query block | `dram__bytes_read.sum` on the prefill core |
+| **A9** | The prefill attention core streams the selected cache **once per request** | An optimistic floor (Q12), and a *bounded* one: the node is 0.10 % of prefill bytes, so the worst tiling costs 1.1× on the step | `dram__bytes_read.sum` on the prefill core |
 | **A10** | The exact kernel names, everywhere | `confidence: none` throughout. The *class* is justified; the implementation is not knowable without the serving image | — |
 
 ---
