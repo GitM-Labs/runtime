@@ -115,6 +115,7 @@ spec:
     - full
     - shared
     - shared
+    - shared
 
   # Mixture of experts. moe_intermediate_size 2048 per expert; the first 3 layers
   # are dense FFN (intermediate_size 12288) with no router or experts.

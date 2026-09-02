@@ -1,83 +1,58 @@
-"""Predicted execution graph for a GLM-5.2-class (``glm_moe_dsa``) decode step.
+"""Predicted execution graph for a GLM-5.2-class (``glm_moe_dsa``) engine step.
 
-A fork of :mod:`gitm.planner.moe_graph`, specialised for ZhipuAI's
+A fork of :mod:`gitm.planner.moe_graph`, specialised for Z.ai's
 ``GlmMoeDsaForCausalLM``. Both families are sparse-MoE with a lightning indexer,
 but the attention differs in kind, not degree, so a shared spec would carry a
-field for each that is dead on the other — the exact "a default silently
-activates" hazard the roofline module warns about. The two graphs therefore live
-apart, and share only the canonical op names (so residuals stay comparable) and
-the :func:`~gitm.planner.roofline.distinct_experts` union term (one owner, no
-drift).
+field for each that is dead on the other. The two graphs live apart and share
+only the canonical op names (so residuals stay comparable) and
+:func:`~gitm.planner.roofline.distinct_experts` (one owner, no drift).
 
-What GLM-5.2 is, read from ``config.json`` and the checkpoint's own tensor index
-(``model.safetensors.index.json``), never from a trace:
+Shape and provenance are in ``docs/glm-5.2/DESIGN-NOTE.md`` and in the catalogue
+entries' ``provenance`` blocks; this docstring carries only what constrains an
+edit to *this file*.
 
-**Attention is MLA + DeepSeek Sparse Attention, with no per-layer compression.**
-Unlike DeepSeek-V4's CSA/HCA schedule (``compress_ratios``), every GLM layer runs
-the *same* attention: a compressed KV latent (``kv_lora_rank=512``, shared across
-all 64 query heads) plus a lightning indexer that scores the whole history and
-keeps ``index_topk=2048`` positions for the core. There is no ``m``/``m'`` split,
-no HCA, no sliding window. So the V4 fields that encode that schedule are simply
-absent here.
+Four properties do the work, and each has a plausible wrong reading:
 
-**IndexShare — the mechanism this fork exists to price.** The checkpoint declares
-``indexer_types`` per layer: ``full`` or ``shared``. A ``full`` layer computes its
-own indexer (projection + score) and selects the top-k; the next three ``shared``
-layers *reuse that selection* and run no indexer at all. This is not an inference:
-the ``shared`` layers physically **carry no indexer tensors** in the weight map.
-Only 21 of 78 layers run the indexer; 57 skip it. ``index_topk_freq=4`` is the
-period of that grouping (one full + three shared), and ``index_skip_topk_offset``
-its offset. Pricing every layer's indexer at full rate — as a naive reading of
-``index_topk`` would — overstates the indexer's share of the step roughly 4x and
-mis-ranks it against the MoE weight traffic that actually dominates decode.
+**MLA + DSA on every layer, no compression schedule.** One KV latent
+(``kv_lora_rank``) shared across all query heads. Deriving cache traffic from
+``num_key_value_heads * head_dim`` is the classic MLA error and overstates it 50x
+on GLM-5.2 — the config's ``num_key_value_heads: 64`` is a red herring.
 
-**The MLP schedule is dense-then-sparse.** ``first_k_dense_replace=3``: the first
-three layers run a conventional dense FFN (``intermediate_size=12288``) with no
-router and no experts; the remaining 75 are MoE (256 routed experts, top-8, one
-shared, ``moe_intermediate_size=2048``). Modelling the dense layers as MoE would
-invent a router GEMM and expert traffic that the weight map shows are not there.
+**IndexShare.** ``indexer_types`` is ``full`` | ``shared`` per layer; a ``shared``
+layer reuses the previous ``full`` layer's top-k and physically carries no indexer
+tensors. Emitting an indexer on all 78 layers overstates it ~3.7x.
 
-**Three precisions in one block, and which op runs in which is read from the
-checkpoint.** ``zai-org/GLM-5.2`` is bf16 (1.507 TB on disk, no
-``quantization_config``); ``zai-org/GLM-5.2-FP8`` is the vendor's *recommended*
-deployment (753.33 GB, e4m3, 128x128 block-scaled) and its
-``quantization_config.modules_to_not_convert`` names what stays wide. On the FP8
-checkpoint the backbone GEMMs — ``q_a``/``q_b``/``kv_a``/``kv_b``, **``o_proj``**,
-the dense FFN, the shared expert and all 256 routed experts — are fp8, while
-``lm_head``, ``embed_tokens``, the MTP ``eh_proj``, every norm and — the outlier
-worth naming — the **lightning indexer's projections** are bf16. The router is
-fp32 on both checkpoints (``moe_router_dtype: "float32"``, a field of the *base*
-config, so it is a model fact and not a quantisation choice).
+**Dense-then-sparse MLP.** ``first_k_dense_replace`` leading layers have no router
+and no experts. Modelling them as MoE invents traffic the weight map denies.
 
-That is three widths inside one attention block, which one ``weight_dtype`` per
-spec cannot say. :attr:`GlmMoeDsaModelSpec.op_dtype_overrides` says it per op, and
-it is load-bearing in both directions: pricing ``lm_head`` at 1 byte/weight
-understates 154,880 x 6,144 of real traffic, and pricing the indexer at fp8
-understates the one node whose cost grows with context. Note the inversion against
-the fp8-backbone models this planner has seen before — here ``o_proj`` is *inside*
-the quantised set and the *indexer* is outside it.
+**Three precisions in one block**, read from
+``quantization_config.modules_to_not_convert`` and ``moe_router_dtype`` rather
+than assumed. On GLM-5.2-FP8 the backbone GEMMs *including* ``o_proj`` are fp8
+while the *indexer*, ``lm_head`` and the MTP ``eh_proj`` are not — the inversion
+of the usual fp8-backbone layout. :attr:`GlmMoeDsaModelSpec.op_dtype_overrides`
+carries it; one ``weight_dtype`` cannot.
 
 Known limits, stated rather than hidden:
 
-* **Prefill is modelled, and it is not decode with a bigger M.** DSA makes the two
-  phases disagree about what ``index_topk`` buys: at decode the core reads at most
-  ``index_topk`` cached entries, so attention is flat in context; at prefill every
-  query in the chunk selects a *different* top-k, so their union is the whole
-  history and the core streams the entire cache once per request. Top-k bounds
-  prefill FLOPs, not prefill bytes. See :func:`core_qk_pairs` /
-  :func:`core_read_entries`.
-* **Uniform routing.** :func:`~gitm.planner.roofline.distinct_experts` assumes a
-  balanced router; real skew touches fewer distinct experts, moving *less* traffic
-  than predicted — the conservative direction.
-* **Expert-parallel skew is calibrated, not predicted.**
-  :attr:`ShardingConfig.ep_imbalance` stays at 1.0 until a trace measures it.
-* **Collectives are bandwidth-plus-launch**: a ring latency floor of one launch
-  each, which is what a 262 kB decode all-reduce is actually bounded by. Still
-  flagged ``estimated``, and still reported unpriced when the SKU carries no
-  interconnect bandwidth.
-* **The MTP economics are a prediction, not a measurement.** Acceptance rate is a
-  serving observable; the graph prices the *cost* of D drafts and a 1+D verify and
-  leaves the payoff to :attr:`BatchConfig.tokens_per_step`.
+* **Prefill is not decode with a bigger M.** ``index_topk`` bounds the core's
+  FLOPs in both phases and its *bytes* in neither: at prefill every query selects
+  a different top-k and their union is the whole cache. See :func:`core_qk_pairs`
+  and :func:`core_read_entries` — reusing ``BatchConfig.attention_qk_pairs`` here
+  is wrong in both directions at once, and the errors partly cancel.
+* **Uniform routing.** ``distinct_experts`` assumes a balanced router; real skew
+  touches fewer experts, moving *less* traffic — the conservative direction.
+* **``ep_imbalance`` is calibrated, not predicted.** It stays 1.0 until a trace
+  measures it.
+* **Collectives are bandwidth-plus-one-launch**, flagged ``estimated``, and still
+  reported unpriced when the SKU carries no interconnect bandwidth.
+* **MTP cost is predicted; acceptance is not.** The graph prices D drafts and a
+  1+D verify and leaves the payoff to :attr:`BatchConfig.tokens_per_step`.
+* **Node names are constrained by the pairing contract.** Every op emitted here
+  must be classifiable by :func:`gitm.optimizer.deviation.classify_op`, or the
+  predicted node goes permanently unmatched while the real kernel files as
+  unmodeled. That is why three norm sites share one ``rms_norm`` op and why
+  SwiGLU lives inside the GEMM that owns its needle. See
+  ``docs/kernel_identity.md``.
 """
 
 from __future__ import annotations
@@ -174,21 +149,17 @@ class GlmMoeDsaModelSpec:
     moe_intermediate_size: int = 256
     #: Dense-FFN width for the leading ``first_k_dense_replace`` layers.
     intermediate_size: int = 768
-    #: Leading layers that run a dense FFN instead of the mixture (GLM
-    #: ``first_k_dense_replace``). Those layers carry no router and no experts.
+    #: Leading layers with a dense FFN: no router, no experts.
     first_k_dense_replace: int = 1
-    #: Per-layer ``dense`` | ``sparse`` when the checkpoint declares it; overrides
-    #: :attr:`first_k_dense_replace` if both are given.
+    #: Per-layer ``dense`` | ``sparse``; overrides :attr:`first_k_dense_replace`.
     mlp_layer_types: tuple[str, ...] = ()
-    #: Scales routed-expert outputs (GLM ``routed_scaling_factor``). Numerics only —
-    #: no effect on the FLOP/byte roofline, carried for completeness.
+    #: Numerics only — no effect on the FLOP/byte roofline.
     routed_scaling_factor: float = 1.0
 
     # ── multi-token prediction ───────────────────────────────────────────────
     num_nextn_predict_layers: int = 0
-    #: The MTP layer reuses the main model's index rather than recomputing it
-    #: (GLM ``index_share_for_mtp_iteration``). The tensor exists but the iteration
-    #: shares — carried as a headroom lever, not banked into the floor.
+    #: The MTP block reuses the main model's index instead of recomputing it,
+    #: and the weight map agrees: it carries no indexer tensors.
     index_share_for_mtp_iteration: bool = True
 
     # ── precision ────────────────────────────────────────────────────────────
@@ -196,17 +167,9 @@ class GlmMoeDsaModelSpec:
     expert_dtype: str = "bf16"
     kv_dtype: str = "bf16"
     act_dtype: str = "bf16"
-    #: Per-op precision, for the ops that do not run in :attr:`weight_dtype`.
-    #: ``(op_name, dtype)`` pairs — a tuple rather than a mapping so the spec
-    #: stays hashable, matching how the per-layer schedules are carried.
-    #:
-    #: One dtype per model is a fiction on this checkpoint. GLM-5.2-FP8 quantises
-    #: the backbone GEMMs and the experts to e4m3 but leaves ``lm_head``, the MTP
-    #: ``eh_proj`` and the **lightning indexer** in bf16
-    #: (``quantization_config.modules_to_not_convert``), and the router is fp32 on
-    #: every variant (``moe_router_dtype``). Without this the indexer — the one
-    #: attention node whose cost grows with context — is priced at half its real
-    #: weight traffic and against a peak it never sees.
+    #: ``(op_name, dtype)`` for the ops that do not run in :attr:`weight_dtype`.
+    #: A tuple, not a mapping, so the spec stays hashable. Read from the
+    #: checkpoint, never assumed — see the module docstring.
     op_dtype_overrides: tuple[tuple[str, str], ...] = ()
 
     # ── derived shapes / schedule ────────────────────────────────────────────
@@ -509,25 +472,15 @@ def _emit_layer(
 ) -> None:
     """Append one transformer layer's predicted nodes to ``g``.
 
-    ``batch`` is the phase this layer runs in, already adjusted by the caller: a
-    decode step, a chunked-prefill step, or a draft stage (prefill stripped). The
-    node *set* is identical across all three — what changes is the class of four
-    of them, which is why phase is a parameter here rather than a second emitter.
+    ``batch`` is the phase, already adjusted by the caller: decode, chunked
+    prefill, or a draft stage (prefill stripped). The node *set* is identical
+    across all three; only the class of four of them changes.
 
-    Three row counts, and conflating any two is a real error:
-
-    ``rows``
-        Sequence positions this layer computes — decode positions (one per
-        sequence per speculative slot) plus whatever prefill chunk rides along.
-        Every projection and every FFN scales with this.
-    ``batch.batch``
-        Distinct KV caches those rows read from. Cache traffic is charged per
-        *sequence*, not per row, which is why verifying 1+D drafted positions in
-        one step reads the cache once — and is what makes MTP pay at all on a
-        memory-bound step.
-    ``batch.prefill_requests``
-        Prompts the prefill tokens belong to — the denominator for anything read
-        once per request rather than once per token.
+    Three row counts, and conflating any two is a real error: ``rows`` (positions
+    computed — every projection scales with it), ``batch.batch`` (distinct KV
+    caches read — charged per *sequence*, which is what makes a 1+D verify pay),
+    and ``batch.prefill_requests`` (the denominator for anything read once per
+    request).
     """
     h = spec.hidden
     aw = weight_bytes(spec.act_dtype)
@@ -626,13 +579,10 @@ def _emit_layer(
     f, b = _linear(rows, h, spec.kv_entry_dim, aw, w_bytes("attn_kv_a", wd))
     add("attn_kv_a", f, b + rows * kv_entry_bytes(spec), wd)
 
-    # KV up-projection: reconstruct per-head K_nope and V from the cached latent
-    # (W^UK, W^UV). Modelled *unabsorbed* — it runs as its own GEMM and the output
-    # projection stays narrow (n_heads * v_head_dim). A serving engine that absorbs
-    # MLA folds W^UK into the query and W^UV into attn_out_proj instead, dropping
-    # this node and doubling attn_out_proj's input width; that is a serving-path
-    # variant, flagged in the catalogue provenance. Kept as a node because the
-    # weight physically exists in the checkpoint and model_weight_bytes counts it.
+    # Reconstruct per-head K_nope and V from the cached latent (W^UK, W^UV),
+    # modelled *unabsorbed*: its own GEMM, and attn_out_proj stays narrow. An
+    # engine that absorbs MLA drops this node and doubles attn_out_proj's input
+    # width instead — a serving variant, flagged in the catalogue provenance.
     f, b = _linear(
         rows, spec.kv_lora_rank,
         spec.n_heads * (spec.qk_nope_head_dim + spec.v_head_dim) // tp, aw,
@@ -668,15 +618,10 @@ def _emit_layer(
             wd,
         )
 
-        # The scan's two dtypes are different questions and this node answers
-        # both. Its **bytes** are governed by how the index keys are *stored*
-        # (``kv_dtype`` — fp8 under the vendor recipe's fp8 cache); its **FLOPs**
-        # are governed by what the indexer *computes* in, and the indexer is one
-        # of the modules the quantiser skipped, so that is the projection's dtype.
-        # One field cannot do both: pricing 2.1 GF of bf16 arithmetic against the
-        # fp8 peak halves it, which is invisible at decode (the node is
-        # memory-bound at every context) and doubles the prefill row, where it is
-        # compute-bound.
+        # Two dtypes, two questions: the *bytes* follow how the keys are stored
+        # (``kv_dtype``), the *FLOPs* follow what the indexer computes in — and the
+        # indexer is one of the modules the quantiser skipped. Invisible at decode
+        # (memory-bound at every context); doubles the prefill row.
         add(
             "attn_index_score",
             # Every one of the 32 index heads scores each candidate against the
@@ -724,11 +669,9 @@ def _emit_layer(
         spec.act_dtype,
     )
 
-    # Output projection: plain dense from the per-head value space back to hidden.
-    # No o_lora/o_groups here (unlike V4), so no ``estimated`` grouping guess. On
-    # the FP8 checkpoint this one *is* quantised — absent from
-    # ``modules_to_not_convert`` — the opposite of the fp8-backbone checkpoints
-    # that keep o_proj wide.
+    # Per-head value space back to hidden. No o_lora/o_groups here (unlike V4).
+    # On the FP8 checkpoint this one *is* quantised — the opposite of the
+    # fp8-backbone checkpoints that keep o_proj wide.
     f, b = _linear(
         rows, spec.n_heads * spec.v_head_dim // tp, h, aw, w_bytes("attn_out_proj", wd)
     )
@@ -760,20 +703,13 @@ def _emit_layer(
     f, b = _linear(rows, h, spec.n_routed_experts, aw, w_bytes("moe_router", wd))
     add("moe_router", f, b, wd)
 
-    # Sigmoid scoring, the noaux_tc bias correction, the top-8 selection and the
-    # renorm — vLLM's fused gating kernel (``topk_softmax`` /
-    # ``moe_align_block_size``), a second launch after the router GEMM above.
+    # vLLM's fused gating kernel (sigmoid + noaux_tc bias + top-8 + renorm): a
+    # second launch after the router GEMM, sharing its op name because both
+    # classify to ``moe_router`` — a mapping the other families depend on, and a
+    # private name here would emit a node no capture can pair against.
     #
-    # It carries the same op name on purpose. Both kernels classify to
-    # ``moe_router`` in ``deviation._OP_RULES``, which is a decision the
-    # dense-MoE and hybrid families already depend on; giving this one a private
-    # name would emit a node no capture can pair against and strand the gating
-    # kernel on the GEMM's row. Two instances of one op, distinguished by issue
-    # order and — where NVTX ranges exist — by identity.
-    #
-    # Kept as its own node regardless of the name it shares: it is the **only
-    # data-dependent shape in the step**, and therefore the node that decides
-    # whether the step can be CUDA-graph captured at all.
+    # Its own node regardless: the **only data-dependent shape in the step**, and
+    # so the thing that decides whether the step is CUDA-graph capturable.
     add(
         "moe_router",
         3.0 * rows * spec.n_routed_experts,
@@ -798,12 +734,10 @@ def _emit_layer(
             ed,
         )
 
-    # Gather rows into expert-major order and scatter the results back. Zero
-    # arithmetic in the gather, and at decode a rounding error — but the expanded
-    # tensor is ``rows x top_k`` wide, so at an 8,192-token prefill chunk this pair
-    # moves hundreds of megabytes per layer for essentially no FLOPs. A graph that
-    # folds it into the expert GEMM cannot show that, and it is a real and
-    # separately addressable share of prefill traffic.
+    # Gather into expert-major order. Zero arithmetic, a rounding error at
+    # decode — but the expanded tensor is ``rows x top_k`` wide, so at an
+    # 8,192-token chunk this and its scatter move hundreds of MB per layer for no
+    # FLOPs. Folded into the expert GEMM, that share of prefill is invisible.
     expanded = rows * spec.top_k
     add("moe_permute", 0.0, aw * (rows * h + expanded * h) / es, spec.act_dtype)
 
@@ -866,17 +800,14 @@ def _emit_collective(
     bytes, so the count is the cost. Under expert parallelism the MoE half
     additionally dispatches and combines across expert ranks.
 
-    ``dispatches_experts`` gates the expert-parallel all-to-all. Only a mixture
-    layer dispatches tokens to expert ranks; the three dense-FFN layers compute
-    their whole FFN locally and emit the all-reduce alone. Charging them an
-    all-to-all would put 5.5 MB of wire traffic per layer on a block that has no
-    experts to send anything to.
+    ``dispatches_experts`` gates the expert-parallel all-to-all: only a mixture
+    layer sends tokens to expert ranks, and charging the dense layers for one puts
+    wire traffic on a block with no experts to send to.
 
     ``serial_launches`` is withheld when the SKU carries no interconnect
     bandwidth, so an unpriced collective still predicts zero time and
     :attr:`Graph.has_unpriced_collectives` keeps reporting it. A latency floor
-    applied there would quietly convert "we cannot price this" into "it costs two
-    microseconds".
+    there would convert "cannot price this" into "costs two microseconds".
     """
     tp = max(1, sh.tp)
     if tp <= 1 and sh.ep <= 1:
@@ -920,25 +851,18 @@ def predict_glm_graph(
 
     One step, three passes, and they are not three graphs:
 
-    **The backbone** runs over every position in the step — decode positions plus
-    any prefill chunk riding along under chunked prefill. With speculative
-    decoding on, "decode positions" is ``batch x (1 + D)``: **verify is not a new
-    graph, it is this one with the row dimension multiplied by 1+D**.
+    **The backbone** runs over every position — decode positions plus any prefill
+    chunk riding along. Under speculative decoding that is ``batch x (1 + D)``:
+    **verify is not a new graph, it is this one at 1+D rows**.
 
-    **The draft chain** is the one genuinely new subgraph. GLM-5.2 has a single
-    MTP module (``num_nextn_predict_layers: 1``) invoked ``D`` times serially,
-    EAGLE-style — stage *k* cannot start until stage *k-1*'s token id exists — and
-    each stage runs its own vocabulary projection. Emitting one draft block and
-    one ``lm_head`` for a ``D``-deep chain understates it by ``D``, and the
-    ``lm_head`` term is not small: it reads the whole untied vocabulary matrix
-    per stage regardless of how few rows ride on it.
+    **The draft chain** is the one genuinely new subgraph: a single MTP module
+    invoked ``D`` times serially, EAGLE-style, each stage running its own
+    vocabulary projection over the whole untied matrix.
 
-    **The epilogue** projects only the rows that need logits —
-    :attr:`BatchConfig.logits_rows`, which is one row per prefilling *request*
-    plus every decode position. Charging every prefill token would overstate a
-    154,880-wide projection by the chunk size.
+    **The epilogue** projects only :attr:`BatchConfig.logits_rows` — one row per
+    prefilling *request* plus every decode position, not the whole chunk.
 
-    With ``sharding`` left at its default the graph is whole-model; given a real
+    With ``sharding`` at its default the graph is whole-model; given a real
     sharding it predicts what *one rank* does.
     """
     spec = model or GlmMoeDsaModelSpec()
@@ -1026,26 +950,18 @@ def predict_glm_graph(
         )
 
     # ── the draft chain ──────────────────────────────────────────────────────
-    # The MTP module is invoked once per drafted token, serially. Each stage sees
-    # one row per sequence (it proposes for the sequence, not for the verify rows)
-    # and carries no prefill: a draft head proposes continuations, it does not
-    # ingest a prompt.
+    # One MTP module invoked once per drafted token, serially, at one row per
+    # sequence and no prefill — a draft proposes continuations, so on a
+    # pure-prefill step it does not run at all (nodes that never launch would show
+    # up as a launch facet made of absent kernels).
     #
-    # ``index_share_for_mtp_iteration`` says the iteration reuses the main model's
-    # selection rather than recomputing it, and the weight map agrees — the MTP
-    # block carries **no** ``self_attn.indexer.*`` tensors, exactly like the 57
-    # ``shared`` layers. So the draft is emitted as a shared block; banking the
-    # projection and the scan into the floor would price a scan the runtime skips.
+    # Emitted as a *shared* block: ``index_share_for_mtp_iteration`` says the
+    # iteration reuses the main selection, and the weight map agrees — no
+    # ``self_attn.indexer.*`` tensors, exactly like the 57 ``shared`` layers.
     #
-    # What the draft is *not* is a smaller copy of the model. The MTP block carries
-    # a full ``mlp.experts.*`` bank in the checkpoint, so every draft stage draws on
-    # a 256-expert mixture — the draft's cost is dominated by expert weight traffic
-    # it pays ``D`` times over, not by its arithmetic.
-    # Gated on there being decode positions at all: on a pure-prefill step the
-    # draft head does not run — it proposes continuations, and there is nothing yet
-    # to continue. Emitting it anyway put 18 zero-work nodes in the graph whose only
-    # cost was their launches, which is a launch facet made of kernels that never
-    # ran.
+    # It is not a smaller copy of the model. The block carries a full
+    # ``mlp.experts.*`` bank, so its cost is expert weight traffic paid ``D`` times
+    # over, not arithmetic.
     if spec.num_nextn_predict_layers > 0 and batch.positions_per_step > 0:
         draft_batch = replace(batch, prefill_tokens=0, speculative_tokens=0)
         stages = max(1, batch.speculative_tokens)
@@ -1125,22 +1041,14 @@ def _op_dtype_overrides(
 ) -> tuple[tuple[str, str], ...]:
     """Per-op precision, read from the checkpoint rather than assumed.
 
-    Two independent sources, and they answer different questions:
+    Two sources answering different questions.
+    ``quantization_config.modules_to_not_convert`` is *what the quantiser
+    skipped* — on GLM-5.2-FP8 that is ``lm_head``, ``embed_tokens``, the MTP
+    ``eh_proj`` and, the one worth naming, the **lightning indexer**.
+    ``moe_router_dtype`` is *what the model computes in regardless*: fp32 on every
+    variant, so it is emitted with or without a quantisation config.
 
-    ``quantization_config.modules_to_not_convert``
-        *What the quantiser skipped.* Those tensors stay at the model dtype while
-        the backbone drops to fp8 — on GLM-5.2-FP8 that is ``lm_head``,
-        ``embed_tokens``, the MTP ``eh_proj`` and, the one worth naming, the
-        **lightning indexer**. Pricing the indexer at fp8 would halve the weight
-        traffic of the one attention node whose cost grows with context.
-
-    ``moe_router_dtype``
-        *What the model computes in regardless.* fp32 on every GLM-5.2 variant,
-        including the unquantised one, so it is emitted whether or not a
-        quantisation config exists.
-
-    Returns an empty tuple when the checkpoint says nothing — an unquantised model
-    needs no overrides beyond the router, and inventing entries would put a
+    Empty when the checkpoint says nothing — inventing entries would put a
     precision in the graph that the checkpoint never declared.
     """
     found: dict[str, str] = {}

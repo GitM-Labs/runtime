@@ -70,7 +70,7 @@ the planner change that made it representable.
 | MTP                         | 1 module, `index_share_for_mtp_iteration: true`, **carries a full MoE**  |
 | Vocab                       | 154,880, untied `lm_head`                                                 |
 | Max context                 | 1,048,576                                                                |
-| Total / active params       | ~754 B / ~39 B                                                           |
+| Total / active params       | **744 B** published + a **9.9 B** MTP block / ~39 B active                |
 
 ```
 L:  0  1  2  3        6        10       14  ...  74       77
@@ -90,13 +90,21 @@ IndexShare period is 4. No single modulo rule reproduces either (§7, G3).
 `config.json`:
 
 - `indexer_types[i] == "full"` → the layer **computes** its own top-2048 selection
-- `indexer_types[i] == "shared"` → the layer **reuses** the group's selection
+- `indexer_types[i] == "shared"` → the layer **reuses the previous `full` layer's
+  top-k** — the semantics `transformers` documents for the field, verbatim
 - `mlp_layer_types[i]` → `"dense"` | `"sparse"`, and it agrees with
   `first_k_dense_replace: 3`
 - `moe_router_dtype: "float32"` → the router is fp32 **on every variant**, because
   this is a field of the base config and not of any quantisation config
 
-**This is proven from the weight map, not inferred.** Indexer tensors
+IndexShare is a published mechanism ([paper 2603.12201](https://huggingface.co/papers/2603.12201)):
+Z.ai reports it "reuses the same indexer across every four sparse attention
+layers, reducing per-token FLOPs by **2.9× at a 1M context length**". That 2.9× is
+a whole-model figure; the **3.7×** used throughout this note is the *indexer's
+own* ratio (78 layers ÷ 21), which is the one that matters when ranking the
+indexer against the MoE term. Two denominators, both correct.
+
+**The schedule is proven from the weight map, not inferred.** Indexer tensors
 (`*.indexer.wq_b`, `.wk`, `.weights_proj`, `.k_norm`) exist on exactly the 21
 `full` layers, on **none** of the 57 `shared` layers, and on **none** of the MTP
 module. A shared layer that recomputed the index would need those weights; it does
@@ -149,6 +157,15 @@ Two published checkpoints at two precisions agreeing to under half a percent is 
 stronger check than either alone: an error in the shape arithmetic would have to
 be precision-proportional to survive both. A 2:4-sparsity-compressed checkpoint
 would be roughly half the fp8 size. It is not — which is the evidence behind A2.
+
+**And a third check falls out of the gap between them.** Z.ai publishes **744 B**
+parameters; the bf16 checkpoint is 753.3 B by its own byte count. The difference
+is the MTP block, which the published figure excludes — and this graph predicts
+**744.2 B with the draft head removed**, a 0.03 % match. That is not just another
+size check: it says the MTP block is **9.9 B**, and a *dense* draft head at
+`intermediate_size` would be **0.23 B**. The draft carrying a full 256-expert
+mixture (§2.4) is therefore confirmed twice over — once from the weight map, once
+from arithmetic on a number the vendor published for another reason.
 
 ### KV cache — the number that drives decode
 
@@ -305,28 +322,23 @@ vocabulary weights *every step* rather than once per request.
 
 ### 2.3 Encoders — there are none, and the absence is worth stating
 
-GLM-5.2 is a **text-only** decoder. There is no vision tower, no audio encoder, no
-patch embedding, no multimodal scatter into `inputs_embeds`. The design template
-this note follows devotes two sections to encoder cost; here they collapse to a
-single fact, and it changes three things downstream:
+GLM-5.2 is a **text-only** decoder: no vision tower, no audio encoder, no
+multimodal scatter into `inputs_embeds`. Three consequences, because the absence
+is load-bearing:
 
-1. **There is no encoder→backbone seam**, so the one unavoidable serial dependency
-   that dominates a multimodal prefill does not exist. Prefill starts at
-   `embed_tokens`.
+1. **Prefill starts at `embed_tokens`.** The encoder→backbone seam that dominates
+   a multimodal prefill — a strict serial prefix nothing can overlap — does not
+   exist here.
 2. **Prompt length is the only input-side variable.** No image or video token
-   count feeds P, so the flip-variable index (§4.4) is one row shorter than a
-   multimodal model's and the remaining rows are correspondingly better
-   constrained.
-3. **No second model is hiding off-checkpoint.** A multimodal note has to carry an
-   open question for an external audio codec it cannot see. Here the checkpoint is
-   the whole model, so every FLOP in the trace should map to a node in §3 — which
-   makes an unexplained kernel block a much stronger signal than it would be
-   elsewhere (§6.4 row 6).
+   count feeds P, so §4.4's flip-variable index is one row shorter and the
+   remaining rows are correspondingly better constrained.
+3. **No second model is hiding off-checkpoint.** Every FLOP in a trace should map
+   to a node in §3, which makes an unexplained kernel block a much stronger
+   signal than it would be elsewhere (§6.4 row 6).
 
-The GLM family does ship vision variants (GLM-4.5V and successors). **They are a
-different checkpoint with a different `model_type` and this graph does not model
-them** — `is_glm_moe_dsa_config` would decline them rather than price a tower it
-never read.
+The GLM family does ship vision variants. **They are a different checkpoint with a
+different `model_type` and this graph does not model them** —
+`is_glm_moe_dsa_config` declines them rather than pricing a tower it never read.
 
 ### 2.4 MTP-on decode — draft and verify
 
@@ -393,7 +405,7 @@ two of them are on the critical path between the last layer and the sample.
 | id  | operator            | kernel class              | shape                          | FLOPs    | bytes         | stream | bound  |
 | --- | ------------------- | ------------------------- | ------------------------------ | -------- | ------------- | ------ | ------ |
 | D0  | `embed_tokens`      | gather (index_select)     | `[32] → [32,6144]`             | 0 F      | 0.393 MB      | compute | launch |
-| E0  | `final_norm`        | fused RMSNorm             | `[32,6144]`, **logits rows only** | 0.6 MF | 0.786 MB   | compute | launch |
+| E0  | `rms_norm`          | fused RMSNorm             | `[32,6144]`, **logits rows only** | 0.6 MF | 0.786 MB   | compute | launch |
 | E1  | `lm_head`           | GEMM (BF16), tall-skinny  | `[32,6144] × [6144,19360]`     | 7.61 GF  | **239.5 MB**  | compute | memory |
 | E2  | `logits_all_gather` | collective (all-gather)   | `[32,19360] → [32,154880]` fp32 | 0 F     | **17.3 MB**   | comm   | memory |
 
@@ -518,7 +530,7 @@ that was never moving bytes. The sign of the MTP decision flips with batch.
 
 | #      | Where                       | Kind                                                              | conf                       | Trace signature if real                                                              |
 | ------ | --------------------------- | ----------------------------------------------------------------- | -------------------------- | ------------------------------------------------------------------------------------ |
-| **S1** | after top-k (`moe_topk`)    | host readback of the expert histogram to size the grouped GEMM     | **low**                    | **76 D2H per decoded token** — fatal for graph capture                                |
+| **S1** | after the gating kernel     | host readback of the expert histogram to size the grouped GEMM     | **low**                    | **76 D2H per decoded token** — fatal for graph capture                                |
 | S2     | around each all-reduce      | stream-to-stream event wait                                        | medium                     | 158 event pairs/step; at 688 kB **the gap *is* the cost**                              |
 | S3     | around each EP all-to-all   | dispatch/combine barrier                                           | medium                     | 76 more, and **none on the 3 dense layers**; an imbalanced rank stalls every other one |
 | S4     | sampling / detokenisation   | D2H of sampled ids every step                                      | **high**                   | one D2H + host round-trip per step; unavoidable, but its *placement* decides overlap  |
@@ -654,7 +666,7 @@ at TP8/EP8, FP8.
 | **Pre** | indexer scan ×21 | **compute** | 5.77 TF against 22 MB of keys — `O(P·C + P²/2)` × 32 heads, and **2.2 % of the step**. **The quadratic lives here, not in the core** | **BF16** arithmetic, fp8 keys — two dtypes, one node | P **and** C |
 | **Pre** | attention core ×79 | compute, **linear in C** | FLOPs capped at 2,048 keys/query; **bytes are the whole cache once per request** | FP8 KV | ⚑ **`index_topk`**; C. Not P² |
 | **Pre** | permute / combine | memory | 8.5 GB/layer-pass on the `8P`-row expanded tensor, near-zero FLOPs | BF16 activations | top-k; **expert imbalance** |
-| **Pre** | *everything else* — embed gather, norms, `lm_head`, `moe_topk` | memory or launch | each under 1.5 %; `lm_head` reads 239.5 MB for **one row per request** | BF16; FP32 top-k | none of them flips |
+| **Pre** | *everything else* — embed gather, norms, `lm_head`, gating | memory or launch | each under 1.5 %; `lm_head` reads 239.5 MB for **one row per request** | BF16; FP32 top-k | none of them flips |
 | **Pre** | **whole prefill pass** | **memory** | **AI 281 vs ridge 412**; 66 % memory / 34 % compute | mixed FP8/BF16/FP32 | prompt length; **chunk size**; EP degree |
 | **MTP** | verify expert GEMMs | **memory** | 256 distinct experts at 192 rows vs 163 at 32 — **+57 %/layer, ~85 % of MTP's cost** | FP8 block-scaled | `B(1+D)` vs E=256; **D**; imbalance |
 | **MTP** | draft expert GEMMs ×D | **memory** | the MTP block carries a **full 256-expert bank**; 5 stages × 163 experts, **linear in D, no saturation** | FP8 block-scaled | **D**; batch |
@@ -707,7 +719,7 @@ graph**, to be confirmed against a capture.
 | Rank | Region | Prediction | Why | Evidence to inspect | What would prove it wrong |
 |---|---|---|---|---|---|
 | **1** | **EP all-to-all at prefill** | **≥44 % of prefill time is wire, and roughly half of it is recoverable** | 105.7 GB/pass in BF16. An fp8 dispatch halves the payload outright; overlapping dispatch with the shared-expert GEMM hides more | NCCL kernel duration vs payload at prefill (§6.4 row 5); whether dispatch is bf16 | duration ≪ payload/900 GB/s → the engine already fuses or compresses it |
-| **2** | **Grouped-GEMM group sizing (the fork)** | either **76 D2H per token** (no graph capture possible) **or** fixed-capacity padding (**all 256 experts read every step**) | The only data-dependent shape in the graph is `moe_topk`. A stack does one or the other — see §5.2 | `cuda_api_sum` D2H count per decode step | 0 D2H **and** MoE bytes that track `distinct_experts(B)` → a device-side path, nothing to recover |
+| **2** | **Grouped-GEMM group sizing (the fork)** | either **76 D2H per token** (no graph capture possible) **or** fixed-capacity padding (**all 256 experts read every step**) | The only data-dependent shape in the graph is the fused gating kernel. A stack does one or the other — see §5.2 | `cuda_api_sum` D2H count per decode step | 0 D2H **and** MoE bytes that track `distinct_experts(B)` → a device-side path, nothing to recover |
 | **3** | ⚑ **CUDA-graph capture at low batch** | **63 % of the B=1 floor is launch overhead** (81 % at eager 5 µs) | 1,033 nodes × 2 µs = 2.07 ms against a 1.24 ms memory term | `cuda_api_sum` launch count with `--cuda-graph-trace=node`; expect **1** `cudaGraphLaunch` | already captured → this rank is worth nothing, and rank 2's fork is already resolved to "padded" |
 | **4** | **The indexer scan at long context** | at 1M it is **54 % of the step**, and IndexShare's 3.7× is already banked | 90.2 GB/step of index keys at S=1M. Levers: fp8 index keys (2×), temporal reuse across steps, a smaller `index_topk_freq` group | `dram__bytes_read.sum` on the scan vs 90.2 GB; whether keys are fp8 | keys already fp8 and no temporal reuse available → architectural |
 | **5** | **`moe_routed` — the memory-bound heart** | 73.8 % of decode; **EPLB placement and the grouped-GEMM backend are the levers** | Weight traffic scales with *distinct* experts woken, not with FLOPs. Good placement cuts per-rank distinct traffic; DeepGEMM cuts the constant | measured per-rank expert traffic vs `distinct_experts`; **the real EP imbalance** | measured traffic already at the union prediction with balance ≈1.0 → the bank is the bank |
@@ -913,46 +925,28 @@ which is exactly what makes them survivable. **A prefill path that is wrong in a
 self-cancelling way is worse than no prefill path**, and it is the version that
 will get suggested — hence four helpers with four docstrings rather than one alias.
 
-### 7.3 What this branch actually changed
+### 7.3 What this branch changed, in kind
 
-```
-gitm/planner/glm_graph.py        op_dtype_overrides + dtype_for; four DSA phase helpers;
-                                 rows = positions + prefill_tokens throughout;
-                                 serial_launches on every node; the full pointwise
-                                 lowering -- rms_norm (residual fused in, as vLLM runs
-                                 it), act_quant gated on the GEMM being fp8, the fused
-                                 gating kernel, moe_permute / moe_combine, and the
-                                 embed_tokens / rms_norm / lm_head / logits_all_gather
-                                 that bracket the stack; _emit_collective x2 per layer,
-                                 EP dispatch only where a layer has experts; the D-stage
-                                 draft chain with per-stage lm_head and eh_proj; the
-                                 indexer's wk + weights_proj, its 32 head scores, and
-                                 its storage dtype held apart from its math dtype;
-                                 the quantisation-map reader
-gitm/optimizer/deviation.py      _OP_RULES entries for the ops the pointwise lowering
-                                 added, plus attn_index_proj (was shadowed by the scan),
-                                 attn_kv_b (present once MLA is modelled unabsorbed) and
-                                 mtp_eh_proj. Existing mappings left alone: the
-                                 gating->moe_router and silu_and_mul->mlp_gate_up
-                                 decisions are shared with the other families
-gitm/planner/context.py          _FP32_PEAKS + fp32_peak_for_sku, wired to hardware_spec_for
-gitm/planner/registry.py         node-owned bound labels, per-dtype ridges, launch count,
-                                 --spec-tokens
-gitm/planner/model_catalogue.py  nested tuple coercion for op_dtype_overrides
-gitm/planner/models/
-  glm-5.2.yaml                   the bf16 model fact + the fp32 router
-  glm-5.2-fp8.yaml               NEW — the vendor's recommended deployment
-tests/test_glm_graph.py          29 tests: the fp8 footprint, the precision map, the
-                                 prefill/decode byte inversion, the D-deep chain, two
-                                 collectives, the 32-head index scan, that a pure-prefill
-                                 step runs no draft head, that a launch floor does not
-                                 hide an unpriced collective, the exact node sequence a
-                                 layer lowers to, and that every op the graph emits
-                                 resolves from some kernel name
-docs/glm-5.2/artifacts/*.json    DELETED — 29k lines of node dumps that go stale on
-                                 every graph change; the commands at the top of this
-                                 note regenerate any of them
-```
+Five things, in the order they re-rank the tables. `git log` has the file list.
+
+1. **Precision became per-op** (`op_dtype_overrides`), read from
+   `modules_to_not_convert` and `moe_router_dtype`. Everything downstream is
+   priced against it, and the FP8 catalogue entry became the one to plan against.
+2. **Prefill exists**, with DSA's own asymptotics rather than a dense family's —
+   four helpers, because FLOPs and bytes stop moving together (G2, §7.2).
+3. **A layer lowers to its kernels, not just its GEMMs** (G8): norms, activation
+   quantisation, the fused gating, the prologue and epilogue. Without them the
+   launch bound the roofline already supported had nothing to bind.
+4. **Node names follow the pairing contract** (G9) rather than redefining it, so
+   the per-op residual diff in §6 can actually pair what the graph predicts.
+5. **The MTP chain is D stages deep**, each with its own vocabulary projection
+   (G7), driven by `--spec-tokens`.
+
+Two supporting fixes outside the family: an fp32 peak for modern SKUs (G4), and
+`gitm plan` keeping the launch bound and pricing the ridge per dtype (G5).
+
+**Deleted:** three committed JSON node dumps, 29k lines that went stale on every
+graph change. The commands at the top of this note regenerate any of them.
 
 ---
 
@@ -993,45 +987,24 @@ docs/glm-5.2/artifacts/*.json    DELETED — 29k lines of node dumps that go sta
 
 ## 9. How to run it
 
-**A. Predict-only (no GPU, free, works now):**
+**Predict-only — free, no GPU, and it answers the two questions that gate
+everything else.** Does the fp8 shape fit (yes: 755.9 GB of weights on 1,128 GB),
+and is the step launch-bound at your batch (yes, below B≈16). The commands are at
+the top of this note.
 
-```bash
-pip install -e .
-gitm plan glm-5.2-fp8 --gpu H200 --batch 32 --kv-len 8192 --tp 8 --ep 8
-gitm plan glm-5.2-fp8 --gpu B200 --batch 32 --kv-len 131072 --tp 8 --ep 8 --json
-gitm plan --list
-```
+**Serve and capture.** The footprint decides the hardware: **fp8 → one 8×H200
+node**, leaving ~370 GB for KV and activations; **bf16 → two nodes** (10.7 H200s
+for weights alone). Full 1M context wants B200/B300 for the extra HBM — 55 GB of
+KV per rank on top of a 96 GB weight share.
 
-**B. Serve + capture (to get the numbers §6 wants validated).** The footprint math
-decides the hardware: **fp8 → one 8×H200 node** (755.9 GB of weights against
-1,128 GB, leaving ~370 GB for KV and activations); **bf16 → two nodes** (1,508 GB,
-10.7 H200s for weights alone). Full 1M context wants B200/B300 for the extra HBM.
-
-1. On RunPod take an **8×H200 SXM** pod with a **network volume ≥ 1 TB** for the
-   141-shard fp8 checkpoint.
-2. Serve with the vendor's own recipe — reproduced here verbatim because §4's
-   constants assume it:
-   ```bash
-   vllm serve zai-org/GLM-5.2-FP8 \
-     --kv-cache-dtype fp8 \
-     --tensor-parallel-size 8 \
-     --speculative-config.method mtp \
-     --speculative-config.num_speculative_tokens 5 \
-     --tool-call-parser glm47 --reasoning-parser glm45 --enable-auto-tool-choice
-   ```
-   Add `--enable-expert-parallel` for the EP8 shape §4 prices; **without it the
-   graph's `moe_all_to_all` rows should not appear at all**, and rank 1 does not
-   exist. That difference is capture C5.
-3. Attach the GitM collector and capture a bounded decode window:
-   ```bash
-   gitm capture serve      # or: gitm capture attach
-   ```
-4. Import and diff observed-vs-predicted per op. **A residual here is a lead, not a
-   defect.**
-
-> ⚠ Take path A first. It is free, and it answers the two questions that gate
-> everything else — does the fp8 shape fit (yes, 755.9 GB on 1,128 GB), and is the
-> step launch-bound at your batch (yes, below B≈16).
+1. An **8×H200 SXM** pod with a **network volume ≥ 1 TB** for the 141-shard fp8
+   checkpoint.
+2. Serve with the vendor recipe quoted in the hardware section — §4's constants
+   assume it. Add `--enable-expert-parallel` for the EP8 shape §4 prices;
+   **without it the `moe_all_to_all` rows should not appear at all**, and rank 1
+   does not exist. That difference is capture C5.
+3. `gitm capture serve` (or `gitm capture attach`) for a bounded decode window.
+4. Diff observed-vs-predicted per op. **A residual is a lead, not a defect.**
 
 ---
 

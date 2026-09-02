@@ -69,12 +69,33 @@ def _expand_layer_types(value: Any, n_layers: int) -> tuple[str, ...]:
     return expanded
 
 
-def load_entry(name_or_path: str | Path) -> dict[str, Any]:
-    """The raw catalogue entry, validated for structure but not yet a spec."""
+def load_entry(name_or_path: str | Path, _seen: frozenset[str] = frozenset()) -> dict[str, Any]:
+    """The raw catalogue entry, validated for structure but not yet a spec.
+
+    ``extends: <entry>`` merges this entry's ``spec`` over that of another. It
+    exists for the case where two entries describe *the same architecture at a
+    different precision* — a bf16 release and its FP8 sibling, which share a
+    78-entry indexer schedule and a 78-entry MLP schedule verbatim. Copying those
+    into both files is 158 lines of duplicated evidence that can drift apart
+    silently, and it hides the thing worth seeing: the two entries differ only in
+    their dtypes. ``provenance`` is deliberately *not* merged — each checkpoint
+    was validated against its own published size and has its own open questions.
+    """
     path = _resolve(name_or_path)
     data = yaml.safe_load(path.read_text()) or {}
     if not isinstance(data, dict):
         raise ValueError(f"{path}: expected a mapping at the top level")
+
+    base_name = data.pop("extends", None)
+    if base_name is not None:
+        key = str(base_name)
+        if key in _seen:
+            raise ValueError(f"{path}: 'extends' cycle through {key!r}")
+        base = load_entry(key, _seen | {key})
+        merged = dict(base.get("spec") or {})
+        merged.update(data.get("spec") or {})
+        data = {**{k: v for k, v in base.items() if k != "provenance"}, **data}
+        data["spec"] = merged
 
     family = data.get("family")
     if family not in _FAMILIES:
@@ -118,6 +139,20 @@ def load_spec(name_or_path: str | Path):
     for key in ("compress_ratios", "dspark_layer_ids", "indexer_types", "mlp_layer_types"):
         if key in raw and isinstance(raw[key], list):
             raw[key] = tuple(raw[key])
+    # Per-layer schedules must cover the model exactly. ``spec_from_hf_config``
+    # already refuses a short one; the catalogue path did not, and a schedule one
+    # entry short does not fail — the missing layers fall through to the modulo
+    # fallback and can land on the right answer by luck, which is a plausible
+    # total resting on evidence that is not there. That is the exact failure the
+    # explicit schedules exist to prevent, so it is an error here too.
+    n_layers = int(raw.get("n_layers", 0) or 0)
+    for key in ("indexer_types", "mlp_layer_types"):
+        sched = raw.get(key)
+        if sched and n_layers and len(sched) != n_layers:
+            raise ValueError(
+                f"{name_or_path}: {key} has {len(sched)} entries for {n_layers} "
+                "layers — the schedule must cover the model exactly"
+            )
     # Nested one level: ``op_dtype_overrides`` is a list of ``[op, dtype]`` pairs
     # in YAML and must reach the frozen spec as a tuple of tuples. Coercing only
     # the outer list would leave inner lists inside a frozen dataclass — hashable

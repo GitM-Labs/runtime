@@ -20,9 +20,12 @@ through:
 
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import replace
 
 import pytest
+import yaml
 
 from gitm.planner.glm_graph import (
     GlmMoeDsaModelSpec,
@@ -33,7 +36,7 @@ from gitm.planner.glm_graph import (
     predict_glm_graph,
     spec_from_hf_config,
 )
-from gitm.planner.model_catalogue import available, load_spec, predict
+from gitm.planner.model_catalogue import available, load_entry, load_spec, predict
 from gitm.planner.registry import detect_family
 from gitm.planner.roofline import BatchConfig, ShardingConfig
 
@@ -532,6 +535,55 @@ def test_catalogue_entry_loads_and_predicts(entry):
     g, family = predict(entry, batch=BatchConfig(batch=1, kv_cache_len=4096))
     assert family == "glm_moe_dsa"
     assert g.total_pred_s > 0
+
+
+def test_catalogue_schedules_cover_the_model_exactly():
+    """A schedule one entry short does not fail — it falls through and may be right.
+
+    The missing layers take the modulo fallback, which on GLM-5.2 happens to
+    produce the correct count. A plausible total resting on evidence that is not
+    there is the exact failure explicit schedules exist to prevent, so the
+    catalogue path refuses it rather than accepting the luck.
+    """
+    published = ["full"] * 3 + (["shared"] * 3 + ["full"]) * 18 + ["shared"] * 3
+    for entry in ("glm-5.2", "glm-5.2-fp8"):
+        spec = load_spec(entry)
+        assert len(spec.indexer_types) == spec.n_layers == 78
+        assert list(spec.indexer_types) == published
+
+    from gitm.planner.model_catalogue import CATALOGUE_DIR
+    from gitm.planner.model_catalogue import load_spec as _load
+
+    short = yaml.safe_load((CATALOGUE_DIR / "glm-5.2.yaml").read_text())
+    short["spec"]["indexer_types"] = short["spec"]["indexer_types"][:-1]
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+        yaml.safe_dump(short, fh)
+        path = fh.name
+    try:
+        with pytest.raises(ValueError, match="must cover the model exactly"):
+            _load(path)
+    finally:
+        os.unlink(path)
+
+
+def test_fp8_entry_inherits_the_schedule_it_shares():
+    """Two precisions of one architecture, and only the dtypes are written twice.
+
+    The FP8 entry ``extends`` the bf16 one. Copying a 78-entry schedule into both
+    files is duplicated evidence that can drift apart silently — and it did:
+    the schedule was one entry short for a while, in the file that had it twice.
+    ``provenance`` is deliberately not inherited; each checkpoint is validated
+    against its own published size.
+    """
+    bf16, fp8 = load_spec("glm-5.2"), load_spec("glm-5.2-fp8")
+    assert fp8.indexer_types == bf16.indexer_types
+    assert fp8.n_layers == bf16.n_layers and fp8.hidden == bf16.hidden
+    assert (fp8.weight_dtype, fp8.kv_dtype) == ("fp8", "fp8")
+    assert (bf16.weight_dtype, bf16.kv_dtype) == ("bf16", "bf16")
+
+    entry = load_entry("glm-5.2-fp8")
+    fields = {e["field"] for e in entry["provenance"]["estimated"]}
+    assert "kv_dtype" in fields  # its own, not the base's
 
 
 def test_fp8_entry_is_the_deployable_one():
