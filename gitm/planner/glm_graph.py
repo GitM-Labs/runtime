@@ -65,23 +65,11 @@ from gitm.planner.roofline import (
     BatchConfig,
     HardwareSpec,
     ShardingConfig,
+    _canon_dtype,
     distinct_experts,
     roofline,
     weight_bytes,
 )
-
-
-def _canon(dtype: str) -> str:
-    """Canonical dtype name, so ``"e4m3"`` and ``"fp8"`` answer the same question."""
-    d = dtype.lower()
-    if d in ("fp8", "e4m3", "e5m2"):
-        return "fp8"
-    if d in ("bf16", "fp16", "float16", "half"):
-        return "fp16"
-    if d in ("fp32", "float32", "tf32"):
-        return "fp32"
-    return d
-
 
 FULL_INDEXER = "full"
 SHARED_INDEXER = "shared"
@@ -248,29 +236,6 @@ def kv_entry_bytes(spec: GlmMoeDsaModelSpec) -> float:
     rope = spec.qk_rope_head_dim * weight_bytes("bf16")
     latent = spec.kv_lora_rank * weight_bytes(spec.kv_dtype)
     return latent + rope
-
-
-def effective_kv_tokens(spec: GlmMoeDsaModelSpec, kv_len: int) -> int:
-    """KV positions the attention *core* reads — bounded by the indexer's top-k.
-
-    Every GLM layer runs DSA, so the core reads at most ``index_topk`` selected
-    positions regardless of how long the context grows. This is why attention is
-    flat in context on this architecture and the term that still grows is the
-    indexer scan, not the core.
-    """
-    if kv_len <= 0:
-        return 0
-    return min(kv_len, spec.index_topk)
-
-
-def index_candidates(spec: GlmMoeDsaModelSpec, kv_len: int) -> int:
-    """Positions the indexer must score — the whole (uncompressed) history.
-
-    GLM does not compress before selecting, so the indexer scores every past
-    token. This is the only term in the attention path that grows with context,
-    and it is paid on ``full`` layers alone.
-    """
-    return max(0, kv_len)
 
 
 def _capped_prefix_sum(context: int, tokens: int, cap: int) -> float:
@@ -552,7 +517,7 @@ def _emit_layer(
         checkpoint there is nothing to quantise and the kernel does not exist,
         which is the sort of difference a single model-wide dtype cannot express.
         """
-        if _canon(spec.dtype_for(gemm_op, wd)) != "fp8":
+        if _canon_dtype(spec.dtype_for(gemm_op, wd)) != "fp8":
             return
         # Read the bf16 activation, write the fp8 one plus its scales.
         add(op, 2.0 * rows * elems,
