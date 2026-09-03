@@ -153,14 +153,15 @@ def load_spec(name_or_path: str | Path):
                 f"{name_or_path}: {key} has {len(sched)} entries for {n_layers} "
                 "layers — the schedule must cover the model exactly"
             )
-    # Nested one level: ``op_dtype_overrides`` is a list of ``[op, dtype]`` pairs
-    # in YAML and must reach the frozen spec as a tuple of tuples. Coercing only
-    # the outer list would leave inner lists inside a frozen dataclass — hashable
-    # in appearance, not in fact.
+    # YAML gives lists; the spec is a frozen dataclass and therefore hashable, so
+    # every collection field has to land as something hashable. A list here does
+    # not fail at load — it fails later, at the first ``hash(spec)``, a long way
+    # from the file that caused it.
+    if isinstance(raw.get("dense_layers"), list):
+        raw["dense_layers"] = frozenset(int(i) for i in raw["dense_layers"])
     if isinstance(raw.get("op_dtype_overrides"), list):
         raw["op_dtype_overrides"] = tuple(
-            tuple(pair) if isinstance(pair, list) else pair
-            for pair in raw["op_dtype_overrides"]
+            (str(op), str(dt)) for op, dt in raw["op_dtype_overrides"]
         )
 
     unknown = set(raw) - known

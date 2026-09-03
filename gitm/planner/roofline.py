@@ -567,8 +567,7 @@ class BatchConfig:
         """
         return (self.prefill_requests if self.is_prefill else 0) + self.positions_per_step
 
-    @property
-    def attention_qk_pairs(self) -> float:
+    def attention_qk_pairs(self, window: int = 0) -> float:
         """Query-key pairs the attention core evaluates this step.
 
         Decode contributes ``batch x kv_len``: one query against the whole cache.
@@ -578,12 +577,31 @@ class BatchConfig:
         The second term is the quadratic one, and it is why prefill is compute-
         bound where decode is memory-bound — at 8192 tokens it is 33.6M pairs
         against a decode step's 8192.
+
+        ``window`` caps how far back any one query may look, for sliding-window
+        layers. It changes the *asymptotics*, not just the constant: the causal
+        triangle becomes a band, so the quadratic term collapses to a linear one.
+        At P=8192 and W=128 that is 1,040,448 pairs against 33,558,528 — a
+        **32x overcount** if the window is ignored, on the term that decides
+        whether prefill is compute-bound. ``0`` means no window, which reproduces
+        the unwindowed expression exactly.
         """
-        pairs = float(self.positions_per_step * self.kv_cache_len)
-        if self.is_prefill:
-            p = self.prefill_tokens
-            pairs += p * self.prefill_context + p * (p + 1) / 2.0
-        return pairs
+        if window > 0:
+            decode = float(self.positions_per_step * min(self.kv_cache_len, window))
+        else:
+            decode = float(self.positions_per_step * self.kv_cache_len)
+        if not self.is_prefill:
+            return decode
+
+        p, ctx = self.prefill_tokens, self.prefill_context
+        if window <= 0:
+            return decode + p * ctx + p * (p + 1) / 2.0
+        if ctx >= window:
+            # Every chunk token already has a full window behind it.
+            return decode + float(p * window)
+        # ``m`` tokens ramp up from ``ctx+1`` to the window; the rest run flat.
+        m = min(p, window - ctx)
+        return decode + m * ctx + m * (m + 1) / 2.0 + (p - m) * window
 
     @property
     def tokens_per_step(self) -> float:

@@ -1,0 +1,170 @@
+# Xiaomi MiMo-V2.5 — hybrid sliding-window / full-attention MoE.
+# Source: the checkpoint's own config.json + model.safetensors.index.json.
+
+name: XiaomiMiMo/MiMo-V2.5
+family: hybrid
+description: >
+  48 layers, 39 sliding-window (W=128) and 9 full attention, top-8 of 256
+  experts with no shared expert. Layer 0 is the only dense MLP. Three dense
+  sliding-window MTP draft layers. Three precisions inside one attention block:
+  fp8 qkv_proj, bf16 o_proj, fp32 router.
+
+spec:
+  hidden: 4096
+  n_layers: 48
+  vocab: 152576
+
+  # Attention. head_dim 192 for Q/K but v_head_dim 128 for V, so o_proj's input
+  # is n_heads * v_head_dim = 8192 — NOT q_dim (12288). Using q_dim overstates
+  # that projection by 1.5x.
+  n_heads: 64
+  num_kv_heads: 4
+  head_dim: 192
+  v_head_dim: 128
+  partial_rotary_factor: 0.334      # 64 of 192 dims rotate
+  attn_output_gate: false
+
+  # Sliding-window layers carry their own GQA shape: 8 KV heads against the
+  # full-attention layers' 4. The per-layer KV width IS the decode KV rate, so a
+  # single head count for the model is wrong on 39 of 48 layers.
+  sliding_window: 128
+  swa_num_kv_heads: 8
+  swa_head_dim: 192
+  swa_v_head_dim: 128
+  swa_rope_theta: 10000.0           # vs 1e7 on full-attention layers
+  swa_attention_sink: true          # add_swa_attention_sink_bias
+
+  # Mixture of experts. n_shared_experts is null in the config — there is no
+  # shared expert, which is unusual for this scale and worth not assuming.
+  num_experts: 256
+  num_experts_per_tok: 8
+  moe_intermediate_size: 2048
+  shared_expert_intermediate_size: 0
+
+  # Layer 0 is the only dense block, and its FFN is 8x an expert's width.
+  dense_intermediate_size: 16384
+  dense_layers: [0]
+
+  # Written out rather than tiled. The full-attention gaps are 5,6,6,6,6,6,6,6 —
+  # layer 0 breaks the stride, so NO {pattern, repeat} form reproduces this
+  # schedule, and a modulo rule guessed from the interval would place all nine
+  # full-attention layers in the wrong positions while producing an entirely
+  # plausible total.
+  layer_types: [
+    full_attention, sliding_attention, sliding_attention, sliding_attention, sliding_attention, full_attention,
+    sliding_attention, sliding_attention, sliding_attention, sliding_attention, sliding_attention, full_attention,
+    sliding_attention, sliding_attention, sliding_attention, sliding_attention, sliding_attention, full_attention,
+    sliding_attention, sliding_attention, sliding_attention, sliding_attention, sliding_attention, full_attention,
+    sliding_attention, sliding_attention, sliding_attention, sliding_attention, sliding_attention, full_attention,
+    sliding_attention, sliding_attention, sliding_attention, sliding_attention, sliding_attention, full_attention,
+    sliding_attention, sliding_attention, sliding_attention, sliding_attention, sliding_attention, full_attention,
+    sliding_attention, sliding_attention, sliding_attention, sliding_attention, sliding_attention, full_attention,
+  ]
+
+  # Dead on this checkpoint — the schedule above is explicit, so no interval is
+  # ever consulted. Stated anyway so the YAML and the config reader agree field
+  # for field, which is what makes the drift test meaningful.
+  full_attention_interval: 1
+
+  # Multi-token prediction. THE COUNT IS NOT IN config.json — it is only visible
+  # as tensors in the safetensors index (48 MTP tensors / 16 per layer = 3), so
+  # the config reader defaults to 0 and this file is where the real number
+  # lives. Each draft layer is DENSE-MLP and SLIDING-window, not a copy of the
+  # backbone's last (full-attention, MoE) layer.
+  mtp_num_hidden_layers: 3
+  mtp_layer_kind: sliding_attention
+  mtp_dense: true
+
+  # Two per layer: post-attention and post-MoE.
+  all_reduces_per_layer: 2
+
+  # Precision. Three of them inside one attention block.
+  weight_dtype: fp8
+  act_dtype: bf16
+  kv_dtype: bf16                    # OPEN — see provenance.open Q1
+  op_dtype_overrides:
+    - [attn_out_proj, bf16]         # in quantization_config.ignored_layers
+    - [moe_router, fp32]            # explicit .float() cast
+    - [lm_head, bf16]               # untied, no scale tensor
+    # The attention core is not one of the fp8 tensors. config.json's
+    # quantization_config covers *linear* weights; the score-value kernel has no
+    # weights at all, and the cache it reads is bf16 (kv_dtype above). Leaving it
+    # at weight_dtype prices it against the fp8 peak — 2x optimistic on a node
+    # that is 3% of a decode step but 3% of prefill's compute too.
+    - [attn_score_value, bf16]
+
+  # Unused by this checkpoint (no linear-attention layers); present because the
+  # spec is shared with the gated-DeltaNet members of the family.
+  linear_num_value_heads: 1
+  linear_value_head_dim: 1
+
+provenance:
+  verified:
+    - claim: the layer schedule reproduces the published structure
+      detail: >
+        hybrid_layer_pattern decodes to full attention at exactly
+        0, 5, 11, 17, 23, 29, 35, 41, 47 — 9 full, 39 windowed. Note the
+        polarity: 1 means WINDOWED (modeling_mimo_v2.py:400,
+        `is_swa_layer = config.hybrid_layer_pattern[layer_idx] == 1`), which is
+        the opposite of how layer_types reads. Inverting it swaps 39 layers for
+        9 while leaving the node count and the total entirely plausible.
+    - claim: the KV rate splits into a growing and a fixed part
+      detail: >
+        9 x 1,280 = 11,520 elements per token of context, plus
+        39 x 2,560 x 128 = 12,779,520 elements fixed per sequence. The 39
+        windowed layers never grow. Counting them per-token inflates the rate
+        ~9.7x and caps concurrency far below what the hardware allows.
+    - claim: predicted weight bytes land near the published checkpoint
+      detail: >
+        308.85 GB predicted against the index's total_size of 315.03 GB
+        (-2.0%). The residual is the vision encoder (~1.46 GB), the audio
+        encoder (~0.52 GB), the MTP head (~1.19 GB) and per-tensor metadata,
+        none of which this spec enumerates. Same class of gap as the -2.4% on
+        DeepSeek-V4 and -3.3% on Qwen3.6.
+
+  estimated:
+    - field: mtp_layer_kind
+      value: sliding_attention
+      detail: >
+        Read from the presence of `self_attn.attention_sink_bias` on every
+        model.mtp.layers.N, which config.json ties to windowed layers
+        (add_swa_attention_sink_bias: true, add_full_attention_sink_bias:
+        false). No declared shape confirms the window size for the draft head.
+        The alternative — inheriting layer 47's full attention, as the old
+        layer_types[-1] fallthrough did — prices a head that is O(1) in context
+        as one that grows with it.
+    - field: all_reduces_per_layer
+      value: 2
+      detail: >
+        A TP convention (post-attention, post-FFN), not an observation. The
+        BYTES were already right before this field existed; what changes is the
+        node count, so 96 NCCL kernels align to 96 predicted nodes instead of
+        billing half of them as unmodelled. Falsifiable by counting NCCL kernels
+        per step in a trace.
+
+  open:
+    - question: KV cache dtype — 1 or 2 bytes per element
+      detail: >
+        config.json declares dtype bfloat16 and quantization_config does not
+        cover the cache, so bf16 is the reading the checkpoint supports. It is
+        a SERVING decision, not a model fact. An fp8 cache halves the KV
+        footprint. Resolve from the engine launch args.
+    - question: is MTP enabled in production, and at what draft length
+      detail: >
+        predict_hybrid_graph emits the draft head only under with_mtp=True,
+        because a node no kernel can match reads as a permanently negative
+        residual. Resolve from the engine launch args.
+    - question: TP-only, or expert parallelism
+      detail: >
+        Changes every collective row. Under EP the all-to-all replaces the
+        all-reduce and ep_imbalance becomes load-bearing — and that figure is
+        calibrated from a trace, not predicted.
+
+  unmodelled:
+    - The vision encoder (28 layers, hidden 1280) and the audio encoder
+      (6 local layers, hidden 1024). A text step never enters either.
+    - The audio codec model, which is not in this checkpoint at all and runs on
+      every audio request.
+    - Prefill IS modelled — see BatchConfig.prefill_tokens and the windowed
+      attention_qk_pairs term, which is banded rather than quadratic for the 39
+      sliding-window layers.

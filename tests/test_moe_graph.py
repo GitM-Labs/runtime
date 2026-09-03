@@ -16,6 +16,7 @@ headroom report would then bill against.
 from __future__ import annotations
 
 import textwrap
+from dataclasses import replace
 
 import pytest
 
@@ -29,6 +30,9 @@ from gitm.planner.hybrid_graph import (
     predict_hybrid_graph,
 )
 from gitm.planner.hybrid_graph import kv_bytes_per_token as hybrid_kv_bytes_per_token
+from gitm.planner.hybrid_graph import (
+    kv_fixed_bytes_per_sequence as hybrid_kv_fixed_bytes,
+)
 from gitm.planner.hybrid_graph import model_weight_bytes as hybrid_model_weight_bytes
 from gitm.planner.hybrid_graph import spec_from_hf_config as hybrid_spec_from_hf_config
 from gitm.planner.model_catalogue import available, load_entry, load_spec, predict
@@ -1361,7 +1365,7 @@ def test_a_default_batchconfig_is_still_a_pure_decode_step():
     """Every existing caller predates prefill and must be unaffected."""
     b = BatchConfig(batch=8, kv_cache_len=1024)
     assert not b.is_prefill
-    assert b.attention_qk_pairs == 8 * 1024
+    assert b.attention_qk_pairs() == 8 * 1024
     assert b.logits_rows == 8
 
 
@@ -1370,10 +1374,10 @@ def test_prefill_attention_is_quadratic_in_the_chunk():
     second term is what makes prefill compute-bound; omitting it would price an
     8192-token chunk as if it were 8192 independent decode queries."""
     b = _pre(8192, ctx=0)
-    assert b.attention_qk_pairs == 8192 * 8193 / 2
+    assert b.attention_qk_pairs() == 8192 * 8193 / 2
 
     with_ctx = _pre(8192, ctx=4096)
-    assert with_ctx.attention_qk_pairs == 8192 * 4096 + 8192 * 8193 / 2
+    assert with_ctx.attention_qk_pairs() == 8192 * 4096 + 8192 * 8193 / 2
 
 
 def test_lm_head_charges_one_row_per_prompt_not_one_per_token():
@@ -1486,3 +1490,650 @@ def test_a_pure_prefill_step_reports_prefill_throughput(capsys):
     out = capsys.readouterr().out
     assert "prefilling 8,192 tokens" in out
     assert "0 tok/s at batch 0" not in out
+
+
+# ── MiMo-V2.5: the windowed-attention hybrid ─────────────────────────────────
+#
+# A third member of the hybrid family, and the one that breaks the family's
+# founding assumption that "not full attention" means "recurrent". MiMo's 39
+# sliding-window layers re-read a KV cache exactly as full attention does — they
+# just read at most 128 entries of it. Priced as linear their cache read
+# vanishes; priced as unbounded it is overstated 64x at 8k context. Each test
+# below pins one number that would otherwise be confidently wrong.
+#
+# Aliased imports, as above: this module hosts three families whose readers share
+# function names.
+
+# The shape of XiaomiMiMo/MiMo-V2.5, trimmed to the keys the planner reads —
+# the same convention as ``V4_CONFIG`` above, and for the same reason: a test
+# that reads a checkpoint off a developer's disk skips everywhere else, so the
+# tests that matter most (the family it classifies as, and the inverted
+# ``hybrid_layer_pattern`` polarity) would never run in CI.
+#
+# ``test_the_two_readers_agree`` is what keeps this honest: it compares every
+# non-exempt field of the spec built from here against the catalogue YAML, so a
+# key dropped in trimming fails loudly rather than quietly weakening the check.
+# Verified spec-identical to the full 57-key config.json at the time of writing.
+MIMO_CONFIG = {
+    'model_type': 'mimo_v2',
+    'hidden_size': 4096,
+    'num_hidden_layers': 48,
+    'vocab_size': 152576,
+    'num_attention_heads': 64,
+    'num_key_value_heads': 4,
+    'head_dim': 192,
+    'v_head_dim': 128,
+    'partial_rotary_factor': 0.334,
+    'sliding_window': 128,
+    'sliding_window_size': 128,
+    'swa_num_key_value_heads': 8,
+    'swa_head_dim': 192,
+    'swa_v_head_dim': 128,
+    'swa_rope_theta': 10000,
+    'add_swa_attention_sink_bias': True,
+    'n_routed_experts': 256,
+    'num_experts_per_tok': 8,
+    'moe_intermediate_size': 2048,
+    'intermediate_size': 16384,
+    'moe_layer_freq': [
+        0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+    ],
+    'hybrid_layer_pattern': [
+        0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1,
+        1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0
+    ],
+    'dtype': 'bfloat16',
+    'quantization_config': {'quant_method': 'fp8'},
+}
+
+
+@pytest.fixture
+def mimo():
+    """Read from the catalogue, as an offline caller does."""
+    return load_spec("mimo-v2.5")
+
+
+@pytest.fixture
+def mimo_cfg():
+    """Read from the checkpoint's own config, as the attach path does."""
+    return MIMO_CONFIG
+
+
+# ── G1: it classifies at all ────────────────────────────────────────────────
+
+
+def test_mimo_classifies_as_hybrid_not_dense(mimo_cfg):
+    """Before the key aliases, ``detect_family`` returned ``dense`` and the
+    planner raised NotImplementedError: ``is_hybrid_moe_config`` wanted
+    ``num_experts`` + ``layer_types`` and MiMo declares neither key, while
+    ``is_sparse_moe_config`` wanted ``index_topk``/``compress_ratios``. The most
+    interesting model in the brief landed in the one family with no reader."""
+    from gitm.planner.registry import detect_family
+
+    assert detect_family(mimo_cfg) == "hybrid"
+
+
+def test_deepseek_v4_still_classifies_as_sparse_moe():
+    """The G1 alias widened ``is_hybrid_moe_config`` to accept
+    ``n_routed_experts`` — which **DeepSeek-V4 also declares**, and
+    ``detect_family`` consults the hybrid predicate first. V4 declares no
+    schedule under either spelling, so it must still fall through. If this ever
+    fails, every V4 prediction is being produced by the wrong graph."""
+    from gitm.planner.registry import detect_family
+
+    assert detect_family(V4_CONFIG) == "sparse_moe"
+
+
+def test_hybrid_layer_pattern_polarity_is_inverted(mimo_cfg):
+    """``hybrid_layer_pattern[i] == 1`` means WINDOWED, the opposite of how
+    ``layer_types`` reads (modeling_mimo_v2.py:400). Reading it the intuitive way
+    swaps 39 layers for 9 — the right node count, a plausible total, and every
+    per-layer residual compared against the wrong mechanism."""
+    spec = hybrid_spec_from_hf_config(mimo_cfg, name="MiMo")
+    full = [i for i in range(spec.n_layers) if spec.is_full_attention(i)]
+    assert full == [0, 5, 11, 17, 23, 29, 35, 41, 47]
+    assert spec.n_sliding_attention_layers == 39
+    assert spec.n_linear_attention_layers == 0
+
+
+def test_no_modulo_rule_reproduces_the_schedule(mimo):
+    """The gaps are 5,6,6,6,6,6,6,6 — layer 0 breaks the stride. This is why the
+    catalogue writes 48 entries out instead of using {pattern, repeat}: an
+    interval of 6 would place full attention at 5,11,...,47 and *miss layer 0*,
+    which is also the only dense-MLP layer."""
+    full = [i for i in range(mimo.n_layers) if mimo.is_full_attention(i)]
+    gaps = [b - a for a, b in zip(full, full[1:], strict=False)]
+    assert gaps == [5, 6, 6, 6, 6, 6, 6, 6]
+    assert 0 in full
+
+
+def test_the_two_readers_agree(mimo, mimo_cfg):
+    """A hand-written YAML and the checkpoint's own config, compared field by
+    field. Drift is what makes a stale catalogue dangerous: it keeps producing
+    confident predictions for a model that changed underneath it."""
+    from dataclasses import fields
+
+    read = hybrid_spec_from_hf_config(mimo_cfg, name=mimo.name)
+    # Fields the config genuinely cannot carry: the MTP head is visible only in
+    # the safetensors index, and the collective count is a TP convention.
+    exempt = {
+        "name",
+        # Visible only as tensors in the safetensors index.
+        "mtp_num_hidden_layers", "mtp_layer_kind", "mtp_dense",
+        # A TP convention and a precision reading, neither declared as a shape.
+        "all_reduces_per_layer", "op_dtype_overrides",
+        # Gated-DeltaNet geometry: MiMo has no recurrent layers, so the reader
+        # leaves these at placeholders rather than demanding fields that govern
+        # no kernel.
+        "linear_num_value_heads", "linear_value_head_dim",
+        "linear_num_key_heads", "linear_key_head_dim", "conv_dim",
+    }
+    differing = {
+        f.name: (getattr(read, f.name), getattr(mimo, f.name))
+        for f in fields(HybridMoEModelSpec)
+        if f.name not in exempt and getattr(read, f.name) != getattr(mimo, f.name)
+    }
+    assert differing == {}
+
+
+def test_mtp_count_is_not_config_derivable(mimo_cfg):
+    """MiMo ships three draft layers and declares them nowhere in config.json —
+    they exist only as tensors in the safetensors index. A reader that invented a
+    count here would predict a head it never saw, so a bare config must yield 0
+    and the catalogue must carry the real number."""
+    assert "mtp_num_hidden_layers" not in mimo_cfg
+    assert hybrid_spec_from_hf_config(mimo_cfg).mtp_num_hidden_layers == 0
+    assert load_spec("mimo-v2.5").mtp_num_hidden_layers == 3
+
+
+# ── G2: the window is a third asymptotic ────────────────────────────────────
+
+
+def test_sliding_window_layers_are_flat_in_context(mimo):
+    """The defining property. A windowed layer reads at most W entries however
+    long the context grows; a full-attention layer's read grows without bound.
+    If these ever move together, the third layer kind has collapsed back into one
+    of the other two."""
+    def core_bytes(kv_len, pred):
+        by_layer = {}
+        for n in pred.nodes:
+            if n.op == "attn_score_value":
+                by_layer[n.layer] = n.prediction.bytes
+        return by_layer
+
+    short = core_bytes(8192, predict_hybrid_graph(
+        mimo, H200, BatchConfig(batch=4, kv_cache_len=8192)))
+    long = core_bytes(131072, predict_hybrid_graph(
+        mimo, H200, BatchConfig(batch=4, kv_cache_len=131072)))
+
+    # 16x the context.
+    assert short[1] == pytest.approx(long[1])          # windowed: unchanged
+    assert long[0] == pytest.approx(short[0] * 16)     # full: grows with it
+
+
+def test_priced_as_unbounded_the_window_costs_64x_too_much(mimo):
+    """The error the window prevents, stated as a number. At 8k context against a
+    128-token window the ratio is exactly kv_len/window."""
+    windowed = predict_hybrid_graph(mimo, H200, BatchConfig(batch=1, kv_cache_len=8192))
+    unwindowed = predict_hybrid_graph(
+        replace(mimo, sliding_window=0), H200, BatchConfig(batch=1, kv_cache_len=8192))
+
+    def swa_core(g):
+        return sum(n.prediction.bytes for n in g.nodes
+                   if n.op == "attn_score_value" and n.layer == 1)
+
+    assert swa_core(unwindowed) / swa_core(windowed) == pytest.approx(8192 / 128)
+
+
+def test_a_windowed_layer_priced_as_linear_would_lose_its_cache_read(mimo):
+    """The §7.2 failure mode: alias the config keys without adding the third kind
+    and MiMo classifies as hybrid, runs, and prices 39 of 48 layers as
+    gated-DeltaNet recurrent state — which is *also* flat in context, so even the
+    qualitative behaviour looks right while the number is wrong and nothing says
+    so. A windowed layer must emit a real cache read."""
+    g = predict_hybrid_graph(mimo, H200, BatchConfig(batch=8, kv_cache_len=8192))
+    swa = [n for n in g.nodes if n.op == "attn_score_value" and n.layer == 1]
+    assert swa and swa[0].prediction.bytes > 0
+    # ...and no recurrent nodes anywhere, since there are no linear layers.
+    assert not [n for n in g.nodes if n.op == "linattn_recurrent"]
+
+
+def test_windowed_prefill_is_banded_not_quadratic():
+    """Prefill's causal triangle becomes a band once a window caps it. At P=8192
+    and W=128 that is 1,040,448 query-key pairs against 33,558,528 — a **32x
+    overcount** on the term that decides whether prefill is compute-bound."""
+    b = BatchConfig(batch=1, kv_cache_len=0, prefill_tokens=8192, prefill_requests=1)
+    assert b.attention_qk_pairs() == 8192 * 8193 / 2          # unwindowed
+    assert b.attention_qk_pairs(window=128) == 1_040_448
+    assert b.attention_qk_pairs() / b.attention_qk_pairs(128) == pytest.approx(32.3, abs=0.1)
+
+
+def test_banded_pair_count_matches_a_brute_force_sum():
+    """The closed form is an optimisation of a sum over tokens; if they ever
+    disagree the closed form is wrong, not the sum."""
+    for p, ctx, w in [(100, 0, 128), (100, 50, 128), (100, 500, 128), (37, 7, 13)]:
+        b = BatchConfig(batch=0, kv_cache_len=0, prefill_tokens=p,
+                        prefill_context=ctx, prefill_requests=1)
+        brute = sum(min(ctx + i + 1, w) for i in range(p))
+        assert b.attention_qk_pairs(window=w) == pytest.approx(brute)
+
+
+# ── G3: geometry, and the direction of its error ────────────────────────────
+
+
+def test_o_proj_input_is_n_heads_times_v_head_dim(mimo):
+    """**The current code OVERSTATES this projection, it does not understate
+    it.** o_proj maps one v_head_dim-wide result per query head back to hidden:
+    64 x 128 = 8192. Using q_dim gives 64 x 192 = 12288, which is 1.5x too
+    *large*.
+
+    The sign is the point. Over-priced, a near-zero residual on this node means a
+    kernel running 1.5x slower than the hardware allows — it reads as healthy
+    when it is not."""
+    assert mimo.o_proj_in == 8192
+    assert mimo.q_dim == 12288
+    assert mimo.q_dim > mimo.o_proj_in          # OVERSTATED, not understated
+    assert mimo.q_dim / mimo.o_proj_in == pytest.approx(1.5)
+
+
+def test_kv_geometry_differs_between_the_two_layer_families(mimo):
+    """8 KV heads on windowed layers against 4 on full-attention ones, and K is
+    192 wide where V is 128. One head count and one width for the model is wrong
+    on 39 of 48 layers — and this is the KV rate, the quantity decode is bound
+    by."""
+    assert mimo.attn_geometry(0) == (64, 4, 192, 128)     # full
+    assert mimo.attn_geometry(1) == (64, 8, 192, 128)     # windowed
+    assert mimo.kv_entry_elems(0) == 1280
+    assert mimo.kv_entry_elems(1) == 2560
+
+
+def test_kv_rate_splits_growing_from_fixed(mimo):
+    """9 layers linear in S, 39 flat: ``11,520 x S + 12.78M`` elements. Counting
+    the windowed layers per-token inflates the rate ~9.7x and caps concurrency
+    far below what the hardware allows."""
+    kw = weight_bytes(mimo.kv_dtype)
+    assert hybrid_kv_bytes_per_token(mimo) / kw == pytest.approx(9 * 1280)
+    assert hybrid_kv_bytes_per_token(mimo) / kw == pytest.approx(11_520)
+    assert hybrid_kv_fixed_bytes(mimo) / kw == pytest.approx(39 * 2560 * 128)
+
+
+def test_mimo_predicted_weights_land_near_the_published_checkpoint(mimo):
+    """308.85 GB against the index's total_size of 315.03 GB, -2.0%. The residual
+    is the two encoders, the MTP head and per-tensor metadata, none of which this
+    spec enumerates — the same class of gap as -2.4% on V4 and -3.3% on Qwen."""
+    whole = hybrid_model_weight_bytes(mimo, ShardingConfig(tp=1))
+    assert whole / 315.031102208e9 == pytest.approx(1.0, abs=0.04)
+
+
+def test_weight_footprint_would_double_at_the_wrong_dtype(mimo):
+    """MiMo stores fp8 weights under a ``bfloat16`` torch dtype. The reader used
+    to take the torch dtype for weights, because every previous member of this
+    family was bf16 throughout — which prices the whole checkpoint at 2 bytes and
+    predicts 617 GB against a 315 GB index."""
+    assert mimo.weight_dtype == "fp8"
+    assert mimo.act_dtype == "bf16"
+    wrong = hybrid_model_weight_bytes(replace(mimo, weight_dtype="bf16"),
+                                      ShardingConfig(tp=1))
+    right = hybrid_model_weight_bytes(mimo, ShardingConfig(tp=1))
+    assert wrong / right == pytest.approx(2.0, abs=0.01)
+
+
+# ── G5: three precisions in one block ───────────────────────────────────────
+
+
+def test_three_precisions_inside_one_attention_block(mimo):
+    """fp8 qkv_proj, bf16 o_proj (in ``ignored_layers``, no scale tensor
+    anywhere), fp32 router (an explicit ``.float()`` cast). One weight_dtype for
+    the model prices o_proj at 1 byte when it is 2."""
+    g = predict_hybrid_graph(mimo, H200, BatchConfig(batch=8, kv_cache_len=4096))
+    seen = {n.op: n.prediction.dtype for n in g.nodes}
+    assert seen["qkv_proj"] == "fp8"
+    assert seen["attn_out_proj"] == "bf16"
+    assert seen["moe_router"] == "fp32"
+    assert seen["lm_head"] == "bf16"
+
+
+def test_an_fp32_router_prices_against_an_fp32_peak(mimo):
+    """Unlike a missing fp8 peak, a missing fp32 one is **not flagged** —
+    ``resolve_peak`` returns the field directly, so ``peak_is_fallback`` stays
+    False and the wrong ceiling looks measured. Without an H200 fp32 entry the
+    router priced against A100's 19.5 TF/s: 3.4x slow, enough to move it from
+    5th to 3rd in the ranked node table."""
+    hw = hardware_spec_for(peak_for_sku("H200"))
+    assert hw.peak_flops_fp32_per_s == pytest.approx(67e12)
+    g = predict_hybrid_graph(mimo, hw, BatchConfig(batch=32, kv_cache_len=8192))
+    router = next(n for n in g.nodes if n.op == "moe_router")
+    assert router.prediction.peak_flops_per_s == pytest.approx(67e12)
+    assert not router.prediction.peak_is_fallback
+
+
+# ── G7: the dense layer and the draft head ──────────────────────────────────
+
+
+def test_layer_zero_is_dense_and_runs_no_router(mimo):
+    """MiMo's layer 0 has a 16384-wide dense MLP, not a mixture. Charging it a
+    256-expert router and an expert bank it does not have is not a rounding
+    error: the expert term dominates the layer."""
+    g = predict_hybrid_graph(mimo, H200, BatchConfig(batch=8, kv_cache_len=4096))
+    layer0 = {n.op for n in g.nodes if n.layer == 0}
+    assert "mlp_gate_up" in layer0 and "mlp_down" in layer0
+    assert "moe_router" not in layer0 and "moe_routed" not in layer0
+    # ...and exactly 47 of the 48 layers do have a mixture.
+    assert len([n for n in g.nodes if n.op == "moe_routed"]) == 47
+
+
+def test_the_draft_head_is_windowed_and_dense(mimo):
+    """Three errors the old MTP path made at once: ``_emit_moe`` unconditionally
+    (the expert-free draft charged a 256-expert router), ``layer_kind`` running
+    off the end of ``layer_types`` and returning layer 47's FULL attention (an
+    O(1)-in-S head priced with a cache growing in S), and one ``lm_head`` for the
+    whole step."""
+    g = predict_hybrid_graph(mimo, H200, BatchConfig(batch=8, kv_cache_len=4096),
+                             with_mtp=True)
+    draft = [n for n in g.nodes if n.layer is not None and n.layer >= mimo.n_layers]
+    assert draft, "no draft nodes emitted"
+    ops = {n.op for n in draft}
+    assert "mlp_gate_up" in ops and "moe_routed" not in ops
+    assert mimo.layer_kind(mimo.n_layers) == "sliding_attention"
+
+
+def test_the_draft_head_is_flat_in_context(mimo):
+    """The consequence of the kind being right. Priced as full attention the
+    draft's cache read grows with S; it is windowed, so it does not."""
+    def draft_core(kv):
+        g = predict_hybrid_graph(mimo, H200, BatchConfig(batch=4, kv_cache_len=kv),
+                                 with_mtp=True)
+        return sum(n.prediction.bytes for n in g.nodes
+                   if n.op == "attn_score_value" and n.layer >= mimo.n_layers)
+
+    assert draft_core(8192) == pytest.approx(draft_core(131072))
+
+
+def test_one_lm_head_per_draft_stage(mimo):
+    """Each stage samples a token before the next can consume it, so each runs
+    its own vocabulary projection. Emitting one for the whole step leaves D of
+    them unmodelled — ~312 MB of weight traffic per missing stage at TP4."""
+    sh = ShardingConfig(tp=4)
+    plain = predict_hybrid_graph(mimo, H200, BatchConfig(batch=8), sh)
+    with_mtp = predict_hybrid_graph(mimo, H200, BatchConfig(batch=8), sh, with_mtp=True)
+    assert len([n for n in plain.nodes if n.op == "lm_head"]) == 1
+    assert len([n for n in with_mtp.nodes if n.op == "lm_head"]) == 1 + 3
+
+
+# ── G6: the one edge that is genuinely required ─────────────────────────────
+
+
+def test_the_draft_chain_is_serial_but_the_backbone_is_not(mimo):
+    """MiMo puts both kinds of serialisation in one step: the MTP chain is
+    genuinely serial (stage i+1 cannot begin before stage i), the 96 all-reduces
+    are not — and today both show up as the same positive residual. Edges are
+    declared only where the evidence is; with none declared the critical path is
+    the sum, which is the honest answer."""
+    plain = predict_hybrid_graph(mimo, H200, BatchConfig(batch=8))
+    assert not any(n.depends_on for n in plain.nodes)
+    assert plain.serial_chain_s == 0.0        # nothing claimed, nothing declared
+
+    mtp = predict_hybrid_graph(mimo, H200, BatchConfig(batch=8), with_mtp=True)
+    assert any(n.depends_on for n in mtp.nodes)
+    # A floor on the serial part, NOT an estimate of the step: unedged nodes are
+    # unconstrained, not known-parallel. Reading this as a step time would treat
+    # the whole backbone as infinitely overlappable.
+    assert 0 < mtp.serial_chain_s < mtp.total_pred_s
+
+
+# ── the collective count, without moving the bytes ──────────────────────────
+
+
+def test_two_all_reduce_nodes_move_the_same_bytes_as_one_did(mimo):
+    """A7 says 96 all-reduces per step (2 per layer x 48); the graph emitted 48.
+    But the BYTES were already right — the expression carried a leading 2.0 for
+    the second reduction. Splitting them must leave the total invariant, or every
+    predicted collective doubles. This is the likeliest way to break the thing
+    while 'fixing' it."""
+    sh = ShardingConfig(tp=4)
+    b = BatchConfig(batch=32, kv_cache_len=8192)
+    two = predict_hybrid_graph(mimo, H200, b, sh)
+    one = predict_hybrid_graph(replace(mimo, all_reduces_per_layer=1), H200, b, sh)
+
+    def coll(g):
+        ns = [n for n in g.nodes if n.op == "tp_all_reduce"]
+        return len(ns), sum(n.prediction.bytes for n in ns)
+
+    n_two, bytes_two = coll(two)
+    n_one, bytes_one = coll(one)
+    assert n_two == 2 * n_one == 96
+    assert bytes_two == pytest.approx(bytes_one)
+
+
+def test_qwen_keeps_one_all_reduce_per_layer():
+    """The field defaults to the long-standing behaviour. Raising it for every
+    model would perturb kernel-to-node alignment on checkpoints nobody has
+    counted NCCL kernels for."""
+    q = load_spec("qwen3.6-35b-a3b")
+    assert q.all_reduces_per_layer == 1
+    g = predict_hybrid_graph(q, H200, BatchConfig(batch=8), ShardingConfig(tp=4))
+    assert len([n for n in g.nodes if n.op == "tp_all_reduce"]) == q.n_layers
+
+
+# ── the regression guard ────────────────────────────────────────────────────
+
+
+def test_new_geometry_fields_are_a_no_op_when_unset():
+    """Every G2/G3 expression must reduce algebraically to the one it replaced
+    when the new fields are unset. This is what makes the change safe for the
+    checkpoints already in the catalogue, and it is checked rather than argued."""
+    q = load_spec("qwen3.6-35b-a3b")
+    assert q.v_head_dim is None
+    assert q.o_proj_in == q.q_dim == 4096
+    assert q.kv_entry_elems(0) == 2 * q.kv_dim
+    assert q.sliding_window == 0
+    assert all(q.attention_window(i) == 0 for i in range(q.n_layers))
+    assert q.dtype_for("attn_out_proj", "bf16") == "bf16"
+    assert q.n_sliding_attention_layers == 0
+    # The reference shape too — it sets none of the new fields either.
+    r = HybridMoEModelSpec()
+    assert r.o_proj_in == r.q_dim
+    assert r.kv_entry_elems(0) == 2 * r.kv_dim
+
+
+def test_the_spec_stays_hashable(mimo):
+    """The dataclass is frozen and therefore hashable, and a Mapping field would
+    make ``hash(spec)`` raise — a long way from the YAML that caused it. Hence
+    the tuple-of-pairs for the dtype overrides and the frozenset for the dense
+    layers."""
+    assert hash(mimo)
+    assert isinstance(mimo.op_dtype_overrides, tuple)
+    assert isinstance(mimo.dense_layers, frozenset)
+
+
+# ── end to end ──────────────────────────────────────────────────────────────
+
+
+def test_mimo_decode_is_dominated_by_expert_weight_traffic(mimo):
+    """The shape of the answer, not just its parts. At batch 32 the union of
+    distinct experts the step must fetch is the overwhelming majority of the
+    step, and it is memory-bound."""
+    hw = hardware_spec_for(peak_for_sku("H200"))
+    g = predict_hybrid_graph(mimo, hw, BatchConfig(batch=32, kv_cache_len=8192),
+                             ShardingConfig(tp=4))
+    routed = sum(n.prediction.t_pred_s for n in g.nodes if n.op == "moe_routed")
+    assert routed / g.total_pred_s > 0.85
+    assert all(n.prediction.bound == "memory"
+               for n in g.nodes if n.op == "moe_routed")
+
+
+def test_prefill_flips_the_step_compute_bound(mimo):
+    """Decode is memory-bound on the expert bank; an 8192-token prefill chunk is
+    compute-bound on the same weights, because the arithmetic scales with tokens
+    while the weight fetch does not."""
+    hw = hardware_spec_for(peak_for_sku("H200"))
+    sh = ShardingConfig(tp=4)
+    dec = predict_hybrid_graph(mimo, hw, BatchConfig(batch=32, kv_cache_len=8192), sh)
+    pre = predict_hybrid_graph(mimo, hw, BatchConfig(
+        batch=1, kv_cache_len=0, prefill_tokens=8192, prefill_requests=1), sh)
+
+    def routed_bound(g):
+        return {n.prediction.bound for n in g.nodes if n.op == "moe_routed"}
+
+    assert routed_bound(dec) == {"memory"}
+    assert routed_bound(pre) == {"compute"}
+
+
+def test_mimo_step_time_is_strongly_sublinear_in_batch(mimo):
+    """The MoE property: 32x the tokens for well under 32x the time, because
+    weight traffic follows the *distinct* experts touched and that saturates."""
+    hw = hardware_spec_for(peak_for_sku("H200"))
+    sh = ShardingConfig(tp=4)
+    t1 = predict_hybrid_graph(mimo, hw, BatchConfig(batch=1, kv_cache_len=8192), sh)
+    t32 = predict_hybrid_graph(mimo, hw, BatchConfig(batch=32, kv_cache_len=8192), sh)
+    assert t32.total_pred_s / t1.total_pred_s < 32 / 2
+
+
+# ── import hygiene between the two families ──────────────────────────────────
+
+
+def _colliding_planner_names() -> set[str]:
+    """Public top-level names defined in BOTH planner graph modules.
+
+    Derived from the source, not hardcoded, so a collision introduced later is
+    caught by the same test rather than needing this list updated.
+    """
+    import ast
+    from pathlib import Path
+
+    planner = Path(__file__).resolve().parent.parent / "gitm" / "planner"
+
+    def public_tops(module: str) -> set[str]:
+        tree = ast.parse((planner / f"{module}.py").read_text(encoding="utf-8"))
+        return {
+            n.name for n in tree.body
+            if isinstance(n, ast.FunctionDef | ast.ClassDef)
+            and not n.name.startswith("_")
+        }
+
+    return public_tops("hybrid_graph") & public_tops("moe_graph")
+
+
+def test_the_two_families_still_collide_on_names():
+    """If this ever comes back empty the guard below is protecting nothing.
+
+    Four functions exist in both families with the same name and different
+    meanings — they take different spec types and answer different questions.
+    That is not itself a defect: each is the right name inside its own module.
+    It only becomes a defect at an import site that pulls both in.
+    """
+    assert _colliding_planner_names() >= {
+        "kv_bytes_per_token",
+        "kv_fixed_bytes_per_sequence",
+        "model_weight_bytes",
+        "spec_from_hf_config",
+    }
+
+
+def test_no_module_imports_a_colliding_planner_name_unaliased():
+    """A file that imports from BOTH planner families must alias the collisions.
+
+    ``from gitm.planner.hybrid_graph import kv_bytes_per_token`` and its
+    sparse-MoE twin bind the same name. Whichever is imported second silently
+    wins for the whole module, and every call afterwards runs against the wrong
+    family — producing a number rather than an error.
+
+    **This is not hypothetical.** It happened in this file: a bare
+    ``kv_fixed_bytes_per_sequence`` was shadowed by the sparse-MoE version, and a
+    MiMo assertion called into ``moe_graph`` and raised
+    ``AttributeError: 'HybridMoEModelSpec' object has no attribute
+    'compress_ratio'``. That one failed loudly because the two specs have
+    different fields; ``kv_bytes_per_token`` would have returned a plausible
+    float instead.
+
+    Aliasing was already the documented convention. A convention that has been
+    violated once is worth a test — this is the mechanical version.
+    """
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    colliding = _colliding_planner_names()
+    families = {"gitm.planner.hybrid_graph", "gitm.planner.moe_graph"}
+    offences = []
+
+    for path in list((root / "gitm").rglob("*.py")) + list((root / "tests").rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+
+        # Every unaliased binding of a colliding name, grouped by name.
+        bare: dict[str, list[str]] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.module not in families:
+                continue
+            for alias in node.names:
+                if alias.name in colliding and alias.asname is None:
+                    bare.setdefault(alias.name, []).append(
+                        f"{node.module.rsplit('.', 1)[-1]}:{node.lineno}"
+                    )
+
+        # ONE bare binding is a deliberate default - the file has chosen which
+        # family that name means. TWO is shadowing: the second silently wins for
+        # the whole module, and every call written before it now runs against
+        # the wrong family.
+        for name, sites in bare.items():
+            if len(sites) > 1:
+                offences.append(
+                    f"{path.relative_to(root).as_posix()}: {name!r} bound "
+                    f"unaliased {len(sites)}x ({', '.join(sites)})"
+                )
+
+    assert not offences, (
+        "a colliding planner name is bound unaliased more than once in the "
+        "same file, so the family it resolves to depends on import order:"
+        + "; ".join(offences)
+    )
+
+
+def test_no_test_module_defines_the_same_test_name_twice():
+    """The same shadowing hazard, one level up: two ``def test_x`` in one file.
+
+    Python keeps the later definition and discards the earlier one, so pytest
+    collects one test and reports green while the other stops running. Nothing
+    fails and nothing warns — the count just quietly drops.
+
+    **This is not hypothetical either.** It happened in this file: the MiMo
+    additions reused ``test_predicted_weights_land_near_the_published_checkpoint``
+    and ``test_step_time_is_strongly_sublinear_in_batch``, silently retiring the
+    Qwen footprint check and the sparse-MoE batch curve — the Qwen one being the
+    exact counterpart of the arithmetic the MiMo work was changing.
+    """
+    import ast
+    from collections import Counter
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    offences = []
+
+    for path in sorted((root / "tests").rglob("test_*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        # Module scope only: a name inside a class or function shadows nothing
+        # that pytest would otherwise have collected.
+        names = Counter(
+            n.name
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+            and n.name.startswith("test_")
+        )
+        offences += [
+            f"{path.relative_to(root).as_posix()}: {name!r} defined {count}x"
+            for name, count in sorted(names.items())
+            if count > 1
+        ]
+
+    assert not offences, (
+        "a test name is defined more than once at module scope, so only the "
+        "last definition runs and the earlier one is silently dead: "
+        + "; ".join(offences)
+    )

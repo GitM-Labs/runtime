@@ -300,7 +300,9 @@ def index_scan_pairs(batch: BatchConfig) -> float:
     prefill and the growth-in-context at decode. Paid on ``full`` layers only,
     which is what IndexShare is worth.
     """
-    return batch.attention_qk_pairs
+    # Called unwindowed: ``window`` exists for sliding-window families and GLM has
+    # no window — the indexer scores the whole history by construction.
+    return batch.attention_qk_pairs()
 
 
 def index_scan_entries(batch: BatchConfig) -> float:

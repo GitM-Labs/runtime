@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -127,6 +126,10 @@ def add_plan_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("--acceptance-rate", type=float, default=0.0,
                     help="Fraction of drafted tokens the verifier keeps. Only "
                          "affects the reported token rate, never the step floor.")
+    ap.add_argument("--launch-overhead", type=float, default=None,
+                    help="Seconds per dependent kernel launch. Default 2e-6 "
+                         "(CUDA-graph replay); eager is nearer 5e-6, and the "
+                         "2.5x moves where launch-bound work crosses over.")
     ap.add_argument("--tp", type=int, default=1, help="Tensor-parallel size.")
     ap.add_argument("--ep", type=int, default=1, help="Expert-parallel size.")
     ap.add_argument("--dp", type=int, default=1, help="Data-parallel size.")
@@ -195,8 +198,17 @@ def _predict(spec, family: str, hw, batch, sharding):
 
 
 def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
+    from gitm.planner.roofline import resolve_peak
+
     agg: dict[str, list[float]] = {}
-    bounds: dict[str, Counter[str]] = {}
+    # The op's own bound, rolled up from the nodes rather than recomputed from
+    # the compute/memory totals. Recomputing drops ``"launch"`` entirely — the
+    # third bound the roofline reports for work whose cost is the *number* of
+    # dependent kernel launches, where both classic terms round to zero. An op
+    # that the model says is launch-bound would print "memory" and read as though
+    # bandwidth were the constraint.
+    bounds: dict[str, set[str]] = {}
+    dtypes: dict[str, str] = {}
     for n in g.nodes:
         p = n.prediction
         a = agg.setdefault(n.op, [0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -206,20 +218,24 @@ def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
         a[3] += p.t_memory_s
         a[4] += p.flops
         a[5] += p.bytes
-        bounds.setdefault(n.op, Counter())[p.bound] += 1
+        bounds.setdefault(n.op, set()).add(p.bound)
+        dtypes.setdefault(n.op, p.dtype)
 
     total = g.total_pred_s
-    # One ridge per *dtype in the graph*, not one for the model. A checkpoint that
-    # runs fp8 GEMMs against a bf16 ridge is measured against a ceiling half its
-    # own: on an H200 that is 412 FLOP/byte answering to 206, which moves the
-    # bound label of every op sitting between them.
-    dtypes = {n.prediction.peak_dtype: n.prediction.peak_flops_per_s for n in g.nodes}
-    ridges = {
-        d: peak / hw.peak_mem_bw_bytes_per_s
-        for d, peak in sorted(dtypes.items())
-        if peak > 0 and hw.peak_mem_bw_bytes_per_s
-    }
-    ridge_line = " · ".join(f"{d} {r:.0f}" for d, r in ridges.items()) or "unpriced"
+
+    def ridge_for(dtype: str) -> float:
+        """FLOP/byte at which ``dtype`` stops being memory-bound on this SKU.
+
+        Per dtype, not per model. A single bf16 ridge is the wrong yardstick for
+        an fp8 op: on H200 the two are 206 and 412 FLOP/byte, so a node judged
+        against 206 when it answers to 412 is placed on the wrong side of the
+        knee — and every attention layer of a mixed-precision checkpoint is such
+        a node.
+        """
+        peak, _ = resolve_peak(hw, dtype)
+        return peak / hw.peak_mem_bw_bytes_per_s if hw.peak_mem_bw_bytes_per_s else 0.0
+
+    ridges = sorted({dtypes[op] for op in agg}, key=lambda d: ridge_for(d))
 
     out = [
         f"model     {getattr(spec, 'name', '?')}  [{family}]",
@@ -227,22 +243,20 @@ def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
         f"hardware  {hw.name}  "
         f"{hw.peak_flops_bf16_per_s / 1e12:.0f} TFLOP/s bf16, "
         f"{hw.peak_mem_bw_bytes_per_s / 1e12:.2f} TB/s",
-        f"ridge     {ridge_line} FLOP/byte — a node below its own dtype's "
-        "ridge is memory-bound",
+        "ridge     " + ", ".join(
+            f"{ridge_for(d):.0f} ({d})" for d in ridges
+        ) + " FLOP/byte — a node below its own dtype's ridge is memory-bound",
         "",
         f"  {'op':24s} {'xN':>4s} {'t_pred':>9s} {'share':>7s} "
         f"{'t_comp':>9s} {'t_mem':>9s} {'AI':>7s}  bound",
     ]
     for op, (n, tp, tc, tm, fl, by) in sorted(agg.items(), key=lambda kv: -kv[1][1]):
         ai = fl / by if by else 0.0
-        # The node's own label, not a recomputed compute-vs-memory one. The
-        # roofline has three bounds and the third — ``launch`` — is the whole
-        # low-batch story on a sparse model: hundreds of pointwise and routing
-        # kernels whose wall time is the launch, not the bytes. Recomputing here
-        # silently relabelled every one of them as memory-bound.
-        bound = bounds[op].most_common(1)[0][0]
-        if len(bounds[op]) > 1:
-            bound = f"{bound}*"  # the op's instances do not agree
+        # Every node of this op agreed, or they did not — say which rather than
+        # picking one. A mixed roll-up is real information: it means the op's
+        # bound flips across layers.
+        kinds = bounds.get(op) or {"memory"}
+        bound = next(iter(kinds)) if len(kinds) == 1 else "/".join(sorted(kinds))
         out.append(
             f"  {op:24s} {int(n):4d} {tp * 1e3:8.3f}m {tp / total:6.1%} "
             f"{tc * 1e3:8.3f}m {tm * 1e3:8.3f}m {ai:7.1f}  {bound}"
@@ -328,6 +342,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     hw = _hardware(args.gpu)
+    if args.launch_overhead is not None:
+        from dataclasses import replace as _replace
+
+        hw = _replace(hw, kernel_launch_overhead_s=args.launch_overhead)
     if args.gpu and args.gpu.lower() not in hw.name.lower():
         print(f"warning: --gpu {args.gpu!r} is not in the catalogue; priced against "
               f"{hw.name}, whose bandwidth may differ by more than 2x.")
