@@ -184,6 +184,37 @@ def test_fp8_checkpoint_reads_what_the_quantiser_skipped():
     assert spec.dtype_for("moe_router", spec.weight_dtype) == "fp32"
 
 
+def test_embed_tokens_carries_its_own_declared_precision():
+    """The untied halves are two tensors and the checkpoint names them separately.
+
+    ``embed_tokens`` used to map onto the ``lm_head`` op, which priced the pair
+    together. That is right for GLM-5.2, where both are in
+    ``modules_to_not_convert`` — and silently wrong for any checkpoint that
+    quantised one and not the other, with ``dtype_for("embed_tokens")`` answering
+    fp8 on a model that explicitly does not convert it.
+    """
+    fp8 = load_spec("glm-5.2-fp8")
+    assert fp8.dtype_for("embed_tokens", fp8.weight_dtype) == "bf16"
+    assert fp8.dtype_for("lm_head", fp8.weight_dtype) == "bf16"
+
+    # The gather reads the table, so the node runs at the table's width.
+    node = [n for n in predict_glm_graph(fp8).nodes if n.op == "embed_tokens"][0]
+    assert node.prediction.dtype == "bf16"
+
+    # And the override is load-bearing: quantising the embedding must move the
+    # footprint by the size of the table, not by nothing.
+    quantised = replace(
+        fp8,
+        op_dtype_overrides=tuple(
+            o for o in fp8.op_dtype_overrides if o[0] != "embed_tokens"
+        ),
+    )
+    table = fp8.vocab * fp8.hidden  # one byte per element saved at fp8
+    assert model_weight_bytes(fp8) - model_weight_bytes(quantised) == pytest.approx(
+        table, rel=0.01
+    )
+
+
 def test_fp8_footprint_matches_published_checkpoint():
     """The same shape arithmetic, checked against a second published precision.
 

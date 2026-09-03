@@ -336,6 +336,7 @@ def model_weight_bytes(
     rw = weight_bytes(spec.dtype_for("moe_router", spec.weight_dtype))
     iw = weight_bytes(spec.dtype_for("attn_index_proj", spec.weight_dtype))
     lw = weight_bytes(spec.dtype_for("lm_head", spec.weight_dtype))
+    tw = weight_bytes(spec.dtype_for("embed_tokens", spec.weight_dtype))
     h = spec.hidden
     inter = spec.moe_intermediate_size
 
@@ -368,11 +369,11 @@ def model_weight_bytes(
         + h * spec.index_n_heads
     )
 
-    # Untied input embedding and vocabulary projection. Both stay wide on the FP8
-    # checkpoint (``embed_tokens`` and ``lm_head`` are in ``modules_to_not_convert``),
-    # so they are priced at their own width rather than the backbone's — 1.9 GB of
-    # the resident footprint that an fp8 read would halve on paper and not on disk.
-    embed = 2.0 * spec.vocab * h * lw / tp
+    # Untied input embedding and vocabulary projection: two tensors, priced
+    # separately because the checkpoint names them separately and could quantise
+    # one without the other. Both stay wide on GLM-5.2-FP8, which is 1.9 GB of
+    # resident footprint an fp8 read would halve on paper and not on disk.
+    embed = spec.vocab * h * (tw + lw) / tp
 
     return (
         experts
@@ -856,14 +857,20 @@ def predict_glm_graph(
     aw = weight_bytes(spec.act_dtype)
     rows = float(batch.positions_per_step + batch.prefill_tokens)
 
-    # Prologue: one gather from the untied input embedding. No FLOPs, and the
-    # bytes are the rows it touches, not the 1.9 GB table — an index_select reads
-    # what it selects.
+    # Prologue: one gather from the untied input embedding. No FLOPs, and the bytes
+    # are the rows it touches, not the 1.9 GB table — an index_select reads what it
+    # selects. It reads at the *table's* width and writes at the activation width;
+    # those are the same on GLM-5.2, and would not be on a checkpoint that
+    # quantised the embedding.
+    embed_dtype = spec.dtype_for("embed_tokens", spec.weight_dtype)
     g.nodes.append(
         PredictedNode(
             "embed_tokens", None,
-            roofline("embed_tokens", 0.0, rows * spec.hidden * aw, hw,
-                     spec.act_dtype, serial_launches=1),
+            roofline(
+                "embed_tokens", 0.0,
+                rows * spec.hidden * (weight_bytes(embed_dtype) + aw), hw,
+                embed_dtype, serial_launches=1,
+            ),
         )
     )
 
@@ -995,7 +1002,7 @@ def is_glm_moe_dsa_config(cfg: dict[str, Any]) -> bool:
 #: have nothing to price.
 _UNQUANTISED_OPS: tuple[tuple[str, str], ...] = (
     ("lm_head", "lm_head"),
-    ("embed_tokens", "lm_head"),  # untied, but priced together in the epilogue
+    ("embed_tokens", "embed_tokens"),
     ("eh_proj", "mtp_eh_proj"),
     ("indexer", "attn_index_proj"),
     ("indexers_proj", "attn_index_proj"),

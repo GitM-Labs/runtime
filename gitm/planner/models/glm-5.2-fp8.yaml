@@ -34,6 +34,7 @@ spec:
   # and lm_head at half of 154,880 x 6,144.
   op_dtype_overrides:
     - [attn_index_proj, bf16]
+    - [embed_tokens, bf16]
     - [lm_head, bf16]
     - [mtp_eh_proj, bf16]
     - [moe_router, fp32]

@@ -448,15 +448,17 @@ At B=32, S=8192, D=5 (the vendor recipe's `num_speculative_tokens`):
 
 | pass                   | nodes     | bytes        | floor         |
 | ---------------------- | --------- | ------------ | ------------- |
-| vanilla decode (D=0)   | 1,614     | 68.60 GB     | 16.551 ms     |
-| — of which the draft   | 23        | 1.27 GB      | 0.297 ms      |
-| draft chain, D=5       | 115       | **6.34 GB**  | 1.483 ms      |
+| vanilla decode (D=0), **draft stage included** | 1,614 | 68.60 GB | 16.551 ms |
+| — of which that one draft stage | 23 | 1.27 GB | 0.297 ms |
+| draft chain, D=5 (5 stages) | 115 | **6.34 GB** | 1.483 ms |
 | verify, 192 rows (backbone only) | 1,591 | 106.4 GB | 26.652 ms |
 | **MTP step total**     | **1,706** | **112.8 GB** | **28.135 ms** |
 
-The node counts reconcile as `1,614 = 1,591 + 23` and `1,706 = 1,591 + 115`: the
-backbone is the same 1,591 nodes either way, and what changes is the draft region
-— one stage (23 nodes) at D=0, five (115) at D=5. Nothing is double-counted.
+**The MTP module is always present** — it is a block in the checkpoint, not an
+option — so "vanilla decode" already contains one draft stage. The backbone (the
+78 transformer layers plus prologue and epilogue) is **1,591 nodes in every
+column**; only the draft region changes. Hence `1,614 = 1,591 + 23` and
+`1,706 = 1,591 + 115`, and nothing is double-counted.
 "192 rows" is `B × (1 + D)` = 32 × 6: the verify pass is the backbone at 1+D rows,
 not a different batch size.
 
@@ -484,7 +486,8 @@ not small at D=5.
 | ~~linear `1+Dα`~~ — **do not use** | 1,137 | ~~3,981~~ | ~~5,118~~ | ~~6,256~~ | ~~α > 0.140~~ |
 | **prefix chain `Σ αⁱ`** — what a verifier does | 1,137 | **2,239** | **3,345** | **5,329** | **α > 0.415** |
 
-against 1,933 tok/s with MTP off. † at α=0 the two agree by construction (one
+against 1,933 tok/s with MTP off — a baseline that carries *no* acceptance
+convention, since `tokens_per_step` degenerates to `batch` at D=0. † at α=0 the two agree by construction (one
 accepted token either way), and the 1,137 is the *cost* of drafting for nothing —
 it is below the MTP-off baseline, which is the point of the column.
 
