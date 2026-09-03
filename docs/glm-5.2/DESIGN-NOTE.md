@@ -446,21 +446,20 @@ as decode latency tolerates; there is no prefill-side reason to make it small.
 
 At B=32, S=8192, D=5 (the vendor recipe's `num_speculative_tokens`):
 
-| pass                   | nodes     | bytes        | floor         |
-| ---------------------- | --------- | ------------ | ------------- |
-| vanilla decode (D=0), **draft stage included** | 1,614 | 68.60 GB | 16.551 ms |
-| — of which that one draft stage | 23 | 1.27 GB | 0.297 ms |
-| draft chain, D=5 (5 stages) | 115 | **6.34 GB** | 1.483 ms |
-| verify, 192 rows (backbone only) | 1,591 | 106.4 GB | 26.652 ms |
-| **MTP step total**     | **1,706** | **112.8 GB** | **28.135 ms** |
+| pass | backbone | + draft | = nodes | bytes | floor |
+| --- | ---: | ---: | ---: | --- | --- |
+| vanilla decode (D=0) | 1,591 | 23 (1 stage) | **1,614** | 68.60 GB | 16.551 ms |
+| MTP step (D=5) | 1,591 | 115 (5 stages) | **1,706** | 112.8 GB | **28.135 ms** |
+| — the verify pass alone | 1,591 | — | 1,591 | 106.4 GB | 26.652 ms |
+| — the draft chain alone | — | 115 | 115 | 6.34 GB | 1.483 ms |
 
 All four rows price EP8 — see [EP] under §4.1.
 
-**The MTP module is always present** — it is a block in the checkpoint, not an
-option — so "vanilla decode" already contains one draft stage. The backbone (the
-78 transformer layers plus prologue and epilogue) is **1,591 nodes in every
-column**; only the draft region changes. Hence `1,614 = 1,591 + 23` and
-`1,706 = 1,591 + 115`, and nothing is double-counted.
+The backbone column is the 78 transformer layers plus prologue and epilogue, and
+it is **the same 1,591 nodes in every row** — verify is that backbone at 1+D rows,
+not a second graph. Only the draft region changes, and the MTP module is always
+present (it is a block in the checkpoint, not an option), which is why even the
+D=0 row carries one stage.
 "192 rows" is `B × (1 + D)` = 32 × 6: the verify pass is the backbone at 1+D rows,
 not a different batch size.
 
@@ -485,8 +484,12 @@ not small at D=5.
 
 | α | 0.0 † | 0.5 | 0.7 | 0.9 | break-even |
 | --- | --- | --- | --- | --- | --- |
+| accepted tokens/step, `Σ αⁱ` (i=0…5) | 1.000 | 1.969 | 2.941 | 4.686 | — |
+| **tok/s** = `32 × Σ αⁱ ÷ 28.135 ms` | 1,137 | **2,239** | **3,345** | **5,329** | **α > 0.415** |
 | ~~linear `1+Dα`~~ — **do not use** | 1,137 | ~~3,981~~ | ~~5,118~~ | ~~6,256~~ | ~~α > 0.140~~ |
-| **prefix chain `Σ αⁱ`** — what a verifier does | 1,137 | **2,239** | **3,345** | **5,329** | **α > 0.415** |
+
+Divide by the **MTP step** (28.135 ms), not by the baseline rate: the step is
+1.70× longer, so a rate ratio against 1,933 tok/s is not an accepted-token count.
 
 against 1,933 tok/s with MTP off — a baseline that carries *no* acceptance
 convention, since `tokens_per_step` degenerates to `batch` at D=0. † at α=0 the two agree by construction (one

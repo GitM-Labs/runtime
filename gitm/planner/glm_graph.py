@@ -1012,8 +1012,7 @@ _UNQUANTISED_OPS: tuple[tuple[str, str], ...] = (
     ("lm_head", "lm_head"),
     ("embed_tokens", "embed_tokens"),
     ("eh_proj", "mtp_eh_proj"),
-    ("indexer", "attn_index_proj"),
-    ("indexers_proj", "attn_index_proj"),
+    ("indexer", "attn_index_proj"),  # subsumes indexers_proj, indexer.k_norm
     ("mlp.gate", "moe_router"),
 )
 
