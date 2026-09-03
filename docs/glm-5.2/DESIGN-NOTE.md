@@ -418,17 +418,30 @@ default costs **707 GB and 319 ms**, not 422 GB and 264 ms.
 | Prefill, P=8192, C=0, TP8/EP8, per rank | value |
 | --- | --- |
 | predicted floor | **264.0 ms** for the chunk (31.0 k tok/s) |
-| bytes moved | **422.0 GB** |
 | FLOPs | **118.4 TF** |
-| whole-pass AI | **281** — below the fp8 ridge of 412, so **memory-bound overall** |
-| facets | compute 666 n / 89.3 ms / 33.8 % · memory 848 n / 174.6 ms / 66.1 % · launch 77 n / 0.2 ms |
+| bytes — **HBM** | **289.0 GB** |
+| bytes — **interconnect** | **133.2 GB** |
+| AI against HBM | **410**, against an fp8 ridge of **412** — *at* the ridge, not below it |
+| where the time goes | **wire 148.0 ms (56 %)** · HBM + compute 116.0 ms (44 %) |
 
-> ⚠ **Dense intuition says prefill is compute-bound. Here it is not**, for two
-> structural reasons: 256 experts × top-8 reads the whole bank per layer
-> regardless of P, and expert parallelism turns the dispatch into a wire-bound
-> all-to-all. `confidence: high for the arithmetic, medium for the conclusion` —
-> the soft link is that essentially all 256 experts are hit, which assumes routing
-> is not pathologically concentrated (A5).
+**Two byte pools, and only one of them answers to the HBM ridge.** An earlier
+version of this table divided FLOPs by *all* 422 GB and reported AI 281, which
+mixed 133 GB of NVLink payload into a denominator the ridge derives from HBM
+bandwidth. Against HBM alone the pass sits at AI 410 — balanced on that axis to
+within half a percent — and the thing actually setting the floor is the wire.
+
+> ⚠ **Dense intuition says prefill is compute-bound. Under EP8 it is
+> communication-bound**, and the two claims are not close: 56 % of the predicted
+> floor is interconnect time. On the HBM axis the pass is balanced (AI 410 vs
+> ridge 412), so neither "compute-bound" nor "memory-bound" is the right label for
+> it — the label is *comm*. Two structural reasons: 256 experts × top-8 reads the
+> whole bank per layer regardless of P, and expert parallelism turns the dispatch
+> into an all-to-all that is 105.7 GB per pass.
+>
+> `confidence: high for the arithmetic, medium for the conclusion` — the soft
+> links are that essentially all 256 experts are hit (A5) and that EP is on at all
+> (Q1). Under TP8-only the wire term largely disappears and the pass reverts to
+> HBM-bound; that is the same fork §4.2 and capture C5 turn on.
 
 **Chunk size multiplies the whole MoE term.** The same 8,192 tokens:
 
@@ -486,10 +499,10 @@ not small at D=5.
 
 | α | 0.0 † | 0.5 | 0.7 | 0.9 | break-even |
 | --- | --- | --- | --- | --- | --- |
-| accepted tokens/step, `Σ αⁱ` (i=0…5) | 1.000 | 1.969 | 2.941 | 4.686 | **1.731** |
+| accepted tokens/step, `Σ αⁱ` = `(1−α⁶)/(1−α)` | 1.000 | 1.969 | 2.941 | 4.686 | **1.731** |
 | **tok/s** = `32 × Σ αⁱ ÷ 28.135 ms` | 1,137 | **2,239** | **3,345** | **5,329** | **α > 0.426** |
 | MTP off, for comparison = `32 ÷ 16.254 ms` | 1,969 | 1,969 | 1,969 | 1,969 | — |
-| ~~linear `1+Dα`~~ — **do not use** | 1,137 | ~~3,981~~ | ~~5,118~~ | ~~6,256~~ | ~~α > 0.146~~ |
+| ~~linear `1+Dα`~~ — **do not use**: assumes *independent* acceptance, but a verifier takes a **prefix** — token *k* only counts if 1…*k*−1 also passed | 1,137 | ~~3,981~~ | ~~5,118~~ | ~~6,256~~ | ~~α > 0.146~~ |
 
 Each row divides its own token count by its own step time, which is what makes
 the two comparable: break-even is where they meet, at `Σ αⁱ = 28.135/16.254 =
@@ -638,7 +651,7 @@ at TP8/EP8, FP8.
 | **Pre** | attention core ×79 | compute, **linear in C** | FLOPs capped at 2,048 keys/query; bytes are the whole cache **once per request — an optimistic floor** (A9/Q12), but a bounded one: this node is 0.10 % of prefill bytes, so the worst tiling is 1.1× on the step | FP8 KV | ⚑ **`index_topk`**; C; ⚠ **per-request vs per-tile** |
 | **Pre** | permute / combine | memory | 8.5 GB/layer-pass on the `8P`-row expanded tensor, near-zero FLOPs | BF16 activations | top-k; **expert imbalance** |
 | **Pre** | *everything else* — embed gather, norms, `lm_head`, gating | memory or launch | each under 1.5 %; `lm_head` reads 239.5 MB for **one row per request** | BF16; FP32 top-k | none of them flips |
-| **Pre** | **whole prefill pass** | **memory** | **AI 281 vs ridge 412**; 66 % memory / 34 % compute | mixed FP8/BF16/FP32 | prompt length; **chunk size**; EP degree |
+| **Pre** | **whole prefill pass** | ⚑ **comm** under EP8 | **56 % of the floor is wire**. On the HBM axis alone AI 410 vs ridge 412 — balanced, not memory-bound | mixed FP8/BF16/FP32 | **EP on/off** (Q1); prompt length; chunk size |
 | **MTP** | verify expert GEMMs | **memory** | 256 distinct experts at 192 rows vs 163 at 32 — **+57 %/layer, ~85 % of MTP's cost** | FP8 block-scaled | `B(1+D)` vs E=256; **D**; imbalance |
 | **MTP** | draft expert GEMMs ×D | **memory** | the MTP block carries a **full 256-expert bank**; 5 stages × 163 experts, **linear in D, no saturation** | FP8 block-scaled | **D**; batch |
 | **MTP** | draft `lm_head` ×5 | memory | 239.5 MB × 5 = **1.20 GB = 19 % of the draft's bytes** | **BF16** | sharded sampling; draft vocab |
