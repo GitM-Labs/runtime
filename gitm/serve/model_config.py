@@ -14,7 +14,7 @@ no planner imports beyond the pure spec builder, no `/proc` beyond what
 entry point takes an injectable ``environ`` and ``cache_root``) and so the planner
 never grows HF-cache concerns.
 
-The load-bearing decision is the **gate**. :func:`spec_from_hf_config` is written
+The load-bearing decision is the **gate**. :func:`sparse_spec_from_hf_config` is written
 for a DeepSeek-V4-class MoE, and every one of its ``cfg.get(key, default)`` calls is
 a DeepSeek default; :func:`gitm.planner.roofline.weight_bytes` falls back to bf16 on
 an unrecognised dtype. Feed either an off-distribution config and you get a
@@ -33,7 +33,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from gitm.planner.moe_graph import spec_from_hf_config
+# Aliased, not bare: ``spec_from_hf_config`` exists in BOTH planner families
+# with different meanings, and this module imports the hybrid one too (below).
+# A bare name here would make the family depend on import order.
+from gitm.planner.moe_graph import spec_from_hf_config as sparse_spec_from_hf_config
 from gitm.planner.roofline import (
     _WEIGHT_BYTES,
     BatchConfig,
@@ -46,7 +49,7 @@ from gitm.serve import discover
 # is *declared* by the config is a silent-mispricing risk, not a default to accept.
 KNOWN_DTYPES = frozenset(_WEIGHT_BYTES)
 
-# Alias -> canonical key that :func:`spec_from_hf_config` reads. Non-DeepSeek MoEs
+# Alias -> canonical key that :func:`sparse_spec_from_hf_config` reads. Non-DeepSeek MoEs
 # name the same tensors differently; without this a valid Mixtral/Qwen3-MoE config
 # would fail the gate for "missing" experts it declares under another name.
 _EXPERT_COUNT_ALIASES = ("n_routed_experts", "num_local_experts", "num_experts")
@@ -153,7 +156,7 @@ def _act_dtype_from_flag(value: str) -> str | None:
     """Map vLLM's ``--dtype`` onto a roofline dtype, or ``None`` for ``auto``.
 
     ``auto`` defers to the checkpoint's ``torch_dtype``, which
-    :func:`spec_from_hf_config` already reads — so only an *explicit* dtype overrides.
+    :func:`sparse_spec_from_hf_config` already reads — so only an *explicit* dtype overrides.
     """
     v = value.lower()
     if v in ("auto", ""):
@@ -244,7 +247,7 @@ def normalize_moe_config(cfg: dict[str, Any]) -> dict[str, Any]:
     """Copy of ``cfg`` with alias keys mapped onto the canonical DeepSeek names.
 
     Only fills a canonical key that is absent, so a config that already uses the
-    DeepSeek names is untouched. This keeps :func:`spec_from_hf_config` a pure,
+    DeepSeek names is untouched. This keeps :func:`sparse_spec_from_hf_config` a pure,
     single-vocabulary builder — the aliasing lives here, at the edge that reads
     foreign configs, and its dict-based tests keep passing unchanged.
     """
@@ -382,7 +385,7 @@ def live_moe_spec(
                 model_ref=model_ref,
                 missing_keys=missing,
             )
-        spec = spec_from_hf_config(normalize_moe_config(cfg), name=model_ref)
+        spec = sparse_spec_from_hf_config(normalize_moe_config(cfg), name=model_ref)
 
     overrides = serving_overrides_from_cmdline(target.cmdline)
     spec_changes: dict[str, Any] = {}

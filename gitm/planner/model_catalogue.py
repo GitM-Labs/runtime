@@ -113,6 +113,16 @@ def load_spec(name_or_path: str | Path):
     for key in ("compress_ratios", "dspark_layer_ids"):
         if key in raw and isinstance(raw[key], list):
             raw[key] = tuple(raw[key])
+    # YAML gives lists; the spec is a frozen dataclass and therefore hashable, so
+    # every collection field has to land as something hashable. A list here does
+    # not fail at load — it fails later, at the first ``hash(spec)``, a long way
+    # from the file that caused it.
+    if isinstance(raw.get("dense_layers"), list):
+        raw["dense_layers"] = frozenset(int(i) for i in raw["dense_layers"])
+    if isinstance(raw.get("op_dtype_overrides"), list):
+        raw["op_dtype_overrides"] = tuple(
+            (str(op), str(dt)) for op, dt in raw["op_dtype_overrides"]
+        )
 
     unknown = set(raw) - known
     if unknown:
