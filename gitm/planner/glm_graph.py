@@ -944,10 +944,19 @@ def predict_glm_graph(
     # It is not a smaller copy of the model. The block carries a full
     # ``mlp.experts.*`` bank, so its cost is expert weight traffic paid ``D`` times
     # over, not arithmetic.
-    if spec.num_nextn_predict_layers > 0 and batch.positions_per_step > 0:
+    # ``num_nextn_predict_layers`` says the block exists in the checkpoint; it does
+    # not say the engine runs it. Drafting happens only under a speculative config,
+    # so at D=0 there are zero drafted tokens and zero stages — the module's weights
+    # stay resident (``model_weight_bytes`` counts them) and none of its kernels
+    # launch. Forcing one stage here charged a pure decode step 0.3 ms of drafting
+    # that a server without ``--speculative-config`` never does.
+    if (
+        spec.num_nextn_predict_layers > 0
+        and batch.speculative_tokens > 0
+        and batch.positions_per_step > 0
+    ):
         draft_batch = replace(batch, prefill_tokens=0, speculative_tokens=0)
-        stages = max(1, batch.speculative_tokens)
-        for stage in range(stages):
+        for stage in range(batch.speculative_tokens):
             _emit_layer(
                 g, spec, hw, spec.n_layers + stage,
                 batch=draft_batch, sh=sh,

@@ -111,7 +111,7 @@ def test_indexshare_shared_layers_emit_no_indexer():
     # One per full-indexer layer, and the MTP head shares (no indexer node).
     assert n_proj == n_score == spec.n_full_indexer_layers == 21
     # Every layer still runs the attention core over the selected positions.
-    assert len(_ops(g, "attn_score_value")) == spec.n_layers + spec.num_nextn_predict_layers
+    assert len(_ops(g, "attn_score_value")) == spec.n_layers
 
 
 def test_mla_kv_traffic_uses_shared_latent_not_heads():
@@ -137,9 +137,7 @@ def test_dense_prefix_runs_ffn_not_mixture():
     # Two per sparse block: the h->256 GEMM, then the fused gating kernel that
     # scores and selects. Same op name because the trace cannot tell them apart
     # (see MOE_LAYER_NODES), so the count is doubled, not the node list.
-    assert len(_ops(g, "moe_router")) == 2 * (
-        spec.n_sparse_mlp_layers + spec.num_nextn_predict_layers
-    )
+    assert len(_ops(g, "moe_router")) == 2 * spec.n_sparse_mlp_layers
 
 
 def test_precision_is_bf16_no_fp4_leak():
@@ -229,7 +227,12 @@ def test_footprint_counts_the_indexers_the_graph_emits(shares):
     Asserted as an identity rather than a constant, so it holds either way round.
     """
     spec = replace(_spec(), index_share_for_mtp_iteration=shares)
-    emitted = len(_ops(predict_glm_graph(spec), "attn_index_proj"))
+    # With a draft stage actually running — at D=0 the block's weights are
+    # resident but none of its kernels launch, so node count and footprint
+    # legitimately diverge there and the identity is about the stage that runs.
+    g = predict_glm_graph(spec, batch=BatchConfig(batch=1, kv_cache_len=4096,
+                                                  speculative_tokens=1))
+    emitted = len(_ops(g, "attn_index_proj"))
     expected = spec.n_full_indexer_layers + (0 if shares else spec.num_nextn_predict_layers)
     assert emitted == expected
 
@@ -357,7 +360,7 @@ def test_two_collectives_per_layer_not_one():
         spec, batch=BatchConfig(batch=1, kv_cache_len=4096),
         sharding=ShardingConfig(tp=8),
     )
-    n_blocks = spec.n_layers + spec.num_nextn_predict_layers
+    n_blocks = spec.n_layers  # no draft stage without --spec-tokens
     assert len(_ops(g, "tp_all_reduce_attn")) == n_blocks
     assert len(_ops(g, "tp_all_reduce_mlp")) == n_blocks
 
@@ -375,9 +378,7 @@ def test_dense_layers_dispatch_no_experts():
         spec, batch=BatchConfig(batch=1, kv_cache_len=4096),
         sharding=ShardingConfig(tp=8, ep=8),
     )
-    assert len(_ops(g, "moe_all_to_all")) == (
-        spec.n_sparse_mlp_layers + spec.num_nextn_predict_layers
-    )
+    assert len(_ops(g, "moe_all_to_all")) == spec.n_sparse_mlp_layers
     assert not [n for n in g.nodes if n.op == "moe_all_to_all" and n.layer < 3]
 
 
@@ -452,6 +453,32 @@ def test_indexer_scans_with_every_index_head():
     )
     # The cached keys are read once per sequence and are NOT per-head.
     assert scan.prediction.bytes == pytest.approx(pairs * spec.index_head_dim * 2)
+
+
+def test_no_draft_head_without_a_speculative_config():
+    """``num_nextn_predict_layers`` says the block exists, not that it runs.
+
+    Drafting happens only under a speculative config. At D=0 nothing is drafted,
+    so no stage is emitted — the weights stay resident (``model_weight_bytes``
+    still counts them) and none of their kernels launch. Emitting one anyway
+    charged a pure decode step 0.3 ms of drafting a server without
+    ``--speculative-config`` never does.
+    """
+    spec = _spec()
+    batch = BatchConfig(batch=32, kv_cache_len=8192)
+    g = predict_glm_graph(spec, batch=batch)
+    assert not [n for n in g.nodes if n.layer is not None and n.layer >= spec.n_layers]
+    assert len(_ops(g, "lm_head")) == 1  # the epilogue only
+    assert len(_ops(g, "attn_q_a")) == spec.n_layers
+
+    # The weights are still resident either way — that is the distinction.
+    assert model_weight_bytes(spec) > model_weight_bytes(
+        replace(spec, num_nextn_predict_layers=0)
+    )
+
+    # One stage per drafted token once a speculative config exists.
+    g5 = predict_glm_graph(spec, batch=replace(batch, speculative_tokens=5))
+    assert len(_ops(g5, "mtp_eh_proj")) == 5
 
 
 def test_a_pure_prefill_step_runs_no_draft_head():
@@ -575,8 +602,7 @@ def test_act_quant_exists_only_where_a_gemm_is_actually_fp8():
     assert not _ops(predict_glm_graph(bf16, batch=batch), "act_quant")
     # Two per block: one ahead of the attention GEMMs, one ahead of the FFN —
     # the two groups of fp8 GEMMs, with bf16 work in between.
-    blocks = fp8.n_layers + fp8.num_nextn_predict_layers
-    assert len(_ops(predict_glm_graph(fp8, batch=batch), "act_quant")) == 2 * blocks
+    assert len(_ops(predict_glm_graph(fp8, batch=batch), "act_quant")) == 2 * fp8.n_layers
 
 
 def test_plan_warns_that_a_speculative_rate_is_a_ceiling():

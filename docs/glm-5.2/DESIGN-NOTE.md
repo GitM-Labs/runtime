@@ -323,7 +323,7 @@ pricing a tower it never read.
 flowchart LR
   subgraph V["VANILLA DECODE"]
     direction TB
-    v1["1 row per seq"] --> v2["78 layers + 1 MTP<br/>1,614 nodes"] --> v3["lm_head"] --> v4["sample"]
+    v1["1 row per seq"] --> v2["78 layers<br/>1,591 nodes"] --> v3["lm_head"] --> v4["sample"]
     v4 --> v5(("1 token"))
   end
   subgraph D["DRAFT — 5 SERIAL stages, 115 nodes"]
@@ -449,32 +449,28 @@ At B=32, S=8192, D=5 (the vendor recipe's `num_speculative_tokens`):
 
 | pass | backbone | + draft | = nodes | bytes | floor |
 | --- | ---: | ---: | ---: | --- | --- |
-| vanilla decode (D=0) | 1,591 | 23 (1 stage) | **1,614** | 68.60 GB | 16.551 ms |
-| MTP step (D=5) | 1,591 | 115 (5 stages) | **1,706** | 112.77 GB | **28.135 ms** |
+| vanilla decode (D=0) | 1,591 | 0 | **1,591** | 67.34 GB | 16.254 ms |
+| MTP step (D=5) | 1,591 | 115 (5 × 23) | **1,706** | 112.77 GB | **28.135 ms** |
 | — the verify pass alone | 1,591 | — | 1,591 | 106.43 GB | 26.652 ms |
 | — the draft chain alone | — | 115 | 115 | 6.34 GB | 1.483 ms |
 
-All four rows price EP8 — see [EP] under §4.1.
+The backbone is the same **1,591 nodes in every row** — the 78 transformer layers
+plus prologue and epilogue. Verify is that backbone at 1+D rows, not a second
+graph. A draft stage is **23 nodes**: the 20 of a shared-indexer MoE layer (A.1)
+plus `rms_norm`, `mtp_eh_proj` and `lm_head` (A.4), identical every stage, so
+`5 × 23 = 115` is exact.
 
-A stage is **23 nodes**: the 20 of a shared-indexer MoE layer (A.1) plus
-`rms_norm`, `mtp_eh_proj` and `lm_head` (A.4). It carries no indexer — that is
-already why it is 20 and not 22 — and every stage is the same block invoked again,
-so `5 × 23 = 115` is exact rather than approximate.
+**At D=0 the draft head does not run at all.** `num_nextn_predict_layers: 1` says
+the block is in the checkpoint; it does not say the engine executes it. Without a
+speculative config nothing is drafted, so no stage is emitted — the weights stay
+resident and none of their kernels launch.
 
-The backbone column is the 78 transformer layers plus prologue and epilogue, and
-it is **the same 1,591 nodes in every row** — verify is that backbone at 1+D rows,
-not a second graph. Only the draft region changes, and the MTP module is always
-present (it is a block in the checkpoint, not an option), which is why even the
-D=0 row carries one stage.
-"192 rows" is `B × (1 + D)` = 32 × 6: the verify pass is the backbone at 1+D rows,
-not a different batch size.
+**Cost ratio 1.73× for up to 6 tokens.** Where the extra 45.43 GB goes:
 
-**Cost ratio 1.70× for up to 6 tokens.** Where the extra 44.17 GB goes:
-
-- **Verify, +37.8 GB**, almost all one line: the expert union saturates, so 6× the
+- **Verify, +39.1 GB**, almost all one line: the expert union saturates, so 6× the
   rows costs 1.57× the expert bytes (163 → 256 distinct). KV read does **not**
   move — 0.43 GB either way, read per *sequence* — and neither does `lm_head`.
-- **The draft chain, +5.07 GB.** Each of 5 stages draws on a full 256-expert bank,
+- **The draft chain, +6.34 GB**, all of it new work. Each of 5 stages draws on a full 256-expert bank,
   linear in D with no saturation to help, so **the draft is 5.3 % of the MTP step
   where a dense-draft model's would be 1–2 %**.
 
@@ -490,21 +486,21 @@ not small at D=5.
 
 | α | 0.0 † | 0.5 | 0.7 | 0.9 | break-even |
 | --- | --- | --- | --- | --- | --- |
-| accepted tokens/step, `Σ αⁱ` (i=0…5) | 1.000 | 1.969 | 2.941 | 4.686 | **1.700** |
-| **tok/s** = `32 × Σ αⁱ ÷ 28.135 ms` | 1,137 | **2,239** | **3,345** | **5,329** | **α > 0.415** |
-| MTP off, for comparison = `32 ÷ 16.551 ms` | 1,933 | 1,933 | 1,933 | 1,933 | — |
-| ~~linear `1+Dα`~~ — **do not use** | 1,137 | ~~3,981~~ | ~~5,118~~ | ~~6,256~~ | ~~α > 0.140~~ |
+| accepted tokens/step, `Σ αⁱ` (i=0…5) | 1.000 | 1.969 | 2.941 | 4.686 | **1.731** |
+| **tok/s** = `32 × Σ αⁱ ÷ 28.135 ms` | 1,137 | **2,239** | **3,345** | **5,329** | **α > 0.426** |
+| MTP off, for comparison = `32 ÷ 16.254 ms` | 1,969 | 1,969 | 1,969 | 1,969 | — |
+| ~~linear `1+Dα`~~ — **do not use** | 1,137 | ~~3,981~~ | ~~5,118~~ | ~~6,256~~ | ~~α > 0.146~~ |
 
 Each row divides its own token count by its own step time, which is what makes
-the two comparable: break-even is where they meet, at `Σ αⁱ = 28.135/16.551 =
-1.700`. Divide by the **MTP step** (28.135 ms), not by the baseline rate: the step is
-1.70× longer, so a rate ratio against the 1,933 tok/s baseline is not an
+the two comparable: break-even is where they meet, at `Σ αⁱ = 28.135/16.254 =
+1.731`. Divide by the **MTP step** (28.135 ms), not by the baseline rate: the step is
+1.70× longer, so a rate ratio against the 1,969 tok/s baseline is not an
 accepted-token count. That baseline carries *no* acceptance convention of its own
 — at D=0 `tokens_per_step` degenerates to `batch`.
 
 † At α=0 both formulas give exactly one accepted token, so the two rows agree by
 construction. The 1,137 is the cost of drafting for nothing, and it sits **below**
-the 1,933 MTP-off baseline — which is the point of keeping the column.
+the 1,969 MTP-off baseline — which is the point of keeping the column.
 
 **The struck row is what `gitm plan --spec-tokens` prints today**, and it
 overstates throughput by up to 1.8×. It is shown only so the discrepancy is
@@ -534,7 +530,7 @@ that was never moving bytes. The sign of the MTP decision flips with batch.
 | S8     | KV rollback                 | discard rejected rows                                              | **low** on mechanism       | pointer rewind (free) or real memmove (not free) — the trace tells you which            |
 | S9     | indexer selection handoff   | the `full` layer's top-k must be visible to its 3 `shared` layers   | **low**                    | if it round-trips the host, IndexShare costs a sync it should not — **21 per step**    |
 
-**S5** is the decode-specific one worth chasing: ~1,614 kernels in ~16 ms, then
+**S5** is the decode-specific one worth chasing: ~1,591 kernels in ~16 ms, then
 control returns to a Python scheduler — if the scheduler is slower than the step,
 no kernel-level work matters. **S7** is the one that breaks CUDA graphs: MTP adds a
 per-step, host-visible, data-dependent sequence length, so a capturing stack needs
@@ -564,17 +560,17 @@ what they cost.
 
 | node | bytes | AI | ×N | Σ ms | bound | share |
 | --- | ---: | ---: | ---: | ---: | --- | ---: |
-| `moe_routed` | 771.3 MB | 3.1 | 76 | **12.213** | memory | **73.8 %** |
-| `attn_score_value` | 42.0 MB | 12.8 | 79 | 0.690 | memory | 4.2 % |
-| `moe_all_to_all` | 5.5 MB | — | 76 | 0.465 | comm | 2.8 % |
-| `rms_norm` | 1.6 MB | 0.8 | 160 | 0.322 | launch | 1.9 % |
-| `act_quant` | 0.6 MB | 0.7 | 158 | 0.316 | launch | 1.9 % |
-| `moe_router` (GEMM + gating) | 3.4 MB | 15.0 | 152 | 0.304 | launch | 1.8 % |
-| `attn_q_a` · `attn_out_proj` | 13.1 MB each | 61.4 | 79 each | 0.216 each | memory | 1.3 % each |
-| 9 more nodes at the launch floor | <5 MB | — | 79 each | 0.158 each | launch | 1.0 % each |
+| `moe_routed` | 771.3 MB | 3.1 | 75 | **12.052** | memory | **74.1 %** |
+| `attn_score_value` | 42.0 MB | 12.8 | 78 | 0.682 | memory | 4.2 % |
+| `moe_all_to_all` | 5.5 MB | — | 75 | 0.459 | comm | 2.8 % |
+| `rms_norm` | 1.6 MB | 0.8 | 157 | 0.314 | launch | 1.9 % |
+| `act_quant` | 0.6 MB | 0.7 | 156 | 0.312 | launch | 1.9 % |
+| `moe_router` (GEMM + gating) | 3.4 MB | 15.0 | 150 | 0.300 | launch | 1.8 % |
+| `attn_q_a` · `attn_out_proj` | 13.1 MB each | 61.4 | 78 each | 0.213 each | memory | 1.3 % each |
+| 9 more nodes at the launch floor | <5 MB | — | 78 each | 0.156 each | launch | 1.0 % each |
 | `attn_index_score` | 33.6 MB | 64.0 | 21 | 0.147 | memory | 0.9 % ← the only term that grows with S |
-| `lm_head` · `mtp_eh_proj` · `logits_all_gather` | 239.5 / 152.2 / 17.3 MB | — | 2 / 1 / 1 | 0.100 / 0.032 / 0.019 | memory | 0.9 % total |
-| **1,614 nodes** | **68.60 GB** | | | **16.551** | | **1,933 tok/s** [A8][EP] |
+| `lm_head` · `logits_all_gather` | 239.5 / 17.3 MB | — | 1 / 1 | 0.050 / 0.019 | memory | 0.4 % total |
+| **1,591 nodes** | **67.34 GB** | | | **16.254** | | **1,969 tok/s** [A8][EP] |
 
 [EP] this table prices **EP8**, which the vendor recipe does not ask for — it sets
 no `--enable-expert-parallel`. Under TP8-only the `moe_all_to_all` row disappears
@@ -589,8 +585,8 @@ instead is grouped-GEMM tail latency, which this graph does not model at all.
 
 | facet | nodes | Σ ms | share | |
 | --- | ---: | ---: | ---: | --- |
-| memory | 441 | 14.203 | 85.8 % | five node types |
-| launch | 1,173 | 2.348 | 14.2 % | 73 % of all nodes, a seventh of the time |
+| memory | 434 | 13.940 | 85.8 % | five node types |
+| launch | 1,157 | 2.314 | 14.2 % | 73 % of all nodes, a seventh of the time |
 | compute | 0 | 0.000 | 0.0 % | the entire roofline claim, one row |
 
 **A MoE layer is 20 kernels and two of them cost anything** (Appendix A.1). Two
@@ -600,9 +596,9 @@ is the only term that grows with S, which does not stay small:
 
 | context S | `attn_index_score` | share of step | step floor |
 | --------- | ------------------ | ------------- | ---------- |
-| 8,192     | 0.147 ms           | 0.9 %         | 16.551 ms  |
-| 131,072   | 2.349 ms           | 12.5 %        | 18.753 ms  |
-| **1,048,576** | **18.795 ms**  | **53.4 %**    | 35.199 ms  |
+| 8,192     | 0.147 ms           | 0.9 %         | 16.254 ms  |
+| 131,072   | 2.349 ms           | 12.7 %        | 18.457 ms  |
+| **1,048,576** | **18.795 ms**  | **53.9 %**    | 34.902 ms  |
 
 **At 1M the indexer scan is the largest node in the step** — and it is the node
 IndexShare already cut 3.7×. "Flat in context" is true of the attention *core* and
@@ -612,16 +608,16 @@ false of the step.
 
 | B   | floor      | tok/s | launch nodes | launch time | compute nodes |
 | --- | ---------- | ----- | ------------ | ----------- | ------------- |
-| 1   | 3.946 ms   | 253   | 1,353        | 2.708 ms = **69 %** | 0 |
-| 4   | 5.633 ms   | 710   | 1,352        | 2.706 ms = 48 %     | 0 |
-| 16  | 11.289 ms  | 1,417 | 1,173        | 2.348 ms = 21 %     | 0 |
-| 32  | 16.551 ms  | 1,933 | 1,173        | 2.348 ms = 14 %     | 0 |
-| 64  | 22.400 ms  | 2,857 | 1,097        | 2.196 ms = 10 %     | 76 |
-| 128 | 27.682 ms  | 4,624 | 939          | 1.880 ms = 7 %      | 76 |
-| 256 | 34.510 ms  | 7,418 | 705          | 1.412 ms = 4 %      | 79 |
+| 1   | 3.813 ms   | 262   | 1,335        | 2.670 ms = **70 %** | 0 |
+| 4   | 5.478 ms   | 730   | 1,334        | 2.668 ms = 49 %     | 0 |
+| 16  | 11.061 ms  | 1,447 | 1,157        | 2.314 ms = 21 %     | 0 |
+| 32  | 16.254 ms  | 1,969 | 1,157        | 2.314 ms = 14 %     | 0 |
+| 64  | 22.028 ms  | 2,905 | 1,082        | 2.164 ms = 10 %     | 75 |
+| 128 | 27.245 ms  | 4,698 | 926          | 1.852 ms = 7 %      | 75 |
+| 256 | 33.977 ms  | 7,534 | 695          | 1.390 ms = 4 %      | 76 |
 
 **Below B≈16 the step is launch-bound in memory-bound clothes.** At B=1 that
-69 % already assumes CUDA-graph replay; at the eager 5 µs it is **85 %**, and the
+70 % already assumes CUDA-graph replay; at the eager 5 µs it is **85 %**, and the
 whole low-batch analysis changes sign (A4, §5 rank 3).
 
 
@@ -649,7 +645,7 @@ at TP8/EP8, FP8.
 | **MTP** | draft `eh_proj` ×5 | memory | `[12288,6144]` BF16, **replicated per rank** | **BF16** — in `modules_to_not_convert` | whether it is TP-sharded |
 | **MTP** | verify attention | **memory, unchanged** | 0.43 GB — read **per sequence, not per row**; 1+D rows share one block table | FP8 KV | seq length; explicitly *not* D |
 | **MTP** | accept/reject + KV rollback | launch + **host sync** | tiny tensors, but a data-dependent host-visible seq length (S7) | n/a | pointer rewind vs memmove |
-| **MTP** | **whole MTP step** | ⚑ **memory above B≈16, launch below — and the two regimes disagree about whether MTP helps** | **1.70×** cost for ≤6 tokens at B=32; break-even α = **0.415** on a prefix chain (§3.3) | mixed | **graph capture**; batch; α; D |
+| **MTP** | **whole MTP step** | ⚑ **memory above B≈16, launch below — and the two regimes disagree about whether MTP helps** | **1.73×** cost for ≤6 tokens at B=32; break-even α = **0.426** on a prefix chain (§3.3) | mixed | **graph capture**; batch; α; D |
 
 **Hardware sensitivity:** nothing flips between H200 SXM and H20 on the compute
 rows — but H20's much lower FP8 peak moves every prefill projection further into
@@ -663,13 +659,13 @@ row, with the magnitude each is worth:
 | Flip variable | Direction and magnitude |
 | --- | --- |
 | **Decode batch B** | expert bytes are **sub-linear**: 8 distinct experts at B=1, 163 at 32, 252 at 128. 253 → 7,418 tok/s across 1→256, and the whole-step label goes launch → memory at B≈16 |
-| **Sequence length S** | moves the indexer scan and **nothing else**: 0.9 % of the step at 8K → 12.5 % at 128K → **53.4 % at 1M** |
+| **Sequence length S** | moves the indexer scan and **nothing else**: 0.9 % of the step at 8K → 12.7 % at 128K → **53.9 % at 1M** |
 | **Prompt length P** | every prefill projection (memory→compute above P≈512), the router, the indexer's quadratic, all-reduce (latency→bandwidth above P≈256) |
 | ⚑ **Chunk size** | **14.9×** on prefill bytes across 1→64 chunks, for identical FLOPs |
 | ⚑ **CUDA-graph capture** | 69 % of the B=1 floor, 85 % at eager 5 µs. Decides whether MTP is a 3× win or a net loss |
 | ⚑ **EP vs TP** | the a2a is 45 % of prefill under EP8, but the per-rank bank is **8× smaller** — a trade, not a cost, since the bank is 85 % of decode DRAM |
 | ⚑ **Precision, and KV dtype** | 1.79× on the decode floor and **10.7 → 5.4 H200s** for weights; 55 GB vs 100 GB of KV per rank at 1M |
-| **D and acceptance α** | 1.70× cost at D=5; break-even α = **0.415** on a prefix chain, 2,239 → 5,329 tok/s across α (§3.3 — the linear convention the graph prints says 0.140, and overstates by up to 1.8×) |
+| **D and acceptance α** | 1.73× cost at D=5; break-even α = **0.426** on a prefix chain, 2,239 → 5,329 tok/s across α (§3.3 — the linear convention the graph prints says 0.146, and overstates by up to 1.8×) |
 
 Two more move single rows and are named where they appear: **absorbed-vs-unabsorbed
 MLA** (±2× on `attn_kv_b` + `attn_out_proj`, Q1) and **expert imbalance** (skew
@@ -688,7 +684,7 @@ graph**, to be confirmed against a capture.
 | **2** | **Grouped-GEMM group sizing (the fork)** | either **76 D2H per token** (no graph capture possible) **or** fixed-capacity padding (**all 256 experts read every step**) | The only data-dependent shape in the graph is the fused gating kernel. A stack does one or the other — see §5.2 | `cuda_api_sum` D2H count per decode step | 0 D2H **and** MoE bytes that track `distinct_experts(B)` → a device-side path, nothing to recover |
 | **3** | ⚑ **CUDA-graph capture at low batch** | **63 % of the B=1 floor is launch overhead** (81 % at eager 5 µs) | 1,033 nodes × 2 µs = 2.07 ms against a 1.24 ms memory term | `cuda_api_sum` launch count with `--cuda-graph-trace=node`; expect **1** `cudaGraphLaunch` | already captured → this rank is worth nothing, and rank 2's fork is already resolved to "padded" |
 | **4** | **The indexer scan at long context** | at 1M it is **54 % of the step**, and IndexShare's 3.7× is already banked | 90.2 GB/step of index keys at S=1M. Levers: fp8 index keys (2×), temporal reuse across steps, a smaller `index_topk_freq` group | `dram__bytes_read.sum` on the scan vs 90.2 GB; whether keys are fp8 | keys already fp8 and no temporal reuse available → architectural |
-| **5** | **`moe_routed` — the memory-bound heart** | 73.8 % of decode; **EPLB placement and the grouped-GEMM backend are the levers** | Weight traffic scales with *distinct* experts woken, not with FLOPs. Good placement cuts per-rank distinct traffic; DeepGEMM cuts the constant | measured per-rank expert traffic vs `distinct_experts`; **the real EP imbalance** | measured traffic already at the union prediction with balance ≈1.0 → the bank is the bank |
+| **5** | **`moe_routed` — the memory-bound heart** | 74.1 % of decode; **EPLB placement and the grouped-GEMM backend are the levers** | Weight traffic scales with *distinct* experts woken, not with FLOPs. Good placement cuts per-rank distinct traffic; DeepGEMM cuts the constant | measured per-rank expert traffic vs `distinct_experts`; **the real EP imbalance** | measured traffic already at the union prediction with balance ≈1.0 → the bank is the bank |
 | **6** | ⚑ **fp32 router at prefill** | **11.0 % of prefill** rests on the reading that the router *GEMM* runs in fp32 | 26 GF/layer at 67 TF/s. If only the softmax/top-k accumulates in fp32 and the GEMM is bf16, this row shrinks ~15× | the engine's router implementation; `cuda_gpu_kern_sum` dtype of the gate GEMM | the GEMM is genuinely fp32 → architectural, and the row stays |
 | **7** | **Decode collective placement** | 158 all-reduces + 76 all-to-alls + 1 logits all-gather per step on the compute stream, **latency-bound**, with idle SMs around them | 688 kB payloads: the gap *is* the cost. Nothing prevents other layers' work overlapping | NCCL ranges and stream ids on the timeline (S2/S3) | already on a separate stream with overlap → nothing to recover |
 | **8** | **Chunk size** | a decode-latency-protecting `--max-num-batched-tokens` can cost **14.9× the prefill bytes** | the expert bank is read per chunk | total prefill MoE DRAM ÷ 95.7 GB — the quotient **is** the chunk count | quotient ≈ 1 → prefill is already unchunked |
@@ -755,7 +751,7 @@ Two worked examples, because the rule is easy to agree with and hard to apply:
   layers' work overlapping. Q2: *yes* — stream assignment. **Recoverable** (rank 7).
 
 **The trap runs in both directions.** The accept/reject readback will look alarming
-and is architectural. The 1,614 kernel launches are entirely *expected* from §3 and
+and is architectural. The 1,591 kernel launches are entirely *expected* from §3 and
 are the largest recoverable item at low batch. **Neither surprise nor familiarity
 is evidence.**
 
@@ -808,7 +804,7 @@ Key: **R:** recoverable → the rank it feeds · **A:** architectural, do not ch
 |---|---|---|---|---|
 | **0** | **Launch args, as text** — not a measurement | C6 | chunk size, graph capture, KV dtype, D, TP/EP, absorbed MLA | Resolves or reframes **ranks 1, 2, 3, 6, 8 before a timeline is opened** |
 | **1** | `cuda_api_sum` — **D2H count per decode step** | C1 | **0** in the MoE region | **R:** 76/token → host-resolved group sizes, no graph capture → **rank 2**. **R:** 0 but MoE bytes flat in B → padded capacity → **rank 3** instead (§5.2). **A:** none |
-| **2** | `cuda_api_sum` — **launches per step**, needs `--cuda-graph-trace=node` | C1 | **1** `cudaGraphLaunch` | **R:** ~1,614 individual launches + CPU gaps below B≈16 → **rank 3**. **F1:** count wildly off 1,614 → the lowering in §3 is wrong by an order of magnitude |
+| **2** | `cuda_api_sum` — **launches per step**, needs `--cuda-graph-trace=node` | C1 | **1** `cudaGraphLaunch` | **R:** ~1,591 individual launches + CPU gaps below B≈16 → **rank 3**. **F1:** count wildly off 1,591 → the lowering in §3 is wrong by an order of magnitude |
 | **3** | `dram__bytes_read.sum` — **MoE region** | C1, C3 | 1.26 GB/layer/rank = **95.7 GB/pass**; **≈85 %** of decode | **R:** prefill total ÷ 95.7 GB > 1 → chunked re-read, and the quotient **is** the chunk count → **rank 8**. **R:** flat in B → padded capacity → **rank 3**. **F2:** much lower → L2 residency, and the central claim of both phases is wrong |
 | **4** | `dram__bytes_read.sum` — **indexer region**, swept in S | C2 | 33.6 MB/layer at 8K → **90.2 GB/step at 1M**, on **21 layers only** | **R:** keys read on 78 layers → IndexShare is not being honoured, a hidden 3.7× → **rank 4**. **R:** 2× the prediction → keys are bf16 where fp8 would do. **A:** growth on 21 layers is the architecture |
 | **5** | **NCCL kernel duration vs payload** | C1, C3, C5 | prefill **∝ payload** (~900 GB/s, 117 ms a2a); decode **flat, ~2 µs × 235** | **R:** prefill a2a at bf16 payload → fp8 dispatch → **rank 1**. **R:** decode collectives on the compute stream with idle SMs → **rank 7**. **A:** the ring latency floor |
@@ -910,7 +906,7 @@ graph change. The commands at the top of this note regenerate any of them.
 | **Q6** | Is the **EP dispatch** bf16 or fp8? | **half of 105.7 GB** at prefill — the largest single recoverable number here | serving image / C6 |
 | **Q7** | Is the **IndexShare selection** passed device-side? | 21 syncs/step if not (S9) | trace D2H attribution |
 | **Q8** | Chunked prefill on, at what chunk size? | **up to 14.9× on prefill bytes** | engine launch args (C6) |
-| **Q9** | **α**, the MTP acceptance rate, in production | the entire MTP decision. Break-even is **0.415** on a prefix chain (0.140 under the linear convention the graph prints — §3.3); 0.5→0.9 is 2,239→5,329 tok/s | engine metrics (C4) — **not predictable from a config** |
+| **Q9** | **α**, the MTP acceptance rate, in production | the entire MTP decision. Break-even is **0.426** on a prefix chain (0.146 under the linear convention the graph prints — §3.3); 0.5→0.9 is 2,239→5,329 tok/s | engine metrics (C4) — **not predictable from a config** |
 | **Q10** | Are the **index keys** cached in fp8 or bf16? | 2× on 90.2 GB/step at 1M context | C6 / trace |
 | **Q11** | Is `eh_proj` **TP-sharded** in the MTP block? | 151 MB → 19 MB per rank per draft stage | serving image |
 | **Q12** | Does the prefill attention kernel read the selected KV once per request, or once per query tile? | Up to 64× on that node — but **the node is 0.10 % of prefill bytes**, so even a 128-row tiling takes the step from 422 GB to 448 GB. **1.1×, and it does not move the prefill conclusion.** Listed last because it is bounded, not because it is small | `dram__bytes_read.sum` on the prefill core |
@@ -1038,8 +1034,8 @@ stay small:
 | context S | `.6b` bytes/layer | `.6b` time/layer | Σ over 21 layers | share of step |
 | --------- | ----------------- | ---------------- | ---------------- | ------------- |
 | 8,192     | 33.6 MB           | 6.99 µs          | 0.147 ms         | 0.9 %         |
-| 131,072   | 537.0 MB          | 0.112 ms         | 2.349 ms         | 12.5 %        |
-| 1,048,576 | **4,296.0 MB**    | **0.895 ms**     | **18.795 ms**    | **53.4 %**    |
+| 131,072   | 537.0 MB          | 0.112 ms         | 2.349 ms         | 12.7 %        |
+| 1,048,576 | **4,296.0 MB**    | **0.895 ms**     | **18.795 ms**    | **53.9 %**    |
 
 **Σ per layer at S=8192: 8.3 GF, 928.4 MB, 0.222 ms** — 5 % more than `Ls,sh`, and
 that 5 % is the whole price of IndexShare's 21-of-78 schedule at short context.
@@ -1095,14 +1091,15 @@ selection the backbone already paid for.
 | region | ×N | nodes each | Σ nodes | Σ ms | share |
 | ------ | -- | ---------- | ------- | ---- | ----- |
 | prologue + epilogue | 1 | 4 | 4 | 0.073 | 0.4 % |
-| `Ld,f` dense layers | 3 | 17 | 51 | 0.155 | 0.9 % |
-| `Ls,f` full-indexer MoE | 18 | 22 | 396 | 3.999 | 24.2 % |
-| `Ls,sh` shared-indexer MoE | 57 | 20 | 1,140 | 12.028 | 72.7 % |
-| `Lmtp` draft (D=1) | 1 | 23 | 23 | 0.297 | 1.8 % |
-| **total** | | | **1,614** | **16.551** | |
+| `Ld,f` dense layers | 3 | 17 | 51 | 0.155 | 1.0 % |
+| `Ls,f` full-indexer MoE | 18 | 22 | 396 | 3.999 | 24.6 % |
+| `Ls,sh` shared-indexer MoE | 57 | 20 | 1,140 | 12.028 | 74.0 % |
 
-At D=5 the draft region becomes 5 × 23 = 115 nodes and 1.483 ms, and the backbone
-runs at 192 rows instead of 32 — **1,706 nodes, 28.135 ms.**
+| **total** | | | **1,591** | **16.254** | |
+
+At D=5 a draft region of 5 × 23 = 115 nodes and 1.483 ms appears, and the backbone
+runs at 192 rows instead of 32 — **1,706 nodes, 28.135 ms.** At D=0 there is no
+draft region at all.
 
 The prologue/epilogue rows are 4 nodes and 0.4 % of the step, and two of them are
 on the critical path between the last layer and the sample: `lm_head` re-reads
