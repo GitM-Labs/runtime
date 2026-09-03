@@ -454,6 +454,8 @@ At B=32, S=8192, D=5 (the vendor recipe's `num_speculative_tokens`):
 | verify, 192 rows (backbone only) | 1,591 | 106.4 GB | 26.652 ms |
 | **MTP step total**     | **1,706** | **112.8 GB** | **28.135 ms** |
 
+All four rows price EP8 — see [EP] under §4.1.
+
 **The MTP module is always present** — it is a block in the checkpoint, not an
 option — so "vanilla decode" already contains one draft stage. The backbone (the
 78 transformer layers plus prologue and epilogue) is **1,591 nodes in every
@@ -559,7 +561,13 @@ what they cost.
 | 9 more nodes at the launch floor | <5 MB | — | 79 each | 0.158 each | launch | 1.0 % each |
 | `attn_index_score` | 33.6 MB | 64.0 | 21 | 0.147 | memory | 0.9 % ← the only term that grows with S |
 | `lm_head` · `mtp_eh_proj` · `logits_all_gather` | 239.5 / 152.2 / 17.3 MB | — | 2 / 1 / 1 | 0.100 / 0.032 / 0.019 | memory | 0.9 % total |
-| **1,614 nodes** | **68.60 GB** | | | **16.551** | | **1,933 tok/s** [A8] |
+| **1,614 nodes** | **68.60 GB** | | | **16.551** | | **1,933 tok/s** [A8][EP] |
+
+[EP] this table prices **EP8**, which the vendor recipe does not ask for — it sets
+no `--enable-expert-parallel`. Under TP8-only the `moe_all_to_all` row disappears
+and the per-rank expert bank doubles instead: a different graph, not a corrected
+one (Q1, capture C5). Every EP-dependent figure in §3 and §4 is conditional on
+that flag.
 
 [A8] every MoE byte term assumes `ep_imbalance = 1.0`. Real skew touches *fewer*
 distinct experts, so the prediction over-states traffic and therefore over-states

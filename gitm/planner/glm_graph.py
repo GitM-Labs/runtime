@@ -342,7 +342,15 @@ def model_weight_bytes(
 
     n_sparse = spec.n_sparse_mlp_layers + spec.num_nextn_predict_layers
     n_dense = spec.n_layers - spec.n_sparse_mlp_layers
-    n_full_idx = spec.n_full_indexer_layers + spec.num_nextn_predict_layers
+    # The MTP block counts here only if it recomputes the index. With
+    # ``index_share_for_mtp_iteration`` it reuses the main model's selection and
+    # carries no indexer tensors — which is exactly what the weight map shows, and
+    # what ``_emit_layer`` already honours by emitting no indexer node for it.
+    # Counting it anyway put one indexer's weights (18.7 MB bf16) in the footprint
+    # that the checkpoint does not contain, and contradicted the graph beside it.
+    n_full_idx = spec.n_full_indexer_layers + (
+        0 if spec.index_share_for_mtp_iteration else spec.num_nextn_predict_layers
+    )
     n_attn = spec.n_layers + spec.num_nextn_predict_layers
 
     experts = n_sparse * spec.n_routed_experts * 3 * h * inter * ew / es

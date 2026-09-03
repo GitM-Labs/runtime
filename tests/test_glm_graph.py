@@ -215,6 +215,35 @@ def test_embed_tokens_carries_its_own_declared_precision():
     )
 
 
+@pytest.mark.parametrize("shares", [True, False])
+def test_footprint_counts_the_indexers_the_graph_emits(shares):
+    """The graph and the footprint must agree on how many indexers exist.
+
+    They are computed independently — one walks layers emitting nodes, the other
+    sums shapes — so they can disagree silently. They did: the footprint counted
+    an indexer for the MTP block while the graph, correctly, emitted none for it,
+    because ``index_share_for_mtp_iteration`` means it reuses the main selection
+    and carries no indexer tensors. 18.7 MB of weights the checkpoint does not
+    have, and a contradiction of the weight-map evidence the note rests on.
+
+    Asserted as an identity rather than a constant, so it holds either way round.
+    """
+    spec = replace(_spec(), index_share_for_mtp_iteration=shares)
+    emitted = len(_ops(predict_glm_graph(spec), "attn_index_proj"))
+    expected = spec.n_full_indexer_layers + (0 if shares else spec.num_nextn_predict_layers)
+    assert emitted == expected
+
+    # And the footprint moves by exactly one indexer between the two readings.
+    one = (
+        spec.q_lora_rank * spec.index_n_heads * spec.index_head_dim
+        + spec.hidden * spec.index_head_dim
+        + spec.hidden * spec.index_n_heads
+    ) * 2  # bf16
+    shared_spec = replace(spec, index_share_for_mtp_iteration=True)
+    own_spec = replace(spec, index_share_for_mtp_iteration=False)
+    assert model_weight_bytes(own_spec) - model_weight_bytes(shared_spec) == pytest.approx(one)
+
+
 def test_fp8_footprint_matches_published_checkpoint():
     """The same shape arithmetic, checked against a second published precision.
 
