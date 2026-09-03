@@ -1021,7 +1021,15 @@ _UNQUANTISED_OPS: tuple[tuple[str, str], ...] = (
     ("lm_head", "lm_head"),
     ("embed_tokens", "embed_tokens"),
     ("eh_proj", "mtp_eh_proj"),
-    ("indexer", "attn_index_proj"),  # subsumes indexers_proj, indexer.k_norm
+    # The indexer's *projections*, named specifically. A bare "indexer" needle also
+    # matches ``indexer.k_norm``, and a norm carries no information about the
+    # projection's width — every fp8 scheme leaves norms wide, so a checkpoint that
+    # skipped only the norm and quantised ``indexers_proj`` would be read as
+    # leaving the whole indexer bf16.
+    ("indexers_proj", "attn_index_proj"),
+    ("indexer.wq_b", "attn_index_proj"),
+    ("indexer.wk", "attn_index_proj"),
+    ("indexer.weights_proj", "attn_index_proj"),
     ("mlp.gate", "moe_router"),
 )
 

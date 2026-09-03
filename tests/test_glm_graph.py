@@ -166,6 +166,7 @@ def test_fp8_checkpoint_reads_what_the_quantiser_skipped():
         "modules_to_not_convert": [
             "model.layers.0.input_layernorm",
             "model.layers.47.mlp.gate.e_score_correction_bias",
+            "model.layers.74.self_attn.indexers_proj",
             "model.layers.74.self_attn.indexer.k_norm",
             "model.layers.78.eh_proj",
             "lm_head",
@@ -180,6 +181,30 @@ def test_fp8_checkpoint_reads_what_the_quantiser_skipped():
     for op in ("lm_head", "mtp_eh_proj", "attn_index_proj"):
         assert spec.dtype_for(op, spec.weight_dtype) == "bf16", op
     assert spec.dtype_for("moe_router", spec.weight_dtype) == "fp32"
+
+
+def test_a_skipped_norm_does_not_imply_a_skipped_projection():
+    """``indexer.k_norm`` in the not-convert list says nothing about the GEMM.
+
+    Every fp8 scheme leaves norms wide, so a norm appearing there carries no
+    information. A bare ``indexer`` needle matched it and marked the whole indexer
+    bf16 — right for GLM-5.2, where ``indexers_proj`` is listed too, and wrong for
+    any checkpoint that skipped only the norm.
+    """
+    cfg = dict(GLM_CONFIG)
+    cfg["quantization_config"] = {
+        "quant_method": "fp8",
+        "modules_to_not_convert": ["model.layers.74.self_attn.indexer.k_norm"],
+    }
+    spec = spec_from_hf_config(cfg)
+    assert spec.dtype_for("attn_index_proj", spec.weight_dtype) == "fp8"
+
+    # Name the projection and it is honoured.
+    cfg["quantization_config"]["modules_to_not_convert"].append(
+        "model.layers.74.self_attn.indexers_proj"
+    )
+    spec = spec_from_hf_config(cfg)
+    assert spec.dtype_for("attn_index_proj", spec.weight_dtype) == "bf16"
 
 
 def test_embed_tokens_carries_its_own_declared_precision():
