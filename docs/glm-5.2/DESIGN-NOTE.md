@@ -175,6 +175,12 @@ whole model, bytes per token of context (fp8 latent, bf16 rope key + index key):
   an fp8 weight costs 1.000244 B, not 1 B — the 128×128 block scale (§7.0)
   78 × (512×1.000244 + 64×2)  +  21 × 128×1.000244  =  52,618 B/token
   bf16 throughout:                                     95,232 B/token
+
+  ⚠ 1.000244 is a *weight*-side constant borrowed for cache bytes. An fp8 KV
+    cache carries a per-token or per-tensor scale, not 128×128 blocks, so the
+    true figure is nearer 78×640 + 21×128 = 52,608. The 10-byte gap is 0.02%
+    and moves nothing; it is named because the constant is the wrong one, not
+    because the number is.
 ```
 
 | Context | fp8 KV  | bf16 KV |
