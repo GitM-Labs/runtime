@@ -29,10 +29,27 @@ nvidia = ["pynvml>=11.5"]
 # fallback (pandas). On a GPU box the harness runs on cuDF/CuPy instead — those
 # install from the RAPIDS channel, not PyPI, so they are not listed here.
 bench = ["pyarrow>=15", "pandas>=2.0"]
-# The vllm-decode workload. Deliberately NOT folded into [gpu]: vLLM is a heavy
+# Two consumers: the vllm-decode workload, and *firing* a traffic replay
+# (gitm/traffic/replay.py). Deliberately NOT folded into [gpu]: vLLM is a heavy
 # install that pins its own torch, and both must be built for a CUDA major the
 # HOST driver supports — see gitm/cuda_env.py, which checks exactly that.
-vllm = ["vllm>=0.6"]
+#
+# Floor is 0.23.0 because `bench serve --dataset-name timed_trace` landed in
+# bfb9ebc21 (2026-05-28), one day AFTER v0.22.0 shipped — checked at the tags,
+# not inferred from dates: v0.22.0 ❌, v0.22.1 ❌, v0.23.0 ✅. Below it the run
+# dies on an argparse complaint about an unknown dataset name, which reads like a
+# typo in our command rather than a missing feature. A too-high floor fails
+# loudly at install time; a too-low one fails quietly at run time, so the floor
+# goes up. gitm.traffic.replay.VLLM_MIN_VERSION carries the same number for the
+# runtime guard.
+#
+# NOT split into a separate [traffic] extra: the traffic library is CPU-only
+# except for firing — adapters, regime, replay-file writing, validation and the
+# viewer all run with no vLLM at all — so an extra named for it would say you
+# need a multi-gigabyte CUDA install to use a library that does not need one.
+# Phase B of the chunked-prefill experiment needs only >=0.19.0 for its own
+# features; it is covered by this floor, not constrained to it.
+vllm = ["vllm>=0.23.0"]
 # Full GPU stack for the real HFT path in two commands: cuDF/CuPy (RAPIDS) +
 # the CUPTI/runtime wheels the tracer shim links + NVML telemetry + the Parquet
 # generator deps. cuDF/CuPy resolve from NVIDIA's index, so install with:

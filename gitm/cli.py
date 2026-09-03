@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+from gitm._banner import add_banner_argument, show_banner
 from gitm.optimizer.deviation import add_deviate_arguments
 from gitm.planner.registry import add_plan_arguments
 
@@ -79,6 +80,7 @@ def _parser() -> argparse.ArgumentParser:
         description="Behavioral compiler and intervention runtime.",
     )
     p.add_argument("--version", action="store_true", help="Print version and exit.")
+    add_banner_argument(p)
     sub = p.add_subparsers(dest="cmd")
 
     run = sub.add_parser("run", help="Run the autonomous optimization loop.")
@@ -317,6 +319,10 @@ def main(argv: list[str] | None = None) -> int:
         argv, serve_argv = argv[:i], argv[i + 1:]
 
     args = _parser().parse_args(argv)
+
+    # Before any output, and never on stdout: --version and the JSON-emitting
+    # subcommands write machine-readable payloads there.
+    show_banner(suppressed=args.no_banner)
 
     if args.version:
         from gitm import __version__
