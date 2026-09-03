@@ -406,7 +406,9 @@ def test_tokens_per_step_accounts_for_acceptance():
     """Drafts are paid for always and counted only when kept."""
     b = BatchConfig(batch=4, speculative_tokens=3, acceptance_rate=0.5)
     assert b.positions_per_step == 16  # all drafted work is computed
-    assert b.tokens_per_step == pytest.approx(4 * (1 + 3 * 0.5))
+    # A prefix chain, not 1 + D*alpha: the verifier stops at the first rejection,
+    # so token k counts only if 1..k-1 did.
+    assert b.tokens_per_step == pytest.approx(4 * (1 + 0.5 + 0.25 + 0.125))
 
 
 # ── the observed side lines up with the predicted side ──────────────────────

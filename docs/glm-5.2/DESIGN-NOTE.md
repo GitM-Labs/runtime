@@ -134,7 +134,12 @@ is byte-for-byte identical between them.
 | `Ld,f`    | **3** | MLA+DSA | **full** | dense 12288 | 576 + 128    | 2× all-reduce         |
 | `Ls,f`    | **18**| MLA+DSA | **full** | MoE 256×2048 | 576 + 128   | 2× all-reduce (+2× a2a under EP) |
 | `Ls,sh`   | **57**| MLA+DSA | shared   | MoE 256×2048 | 576         | 2× all-reduce (+2× a2a under EP) |
-| `Lmtp`    | **1** | MLA+DSA | shared   | MoE 256×2048 | 576         | 2× all-reduce, ×D stages |
+| `Lmtp`    | **1**, ×D | MLA+DSA | shared   | MoE 256×2048 | 576     | 2× all-reduce per stage |
+
+`Ld,f` and `Ls,f` are both full-indexer archetypes — 3 + 18 = **21**, matching §1.
+The transformer stack is 3 + 18 + 57 = **78**; `Lmtp` is a 79th block that exists
+in the checkpoint and runs **only under a speculative config**, once per drafted
+token (§3.3).
 
 The two schedules do not line up — a 3-layer dense prefix, a 3-layer `full`
 prefix, then an IndexShare period of 4 — so no single modulo rule reproduces
@@ -190,7 +195,7 @@ B200s and `--max-num-seqs 32` for full context.
 | `q_a`/`q_b`/`kv_a`/`kv_b`, **`o_proj`**, dense FFN | **FP8 e4m3**, 128×128 block     | absent from `modules_to_not_convert`               |
 | routed experts, shared expert                       | **FP8 e4m3**, 128×128 block     | absent from `modules_to_not_convert`               |
 | `lm_head`, `embed_tokens`                           | **BF16**                        | named in `modules_to_not_convert`                  |
-| **lightning indexer** (`indexers_proj`, `k_norm`)   | **BF16**                        | named in `modules_to_not_convert`                  |
+| **lightning indexer** — `indexers_proj`, `wq_b`, `wk`, `weights_proj` (+ `k_norm`) | **BF16** | named in `modules_to_not_convert`                  |
 | MTP `eh_proj`, `enorm`, `hnorm`                     | **BF16**                        | named in `modules_to_not_convert`                  |
 | MoE router (`mlp.gate` + `e_score_correction_bias`) | **FP32**                        | `moe_router_dtype: "float32"`, base config          |
 | all norms                                           | **BF16**                        | named in `modules_to_not_convert`                  |
@@ -490,36 +495,28 @@ resident and none of their kernels launch.
 **~86 % of the price of speculation is the MoE expert bank** — charged because
 more rows and stages touch more experts, not because more work is done per token.
 
-**Break-even, and a caveat that moves it by 3×.** `BatchConfig.tokens_per_step`
-counts accepted tokens as `1 + D·α` — the repo-wide convention, used by every
-family. That is right for independent draws and wrong for speculative decoding,
-where the verifier accepts a *prefix*: token *k* only counts if 1…*k*−1 were also
-accepted, so expected accepted length is `Σ αⁱ` for *i* = 0…D. The difference is
-not small at D=5.
+**Break-even.** Accepted tokens follow a **prefix chain**: the verifier walks the
+draft in order and stops at the first rejection, so token *k* counts only if
+1…*k*−1 did. The expectation is `Σ αⁱ = (1−α^(D+1))/(1−α)`, not `1 + D·α` — that
+would be the answer for *independent* draws, and at D=5 it overstates accepted
+tokens by 1.8× at α=0.5.
 
-| α | 0.0 † | 0.5 | 0.7 | 0.9 | break-even |
+| α | 0.0 | 0.5 | 0.7 | 0.9 | break-even |
 | --- | --- | --- | --- | --- | --- |
-| accepted tokens/step, `Σ αⁱ` = `(1−α⁶)/(1−α)` | 1.000 | 1.969 | 2.941 | 4.686 | **1.731** |
+| accepted tokens/step, `(1−α⁶)/(1−α)` | 1.000 | 1.969 | 2.941 | 4.686 | **1.731** |
 | **tok/s** = `32 × Σ αⁱ ÷ 28.135 ms` | 1,137 | **2,239** | **3,345** | **5,329** | **α > 0.426** |
 | MTP off, for comparison = `32 ÷ 16.254 ms` | 1,969 | 1,969 | 1,969 | 1,969 | — |
-| ~~linear `1+Dα`~~ — **do not use**: assumes *independent* acceptance, but a verifier takes a **prefix** — token *k* only counts if 1…*k*−1 also passed | 1,137 | ~~3,981~~ | ~~5,118~~ | ~~6,256~~ | ~~α > 0.146~~ |
 
 Each row divides its own token count by its own step time, which is what makes
-the two comparable: break-even is where they meet, at `Σ αⁱ = 28.135/16.254 =
-1.731`. Divide by the **MTP step** (28.135 ms), not by the baseline rate: the step is
-1.70× longer, so a rate ratio against the 1,969 tok/s baseline is not an
-accepted-token count. That baseline carries *no* acceptance convention of its own
-— at D=0 `tokens_per_step` degenerates to `batch`.
+them comparable: break-even is where they meet, at `Σ αⁱ = 28.135/16.254 = 1.731`.
 
-† At α=0 both formulas give exactly one accepted token, so the two rows agree by
-construction. The 1,137 is the cost of drafting for nothing, and it sits **below**
-the 1,969 MTP-off baseline — which is the point of keeping the column.
-
-**The struck row is what `gitm plan --spec-tokens` prints today**, and it
-overstates throughput by up to 1.8×. It is shown only so the discrepancy is
-recognisable in CLI output; the CLI itself now says so. Fixing the convention
-means changing shared `BatchConfig` semantics for every family, so it is stated
-here rather than made here.
+`BatchConfig.tokens_per_step` computes the chain, so
+`gitm plan --spec-tokens 5 --acceptance-rate 0.5` prints the 2,239 above. It used
+to compute `1 + D·α` — an earlier revision of this note carried a warning about
+its own tool's output, which was the wrong place to fix it. The linear form was
+shared with every family and wrong for all of them, since any verifier accepts a
+prefix; a tree-attention scheme verifying several candidate continuations at once
+would need its own term and does not have one here.
 
 Z.ai claims the GLM-5.2 MTP layer raises accepted length up to 20 % over its
 predecessor, which likely clears even the chained bar — but **α is a serving
@@ -678,7 +675,7 @@ row, with the magnitude each is worth:
 | ⚑ **CUDA-graph capture** | 69 % of the B=1 floor, 85 % at eager 5 µs. Decides whether MTP is a 3× win or a net loss |
 | ⚑ **EP vs TP** | the a2a is 45 % of prefill under EP8, but the per-rank bank is **8× smaller** — a trade, not a cost, since the bank is 85 % of decode DRAM |
 | ⚑ **Precision, and KV dtype** | 1.79× on the decode floor and **10.7 → 5.4 H200s** for weights; 55 GB vs 100 GB of KV per rank at 1M |
-| **D and acceptance α** | 1.73× cost at D=5; break-even α = **0.426** on a prefix chain, 2,239 → 5,329 tok/s across α (§3.3 — the linear convention the graph prints says 0.146, and overstates by up to 1.8×) |
+| **D and acceptance α** | 1.73× cost at D=5; break-even α = **0.426**, 2,239 → 5,329 tok/s across α (§3.3) |
 
 Two more move single rows and are named where they appear: **absorbed-vs-unabsorbed
 MLA** (±2× on `attn_kv_b` + `attn_out_proj`, Q1) and **expert imbalance** (skew
@@ -897,8 +894,10 @@ Five things, in the order they re-rank the tables. `git log` has the file list.
 5. **The MTP chain is D stages deep**, each with its own vocabulary projection
    (G7), driven by `--spec-tokens`.
 
-Two supporting fixes outside the family: an fp32 peak for modern SKUs (G4), and
-`gitm plan` keeping the launch bound and pricing the ridge per dtype (G5).
+Three supporting fixes outside the family: an fp32 peak for modern SKUs (G4),
+`gitm plan` keeping the launch bound and pricing the ridge per dtype (G5), and
+`BatchConfig.tokens_per_step` counting accepted tokens as a prefix chain rather
+than `1 + D·α` — shared with every family and wrong for all of them.
 
 **Deleted:** three committed JSON node dumps, 29k lines that went stale on every
 graph change. The commands at the top of this note regenerate any of them.
@@ -919,7 +918,7 @@ graph change. The commands at the top of this note regenerate any of them.
 | **Q6** | Is the **EP dispatch** bf16 or fp8? | **half of 105.7 GB** at prefill — the largest single recoverable number here | serving image / C6 |
 | **Q7** | Is the **IndexShare selection** passed device-side? | 21 syncs/step if not (S9) | trace D2H attribution |
 | **Q8** | Chunked prefill on, at what chunk size? | **up to 14.9× on prefill bytes** | engine launch args (C6) |
-| **Q9** | **α**, the MTP acceptance rate, in production | the entire MTP decision. Break-even is **0.426** on a prefix chain (0.146 under the linear convention the graph prints — §3.3); 0.5→0.9 is 2,239→5,329 tok/s | engine metrics (C4) — **not predictable from a config** |
+| **Q9** | **α**, the MTP acceptance rate, in production | the entire MTP decision. Break-even is **0.426**; 0.5→0.9 is 2,239→5,329 tok/s | engine metrics (C4) — **not predictable from a config** |
 | **Q10** | Are the **index keys** cached in fp8 or bf16? | 2× on 90.2 GB/step at 1M context | C6 / trace |
 | **Q11** | Is `eh_proj` **TP-sharded** in the MTP block? | 151 MB → 19 MB per rank per draft stage | serving image |
 | **Q12** | Does the prefill attention kernel read the selected KV once per request, or once per query tile? | Up to 64× on that node — but **the node is 0.10 % of prefill bytes**, so even a 128-row tiling takes the step from 422 GB to 448 GB. **1.1×, and it does not move the prefill conclusion.** Listed last because it is bounded, not because it is small | `dram__bytes_read.sum` on the prefill core |
@@ -968,7 +967,8 @@ KV per rank on top of a 96 GB weight share.
 ## Appendix A — Predicted node tables
 
 Trace-day reference for §3. **B=32, S=8192, TP8/EP8, FP8 weights and KV, per
-rank.** The 79 blocks are `Ld,f` ×3 + `Ls,f` ×18 + `Ls,sh` ×57 + `Lmtp` ×1; A.2–A.4
+rank.** The 78 transformer blocks are `Ld,f` ×3 + `Ls,f` ×18 + `Ls,sh` ×57, plus
+`Lmtp` ×D when drafting is on; A.2–A.4
 are **deltas** from A.1, since everything unlisted is byte-for-byte identical.
 
 Two columns are omitted rather than repeated. Every node runs on the compute

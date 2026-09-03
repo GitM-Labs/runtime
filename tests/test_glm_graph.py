@@ -630,26 +630,36 @@ def test_act_quant_exists_only_where_a_gemm_is_actually_fp8():
     assert len(_ops(predict_glm_graph(fp8, batch=batch), "act_quant")) == 2 * fp8.n_layers
 
 
-def test_plan_warns_that_a_speculative_rate_is_a_ceiling():
-    """``tokens_per_step`` counts ``1 + D*alpha``; a verifier accepts a prefix.
+def test_accepted_tokens_follow_a_prefix_chain():
+    """A verifier stops at the first rejection, so acceptance compounds.
 
-    The convention is shared with every family and not this branch's to change, so
-    the rate is printed as-is — but a number that is up to 1.8x optimistic at D=5
-    must not leave the CLI unlabelled, or the design note's caveat protects only
-    the readers who found the design note.
+    ``1 + D*alpha`` is the independent-draws answer and overstates throughput by
+    up to 1.8x at D=5; the CLI reported it, and the design note had to carry a
+    warning about its own output. Fixed at the source instead.
     """
+    b = BatchConfig(batch=32, speculative_tokens=5, acceptance_rate=0.5)
+    chain = sum(0.5 ** i for i in range(6))
+    assert b.tokens_per_step == pytest.approx(32 * chain)
+    assert b.tokens_per_step < 32 * (1 + 5 * 0.5)  # strictly under the linear form
+
+    # No speculation, no chain: the term degenerates to the batch.
+    assert BatchConfig(batch=32).tokens_per_step == 32
+    # Perfect acceptance keeps every drafted token.
+    assert BatchConfig(
+        batch=1, speculative_tokens=5, acceptance_rate=1.0
+    ).tokens_per_step == pytest.approx(6)
+
+
+def test_plan_flags_a_speculative_step_with_no_acceptance_rate():
+    """Priced without an acceptance rate, the reported rate is a floor."""
     from gitm.planner.registry import main
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         main(["glm-5.2-fp8", "--gpu", "H200", "--batch", "32", "--kv-len", "8192",
-              "--tp", "8", "--ep", "8", "--spec-tokens", "5",
-              "--acceptance-rate", "0.5"])
-    out = buf.getvalue()
-    assert "speculative step (D=5)" in out
-    assert "1.78x optimistic" in out
+              "--tp", "8", "--ep", "8", "--spec-tokens", "5"])
+    assert "no --acceptance-rate" in buf.getvalue()
 
-    # A non-speculative step says nothing, because nothing is being approximated.
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         main(["glm-5.2-fp8", "--gpu", "H200", "--batch", "32", "--kv-len", "8192"])

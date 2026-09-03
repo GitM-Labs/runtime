@@ -256,7 +256,15 @@ def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
             f"{g.batch.prefill_tokens / total:,.0f} tok/s "
             f"prefilling {g.batch.prefill_tokens:,} tokens"
             if g.batch.is_prefill
-            else f"{g.batch.batch / total:,.0f} tok/s at batch {g.batch.batch}"
+            # ``tokens_per_step`` is the accepted-token count: the batch on a
+            # plain decode step, and the prefix-chain expectation once drafting is
+            # on. Reporting ``batch / total`` there would price D drafts and then
+            # credit none of them.
+            else f"{g.batch.tokens_per_step / total:,.0f} tok/s at batch "
+                 f"{g.batch.batch}"
+                 + (f", D={g.batch.speculative_tokens} "
+                    f"alpha={g.batch.acceptance_rate:g}"
+                    if g.batch.speculative_tokens > 0 else "")
         ),
         f"  {len(g.nodes)} nodes, {n_compute} compute-bound, "
         f"{n_launch} launch-bound",
@@ -264,31 +272,13 @@ def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
     if any(b for b in bounds.values() if len(b) > 1):
         out.append("  * this op's instances do not share a bound — the label is "
                    "the majority one")
-    if g.batch.speculative_tokens > 0:
-        # ``tokens_per_step`` counts accepted tokens as ``1 + D*alpha``. A verifier
-        # accepts a *prefix*, so the real expectation is ``sum(alpha**i)`` — smaller
-        # for every alpha < 1, by up to 1.8x at D=5, alpha=0.5. The convention is
-        # shared with every family and not this module's to change, but a rate
-        # printed from it should not be read as achievable.
-        d = g.batch.speculative_tokens
-        a = g.batch.acceptance_rate
-        linear = 1.0 + d * a
-        chain = sum(a ** i for i in range(d + 1))
+    if g.batch.speculative_tokens > 0 and g.batch.acceptance_rate <= 0:
+        # A speculative step with no acceptance rate given prices the work and
+        # reports one accepted token, which is the floor rather than the outcome.
         out.append(
-            f"  ! speculative step (D={d}): rates above assume accepted tokens = "
-            f"1+D*alpha. A verifier accepts a prefix, so the expectation is "
-            f"sum(alpha^i)"
+            f"  ! speculative step (D={g.batch.speculative_tokens}) with no "
+            "--acceptance-rate: the rate above assumes every draft is rejected"
         )
-        if a > 0 and linear > chain:
-            out.append(
-                f"    at alpha={a:g} that is {linear:.2f} vs {chain:.2f} tokens/step "
-                f"— the printed rate is {linear / chain:.2f}x optimistic"
-            )
-        else:
-            out.append(
-                "    set --acceptance-rate to compare the two; break-even is "
-                "higher than the linear form implies"
-            )
     if g.has_unpriced_collectives:
         out.append("  ! collectives unpriced — this SKU has no interconnect bandwidth "
                    "in the catalogue")
