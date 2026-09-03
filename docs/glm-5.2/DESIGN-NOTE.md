@@ -449,8 +449,8 @@ At B=32, S=8192, D=5 (the vendor recipe's `num_speculative_tokens`):
 | pass | backbone | + draft | = nodes | bytes | floor |
 | --- | ---: | ---: | ---: | --- | --- |
 | vanilla decode (D=0) | 1,591 | 23 (1 stage) | **1,614** | 68.60 GB | 16.551 ms |
-| MTP step (D=5) | 1,591 | 115 (5 stages) | **1,706** | 112.8 GB | **28.135 ms** |
-| — the verify pass alone | 1,591 | — | 1,591 | 106.4 GB | 26.652 ms |
+| MTP step (D=5) | 1,591 | 115 (5 stages) | **1,706** | 112.77 GB | **28.135 ms** |
+| — the verify pass alone | 1,591 | — | 1,591 | 106.43 GB | 26.652 ms |
 | — the draft chain alone | — | 115 | 115 | 6.34 GB | 1.483 ms |
 
 All four rows price EP8 — see [EP] under §4.1.
@@ -463,7 +463,7 @@ D=0 row carries one stage.
 "192 rows" is `B × (1 + D)` = 32 × 6: the verify pass is the backbone at 1+D rows,
 not a different batch size.
 
-**Cost ratio 1.70× for up to 6 tokens.** Where the extra 44.2 GB goes:
+**Cost ratio 1.70× for up to 6 tokens.** Where the extra 44.17 GB goes:
 
 - **Verify, +37.8 GB**, almost all one line: the expert union saturates, so 6× the
   rows costs 1.57× the expert bytes (163 → 256 distinct). KV read does **not**
@@ -489,12 +489,13 @@ not small at D=5.
 | ~~linear `1+Dα`~~ — **do not use** | 1,137 | ~~3,981~~ | ~~5,118~~ | ~~6,256~~ | ~~α > 0.140~~ |
 
 Divide by the **MTP step** (28.135 ms), not by the baseline rate: the step is
-1.70× longer, so a rate ratio against 1,933 tok/s is not an accepted-token count.
+1.70× longer, so a rate ratio against the 1,933 tok/s baseline is not an
+accepted-token count. That baseline carries *no* acceptance convention of its own
+— at D=0 `tokens_per_step` degenerates to `batch`.
 
-against 1,933 tok/s with MTP off — a baseline that carries *no* acceptance
-convention, since `tokens_per_step` degenerates to `batch` at D=0. † at α=0 the two agree by construction (one
-accepted token either way), and the 1,137 is the *cost* of drafting for nothing —
-it is below the MTP-off baseline, which is the point of the column.
+† At α=0 both formulas give exactly one accepted token, so the two rows agree by
+construction. The 1,137 is the cost of drafting for nothing, and it sits **below**
+the 1,933 MTP-off baseline — which is the point of keeping the column.
 
 **The struck row is what `gitm plan --spec-tokens` prints today**, and it
 overstates throughput by up to 1.8×. It is shown only so the discrepancy is
