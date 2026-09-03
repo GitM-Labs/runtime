@@ -710,6 +710,10 @@ KV cache replicated across TP ranks** (one shared MLA latent cannot be split), a
 **the indexer scan growing with context** (IndexShare already cut it 3.7×; the
 remainder is the cost of selecting from an uncompressed history).
 
+The draft-gap row covers the **draft chain only**. The verify pass is one backbone
+forward with no cross-stage dependency, so its collectives are as overlappable as
+any other step's (rank 7) — a gap around them is not excused by this section.
+
 ---
 
 ## 6. Validation plan

@@ -28,6 +28,13 @@ spec:
   # the two halves separately for exactly this reason.
   kv_dtype: fp8
 
+  # NOT overridden, and deliberately so: act_dtype stays bf16, inherited from
+  # `glm-5.2`. Weights are fp8 on disk; activations are bf16 in flight and get
+  # quantised per-GEMM at run time (activation_scheme "dynamic"), which is the
+  # act_quant node. Every norm, permute and scatter therefore runs bf16 here.
+  # Listed as a comment because `extends` makes an inherited value invisible,
+  # and three fp8 lines above it invite the wrong inference.
+
   # From quantization_config.modules_to_not_convert, plus the router's own dtype
   # from the base config. Without these the indexer — the one attention node
   # whose cost grows with context — is priced at half its real weight traffic,
