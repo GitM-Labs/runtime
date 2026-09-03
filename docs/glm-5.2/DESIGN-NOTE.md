@@ -456,6 +456,11 @@ At B=32, S=8192, D=5 (the vendor recipe's `num_speculative_tokens`):
 
 All four rows price EP8 — see [EP] under §4.1.
 
+A stage is **23 nodes**: the 20 of a shared-indexer MoE layer (A.1) plus
+`rms_norm`, `mtp_eh_proj` and `lm_head` (A.4). It carries no indexer — that is
+already why it is 20 and not 22 — and every stage is the same block invoked again,
+so `5 × 23 = 115` is exact rather than approximate.
+
 The backbone column is the 78 transformer layers plus prologue and epilogue, and
 it is **the same 1,591 nodes in every row** — verify is that backbone at 1+D rows,
 not a second graph. Only the draft region changes, and the MTP module is always
@@ -485,11 +490,14 @@ not small at D=5.
 
 | α | 0.0 † | 0.5 | 0.7 | 0.9 | break-even |
 | --- | --- | --- | --- | --- | --- |
-| accepted tokens/step, `Σ αⁱ` (i=0…5) | 1.000 | 1.969 | 2.941 | 4.686 | — |
+| accepted tokens/step, `Σ αⁱ` (i=0…5) | 1.000 | 1.969 | 2.941 | 4.686 | **1.700** |
 | **tok/s** = `32 × Σ αⁱ ÷ 28.135 ms` | 1,137 | **2,239** | **3,345** | **5,329** | **α > 0.415** |
+| MTP off, for comparison = `32 ÷ 16.551 ms` | 1,933 | 1,933 | 1,933 | 1,933 | — |
 | ~~linear `1+Dα`~~ — **do not use** | 1,137 | ~~3,981~~ | ~~5,118~~ | ~~6,256~~ | ~~α > 0.140~~ |
 
-Divide by the **MTP step** (28.135 ms), not by the baseline rate: the step is
+Each row divides its own token count by its own step time, which is what makes
+the two comparable: break-even is where they meet, at `Σ αⁱ = 28.135/16.551 =
+1.700`. Divide by the **MTP step** (28.135 ms), not by the baseline rate: the step is
 1.70× longer, so a rate ratio against the 1,933 tok/s baseline is not an
 accepted-token count. That baseline carries *no* acceptance convention of its own
 — at D=0 `tokens_per_step` degenerates to `batch`.
@@ -1066,6 +1074,10 @@ for the sequence, not for the verify rows.
 | M.3–M.22 | the whole `Ls,sh` block (A.1) | as A.1 | 5.6 GF | 874.9 MB | mixed | 211 | memory |
 | M.23 | `lm_head` | GEMM, vocab-sharded `[6144→19360]` | 7,612.7 MF | **239.528 MB** | **BF16** | 49.90 | memory |
 | M.24 | `argmax` + D2H | sampling + host round-trip | — | small | BF16 | — | **sync (S6)** |
+
+**23 emitted nodes** — M.1, M.2, the 20 of M.3–M.22, and M.23. M.24 is a
+synchronization point, not a graph node, which is why the stage counts 23 and not
+24 in §3.3.
 
 **Σ per stage: 18.0 GF, 1,268.2 MB, 0.297 ms — ×5 = 6.34 GB, 1.483 ms.**
 
