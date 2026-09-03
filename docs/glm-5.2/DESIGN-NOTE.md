@@ -167,8 +167,9 @@ per layer per token, elements:
   full-indexer layers, additionally         + 128   ← the cached index key
 
 whole model, bytes per token of context (fp8 latent, bf16 rope key + index key):
-  78 × (512·1 + 64·2)  +  21 × 128·1  =  52,618 B/token
-  bf16 throughout:                       95,232 B/token
+  an fp8 weight costs 1.000244 B, not 1 B — the 128×128 block scale (§7.0)
+  78 × (512×1.000244 + 64×2)  +  21 × 128×1.000244  =  52,618 B/token
+  bf16 throughout:                                     95,232 B/token
 ```
 
 | Context | fp8 KV  | bf16 KV |
