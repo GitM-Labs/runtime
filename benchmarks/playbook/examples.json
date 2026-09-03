@@ -1,0 +1,400 @@
+{
+  "schema_id": "gitm.playbook.row/v1",
+  "rows": [
+    {
+      "schema_id": "gitm.playbook.row/v1",
+      "row_id": "ex1-prefix-cache-mooncake",
+      "identity": {
+        "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+        "model_revision": "95a723d0",
+        "gpu_sku": "NVIDIA H100 80GB",
+        "env": {
+          "schema_id": "pending-adit/env-capture",
+          "engine": "vllm",
+          "engine_version": "0.11.0",
+          "driver_version": null,
+          "torch_version": null,
+          "cuda_version": null
+        },
+        "regime": {
+          "source_kind": "production",
+          "trace": "mooncake",
+          "requests": 400,
+          "rate_rps": 2.8368794326241136,
+          "io_ratio": 39.09367234191124,
+          "input_p50": 9075,
+          "input_p95": 49904,
+          "output_p50": 370,
+          "output_p95": 662,
+          "burstiness": 6.738120567375886,
+          "bin_s": 1.0,
+          "burstiness_defined": true,
+          "concurrency": null,
+          "in_envelope": true,
+          "notes": []
+        },
+        "knobs": {
+          "enable_prefix_caching": true
+        }
+      },
+      "delta": {
+        "throughput_pct": 14.5,
+        "ttft_p99_ms": -18.0,
+        "itl_p99_ms": 0.3,
+        "repeats": 5,
+        "throughput_ci95_pct": [
+          9.1,
+          19.4
+        ],
+        "latency_blowout": null
+      },
+      "provenance": {
+        "trace_source": "mooncake",
+        "trace_sha256": "8090d6a38401d280fd88112ba22007ff4354be59c986f4f6bcc250edd45a52dc",
+        "trace_drops": {},
+        "regime_label": "prod/io32/in8k/out256/burst-hi/copen",
+        "repeat_raw_data": [],
+        "promotion_rule": "pending-adit/promotion-rule",
+        "config_capture": "pending-adit",
+        "verified_at": "2026-09-02T00:00:00Z",
+        "replay_chunk_hash_size": 512,
+        "replay_self_timed": true,
+        "prefix_synthesized": false
+      },
+      "evidence": "illustrative",
+      "invalidated": null,
+      "notes": [
+        "Regime is real (measured off the pinned Mooncake fixture). The delta is not: no run against a live endpoint has happened. Shape to build against, not a claim."
+      ]
+    },
+    {
+      "schema_id": "gitm.playbook.row/v1",
+      "row_id": "ex2-max-num-seqs-burstgpt",
+      "identity": {
+        "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+        "model_revision": "95a723d0",
+        "gpu_sku": "NVIDIA H100 80GB",
+        "env": {
+          "schema_id": "pending-adit/env-capture",
+          "engine": "vllm",
+          "engine_version": "0.11.0",
+          "driver_version": null,
+          "torch_version": null,
+          "cuda_version": null
+        },
+        "regime": {
+          "source_kind": "production",
+          "trace": "burstgpt",
+          "requests": 383,
+          "rate_rps": 0.010276637419839545,
+          "io_ratio": 1.8821556431490254,
+          "input_p50": 353,
+          "input_p95": 1638,
+          "output_p50": 238,
+          "output_p95": 841,
+          "burstiness": 1.0106110910396904,
+          "bin_s": 1.0,
+          "burstiness_defined": true,
+          "concurrency": null,
+          "in_envelope": true,
+          "notes": []
+        },
+        "knobs": {
+          "max_num_seqs": 64
+        }
+      },
+      "delta": {
+        "throughput_pct": 8.1,
+        "ttft_p99_ms": -4.2,
+        "itl_p99_ms": 1.0,
+        "repeats": 5,
+        "throughput_ci95_pct": [
+          3.3,
+          12.6
+        ],
+        "latency_blowout": null
+      },
+      "provenance": {
+        "trace_source": "burstgpt",
+        "trace_sha256": "7865fda5dac50938a84dfccb06c405e2f5202969ecfbd671c8399de00f4335f0",
+        "trace_drops": {
+          "zero_input_tokens": 17
+        },
+        "regime_label": "prod/io1/in256/out128/burst-poisson/copen",
+        "repeat_raw_data": [],
+        "promotion_rule": "pending-adit/promotion-rule",
+        "config_capture": "pending-adit",
+        "verified_at": "2026-09-02T00:00:00Z",
+        "replay_chunk_hash_size": 512,
+        "replay_self_timed": true,
+        "prefix_synthesized": true
+      },
+      "evidence": "illustrative",
+      "invalidated": null,
+      "notes": [
+        "The counter-example to ex1: same model, same GPU, no prefix identity in the source at all. A prefix-caching row must never be selected for this regime."
+      ]
+    },
+    {
+      "schema_id": "gitm.playbook.row/v1",
+      "row_id": "ex3-chunked-prefill-qwen",
+      "identity": {
+        "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+        "model_revision": "95a723d0",
+        "gpu_sku": "NVIDIA H100 80GB",
+        "env": {
+          "schema_id": "pending-adit/env-capture",
+          "engine": "vllm",
+          "engine_version": "0.11.0",
+          "driver_version": null,
+          "torch_version": null,
+          "cuda_version": null
+        },
+        "regime": {
+          "source_kind": "production",
+          "trace": "mooncake",
+          "requests": 400,
+          "rate_rps": 2.8368794326241136,
+          "io_ratio": 39.09367234191124,
+          "input_p50": 9075,
+          "input_p95": 49904,
+          "output_p50": 370,
+          "output_p95": 662,
+          "burstiness": 6.738120567375886,
+          "bin_s": 1.0,
+          "burstiness_defined": true,
+          "concurrency": null,
+          "in_envelope": true,
+          "notes": []
+        },
+        "knobs": {
+          "enable_chunked_prefill": true,
+          "max_num_batched_tokens": 8192
+        }
+      },
+      "delta": {
+        "throughput_pct": 6.4,
+        "ttft_p99_ms": -31.0,
+        "itl_p99_ms": 2.1,
+        "repeats": 5,
+        "throughput_ci95_pct": null,
+        "latency_blowout": null
+      },
+      "provenance": {
+        "trace_source": "mooncake",
+        "trace_sha256": "8090d6a38401d280fd88112ba22007ff4354be59c986f4f6bcc250edd45a52dc",
+        "trace_drops": {},
+        "regime_label": "prod/io32/in8k/out256/burst-hi/copen",
+        "repeat_raw_data": [],
+        "promotion_rule": "pending-adit/promotion-rule",
+        "config_capture": "pending-adit",
+        "verified_at": "2026-09-02T00:00:00Z",
+        "replay_chunk_hash_size": 512,
+        "replay_self_timed": true,
+        "prefix_synthesized": false
+      },
+      "evidence": "illustrative",
+      "invalidated": null,
+      "notes": [
+        "This is the row deliverable 3 would produce. It stays illustrative until Phase B runs -- that needs one 80 GB card, which we do not have."
+      ]
+    },
+    {
+      "schema_id": "gitm.playbook.row/v1",
+      "row_id": "ex4-retired-engine-bump",
+      "identity": {
+        "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+        "model_revision": "95a723d0",
+        "gpu_sku": "NVIDIA H100 80GB",
+        "env": {
+          "schema_id": "pending-adit/env-capture",
+          "engine": "vllm",
+          "engine_version": "0.12.0",
+          "driver_version": null,
+          "torch_version": null,
+          "cuda_version": null
+        },
+        "regime": {
+          "source_kind": "production",
+          "trace": "mooncake",
+          "requests": 400,
+          "rate_rps": 2.8368794326241136,
+          "io_ratio": 39.09367234191124,
+          "input_p50": 9075,
+          "input_p95": 49904,
+          "output_p50": 370,
+          "output_p95": 662,
+          "burstiness": 6.738120567375886,
+          "bin_s": 1.0,
+          "burstiness_defined": true,
+          "concurrency": null,
+          "in_envelope": true,
+          "notes": []
+        },
+        "knobs": {
+          "enable_prefix_caching": true
+        }
+      },
+      "delta": {
+        "throughput_pct": 11.0,
+        "ttft_p99_ms": -12.0,
+        "itl_p99_ms": 0.4,
+        "repeats": 4,
+        "throughput_ci95_pct": null,
+        "latency_blowout": null
+      },
+      "provenance": {
+        "trace_source": "mooncake",
+        "trace_sha256": "8090d6a38401d280fd88112ba22007ff4354be59c986f4f6bcc250edd45a52dc",
+        "trace_drops": {},
+        "regime_label": "prod/io32/in8k/out256/burst-hi/copen",
+        "repeat_raw_data": [],
+        "promotion_rule": "pending-adit/promotion-rule",
+        "config_capture": "pending-adit",
+        "verified_at": "2026-09-02T00:00:00Z",
+        "replay_chunk_hash_size": 512,
+        "replay_self_timed": true,
+        "prefix_synthesized": false
+      },
+      "evidence": "illustrative",
+      "invalidated": {
+        "reason": "vLLM 0.11 -> 0.12 scheduler rewrite; the measured delta is against a scheduler that no longer exists",
+        "at": "2026-09-02T00:00:00Z",
+        "by": "validation"
+      },
+      "notes": [
+        "Kept, not deleted. A deleted row leaves no record that the claim was made, which is the first thing a reviewer asks for."
+      ]
+    },
+    {
+      "schema_id": "gitm.playbook.row/v1",
+      "row_id": "ex6-prefix-cache-on-a-synthesized-trace",
+      "identity": {
+        "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+        "model_revision": "95a723d0",
+        "gpu_sku": "NVIDIA H100 80GB",
+        "env": {
+          "schema_id": "pending-adit/env-capture",
+          "engine": "vllm",
+          "engine_version": "0.11.0",
+          "driver_version": null,
+          "torch_version": null,
+          "cuda_version": null
+        },
+        "regime": {
+          "source_kind": "production",
+          "trace": "burstgpt",
+          "requests": 383,
+          "rate_rps": 0.010276637419839545,
+          "io_ratio": 1.8821556431490254,
+          "input_p50": 353,
+          "input_p95": 1638,
+          "output_p50": 238,
+          "output_p95": 841,
+          "burstiness": 1.0106110910396904,
+          "bin_s": 1.0,
+          "burstiness_defined": true,
+          "concurrency": null,
+          "in_envelope": true,
+          "notes": []
+        },
+        "knobs": {
+          "enable_prefix_caching": true
+        }
+      },
+      "delta": {
+        "throughput_pct": 1.2,
+        "ttft_p99_ms": -0.4,
+        "itl_p99_ms": 0.0,
+        "repeats": 5,
+        "throughput_ci95_pct": null,
+        "latency_blowout": null
+      },
+      "provenance": {
+        "trace_source": "burstgpt",
+        "trace_sha256": "7865fda5dac50938a84dfccb06c405e2f5202969ecfbd671c8399de00f4335f0",
+        "trace_drops": {
+          "zero_input_tokens": 17
+        },
+        "regime_label": "prod/io1/in256/out128/burst-poisson/copen",
+        "repeat_raw_data": [],
+        "promotion_rule": "pending-adit/promotion-rule",
+        "config_capture": "pending-adit",
+        "verified_at": "2026-09-02T00:00:00Z",
+        "replay_chunk_hash_size": 512,
+        "replay_self_timed": true,
+        "prefix_synthesized": true
+      },
+      "evidence": "illustrative",
+      "invalidated": null,
+      "notes": [
+        "delta_is_floor: BurstGPT has no prefix identity, so D1 synthesized unique blocks per request and the replay saw the LEAST reuse the real traffic could have had. +1.2% is a lower bound, never quotable as the gain."
+      ]
+    },
+    {
+      "schema_id": "gitm.playbook.row/v1",
+      "row_id": "ex5-scoreboard-not-production",
+      "identity": {
+        "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+        "model_revision": "95a723d0",
+        "gpu_sku": "NVIDIA H100 80GB",
+        "env": {
+          "schema_id": "pending-adit/env-capture",
+          "engine": "vllm",
+          "engine_version": "0.11.0",
+          "driver_version": null,
+          "torch_version": null,
+          "cuda_version": null
+        },
+        "regime": {
+          "source_kind": "scoreboard",
+          "trace": "artificialanalysis-fixed",
+          "requests": 1000,
+          "rate_rps": 1.0,
+          "io_ratio": 4.0,
+          "input_p50": 1024,
+          "input_p95": 1024,
+          "output_p50": 256,
+          "output_p95": 256,
+          "burstiness": 0.0,
+          "bin_s": 1.0,
+          "burstiness_defined": true,
+          "concurrency": null,
+          "in_envelope": true,
+          "notes": [
+            "fixed-length scoreboard condition; not production traffic"
+          ]
+        },
+        "knobs": {
+          "max_num_seqs": 64
+        }
+      },
+      "delta": {
+        "throughput_pct": 22.0,
+        "ttft_p99_ms": -9.0,
+        "itl_p99_ms": 0.1,
+        "repeats": 3,
+        "throughput_ci95_pct": null,
+        "latency_blowout": null
+      },
+      "provenance": {
+        "trace_source": "mooncake",
+        "trace_sha256": "8090d6a38401d280fd88112ba22007ff4354be59c986f4f6bcc250edd45a52dc",
+        "trace_drops": {},
+        "regime_label": "board/io4/in1k/out256/burst-flat/copen",
+        "repeat_raw_data": [],
+        "promotion_rule": "pending-adit/promotion-rule",
+        "config_capture": "pending-adit",
+        "verified_at": "2026-09-02T00:00:00Z",
+        "replay_chunk_hash_size": 512,
+        "replay_self_timed": true,
+        "prefix_synthesized": false
+      },
+      "evidence": "illustrative",
+      "invalidated": null,
+      "notes": [
+        "source_kind=scoreboard. The biggest claimed delta in the file, and it is gated out of every production lookup by equality, not by distance."
+      ]
+    }
+  ]
+}
