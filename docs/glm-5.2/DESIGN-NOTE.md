@@ -387,6 +387,12 @@ The step does not begin at layer 0 or end at layer 77.
 | E1  | `lm_head`           | GEMM (BF16), tall-skinny  | `[32,6144] × [6144,19360]`     | 7.61 GF  | **239.5 MB**  | memory |
 | E2  | `logits_all_gather` | collective (all-gather)   | `[32,19360] → [32,154880]` fp32 | 0 F     | **17.3 MB**   | memory |
 
+**Both vocabulary tensors shard, not just `lm_head`.** vLLM builds the input
+embedding as `VocabParallelEmbedding`, split by vocabulary across TP ranks the
+same way the output projection is, so `model_weight_bytes` divides both by `tp` —
+as the dense-MoE and hybrid families already do. A framework that replicated the
+input table instead would hold `tp × 1.9 GB / 2` more per node.
+
 **D0 reads what it selects, not the table** — 393 kB at 32 rows; the resident
 1.9 GB matters for the fit math, not the step. **E0 runs over `logits_rows`**, so
 at prefill it is one row per prompt and not the chunk. **E2 exists because E1 is
@@ -470,6 +476,10 @@ At B=32, S=8192, D=5 (the vendor recipe's `num_speculative_tokens`):
 | vanilla decode (D=0) | 1,591 | 0 | **1,591** | 67.34 GB | 16.254 ms |
 | MTP step (D=5) | 1,591 | 115 (5 × 23) | **1,706** | 112.77 GB | **28.135 ms** |
 | — the verify pass alone | 1,591 | — | 1,591 | 106.43 GB | 26.652 ms |
+
+Verify is the backbone at **6× the rows and the same node count** — more work per
+kernel, not more kernels. That is why its bytes rise (106.43 vs 67.34 GB) while
+its node count does not move.
 | — the draft chain alone | — | 115 | 115 | 6.34 GB | 1.483 ms |
 
 The backbone is the same **1,591 nodes in every row** — the 78 transformer layers
@@ -509,7 +519,7 @@ tokens by 1.8× at α=0.5.
 | α | 0.0 | 0.5 | 0.7 | 0.9 | break-even |
 | --- | --- | --- | --- | --- | --- |
 | accepted tokens/step, `(1−α⁶)/(1−α)` | 1.000 | 1.969 | 2.941 | 4.686 | **1.731** |
-| **tok/s** = `32 × Σ αⁱ ÷ 28.135 ms` | 1,137 | **2,239** | **3,345** | **5,329** | **α > 0.426** |
+| **tok/s** = `32 × Σ αⁱ ÷ 28.135 ms` | 1,137 | **2,239** | **3,345** | **5,329** | **α > 0.426**, where this row crosses 1,969 |
 | MTP off, for comparison = `32 ÷ 16.254 ms` | 1,969 | 1,969 | 1,969 | 1,969 | — |
 
 Each row divides its own token count by its own step time, which is what makes
