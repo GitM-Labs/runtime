@@ -488,7 +488,12 @@ resident and none of their kernels launch.
 - **Verify, +39.1 GB**, almost all one line: the expert union saturates, so 6× the
   rows costs 1.57× the expert bytes (163 → 256 distinct). KV read does **not**
   move — 0.43 GB either way, read per *sequence* — and neither does `lm_head`.
-- **The draft chain, +6.34 GB**, all of it new work. Each of 5 stages draws on a full 256-expert bank,
+- **The draft chain, +6.34 GB**, all of it new work. A stage is **0.297 ms** and
+  the chain is 5 of them: `moe_routed` 0.161 ms, `lm_head` 0.050, `mtp_eh_proj`
+  0.032, the rest of the attention block 0.054. The expert bank is **54 %** of a stage,
+  not all of it — the vocabulary projection (17 %) and the `[12288→6144]` fusion
+  (11 %) are another 28 % together, and neither gets cheaper for being a draft.
+  Itemised per node in **Appendix A.4**. Each of 5 stages draws on a full 256-expert bank,
   linear in D with no saturation to help, so **the draft is 5.3 % of the MTP step
   where a dense-draft model's would be 1–2 %**.
 
