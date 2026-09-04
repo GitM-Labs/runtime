@@ -1,0 +1,200 @@
+# zai-org/GLM-5.2 — GlmMoeDsaForCausalLM (MLA + DeepSeek Sparse Attention + MoE).
+# Source: https://huggingface.co/zai-org/GLM-5.2/blob/main/config.json
+# Read from config.json and model.safetensors.index.json only — no traces.
+
+name: zai-org/GLM-5.2
+family: glm_moe_dsa
+description: >
+  78 layers, hidden 6144, ~754B total / ~40B active per token. MLA attention
+  (kv_lora_rank 512, one latent shared across 64 query heads) with a DeepSeek
+  Sparse Attention lightning indexer selecting top-2048. IndexShare: only 21 of
+  78 layers compute the index; the other 57 reuse a neighbour's selection and
+  carry no indexer weights. First 3 layers dense, remaining 75 MoE (256 experts,
+  top-8, one shared). One MTP draft head. bf16 throughout.
+
+spec:
+  hidden: 6144
+  n_layers: 78
+  vocab: 154880
+
+  # MLA attention. head_dim (192) is the nope width; q_head_dim widens to
+  # 192+64=256, and v_head_dim (256) differs from it — score and value reads use
+  # different per-head widths. num_key_value_heads is 64 in the config but is a
+  # red herring: the cache holds one kv_lora_rank latent per token, shared across
+  # all 64 query heads, so KV traffic derives from kv_lora_rank, never 64*head_dim.
+  n_heads: 64
+  q_lora_rank: 2048
+  kv_lora_rank: 512
+  qk_nope_head_dim: 192
+  qk_rope_head_dim: 64
+  v_head_dim: 256
+
+  # DeepSeek Sparse Attention indexer. index_topk_freq 4 is the IndexShare period:
+  # one 'full' layer computes the top-2048 selection, the next three reuse it.
+  index_n_heads: 32
+  index_head_dim: 128
+  index_topk: 2048
+  index_topk_freq: 4
+  # Read verbatim from the checkpoint (period-4 past the dense prefix). The 'shared'
+  # layers physically carry no indexer weights — this schedule is proven, not fitted.
+  indexer_types:
+    - full
+    - full
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+    - full
+    - shared
+    - shared
+    - shared
+
+  # Mixture of experts. moe_intermediate_size 2048 per expert; the first 3 layers
+  # are dense FFN (intermediate_size 12288) with no router or experts.
+  n_routed_experts: 256
+  n_shared_experts: 1
+  num_experts_per_tok: 8
+  moe_intermediate_size: 2048
+  intermediate_size: 12288
+  first_k_dense_replace: 3
+  routed_scaling_factor: 2.5
+
+  # Multi-token prediction. One MTP module, invoked once per drafted token
+  # (EAGLE-style); the vendor recipe runs it 5 deep. index_share_for_mtp_iteration:
+  # the draft reuses the main model's selection, and the weight map agrees — the
+  # MTP block carries no indexer tensors, exactly like the 57 'shared' layers.
+  num_nextn_predict_layers: 1
+  index_share_for_mtp_iteration: true
+
+  # The bf16 release: no quantization_config, and 1.507 TB on disk matches an
+  # all-bf16 read. This is the model fact. It is NOT the deployment shape — the
+  # vendor ships and recommends zai-org/GLM-5.2-FP8 (753.33 GB), which is the
+  # `glm-5.2-fp8` entry beside this one and the one to plan against. Keep this
+  # entry for what it answers: what the unquantised model costs, and therefore
+  # what quantisation is actually worth.
+  weight_dtype: bf16
+  expert_dtype: bf16
+  kv_dtype: bf16
+  act_dtype: bf16
+
+  # fp32 even here. moe_router_dtype is a field of the base config, not of any
+  # quantisation config, so the router's precision is a property of the model and
+  # not of the deployment — the one op that does not follow weight_dtype on an
+  # otherwise uniformly-bf16 checkpoint.
+  op_dtype_overrides:
+    - [moe_router, fp32]
+
+provenance:
+  verified:
+    - claim: IndexShare is read from the weight map, not inferred
+      detail: >
+        model.safetensors.index.json carries indexer tensors (*.indexer.*) on
+        exactly the 21 layers whose indexer_types is 'full' (0,1,2,6,10,...,74)
+        and on none of the 57 'shared' layers. A shared layer that recomputed the
+        index would need those weights; it does not have them.
+    - claim: dense/sparse MLP split matches the tensor map
+      detail: >
+        Layers 0-2 carry no expert tensors (dense FFN); layers 3-77 and the MTP
+        layer carry experts.* and shared_experts.*. Matches first_k_dense_replace 3.
+    - claim: predicted weight bytes match the published checkpoint
+      detail: >
+        model.safetensors.index.json total_size is 1,506,659,919,872 B (1.507 TB)
+        across 282 shards. model_weight_bytes at bf16 lands within a few percent;
+        the residual is norms/biases and the coarse MTP roll-in.
+
+  estimated:
+    - field: index_share_for_mtp_iteration handling
+      value: MTP emitted as a shared (no-indexer) block
+      detail: >
+        The MTP layer carries indexer weights in the map, but the config sets
+        index_share_for_mtp_iteration=true, so the iteration reuses the main
+        model's index. Emitting the draft as a full-indexer block would over-
+        predict a scan the runtime skips; the alternative reading is a headroom
+        lever to check once a trace exists.
+    - field: MLA absorption (attn_kv_b vs attn_out_proj width)
+      value: unabsorbed — kv_b runs as its own GEMM, o_proj narrow
+      detail: >
+        The graph models MLA unabsorbed: attn_kv_b reconstructs per-head K/V from
+        the latent and attn_out_proj is n_heads*v_head_dim -> hidden (16384->6144).
+        A serving engine that absorbs MLA (the common vLLM decode path) folds W^UK
+        into the query and W^UV into the output, dropping attn_kv_b and doubling
+        attn_out_proj's input width to n_heads*kv_lora_rank (32768->6144). Same
+        resident weights either way (validated footprint holds), but the two
+        readings move attn_out_proj by 2x — which is exactly headroom item #3 to
+        settle against a capture: does the engine run absorbed MLA?
+
+  unmodelled:
+    - index_topk_freq as a *temporal* reuse across decode steps. Modelled here as
+      the spatial layer-group period (which the weight map proves); any additional
+      step-to-step reuse would only reduce indexer cost further.
+    - Absorbed-MLA decode. See the estimated entry above.
+    - Acceptance rate under MTP. The graph prices D drafts and a 1+D verify; the
+      fraction kept is a serving observable, not a config-derivable one.

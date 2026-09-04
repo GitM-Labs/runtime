@@ -10,12 +10,20 @@ from gitm.planner.roofline import BatchConfig, HardwareSpec, ShardingConfig
 
 
 def detect_family(cfg: dict[str, Any]) -> str:
-    """``"hybrid"`` | ``"sparse_moe"`` | ``"dense"`` for a HuggingFace config."""
+    """``"hybrid"`` | ``"glm_moe_dsa"`` | ``"sparse_moe"`` | ``"dense"`` for a config."""
+    from gitm.planner.glm_graph import is_glm_moe_dsa_config
     from gitm.planner.hybrid_graph import is_hybrid_moe_config
     from gitm.planner.moe_graph import is_sparse_moe_config
 
+    # The hybrid guard reads ``num_experts``; GLM and V4 both spell it
+    # ``n_routed_experts``, so they fall through it. GLM must be tested *before*
+    # sparse_moe: both carry ``index_topk`` + ``n_routed_experts``, so the
+    # structural sparse-MoE test would claim GLM first — the model_type check is
+    # the clean separator and has to win.
     if is_hybrid_moe_config(cfg):
         return "hybrid"
+    if is_glm_moe_dsa_config(cfg):
+        return "glm_moe_dsa"
     if is_sparse_moe_config(cfg):
         return "sparse_moe"
     return "dense"
@@ -28,6 +36,10 @@ def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None):
         from gitm.planner.hybrid_graph import spec_from_hf_config as _hybrid
 
         return _hybrid(cfg, name=name)
+    if family == "glm_moe_dsa":
+        from gitm.planner.glm_graph import spec_from_hf_config as _glm
+
+        return _glm(cfg, name=name)
     if family == "sparse_moe":
         from gitm.planner.moe_graph import spec_from_hf_config as _sparse
 
@@ -61,15 +73,21 @@ def predict_for_config(
         from gitm.planner.hybrid_graph import spec_from_hf_config as _hybrid
 
         return predict_hybrid_graph(_hybrid(cfg, name=name), hw, batch, sharding), family
+    if family == "glm_moe_dsa":
+        from gitm.planner.glm_graph import predict_glm_graph
+        from gitm.planner.glm_graph import spec_from_hf_config as _glm
+
+        return predict_glm_graph(_glm(cfg, name=name), hw, batch, sharding), family
     if family == "sparse_moe":
         from gitm.planner.moe_graph import predict_moe_graph
         from gitm.planner.moe_graph import spec_from_hf_config as _sparse
 
         return predict_moe_graph(_sparse(cfg, name=name), hw, batch, sharding), family
     raise NotImplementedError(
-        f"{name or 'this checkpoint'} is neither a hybrid linear-attention MoE nor a "
-        "DeepSeek-V4-class sparse-MoE checkpoint. The dense graph models it, but has "
-        "no config reader — construct a ModelSpec and call predict_graph directly."
+        f"{name or 'this checkpoint'} is neither a hybrid linear-attention MoE, a "
+        "GLM-5.2-class glm_moe_dsa, nor a DeepSeek-V4-class sparse-MoE checkpoint. The "
+        "dense graph models it, but has no config reader — construct a ModelSpec and "
+        "call predict_graph directly."
     )
 
 
@@ -102,6 +120,12 @@ def add_plan_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="Context already cached before this chunk (0 for a first chunk).")
     ap.add_argument("--prefill-requests", type=int, default=1,
                     help="How many prompts those tokens belong to — sets lm_head rows.")
+    ap.add_argument("--spec-tokens", type=int, default=0,
+                    help="Speculative (MTP) draft tokens per step. Adds a D-deep "
+                         "draft chain and makes the backbone a 1+D-row verify.")
+    ap.add_argument("--acceptance-rate", type=float, default=0.0,
+                    help="Fraction of drafted tokens the verifier keeps. Only "
+                         "affects the reported token rate, never the step floor.")
     ap.add_argument("--launch-overhead", type=float, default=None,
                     help="Seconds per dependent kernel launch. Default 2e-6 "
                          "(CUDA-graph replay); eager is nearer 5e-6, and the "
@@ -164,6 +188,10 @@ def _predict(spec, family: str, hw, batch, sharding):
         from gitm.planner.hybrid_graph import predict_hybrid_graph
 
         return predict_hybrid_graph(spec, hw, batch, sharding)
+    if family == "glm_moe_dsa":
+        from gitm.planner.glm_graph import predict_glm_graph
+
+        return predict_glm_graph(spec, hw, batch, sharding)
     from gitm.planner.moe_graph import predict_moe_graph
 
     return predict_moe_graph(spec, hw, batch, sharding)
@@ -235,16 +263,36 @@ def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
         )
 
     n_compute = sum(1 for n in g.nodes if n.prediction.bound == "compute")
+    n_launch = sum(1 for n in g.nodes if n.prediction.bound == "launch")
     out += [
         "",
         f"  floor {total * 1e3:.3f} ms/step   " + (
             f"{g.batch.prefill_tokens / total:,.0f} tok/s "
             f"prefilling {g.batch.prefill_tokens:,} tokens"
             if g.batch.is_prefill
-            else f"{g.batch.batch / total:,.0f} tok/s at batch {g.batch.batch}"
+            # ``tokens_per_step`` is the accepted-token count: the batch on a
+            # plain decode step, and the prefix-chain expectation once drafting is
+            # on. Reporting ``batch / total`` there would price D drafts and then
+            # credit none of them.
+            else f"{g.batch.tokens_per_step / total:,.0f} tok/s at batch "
+                 f"{g.batch.batch}"
+                 + (f", D={g.batch.speculative_tokens} "
+                    f"alpha={g.batch.acceptance_rate:g}"
+                    if g.batch.speculative_tokens > 0 else "")
         ),
-        f"  {len(g.nodes)} nodes, {n_compute} compute-bound",
+        f"  {len(g.nodes)} nodes, {n_compute} compute-bound, "
+        f"{n_launch} launch-bound",
     ]
+    if any(b for b in bounds.values() if len(b) > 1):
+        out.append("  * this op's instances do not share a bound — the label is "
+                   "the majority one")
+    if g.batch.speculative_tokens > 0 and g.batch.acceptance_rate <= 0:
+        # A speculative step with no acceptance rate given prices the work and
+        # reports one accepted token, which is the floor rather than the outcome.
+        out.append(
+            f"  ! speculative step (D={g.batch.speculative_tokens}) with no "
+            "--acceptance-rate: the rate above assumes every draft is rejected"
+        )
     if g.has_unpriced_collectives:
         out.append("  ! collectives unpriced — this SKU has no interconnect bandwidth "
                    "in the catalogue")
@@ -314,7 +362,10 @@ def main(argv: list[str] | None = None) -> int:
               f"kv_len={args.kv_len}, TP={args.tp} EP={args.ep}")
         print(f"  {'batch':>7s} {'ms/step':>10s} {'tok/s':>12s} {'compute-bound':>14s}")
         for b in sizes:
-            g = _predict(spec, family, hw, BatchConfig(batch=b, kv_cache_len=args.kv_len),
+            g = _predict(spec, family, hw,
+                         BatchConfig(batch=b, kv_cache_len=args.kv_len,
+                                     speculative_tokens=args.spec_tokens,
+                                     acceptance_rate=args.acceptance_rate),
                          sharding)
             cb = sum(1 for n in g.nodes if n.prediction.bound == "compute")
             print(f"  {b:7d} {g.total_pred_s * 1e3:9.3f} "
@@ -323,6 +374,8 @@ def main(argv: list[str] | None = None) -> int:
 
     batch = BatchConfig(
         batch=args.batch, kv_cache_len=args.kv_len,
+        speculative_tokens=args.spec_tokens,
+        acceptance_rate=args.acceptance_rate,
         prefill_tokens=args.prefill_tokens, prefill_context=args.prefill_context,
         prefill_requests=args.prefill_requests,
     )
@@ -339,6 +392,8 @@ def main(argv: list[str] | None = None) -> int:
             "hardware": hw.name,
             "sharding": {"tp": args.tp, "ep": args.ep, "dp": args.dp},
             "batch": {"batch": args.batch, "kv_cache_len": args.kv_len,
+                      "speculative_tokens": args.spec_tokens,
+                      "acceptance_rate": args.acceptance_rate,
                       "prefill_tokens": args.prefill_tokens,
                       "prefill_context": args.prefill_context,
                       "prefill_requests": args.prefill_requests},

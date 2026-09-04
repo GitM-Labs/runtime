@@ -18,7 +18,12 @@ jobs:
         with:
           fetch-depth: 0 # Fetches full history so git diff can calculate cleanly
 
+      # Advisory, so an upstream outage must not block a PR. This action exits
+      # non-zero when the Gemini API answers 503 "experiencing high demand",
+      # which it did five times on PR #104 alone — a red check that says nothing
+      # about the branch. The review still posts when the API answers.
       - name: Run Gemini Code Review
+        continue-on-error: true
         uses: sshnaidm/gemini-code-review-action@v2
         with:
           gemini-key: ${{ secrets.GEMINI_API_KEY }}

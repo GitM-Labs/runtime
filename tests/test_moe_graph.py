@@ -410,7 +410,9 @@ def test_tokens_per_step_accounts_for_acceptance():
     """Drafts are paid for always and counted only when kept."""
     b = BatchConfig(batch=4, speculative_tokens=3, acceptance_rate=0.5)
     assert b.positions_per_step == 16  # all drafted work is computed
-    assert b.tokens_per_step == pytest.approx(4 * (1 + 3 * 0.5))
+    # A prefix chain, not 1 + D*alpha: the verifier stops at the first rejection,
+    # so token k counts only if 1..k-1 did.
+    assert b.tokens_per_step == pytest.approx(4 * (1 + 0.5 + 0.25 + 0.125))
 
 
 # ── the observed side lines up with the predicted side ──────────────────────
@@ -1158,6 +1160,10 @@ def test_defaults_do_not_match_any_catalogued_checkpoint():
     """Stronger than a size bound: no field-by-field match with a real entry."""
     d = HybridMoEModelSpec()
     for entry in available():
+        # Only hybrid entries are HybridMoEModelSpecs; other families (glm_moe_dsa,
+        # sparse_moe) have their own reference-default tests and their own fields.
+        if load_entry(entry).get("family") != "hybrid":
+            continue
         hybrid_spec = load_spec(entry)
         assert (hybrid_spec.hidden, hybrid_spec.n_layers, hybrid_spec.num_experts) != (
             d.hidden, d.n_layers, d.num_experts

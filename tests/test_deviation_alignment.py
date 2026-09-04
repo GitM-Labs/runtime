@@ -38,7 +38,12 @@ def test_classify_op():
     assert classify_op("triton_qkv_proj_gemm") == "qkv_proj"
     assert classify_op("cutlass_down_proj_kernel") == "mlp_down"
     assert classify_op("lm_head_logits") == "lm_head"
-    assert classify_op("triton_rms_norm") is None  # not a modeled op
+    # Modelled since the GLM-5.2 graph began emitting the pointwise work: on a
+    # sparse model at low batch the norms are most of the launches, and a step
+    # bounded by its launches cannot be explained by a graph of GEMMs alone.
+    # All three norm sites in a block share this op — they are one kernel name,
+    # and only an NVTX range can say which site a launch belongs to.
+    assert classify_op("triton_rms_norm") == "rms_norm"
 
 
 def test_classify_op_matches_real_vllm_kernel_names():

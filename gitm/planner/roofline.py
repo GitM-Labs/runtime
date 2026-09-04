@@ -609,8 +609,23 @@ class BatchConfig:
 
         Always at least ``batch``: the non-speculative token is verified, not
         drafted, so it is never rejected.
+
+        The speculative term is a **prefix chain**, not a product. A verifier
+        walks the draft in order and stops at the first rejection, so draft token
+        *k* is kept only if 1…*k*-1 were also kept: the expectation is
+        ``sum(alpha**i for i in 0..D)``, not ``1 + D*alpha``. The two are far
+        apart where it matters — at D=5, alpha=0.5 the linear form claims 3.5
+        accepted tokens against a real 1.97, overstating throughput 1.8x and
+        putting break-even at less than a third of its true value.
+
+        This models a single-chain verifier (EAGLE/MTP-style), which is what every
+        family here drafts with. A tree-attention scheme that verifies several
+        candidate continuations at once accepts more than one chain and would need
+        its own term.
         """
-        return self.batch * (1.0 + max(0, self.speculative_tokens) * self.acceptance_rate)
+        d = max(0, self.speculative_tokens)
+        a = self.acceptance_rate
+        return self.batch * sum(a ** i for i in range(d + 1))
 
 
 @dataclass(frozen=True)
