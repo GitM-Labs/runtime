@@ -29,9 +29,6 @@ nvidia = ["pynvml>=11.5"]
 # fallback (pandas). On a GPU box the harness runs on cuDF/CuPy instead — those
 # install from the RAPIDS channel, not PyPI, so they are not listed here.
 bench = ["pyarrow>=15", "pandas>=2.0"]
-# install that pins its own torch, and both must be built for a CUDA major the
-# HOST driver supports — see gitm/cuda_env.py, which checks exactly that.
-#
 vllm = ["vllm>=0.23.0"]
 # Full GPU stack for the real HFT path in two commands: cuDF/CuPy (RAPIDS) +
 # the CUPTI/runtime wheels the tracer shim links + NVML telemetry + the Parquet
