@@ -1,0 +1,7 @@
+Timestamp,Session ID,Elapsed time,Model,Request tokens,Response tokens,Total tokens,Log Type
+10,3f2a7c11-0000-4000-8000-000000000001,5,ChatGPT,100,50,150,Conversation log
+20,,3,ChatGPT,200,60,260,API log
+30,3f2a7c11-0000-4000-8000-000000000001,zzz,ChatGPT,120,40,160,Conversation log
+40,3f2a7c11-0000-4000-8000-000000000002,7,ChatGPT,0,0,0,Conversation log
+50,3f2a7c11-0000-4000-8000-000000000002
+35,3f2a7c11-0000-4000-8000-000000000003,2,ChatGPT,80,20,100,Conversation log

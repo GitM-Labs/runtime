@@ -1,0 +1,28 @@
+schema: gitm.bench.manifest/v1
+benchmark: traffic_replay
+dataset_root: traffic_replay/fixtures
+generated_by_gitm: 0.1.13
+file_count: 7
+total_bytes: 150941
+files:
+- path: benchserve_result.json
+  sha256: a780cd29916523c38c12ca833e92896bc75c93b6f94d92826ad10f440e2e35a4
+  bytes: 1045
+- path: burstgpt3_dirty.csv
+  sha256: 6b78a95497587a539f0f10fd0db4eb2a56aadf1af69c3f3eb058ba1c4cee73fd
+  bytes: 474
+- path: burstgpt3_slice.csv
+  sha256: 5465fc4c38b0815b8f75d126a120c229ae93632d62e3adf1792f5e8401a73559
+  bytes: 34278
+- path: burstgpt_dirty.csv
+  sha256: 8002d35e1b3ab5bd1169426036d3e7af93c08acd453bb879391eac752e210bc5
+  bytes: 372
+- path: burstgpt_slice.csv
+  sha256: 7865fda5dac50938a84dfccb06c405e2f5202969ecfbd671c8399de00f4335f0
+  bytes: 16840
+- path: mooncake_dirty.jsonl
+  sha256: 483a2e36924902f4bf7fc52ca29d73897918e04e9c30abd521b13852432621a0
+  bytes: 639
+- path: mooncake_slice.jsonl
+  sha256: 8090d6a38401d280fd88112ba22007ff4354be59c986f4f6bcc250edd45a52dc
+  bytes: 97293
