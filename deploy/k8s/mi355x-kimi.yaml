@@ -126,6 +126,12 @@ spec:
               value: moonshotai/Kimi-K2.5
             - name: HF_HOME
               value: /weights/hf
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+                  optional: true
             # --- GITM tracer hook. Dormant until the gitm container arms. ---
             # The HIP runtime (rocprofiler-register) loads this tool into every
             # process that initializes HIP — the AMD equivalent of
