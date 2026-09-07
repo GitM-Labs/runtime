@@ -1,46 +1,67 @@
-# GITM reproducible runtime image — ROCm variant, for MI300X/MI355X hosts.
+# GITM reproducible runtime image — ROCm variant, for MI300X/MI355X clusters.
 #
-# Same contract as the CUDA Dockerfile: build ONCE, push, share the *digest*.
-# The base must be a ROCm >= 6.2 image (rocprofiler-sdk is the tracer's
-# collection API); MI355X (gfx950) needs ROCm 7.x. Keep the ROCm minor version
-# aligned with the serving image the tracer tool gets copied into
-# (deploy/k8s/mi355x-kimi.yaml copies libgitm_rocm_inject.so across containers,
-# so its rocprofiler-sdk ABI must match the serving runtime's).
+# Deliberately NOT based on rocm/pytorch (~30GB): the gitm harness needs no
+# torch and no GPU math stack. What this image must provide is exactly:
+#   * python + the gitm package (small CPU wheels only — see pyproject extras),
+#   * a C compiler + rocprofiler-sdk headers/lib to COMPILE the tracer tool,
+#   * librocprofiler-sdk.so so the sidecar's clock reads (injection.clock_now)
+#     resolve at run time.
+# The tool itself executes inside the SERVING container (vLLM's own ROCm),
+# where its rpath resolves that container's /opt/rocm/lib — so what must stay
+# aligned is ROCM_VERSION below vs the serving image's ROCm minor
+# (`cat /opt/rocm/.info/version` in a running vllm pod tells you its version).
 #
-#   docker build -f Dockerfile.rocm -t <registry>/gitm-rocm:<tag> .
-#   docker push <registry>/gitm-rocm:<tag>
-#   docker inspect --format='{{index .RepoDigests 0}}' <registry>/gitm-rocm:<tag>
+#   docker buildx build --platform linux/amd64 -f Dockerfile.rocm \
+#       -t <registry>/gitm-rocm:<tag> --push .
+#   docker buildx imagetools inspect <registry>/gitm-rocm:<tag>   # digest to pin
 
-FROM rocm/pytorch:latest
-# ^ Pin to a dated tag before the first shared build (e.g. a rocm7.x_ubuntu24.04
-# _py3.12 tag); "latest" is only acceptable until the digest is frozen.
+FROM ubuntu:24.04
+
+# MI355X (gfx950) hosts run ROCm 7.x. Match the serving image's minor.
+ARG ROCM_VERSION=7.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     ROCM_PATH=/opt/rocm \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
+# Base toolchain + AMD's apt repo, then rocprofiler-sdk ONLY — this pulls the
+# HSA runtime and rocprofiler-register as deps, not the multi-GB math libraries.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg build-essential \
+        python3 python3-venv python3-dev git \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+        | gpg --dearmor -o /etc/apt/keyrings/rocm.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main" \
+        > /etc/apt/sources.list.d/rocm.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        rocprofiler-sdk \
+    && rm -rf /var/lib/apt/lists/*
+
+# Ubuntu 24.04 marks the system python externally-managed; a venv keeps pip
+# ordinary and the image layout obvious.
+RUN python3 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+
 WORKDIR /opt/gitm
 
 # The package + its CPU deps, pinned via constraints.txt for reproducibility.
-# No [nvidia] extra here — torch/ROCm comes from the base image.
 COPY pyproject.toml constraints.txt README.md ./
 COPY gitm ./gitm
 COPY benchmarks ./benchmarks
 COPY tests ./tests
 COPY docs ./docs
 COPY scripts ./scripts
-RUN python -m pip install -e ".[dev,bench]" -c constraints.txt
+RUN pip install -e ".[dev,bench]" -c constraints.txt
 
 # Build the ROCm tracer tool against this image's rocprofiler-sdk.
 RUN python -m gitm.tracer._rocm.build
 
 # Freeze the fully-resolved stack into the image for auditing / exact re-pin.
-RUN python -m pip freeze > /opt/gitm/requirements.lock
+RUN pip freeze > /opt/gitm/requirements.lock
 
 # Same sealed/least-privilege runtime as the CUDA image: uid 10001, no root.
-# GPU access comes from the device plugin's mounts + the pod's video/render
-# supplementalGroups, not from privilege here.
 RUN useradd --create-home --uid 10001 gitm \
     && chown -R gitm:gitm /opt/gitm
 USER gitm
