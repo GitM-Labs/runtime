@@ -674,7 +674,7 @@ def apply_tracing_env(env, trace_path, *, nvtx: bool, no_trace: bool) -> None:
     from gitm.tracer import injection
 
     if no_trace:
-        for var in (injection.ENV_LIB, injection.ENV_OUT,
+        for var in (injection.ENV_LIB, injection.ENV_ROCP, injection.ENV_OUT,
                     injection.ENV_NVTX, injection.ENV_NVTX_INJECT):
             env.pop(var, None)
         return
@@ -741,21 +741,29 @@ def launch_and_capture(args, serve_argv: list[str] | None = None):
         return 0, None
 
     apply_tracing_env(os.environ, trace_path, nvtx=nvtx, no_trace=no_trace)
+    vendor = injection.active_vendor()
     if no_trace:
-        print("==> tracing OFF (baseline arm): no CUPTI collection, no trace written")
+        print("==> tracing OFF (baseline arm): no collection, no trace written")
+    elif vendor == "amd":
+        print(f"==> {injection.ENV_ROCP}={os.environ[injection.ENV_ROCP]}")
     else:
-        print(f"==> {injection.ENV_LIB}={os.environ[injection.ENV_LIB]}")
+        print(f"==> {injection.ENV_LIB}={os.environ.get(injection.ENV_LIB, '')}")
     if nvtx:
-        # Report the NVTX injection path rather than assuming it. run_env sets it
-        # only when a libcupti was resolved, and a missing one is the failure that
-        # produces a trace full of markerless kernels with no error anywhere.
-        inject = os.environ.get(injection.ENV_NVTX_INJECT)
         print(f"==> {injection.ENV_NVTX}=1")
-        if inject:
-            print(f"==> {injection.ENV_NVTX_INJECT}={inject}")
+        if vendor == "amd":
+            # No second variable exists on AMD: rocTX ranges reach the injected
+            # tool through rocprofiler's own marker service.
+            pass
         else:
-            print(f"!!! {injection.ENV_NVTX_INJECT} unresolved — NVTX will hand no "
-                  "ranges to CUPTI and every kernel will come back unattributed")
+            # Report the NVTX injection path rather than assuming it. run_env sets
+            # it only when a libcupti was resolved, and a missing one is the failure
+            # that produces a trace full of markerless kernels with no error anywhere.
+            inject = os.environ.get(injection.ENV_NVTX_INJECT)
+            if inject:
+                print(f"==> {injection.ENV_NVTX_INJECT}={inject}")
+            else:
+                print(f"!!! {injection.ENV_NVTX_INJECT} unresolved — NVTX will hand no "
+                      "ranges to CUPTI and every kernel will come back unattributed")
 
     base = f"http://{args.host}:{args.port}"
     cmd = list(serve_argv)

@@ -1,0 +1,48 @@
+# GITM reproducible runtime image — ROCm variant, for MI300X/MI355X hosts.
+#
+# Same contract as the CUDA Dockerfile: build ONCE, push, share the *digest*.
+# The base must be a ROCm >= 6.2 image (rocprofiler-sdk is the tracer's
+# collection API); MI355X (gfx950) needs ROCm 7.x. Keep the ROCm minor version
+# aligned with the serving image the tracer tool gets copied into
+# (deploy/k8s/mi355x-kimi.yaml copies libgitm_rocm_inject.so across containers,
+# so its rocprofiler-sdk ABI must match the serving runtime's).
+#
+#   docker build -f Dockerfile.rocm -t <registry>/gitm-rocm:<tag> .
+#   docker push <registry>/gitm-rocm:<tag>
+#   docker inspect --format='{{index .RepoDigests 0}}' <registry>/gitm-rocm:<tag>
+
+FROM rocm/pytorch:latest
+# ^ Pin to a dated tag before the first shared build (e.g. a rocm7.x_ubuntu24.04
+# _py3.12 tag); "latest" is only acceptable until the digest is frozen.
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    ROCM_PATH=/opt/rocm \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /opt/gitm
+
+# The package + its CPU deps, pinned via constraints.txt for reproducibility.
+# No [nvidia] extra here — torch/ROCm comes from the base image.
+COPY pyproject.toml constraints.txt README.md ./
+COPY gitm ./gitm
+COPY benchmarks ./benchmarks
+COPY tests ./tests
+COPY docs ./docs
+COPY scripts ./scripts
+RUN python -m pip install -e ".[dev,bench]" -c constraints.txt
+
+# Build the ROCm tracer tool against this image's rocprofiler-sdk.
+RUN python -m gitm.tracer._rocm.build
+
+# Freeze the fully-resolved stack into the image for auditing / exact re-pin.
+RUN python -m pip freeze > /opt/gitm/requirements.lock
+
+# Same sealed/least-privilege runtime as the CUDA image: uid 10001, no root.
+# GPU access comes from the device plugin's mounts + the pod's video/render
+# supplementalGroups, not from privilege here.
+RUN useradd --create-home --uid 10001 gitm \
+    && chown -R gitm:gitm /opt/gitm
+USER gitm
+
+CMD ["./scripts/verify_infra.sh"]

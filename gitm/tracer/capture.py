@@ -54,11 +54,12 @@ def capture(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    injected = injection.active()
+    injected_vendor = injection.active_vendor()
+    injected = injected_vendor is not None
     backend = None if injected else _backend()
     started_ns = time.time_ns()
     if injected:
-        source = "cupti"
+        source = "rocprof" if injected_vendor == "amd" else "cupti"
     elif backend is not None:
         vendor = getattr(backend, "vendor", "") or ""
         if vendor == "amd":
@@ -72,8 +73,8 @@ def capture(
         workload_id=workload_id,
         fingerprint=fingerprint,
         run_id=run_id or uuid.uuid4().hex,
-        device_count=_device_count(backend, injected),
-        vendor="nvidia" if injected else (backend.vendor if backend else "none"),
+        device_count=_device_count(backend, injected_vendor),
+        vendor=injected_vendor if injected_vendor else (backend.vendor if backend else "none"),
         captured_at_ns=started_ns,
         duration_ns=0,
         source=source,  # type: ignore[arg-type]
@@ -90,13 +91,14 @@ def capture(
         # here), and unlinking it would silently redirect every kernel record into a
         # deleted inode.
         injection.clear_stale_shards()
-        window_start = injection.cupti_now()
+        window_start = injection.clock_now()
         if window_start is None:
             warnings.warn(
-                "injected capture cannot read the CUPTI clock, so the window can't "
+                "injected capture cannot read the record clock, so the window can't "
                 "be bounded: the trace will include everything the traced processes "
-                "did, including model load and CUDA-graph capture. Build the shim "
-                "(python -m gitm.tracer._cupti.build) to fix.",
+                "did, including model load and graph capture. Build the shim "
+                "(python -m gitm.tracer._cupti.build on NVIDIA; on AMD, check that "
+                "librocprofiler-sdk.so is loadable) to fix.",
                 stacklevel=2,
             )
         injection.arm()
@@ -118,7 +120,7 @@ def capture(
     finally:
         ended_ns = time.time_ns()
         if injected:
-            window_end = injection.cupti_now()
+            window_end = injection.clock_now()
             # Stay armed while other processes' in-flight CUPTI buffers land — we
             # can't reach into a child to force a flush, so we wait out its flush
             # period. Disarming first would drop the tail of the trace.
@@ -175,14 +177,19 @@ def write_trace_jsonl(path: str | Path, trace: Trace) -> None:
 _write_jsonl = write_trace_jsonl
 
 
-def _device_count(backend, injected: bool) -> int:
+def _device_count(backend, injected_vendor: str | None) -> int:
     """Device count for the trace header.
 
     Under injection we never construct a backend — collection belongs to the driver-
-    loaded library — but the compiled shim is still importable and counting devices
-    doesn't touch CUPTI's activity callbacks, so it stays safe to ask.
+    loaded library — but the compiled shim (NVIDIA) and the kfd topology (AMD) are
+    still readable, and neither touches the collector's activity callbacks, so it
+    stays safe to ask.
     """
-    if injected:
+    if injected_vendor == "amd":
+        from gitm.tracer import _rocm
+
+        counter = _rocm.device_count
+    elif injected_vendor is not None:
         from gitm.tracer._cupti import load_shim
 
         shim = load_shim()
