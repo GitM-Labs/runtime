@@ -56,6 +56,45 @@ def test_inactive_when_another_profiler_owns_the_injection_hook(run_env, monkeyp
 
 def test_active_with_our_lib_and_an_output(run_env):
     assert injection.active()
+    assert injection.active_vendor() == "nvidia"
+
+
+def test_active_vendor_amd_via_rocp_tool_libraries(tmp_path, monkeypatch):
+    """ROCP_TOOL_LIBRARIES is the AMD hook — colon-separated, and ours may ride
+    alongside another tool's entry without disowning the run."""
+    from gitm.tracer import _rocm
+
+    monkeypatch.delenv(injection.ENV_LIB, raising=False)
+    monkeypatch.setenv(injection.ENV_OUT, str(tmp_path / "trace.jsonl"))
+    monkeypatch.setenv(
+        injection.ENV_ROCP, f"/opt/other/libtool.so:/opt/gitm/{_rocm.LIB_NAME}"
+    )
+    assert injection.active_vendor() == "amd"
+
+
+def test_inactive_when_only_another_rocm_tool_is_listed(tmp_path, monkeypatch):
+    """rocprofv3 sets ROCP_TOOL_LIBRARIES too. Those records are not ours."""
+    monkeypatch.delenv(injection.ENV_LIB, raising=False)
+    monkeypatch.setenv(injection.ENV_OUT, str(tmp_path / "trace.jsonl"))
+    monkeypatch.setenv(injection.ENV_ROCP, "/opt/rocm/lib/librocprofv3-tool.so")
+    assert injection.active_vendor() is None
+
+
+def test_run_env_amd_sets_the_rocm_hook_and_no_nvtx_injection_path(tmp_path):
+    """On AMD, nvtx=True must NOT render NVTX_INJECTION64_PATH: rocTX reaches
+    the injected tool through rocprofiler's own marker service, and exporting
+    the NVIDIA variable would only mislead whoever reads the env."""
+    env = injection.run_env(tmp_path / "t.jsonl", nvtx=True, vendor="amd")
+    assert injection.ENV_ROCP in env
+    assert env[injection.ENV_NVTX] == "1"
+    assert injection.ENV_LIB not in env
+    assert injection.ENV_NVTX_INJECT not in env
+
+
+def test_run_env_nvidia_shape_is_unchanged(tmp_path):
+    env = injection.run_env(tmp_path / "t.jsonl", vendor="nvidia")
+    assert injection.ENV_LIB in env
+    assert injection.ENV_ROCP not in env
 
 
 # --------------------------------------------------------------------------- #
@@ -86,6 +125,20 @@ def test_window_filter_drops_records_outside_the_capture_window(run_env):
     events = injection.read_shards(start_ns=100, end_ns=200)
 
     assert [e.name for e in events] == ["decode_step"]
+
+
+def test_collector_drop_report_warns_and_is_not_an_event(run_env):
+    """The ROCm collector writes {"kind":"meta","dropped_records":N} when
+    rocprofiler drops records. It must surface as a loss warning, not decode as
+    an event and not count as a malformed line."""
+    shard = run_env.with_name(run_env.name + ".111")
+    shard.write_text(
+        json.dumps({"kind": "meta", "dropped_records": 7}) + "\n"
+        + _kernel("k", 100, 200) + "\n"
+    )
+    with pytest.warns(RuntimeWarning, match="7 record"):
+        events = injection.read_shards()
+    assert [e.name for e in events] == ["k"]
 
 
 def test_partial_trailing_line_from_a_killed_process_is_tolerated(run_env):

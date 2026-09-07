@@ -1,0 +1,199 @@
+# Kimi K2.5 on 8x MI355X with the GITM ROCm tracer — one `kubectl apply -f` unit.
+#
+# Architecture (one pod, because the tracer's arming protocol requires it):
+#
+#   initContainer  gitm-tool     copies libgitm_rocm_inject.so (built into the
+#                                gitm ROCm image) into the shared volume, so the
+#                                serving image needs no gitm install.
+#   container      sglang        serves Kimi K2.5; ROCP_TOOL_LIBRARIES makes the
+#                                HIP runtime load our collector into EVERY
+#                                process it spawns (scheduler + TP workers).
+#                                Writes trace shards to /scratch — only while
+#                                armed, so an idle server writes nothing.
+#   container      gitm          the harness. `kubectl exec` into it to run
+#                                benchmarks; gitm.tracer.capture() arms the
+#                                window by touching /scratch/trace/kimi.jsonl.arm
+#                                and merges the per-pid shards on close. Shard
+#                                and arm files must be the SAME files the server
+#                                sees — hence the shared emptyDir, hence one pod.
+#
+# Cluster prerequisites (once per cluster, not part of this file):
+#   * AMD GPU device plugin (exposes amd.com/gpu):
+#       kubectl create -f https://raw.githubusercontent.com/ROCm/k8s-device-plugin/master/k8s-ds-amdgpu-dp.yaml
+#   * A StorageClass able to provision RWO volumes >= 1.5Ti for the weights
+#     (Kimi K2.5 is ~600GB+ at its native precision; first pull is slow — the
+#     PVC keeps it across pod restarts).
+#
+# Before applying, replace:
+#   * REGISTRY/gitm-rocm@sha256:...   build from Dockerfile.rocm, pin by digest
+#   * SGLANG_IMAGE                    a ROCm gfx950 (MI35x) SGLang build — check
+#                                     lmsysorg/sglang -rocm / rocm/sgl-dev tags;
+#                                     ROCm minor version should match the gitm
+#                                     image so the copied tool's rocprofiler-sdk
+#                                     ABI matches the runtime's.
+#   * MODEL_ID                        confirm against `GET /v1/models` once up.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gitm-system
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kimi-weights
+  namespace: gitm-system
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1536Gi
+  # storageClassName: <set for your cluster>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kimi-k25-mi355x
+  namespace: gitm-system
+  labels:
+    app: kimi-k25
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # 8 GPUs + a 1.5Ti RWO volume: never two pods at once
+  selector:
+    matchLabels:
+      app: kimi-k25
+  template:
+    metadata:
+      labels:
+        app: kimi-k25
+    spec:
+      automountServiceAccountToken: false
+      # Required for correctness, not convenience: injection.clear_stale_shards
+      # decides whether a shard's owning process is alive with os.kill(pid, 0).
+      # Without a shared pid namespace the gitm container cannot see the
+      # server's pids, judges every live shard stale, and unlinks the file out
+      # from under a writing EngineCore — the empty-trace failure mode the
+      # injection docstring documents.
+      shareProcessNamespace: true
+      securityContext:
+        # /dev/kfd and /dev/dri (mounted by the device plugin) are group
+        # video/render on ROCm hosts.
+        supplementalGroups: [44, 110]
+      volumes:
+        - name: weights
+          persistentVolumeClaim:
+            claimName: kimi-weights
+        - name: scratch          # trace shards + arm file + the copied tool
+          emptyDir: {}
+        - name: dshm             # RCCL/tensor-parallel shared memory
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      initContainers:
+        - name: gitm-tool
+          image: REGISTRY/gitm-rocm@sha256:REPLACE_WITH_DIGEST
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              mkdir -p /scratch/lib /scratch/trace
+              cp "$(python -c 'from gitm.tracer._rocm import lib_path; print(lib_path())')" /scratch/lib/
+          volumeMounts:
+            - name: scratch
+              mountPath: /scratch
+      containers:
+        - name: sglang
+          image: SGLANG_IMAGE
+          command: ["python3", "-m", "sglang.launch_server"]
+          args:
+            - --model-path=$(MODEL_ID)
+            - --tp=8
+            - --trust-remote-code
+            - --host=0.0.0.0
+            - --port=8000
+            # Kimi K2.5's MTP head, via SGLang's NextN-style speculative path.
+            # Without these the server decodes autoregressively and streams
+            # avg_decoded_tokens_per_iter: 1.0 — plain decode, no spec decode
+            # experiment. Acceptance shows up in that same field (>1.0).
+            - --speculative-algorithm=NEXTN
+            - --speculative-num-steps=1
+            - --speculative-eagle-topk=1
+            - --speculative-num-draft-tokens=2
+          env:
+            - name: MODEL_ID
+              value: moonshotai/Kimi-K2.5
+            - name: HF_HOME
+              value: /weights/hf
+            # --- GITM tracer hook. Dormant until the gitm container arms. ---
+            # The HIP runtime (rocprofiler-register) loads this tool into every
+            # process that initializes HIP — the AMD equivalent of
+            # CUDA_INJECTION64_PATH, inherited by all TP worker children.
+            - name: ROCP_TOOL_LIBRARIES
+              value: /scratch/lib/libgitm_rocm_inject.so
+            - name: GITM_TRACE_OUT
+              value: /scratch/trace/kimi.jsonl
+            # Correlation (HIP-API + rocTX records) costs real throughput.
+            # Leave it "0" for clean perf numbers; set "1" only for the runs
+            # whose job is layer/op attribution, and restart the pod — it is
+            # read once at HIP init. (No NVTX_INJECTION64_PATH analog exists:
+            # rocTX flows through the same tool.)
+            - name: GITM_TRACE_NVTX
+              value: "0"
+          ports:
+            - containerPort: 8000
+          resources:
+            limits:
+              amd.com/gpu: 8
+          volumeMounts:
+            - name: weights
+              mountPath: /weights
+            - name: scratch
+              mountPath: /scratch
+            - name: dshm
+              mountPath: /dev/shm
+          startupProbe:
+            httpGet: { path: /health, port: 8000 }
+            # ~600GB of weights: allow up to 60min for first load from cold PVC
+            periodSeconds: 30
+            failureThreshold: 120
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+        - name: gitm
+          image: REGISTRY/gitm-rocm@sha256:REPLACE_WITH_DIGEST
+          # The harness idles; runs are launched by hand (or by a Job) with:
+          #   kubectl exec -it deploy/kimi-k25-mi355x -c gitm -- \
+          #     python -m gitm.bench ... --endpoint http://localhost:8000
+          # capture() arms/merges against the same /scratch the server writes.
+          command: ["sleep", "infinity"]
+          env:
+            - name: GITM_TRACE_OUT
+              value: /scratch/trace/kimi.jsonl
+            - name: GITM_SCRATCH
+              value: /scratch
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            limits:
+              cpu: "8"
+              memory: 32Gi
+          volumeMounts:
+            - name: scratch
+              mountPath: /scratch
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kimi-k25
+  namespace: gitm-system
+spec:
+  selector:
+    app: kimi-k25
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

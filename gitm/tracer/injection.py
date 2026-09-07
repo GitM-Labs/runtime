@@ -33,10 +33,17 @@ from pathlib import Path
 from gitm.tracer.schema import TraceEvent
 
 ENV_LIB = "CUDA_INJECTION64_PATH"
+#: The AMD loading hook: rocprofiler-register (in the HIP runtime, ROCm >= 6.2)
+#: dlopens every library listed here at HIP init — the same inherited-env,
+#: follows-children property CUDA_INJECTION64_PATH has. Colon-separated list.
+ENV_ROCP = "ROCP_TOOL_LIBRARIES"
 ENV_OUT = "GITM_TRACE_OUT"
-#: Turns on RUNTIME/DRIVER/MARKER collection in the collector (cupti_core.c).
+#: Turns on RUNTIME/DRIVER/MARKER collection in the collector (cupti_core.c),
+#: and HIP-API/rocTX collection in the ROCm one (rocm_inject.c).
 ENV_NVTX = "GITM_TRACE_NVTX"
 #: Read by NVTX itself, not by us and not by the CUDA driver — see run_env().
+#: NVIDIA-only: rocTX markers reach the ROCm collector through its own marker
+#: tracing service, so the two-mechanism split does not exist on AMD.
 ENV_NVTX_INJECT = "NVTX_INJECTION64_PATH"
 ENV_SETTLE = "GITM_TRACE_SETTLE_S"
 
@@ -57,14 +64,40 @@ def lib_path() -> Path:
     return Path(_cupti.__file__).resolve().parent / LIB_NAME
 
 
-def active() -> bool:
-    """True when this run is being collected by our injection library.
-    Checks that the injection path actually points at ``libgitm_inject.so``: another
-    profiler (nsys sets this variable too) means the trace is not ours to merge, and
-    we must not silently claim its records or skip our own in-process collection.
+def rocm_lib_path() -> Path:
+    """Where the ROCm injection tool is built, whether or not it exists yet."""
+    from gitm.tracer import _rocm
+
+    return _rocm.lib_path()
+
+
+def active_vendor() -> str | None:
+    """``"nvidia"``/``"amd"`` when this run is collected by OUR injected library,
+    else ``None``.
+
+    Checks that the hook actually points at our library: another profiler
+    (nsys sets ``CUDA_INJECTION64_PATH`` too; rocprofv3 sets
+    ``ROCP_TOOL_LIBRARIES``) means the trace is not ours to merge, and we must
+    not silently claim its records or skip our own in-process collection.
+    ``ROCP_TOOL_LIBRARIES`` is a colon-separated list, so ours may ride
+    alongside another tool's entry.
     """
+    if not os.environ.get(ENV_OUT):
+        return None
     lib = os.environ.get(ENV_LIB, "")
-    return bool(lib) and Path(lib).name == LIB_NAME and bool(os.environ.get(ENV_OUT))
+    if lib and Path(lib).name == LIB_NAME:
+        return "nvidia"
+    from gitm.tracer._rocm import LIB_NAME as ROCM_LIB_NAME
+
+    for entry in os.environ.get(ENV_ROCP, "").split(":"):
+        if entry and Path(entry).name == ROCM_LIB_NAME:
+            return "amd"
+    return None
+
+
+def active() -> bool:
+    """True when this run is being collected by our injection library."""
+    return active_vendor() is not None
 
 
 def libcupti_path() -> Path | None:
@@ -83,20 +116,47 @@ def libcupti_path() -> Path | None:
     return so if so.exists() else None
 
 
-def run_env(out_path: str | Path, *, nvtx: bool = False) -> dict[str, str]:
+def detect_vendor() -> str:
+    """``"amd"`` on a ROCm box, else ``"nvidia"``.
+
+    kfd topology is the ground truth for AMD GPUs and exists without any
+    library loaded; NVIDIA stays the default so a CPU-only dev box renders the
+    same env it always has.
+    """
+    from gitm.tracer import _rocm
+
+    return "amd" if _rocm.device_count() > 0 else "nvidia"
+
+
+def run_env(
+    out_path: str | Path, *, nvtx: bool = False, vendor: str | None = None
+) -> dict[str, str]:
     """The environment a traced run needs, ready to export.
 
     ``nvtx`` additionally turns on the correlation records that resolve an
-    anonymous GEMM to a layer and an op. It sets two variables, and the second
-    is the one nobody guesses: **NVTX and CUDA injection are separate
-    mechanisms.** ``CUDA_INJECTION64_PATH`` is read by the CUDA driver and is
-    how our collector gets loaded; NVTX is header-only and consults
+    anonymous GEMM to a layer and an op.
+
+    On NVIDIA it sets two variables, and the second is the one nobody guesses:
+    **NVTX and CUDA injection are separate mechanisms.**
+    ``CUDA_INJECTION64_PATH`` is read by the CUDA driver and is how our
+    collector gets loaded; NVTX is header-only and consults
     ``NVTX_INJECTION64_PATH`` to decide which tool receives push/pop. Enabling
     ``CUPTI_ACTIVITY_KIND_MARKER`` gives CUPTI somewhere to put ranges but does
     not make NVTX hand them over — verified on a B200, where markers stayed at
     zero until this was set.
+
+    On AMD there is deliberately no third variable: rocTX push/pop (what
+    ``torch.cuda.nvtx`` maps to under ROCm) is delivered to the SAME injected
+    tool by rocprofiler-sdk's marker tracing service, so ``GITM_TRACE_NVTX=1``
+    alone flips correlation on. ``vendor`` overrides autodetection for tests
+    and for rendering an env on a machine other than the one that will run it.
     """
-    env = {ENV_LIB: str(lib_path()), ENV_OUT: str(Path(out_path).resolve())}
+    out = str(Path(out_path).resolve())
+    if (vendor or detect_vendor()) == "amd":
+        return {ENV_ROCP: str(rocm_lib_path()), ENV_OUT: out} | (
+            {ENV_NVTX: "1"} if nvtx else {}
+        )
+    env = {ENV_LIB: str(lib_path()), ENV_OUT: out}
     if nvtx:
         env[ENV_NVTX] = "1"
         cupti = libcupti_path()
@@ -238,6 +298,7 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
 
     records: list[dict] = []
     dropped_lines = 0
+    collector_drops = 0
     for shard in shard_paths():
         try:
             text = shard.read_text(encoding="utf-8", errors="replace")
@@ -274,6 +335,13 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
             if rec.get("kind") in ("marker", "runtime"):
                 records.append(rec)
                 continue
+            # In-band loss report from the ROCm collector (rocprofiler-sdk
+            # counts drops; CUPTI never told us). Not an event — surface it.
+            if rec.get("kind") == "meta":
+                drops = rec.get("dropped_records")
+                if isinstance(drops, int):
+                    collector_drops += drops
+                continue
 
             ts = rec.get("start_ns")
             if not isinstance(ts, int):
@@ -289,6 +357,14 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
         warnings.warn(
             f"injected trace coverage: dropped {dropped_lines} malformed or incomplete "
             "shard line(s)",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if collector_drops:
+        warnings.warn(
+            f"injected trace coverage: the collector reported {collector_drops} "
+            "record(s) dropped before reaching the shard — the trace is lossy; "
+            "raise GITM_TRACE_FLUSH_MS frequency or the buffer size",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -323,3 +399,19 @@ def cupti_now() -> int | None:
     except Exception:
         return None
     return ts or None
+
+
+def clock_now() -> int | None:
+    """The record-clock reading for whichever vendor's collector is injected.
+
+    NVIDIA reads through the CUPTI shim, AMD through
+    ``rocprofiler_get_timestamp`` (ctypes, no HIP init) — each the same clock
+    its collector stamps records with, which is the whole point: the window
+    bounds and the record timestamps must share a domain or the filter
+    silently drops everything.
+    """
+    if active_vendor() == "amd":
+        from gitm.tracer import _rocm
+
+        return _rocm.timestamp()
+    return cupti_now()
