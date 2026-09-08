@@ -1,0 +1,17 @@
+# Both Dockerfiles COPY only: pyproject.toml constraints.txt README.md
+# gitm/ benchmarks/ tests/ docs/ scripts/ deploy/. Everything else is dead
+# weight in the build context (vllm/ alone is ~400MB).
+.git
+vllm
+evidence
+assets
+harness
+runtime-experiment-harness
+telemetry
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+*.egg-info
+dist
+build

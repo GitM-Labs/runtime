@@ -40,8 +40,11 @@ def test_no_clusterrole_binding_grants_api_access():
 
 
 def test_container_runs_as_non_root_user():
-    text = (_ROOT / "Dockerfile").read_text()
-    # a USER directive that isn't root, appearing after the build steps
-    user_lines = [ln for ln in text.splitlines() if ln.strip().startswith("USER ")]
-    assert user_lines, "Dockerfile must drop to a non-root USER"
-    assert all("root" not in ln for ln in user_lines)
+    dockerfiles = sorted(_ROOT.glob("Dockerfile*"))
+    assert dockerfiles, "no Dockerfile found beside the test tree"
+    for path in dockerfiles:
+        text = path.read_text()
+        # a USER directive that isn't root, appearing after the build steps
+        user_lines = [ln for ln in text.splitlines() if ln.strip().startswith("USER ")]
+        assert user_lines, f"{path.name} must drop to a non-root USER"
+        assert all("root" not in ln for ln in user_lines), path.name
