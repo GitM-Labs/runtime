@@ -36,7 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} noble main" \
         > /etc/apt/sources.list.d/rocm.list \
     && apt-get update && apt-get install -y --no-install-recommends \
-        rocprofiler-sdk \
+        rocprofiler-sdk hsa-rocr-dev hsakmt-roct-dev hip-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Ubuntu 24.04 marks the system python externally-managed; a venv keeps pip
