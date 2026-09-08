@@ -71,6 +71,10 @@ def build() -> Path:
     cc = os.environ.get("CC", "cc")
     cmd = [
         cc, "-shared", "-fPIC", "-O2", "-pthread",
+        # The sdk's HIP api_args.h drags in hip_runtime.h, which refuses to
+        # compile without a platform selection. hipcc would define this; a
+        # plain host cc (all we need for a C tool) must say it explicitly.
+        "-D__HIP_PLATFORM_AMD__",
         f"-I{inc}",
         str(SRC),
         f"-L{lib}",
