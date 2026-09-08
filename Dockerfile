@@ -48,6 +48,11 @@ COPY benchmarks ./benchmarks
 COPY tests ./tests
 COPY docs ./docs
 COPY scripts ./scripts
+# tests/test_deploy_manifests.py validates the manifests and the Dockerfiles'
+# non-root USER; without these the image's CMD (verify_infra.sh -> pytest)
+# fails those checks.
+COPY deploy ./deploy
+COPY Dockerfile Dockerfile.rocm ./
 RUN python -m pip install -e ".[dev,bench,nvidia]" -c constraints.txt
 
 # Build the CUPTI tracer shim against this image's CUDA toolkit.

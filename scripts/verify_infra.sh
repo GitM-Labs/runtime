@@ -28,10 +28,10 @@ check "pytest (full suite)"            "$PY -m pytest -q"
 check "ruff (lint, new surface)"       "ruff check gitm/bench gitm/tracer/_cupti gitm/tracer/_cupti_decode.py gitm/tracer/cupti.py gitm/optimizer/apply.py benchmarks tests/test_bench.py tests/test_bench_datasets.py tests/test_cupti.py tests/test_hft_harness.py tests/test_framework_harnesses.py tests/test_apply_rollback.py"
 check "import sanity (all new modules)" "$PY - <<'EOF'
 import importlib
-for m in ['gitm.bench.schema','gitm.bench.manifest','gitm.bench.baseline','gitm.bench.profile','gitm.bench.edge_manifest','gitm.bench.results','gitm.bench.runner','gitm.bench.reproduce','gitm.bench.cli','gitm.tracer.cupti','gitm.tracer._cupti_decode','gitm.optimizer.apply','gitm.benchmarks.hft.harness','gitm.runtime_driver','gitm.workloads','benchmarks.hft.generate','benchmarks.hft.harness','benchmarks.biotech.fetch','benchmarks.biotech.harness','benchmarks.edge.fetch','benchmarks.edge.harness','benchmarks.skeleton.measure_overhead']:
+for m in ['gitm.bench.schema','gitm.bench.manifest','gitm.bench.baseline','gitm.bench.profile','gitm.bench.edge_manifest','gitm.bench.results','gitm.bench.runner','gitm.bench.reproduce','gitm.bench.cli','gitm.tracer.cupti','gitm.tracer._cupti_decode','gitm.optimizer.apply','gitm.benchmarks.hft.harness','gitm.runtime_driver','gitm.workloads','benchmarks.hft.generate','benchmarks.hft.harness','benchmarks.biotech.fetch','benchmarks.biotech.harness','benchmarks.edge.fetch','benchmarks.edge.harness','benchmarks.overhead.measure_overhead']:
     importlib.import_module(m)
 EOF"
-check "intervention library validates" "$PY -c 'from gitm.kernels import load_library; assert len(load_library())==18'"
+check "intervention library validates" "$PY -c 'from gitm.kernels import load_library; assert len(load_library())==28'"
 check "wheel build + data files"        "$PY -m build --wheel >/dev/null 2>&1 && $PY - <<'EOF'
 import zipfile, glob
 n = zipfile.ZipFile(sorted(glob.glob('dist/*.whl'))[-1]).namelist()
@@ -85,7 +85,7 @@ r=optimize(workload='vllm-decode', budget='1s', target=0.15)
 assert pathlib.Path(r['summary']['report_path']).exists()\""
 check "gitm doctor"  "GITM_SCRATCH=\$(mktemp -d) $PY -m gitm.cli doctor"
 check "gitm.bench CLI help" "$PY -m gitm.bench --help"
-check "overhead harness runs" "$PY -m benchmarks.skeleton.measure_overhead --runs 2 --steps 30"
+check "overhead harness runs" "$PY -m benchmarks.overhead.measure_overhead --runs 2 --steps 30"
 
 echo "==================== TIER 3: GPU box (auto-detected) ===================="
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then

@@ -27,6 +27,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Base toolchain + AMD's apt repo, then rocprofiler-sdk ONLY — this pulls the
 # HSA runtime and rocprofiler-register as deps, not the multi-GB math libraries.
+# hsa-amd-aqlprofile + libdw1t64 are runtime deps of librocprofiler-sdk.so that
+# apt does NOT pull in; without them the sidecar's dlopen for clock_now() fails
+# and every windowed capture is silently empty (timestamp() -> None).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg build-essential \
         python3 python3-venv python3-dev git \
@@ -37,6 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         > /etc/apt/sources.list.d/rocm.list \
     && apt-get update && apt-get install -y --no-install-recommends \
         rocprofiler-sdk hsa-rocr-dev hsakmt-roct-dev hip-dev \
+        hsa-amd-aqlprofile libdw1t64 \
     && rm -rf /var/lib/apt/lists/*
 
 # Ubuntu 24.04 marks the system python externally-managed; a venv keeps pip
@@ -53,6 +57,11 @@ COPY benchmarks ./benchmarks
 COPY tests ./tests
 COPY docs ./docs
 COPY scripts ./scripts
+# tests/test_deploy_manifests.py validates the manifests and the Dockerfiles'
+# non-root USER; without these the image's CMD (verify_infra.sh -> pytest)
+# fails those checks.
+COPY deploy ./deploy
+COPY Dockerfile Dockerfile.rocm ./
 RUN pip install -e ".[dev,bench]" -c constraints.txt
 
 # Build the ROCm tracer tool against this image's rocprofiler-sdk.
