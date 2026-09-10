@@ -12,7 +12,7 @@ Library map (`runtime/gitm/traffic/`):
 | `validate.py`                                 | `compare`, `REPLAY_THRESHOLDS` / `SAMPLED_THRESHOLDS`    |
 | `results.py`                                  | seam 3`join_result`, `BenchRun`                            |
 | `runner.py`                                   | `check_vllm`, `run_replay`, `RunResult`                  |
-| `gui.py` / `__main__.py` / `_selftest.py` | viewer, CLI, pinned checks                                     |
+| `gui.py` / `__main__.py` | viewer, CLI |
 
 ---
 
@@ -65,7 +65,7 @@ raw trace → normalized requests → controlled replay → measured result
 7. vLLM bench serve --self-timed                         (seam 2)
 8. join_result → BenchRun (reconcile + regime)           (seam 3)
 9. D2 / D3 / D4 consume plan + regime + results
-10. CLI / GUI / selftests (entry points)
+10. CLI / GUI (entry points)
 ```
 
 ---
@@ -1357,13 +1357,12 @@ Mooncake-shaped intent — gated on long input + prefix identity:
 
 ---
 
-# Step 10 — CLI, GUI, and selftests
+# Step 10 — CLI, GUI, and tests
 
 ### CLI (`python -m gitm.traffic`)
 
 | Flag                                                    | Role                                              |
 | ------------------------------------------------------- | ------------------------------------------------- |
-| `--selftest`                                          | run every pinned check in`_selftest.py`         |
 | `--describe ADAPTER PATH`                             | load + print meta / regime                        |
 | `--replay ADAPTER PATH`                               | `write_timed_trace` + `compare` + print argv  |
 | `--fire`                                              | actually run argv (needs vLLM ≥ 0.23.0 + server) |
@@ -1379,7 +1378,7 @@ Everything except `--fire` is CPU-only.
 
 Read-only viewer bound to `127.0.0.1`. Routes: `/api/describe`, `/api/replay`, `/api/sweep`. Paths sandboxed under a configured root (default: committed fixtures); refuses anything outside that root.
 
-### Selftests (`_selftest.run_all`)
+### Tests (`tests/test_traffic.py`)
 
 Pin the behaviors this doc describes, including: fixture labels; every `DropReason` fires; `FILTERED_OUT` ≠ defect; provenance reconcile; replay round-trip; refuse truncate at `block_tokens=16`; session replay understates reuse; regime axes separate traces; parameterized envelope; argv; version guard; join drops misleading fields / catches 32× short / both pacing failures; `unjoined_keys` empty for the recorded real-run keys.
 
@@ -1389,7 +1388,7 @@ Pin the behaviors this doc describes, including: fixture labels; every `DropReas
 
 | Item                                                           | Status                                                                                                          |
 | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| D4 playbook schema / selftests                                 | **Built** — calibrated regime-distance threshold still open (R5 / D4-9); shipped policy exact-match only |
+| D4 playbook schema / tests                                     | **Built** — calibrated regime-distance threshold still open (R5 / D4-9); shipped policy exact-match only |
 | Shared config-capture schema                                   | **Open** (R1)                                                                                             |
 | Cross-tokenizer reconciliation rule                            | **Open**                                                                                                  |
 | Faithful arrival offsets via`timed_trace` + `--self-timed` | **Closed** (read from vLLM source; no custom load gen)                                                    |

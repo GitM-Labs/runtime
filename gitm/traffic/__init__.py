@@ -14,8 +14,7 @@ row is keyed on.
     print(" ".join(plan.bench_serve_argv(model="...")))
 
 CPU-only: nothing here needs a GPU, and only the final firing needs a server.
-Run ``python -m gitm.traffic --selftest`` for the check that fails if any of it
-regresses.
+``tests/test_traffic.py`` is the check that fails if any of it regresses.
 """
 
 from gitm.traffic.adapters import ADAPTERS, read_burstgpt, read_mooncake

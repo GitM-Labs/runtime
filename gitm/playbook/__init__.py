@@ -18,7 +18,7 @@ combined with L-infinity on the numeric regime axes. The distance threshold is
 **not calibrated yet** and the shipped policy says so — see
 :mod:`gitm.playbook.match`.
 
-CPU-only. ``python -m gitm.playbook --selftest`` is the check.
+CPU-only. ``tests/test_playbook.py`` is the check.
 """
 
 from gitm.playbook.match import (

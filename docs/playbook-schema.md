@@ -13,7 +13,7 @@ worked rows in `benchmarks/playbook/examples.json`.
 > §5 says exactly what would change it.
 
 ```bash
-python -m gitm.playbook --selftest                          # 17 checks
+python -m pytest tests/test_playbook.py -q
 python -m gitm.playbook --show     benchmarks/playbook/examples.json
 python -m gitm.playbook --distance benchmarks/playbook/examples.json ex1-… ex2-…
 python -m gitm.playbook --lookup   benchmarks/playbook/examples.json ex1-…
@@ -40,7 +40,7 @@ python -m gitm.playbook --lookup   benchmarks/playbook/examples.json ex1-…
 
 `Regime` is deliverable 1's type, **imported**. There is no second copy — a
 second one would drift inside a week and the distance would be measured in two
-different coordinate systems. `check_regime_is_imported_not_redeclared` asserts
+different coordinate systems. `test_regime_is_imported_not_redeclared` asserts
 the field's annotation is literally `gitm.traffic.regime.Regime`.
 
 ### What the types refuse to hold
@@ -170,7 +170,7 @@ regime_distance = max(input_p50, input_p95, output_p50, output_p95,
 ```
 
 Not a mean, not a Euclidean norm. **A row is as far away as its worst axis.** The
-case this exists for, asserted in `check_linf_is_the_worst_axis`: a candidate
+case this exists for, asserted in `test_linf_is_the_worst_axis`: a candidate
 identical on five axes and 8× off on `input_p95`. The mean calls that a 0.5
 mismatch and would apply the row; L-inf calls it 3.0 and does not. That is a
 long-context workload against a short-context row.
@@ -192,7 +192,7 @@ there would be exactly the mistake this module is written to avoid.
 
 The decision is material, not cosmetic: two regimes identical except for an 8×
 difference in offered rate are distance **0.0** by default and **3.0** with the
-axis on (`check_rate_is_not_in_the_default_axes`). Turning it on is one field:
+axis on (`test_rate_is_not_in_the_default_axes`). Turning it on is one field:
 
 ```python
 MatchPolicy(name="with-rate", axes=(*DEFAULT_AXES, "rate_rps"), tolerances=…)

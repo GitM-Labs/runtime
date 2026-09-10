@@ -1,6 +1,5 @@
-"""CLI for the traffic library: describe a trace, emit a replay, validate, selftest.
+"""CLI for the traffic library: describe a trace, emit a replay, validate.
 
-    python -m gitm.traffic --selftest
     python -m gitm.traffic --describe burstgpt BurstGPT_1.csv
     python -m gitm.traffic --replay mooncake trace.jsonl --out replay.jsonl --model Qwen/...
     python -m gitm.traffic --sweep burstgpt BurstGPT_1.csv
@@ -18,8 +17,6 @@ from __future__ import annotations
 import argparse
 import sys
 
-from gitm._banner import add_banner_argument, show_banner
-from gitm.traffic._selftest import run_all
 from gitm.traffic.adapters import ADAPTERS
 from gitm.traffic.parameterize import fit, grid
 from gitm.traffic.regime import Regime, SourceKind
@@ -35,8 +32,6 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     p = argparse.ArgumentParser(prog="python -m gitm.traffic")
-    add_banner_argument(p)
-    p.add_argument("--selftest", action="store_true", help="run every check and exit")
     p.add_argument("--describe", nargs=2, metavar=("ADAPTER", "PATH"))
     p.add_argument("--replay", nargs=2, metavar=("ADAPTER", "PATH"))
     p.add_argument("--sweep", nargs=2, metavar=("ADAPTER", "PATH"))
@@ -61,10 +56,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-rows", type=int, default=None)
     p.add_argument("--kind", default="production", choices=[k.value for k in SourceKind])
     a = p.parse_args(argv)
-    show_banner(suppressed=a.no_banner)
-
-    if a.selftest:
-        return run_all()
 
     if a.gui:
         from pathlib import Path

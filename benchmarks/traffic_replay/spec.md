@@ -8,7 +8,6 @@ harness, and tagged with the workload regime every result row is keyed on.
 the final firing needs a server.
 
 ```bash
-python -m gitm.traffic --selftest                                  # the check
 python -m gitm.traffic --describe burstgpt <BurstGPT_1.csv>        # meta + regime
 python -m gitm.traffic --replay  mooncake <trace.jsonl> --out replay.jsonl \
                                  --model Qwen/Qwen3.6-35B-A3B-FP8  # + validation
@@ -61,7 +60,7 @@ be a hand-wave.
 
 ## 3. What the real data actually contains
 
-Pinned in `gitm/traffic/_selftest.py`, measured not assumed:
+Pinned in `tests/test_traffic.py`, measured not assumed:
 
 | | BurstGPT_1 slice | BurstGPT_3 slice | Mooncake slice |
 |---|---|---|---|
@@ -205,12 +204,10 @@ for both adapters.
 ## 8. The check
 
 ```bash
-python -m gitm.traffic --selftest        # 10 checks, 2 real traces, 7 drop reasons
-python -m pytest tests/test_traffic.py -q   # the same assertions, as pytest cases
+python -m pytest tests/test_traffic.py -q
 ```
 
-The assertions live in `gitm/traffic/_selftest.py` and both entry points call
-them, so the runnable check named here and the one CI runs cannot drift apart.
+The assertions live in `tests/test_traffic.py`; CI runs the same file.
 
 ## 9. Not in v1, and why
 
@@ -220,7 +217,7 @@ them, so the runnable check named here and the one CI runs cannot drift apart.
 - **Session-aware *firing*.** The adapter is session-aware; the replay path
   cannot be. vLLM's `timed_trace` format has **no session field**, so conversation
   identity stops at the emitter — pinned by
-  `check_session_trace_replay_understates_reuse`, not left as folklore. Sessions
+  `test_session_trace_replay_understates_reuse`, not left as folklore. Sessions
   are available for analysis and regime characterization today. Making them flow
   would mean deriving prefix blocks from session membership, i.e. asserting how
   much each turn re-sends: an *invented* cache hit, which is the one thing this

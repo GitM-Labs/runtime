@@ -1,6 +1,5 @@
 """CLI for the playbook: inspect a file, measure a distance, run a lookup.
 
-    python -m gitm.playbook --selftest
     python -m gitm.playbook --show benchmarks/playbook/examples.json
     python -m gitm.playbook --distance benchmarks/playbook/examples.json ex1-... ex2-...
     python -m gitm.playbook --lookup benchmarks/playbook/examples.json ex2-...
@@ -21,8 +20,6 @@ import json
 import sys
 from pathlib import Path
 
-from gitm._banner import add_banner_argument, show_banner
-from gitm.playbook._selftest import run_all
 from gitm.playbook.match import UNCALIBRATED_POLICY, lookup, regime_distance
 from gitm.playbook.schema import Playbook
 
@@ -43,16 +40,10 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     p = argparse.ArgumentParser(prog="python -m gitm.playbook")
-    add_banner_argument(p)
-    p.add_argument("--selftest", action="store_true", help="run every check and exit")
     p.add_argument("--show", metavar="PLAYBOOK")
     p.add_argument("--distance", nargs=3, metavar=("PLAYBOOK", "ROW_A", "ROW_B"))
     p.add_argument("--lookup", nargs=2, metavar=("PLAYBOOK", "ROW_ID"))
     a = p.parse_args(argv)
-    show_banner(suppressed=a.no_banner)
-
-    if a.selftest:
-        return run_all()
 
     if a.show:
         book = _load(a.show)

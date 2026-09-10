@@ -402,6 +402,6 @@ def read_mooncake(
     )
 
 
-#: Adapter registry — name to reader. Keeps the CLI and the selftest from
+#: Adapter registry — name to reader. Keeps the CLI and the tests from
 #: growing an if-chain per source.
 ADAPTERS = {"burstgpt": read_burstgpt, "mooncake": read_mooncake}
