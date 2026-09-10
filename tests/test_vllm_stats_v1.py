@@ -142,7 +142,7 @@ def test_layer_index_is_read_from_the_path_not_a_counter():
     assert op_for_module("model.layers.3.self_attn.qkv_proj") == ("qkv_proj", 3)
     assert op_for_module("model.layers.11.mlp.experts") == ("moe_routed", 11)
     assert op_for_module("lm_head") == ("lm_head", None)
-    assert op_for_module("model.embed_tokens") is None
+    assert op_for_module("model.embed_tokens") == ("embed_tokens", None)
     assert op_for_module("") is None
 
 

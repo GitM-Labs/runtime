@@ -245,7 +245,7 @@ def test_an_unmapped_module_keeps_its_own_name_rather_than_being_dropped():
     gap rather than a silent one."""
     from gitm.tracer._cupti_decode import normalize_range_name
 
-    assert normalize_range_name(_vllm_range(f"{_QWEN}.2.input_layernorm")) == "L2/input_layernorm"
+    assert normalize_range_name(_vllm_range(f"{_QWEN}.2.unmapped_module")) == "L2/unmapped_module"
 
 
 def test_the_block_range_is_named_layer_not_its_index():

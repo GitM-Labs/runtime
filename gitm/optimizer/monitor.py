@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from gitm.optimizer.deviation import classify_op
+from gitm.optimizer.deviation import observed_op
 from gitm.optimizer.invariants import INVARIANTS, Invariant, Violation
 from gitm.optimizer.multibasis import confirmed_positions
 from gitm.planner.graph import Graph, PredictedNode
@@ -128,7 +128,7 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
         classes.setdefault(pn.op, {}).setdefault(_class_key(pn), pn)
 
     for ok in obs:
-        op = ok.range_op or classify_op(ok.name)
+        op = observed_op(ok.name, ok.range_op)
         if op is None:
             continue
         cls = list(classes.get(op, {}).values())

@@ -322,6 +322,7 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
             if not isinstance(rec, dict):
                 dropped_lines += 1
                 continue
+            rec["pid"] = _shard_pid(shard)
             # Correlation records (runtime/driver launches and NVTX marker
             # halves) are consumed by decode_records to build the range index and
             # are never emitted as events.

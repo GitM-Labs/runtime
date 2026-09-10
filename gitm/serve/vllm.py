@@ -600,6 +600,8 @@ def drive_load(base: str, model: str, prompts: list[str], *, concurrency: int,
 def add_serve_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """The launch path's flags. Shared verbatim between ``gitm capture serve`` and the
     standalone script so the two can never drift into different defaults."""
+    ap.add_argument("--model", default=None,
+                    help="Checkpoint to serve. Alternatively pass a full command after --.")
     ap.add_argument("--out", default=None,
                     help="output dir (default $GITM_SCRATCH/traces/vllm-serve-<ts>)")
     ap.add_argument("--port", type=int, default=8000)
@@ -643,7 +645,7 @@ def add_serve_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    serve_argv = DEFAULT_SERVE_ARGV
+    serve_argv = None
     if "--" in argv:
         i = argv.index("--")
         argv, serve_argv = argv[:i], argv[i + 1:]
@@ -700,7 +702,12 @@ def launch_and_capture(args, serve_argv: list[str] | None = None):
               "collected by the tracer --no-trace disables.")
         return 2, None
 
-    serve_argv = list(serve_argv) if serve_argv else list(DEFAULT_SERVE_ARGV)
+    model = getattr(args, "model", None)
+    if model and serve_argv:
+        print("--model and a full serve command after -- are mutually exclusive.")
+        return 2, None
+    serve_argv = (list(serve_argv) if serve_argv else
+                  ["vllm", "serve", model] if model else list(DEFAULT_SERVE_ARGV))
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out_dir = Path(args.out) if args.out else traces_dir() / f"vllm-serve-{stamp}"

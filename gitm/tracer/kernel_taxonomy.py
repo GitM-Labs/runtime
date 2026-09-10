@@ -34,7 +34,7 @@ NAME_MAX = 1023
 
 # Ordered: first match wins, case-insensitive substring against the (mangled) name.
 # Order is load-bearing where vocabularies overlap:
-#   * MoE first — `marlin_moe`/`moe_align` also contain "gemm"/"align", and an MoE
+#   * MoE before GEMM — `marlin_moe`/`moe_align` also contain "gemm"/"align", and an MoE
 #     GEMM is more usefully an MoE kernel than a GEMM.
 #   * collectives before GEMM — NCCL's kernels mention neither, but custom all-reduce
 #     paths do carry "reduce", which the elementwise rules would otherwise claim.
@@ -44,15 +44,15 @@ NAME_MAX = 1023
 #     the generic quant rules, which are then left with the standalone
 #     quantise/dequantise passes.
 _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("moe", ("moe", "expert", "topk_softmax", "grouped_gemm", "group_gemm",
-             "groupedgemm", "gather_scatter", "sort_tokens", "routing", "router")),
     # "cross_device_reduce" is vLLM's own custom all-reduce (the fast path TP=2 takes
     # on NVLink). Without it the generic "reduce" needle files it as elementwise and
     # the collective cost disappears into the noise — which is the one cost a TP run
     # exists to measure.
     ("collective", ("nccl", "all_reduce", "allreduce", "reduce_scatter", "reducescatter",
                     "all_gather", "allgather", "custom_ar", "cross_device", "one_shot",
-                    "two_shot")),
+                    "two_shot", "all_to_all", "alltoall", "dispatch_combine")),
+    ("moe", ("moe", "expert", "topk_softmax", "grouped_gemm", "group_gemm",
+             "groupedgemm", "gather_scatter", "sort_tokens", "routing", "router")),
     # Speculative decoding: drafting scaffolding and rejection sampling.
     #
     #   * `eagle_step_slot_mapping_metadata_kernel` contains "slot_mapping" and
@@ -128,7 +128,7 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
                    "paged_attn", "attention", "attn_score", "splitkv", "merge_attn",
                    "mha_fwd", "cutlass_mla", "flash_mla", "mla_sparse", "sparse_mla",
                    "indexer", "lightning_index", "batchprefill", "batchdecode",
-                   "pagedkv", "prepare_varlen", "compute_attn")),
+                   "pagedkv", "prepare_varlen", "compute_attn", "sparse_fwd")),
     ("kv_cache", ("reshape_and_cache", "slot_mapping", "copy_blocks", "swap_blocks",
                   "concat_and_cache", "block_table")),
     # "nvjet" is cuBLAS's JIT-generated Hopper/Blackwell GEMM family

@@ -364,11 +364,11 @@ def live_moe_spec(
             model_ref=model_ref,
         )
 
-    if family == "hybrid":
-        from gitm.planner.hybrid_graph import spec_from_hf_config as _hybrid_spec
+    if family in ("hybrid", "glm_moe_dsa"):
+        from gitm.planner.registry import spec_from_hf_config as _family_spec
 
         try:
-            spec = _hybrid_spec(cfg, name=model_ref)
+            spec = _family_spec(cfg, name=model_ref)
         except ValueError as e:
             # The reader refuses to substitute another checkpoint's value for a
             # shape this config does not declare.
