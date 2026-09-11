@@ -139,17 +139,25 @@ def attach_checks(target: discover.Target, base_url: str) -> list:
         )
     )
 
-    if injection.cupti_now():
-        checks.append(Check("cupti-clock", "pass", "readable — the window can be bounded"))
+    # Vendor-aware: clock_now() reads whichever collector clock this process's
+    # environment names (CUPTI shim on NVIDIA, rocprofiler_get_timestamp on
+    # AMD). The window bounds must share the record clock's domain, so the
+    # check and the windowing must go through the same dispatch — a CUPTI-only
+    # probe here refused every AMD attach whose windowing would have worked.
+    if injection.clock_now():
+        checks.append(Check("window-clock", "pass", "readable — the window can be bounded"))
     else:
         checks.append(
             Check(
-                "cupti-clock",
+                "window-clock",
                 "fail",
-                "cannot read the CUPTI clock, so the window cannot be bounded in the "
-                "collector's time domain. The shards hold records from every earlier "
+                "cannot read the collector's clock, so the window cannot be bounded "
+                "in its time domain. The shards hold records from every earlier "
                 "window too, and merging them unbounded would silently mix runs. "
-                "Build the shim: python -m gitm.tracer._cupti.build",
+                "NVIDIA: build the shim (python -m gitm.tracer._cupti.build). "
+                "AMD: the hook env vars must name our tool in THIS process too "
+                "(clock dispatch reads them), and librocprofiler-sdk must dlopen "
+                "(hsa-amd-aqlprofile + libdw1t64 present).",
             )
         )
 

@@ -85,6 +85,16 @@ def build() -> Path:
     print("compiling rocm injection tool:\n  " + " ".join(shlex.quote(c) for c in cmd))
     subprocess.run(cmd, check=True)
     print(f"built {LIB}")
+
+    # The roctx forwarding shim rides along. Pure dlfcn — no sdk headers or
+    # libs at build time (it resolves librocprofiler-sdk-roctx at run time),
+    # so it cannot fail for toolchain reasons the tool build didn't already.
+    shim_src = SRC.with_name("roctx_shim.c")
+    shim_out = LIB.with_name("libgitm_roctx_shim.so")
+    shim_cmd = [cc, "-shared", "-fPIC", "-O2", str(shim_src), "-ldl", "-o", str(shim_out)]
+    print("compiling roctx shim:\n  " + " ".join(shlex.quote(c) for c in shim_cmd))
+    subprocess.run(shim_cmd, check=True)
+    print(f"built {shim_out}")
     return LIB
 
 

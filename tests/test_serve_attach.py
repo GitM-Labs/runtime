@@ -420,3 +420,47 @@ def test_cli_list_reports_every_server_with_its_verdict(tmp_path, monkeypatch, c
     listed = json.loads(capsys.readouterr().out)
     assert [t["pid"] for t in listed] == [100, 200]
     assert [t["traceable"] for t in listed] == [True, False]
+
+
+# --- AMD targets -------------------------------------------------------------
+#
+# The MI355X gap found live: classify() only accepted the CUDA hook, so a vLLM
+# server correctly launched with ROCP_TOOL_LIBRARIES=<our tool> was refused
+# with "started without CUDA_INJECTION64_PATH" — on a box where that variable
+# will never be set. These pin the vendor-neutral read of the target environ.
+
+
+def test_amd_server_with_our_rocm_tool_is_traceable(tmp_path):
+    from gitm.tracer._rocm import LIB_NAME as ROCM_LIB_NAME
+
+    proc = tmp_path / "proc"
+    trace_out = tmp_path / "run" / "trace.jsonl"
+    trace_out.parent.mkdir(parents=True)
+    env = {
+        "PATH": "/usr/bin",
+        # Colon-separated list, ours alongside another entry — the documented
+        # ROCP_TOOL_LIBRARIES shape.
+        injection.ENV_ROCP: f"/other/libsomething.so:/scratch/lib/{ROCM_LIB_NAME}",
+        injection.ENV_OUT: str(trace_out),
+    }
+    _mkproc(proc, 600, SERVE, env)
+    trace_out.with_name(trace_out.name + ".600").write_text("")
+
+    t = discover.classify(600, proc)
+    assert t.traceable is True
+    assert t.inject_lib.endswith(ROCM_LIB_NAME)
+    assert t.shard_pids == [600]
+
+
+def test_amd_server_held_by_rocprofv3_alone_is_not_ours(tmp_path):
+    proc = tmp_path / "proc"
+    env = {
+        "PATH": "/usr/bin",
+        injection.ENV_ROCP: "/opt/rocm/lib/librocprofv3-tool.so",
+        injection.ENV_OUT: str(tmp_path / "t.jsonl"),
+    }
+    _mkproc(proc, 700, SERVE, env)
+
+    t = discover.classify(700, proc)
+    assert t.traceable is False
+    assert "another profiler" in t.reason

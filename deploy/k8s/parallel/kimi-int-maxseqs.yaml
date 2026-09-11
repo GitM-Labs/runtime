@@ -1,0 +1,247 @@
+# Kimi K2.5 on 8x MI355X — the full-loop pod: vLLM serving + GITM harness.
+# The E0–E8 unit for docs/mi355x_experiment_plan.md, driven by
+# scripts/kimi_loop/ from inside the gitm sidecar.
+#
+# Differences from mi355x-kimi.yaml (the SGLang tracer-validation unit), each
+# for a reason discovered on this cluster:
+#
+#   * ONE image everywhere: vllm/vllm-openai-rocm, digest-pinned — the exact
+#     digest rex already served Kimi K2.5 with on these nodes. It carries vLLM,
+#     rocprofiler-sdk (rocprofv3 ran from it) and a toolchain, so the same
+#     image serves, builds the tracer tool, and hosts the harness. No REGISTRY
+#     placeholders, and the tool's rocprofiler-sdk ABI matches the runtime that
+#     loads it by construction.
+#   * vLLM, not SGLang. The Kimi-K2.5 checkpoint ships NO MTP head (zero
+#     nextn/eh_proj tensors — see gitm/planner/models/kimi-k2.5.yaml
+#     provenance), so SGLang's NEXTN flags were drafting with nothing. vLLM is
+#     also what gitm.traffic's BurstGPT replay (`vllm bench serve` timed_trace),
+#     GuideLLM, and --enable-layerwise-nvtx-tracing all speak.
+#   * Weights from the cluster's shared filesystem (hostPath /mnt/shared),
+#     where the 594.9 GB HF cache already sits — not a 1.5Ti local-path PVC
+#     that would re-pull on every fresh market node.
+#   * tolerations for the amd.com/gpu:NoSchedule taint. GPU nodes here carry
+#     it; a spec without the toleration waits on the market forever (the
+#     scheduling simulation can never place the pod).
+#   * Arm switching WITHOUT a pod rollout: on this cluster a new pod means a
+#     new marketplace ProvisioningRequest — minutes-to-hours per arm flip. The
+#     serving container is a supervisor loop that sources /scratch/arm.env and
+#     (re)launches vllm serve; the gitm sidecar flips arms by rewriting that
+#     file and killing the server process (shareProcessNamespace), costing one
+#     in-pod model reload instead of a node re-provision. ROCP_TOOL_LIBRARIES
+#     is read at HIP init, so a process restart is exactly enough.
+#
+# Arms (written by scripts/kimi_loop/arm.sh, sourced by the supervisor):
+#   A  clean:      ROCP_TOOL_LIBRARIES=""  (empty list = no tool loaded)
+#   B  traced:     ROCP_TOOL_LIBRARIES=/scratch/lib/libgitm_rocm_inject.so
+#   C  correlate:  B + GITM_TRACE_NVTX=1 + GITM_EXTRA_VLLM_ARGS=--enable-layerwise-nvtx-tracing
+#
+# Cluster facts this file assumes (verified 2026-09-10/11):
+#   * kueue ClusterQueue "market" + LocalQueue default/default; pods are gated
+#     and admitted through a marketplace ProvisioningRequest.
+#   * Secret default/hf-token-secret (key: token) exists.
+#   * /mnt/shared is the shared FS on GPU nodes; hf-cache/hub holds Kimi K2.5.
+#   * The gitm wheel is at /mnt/shared/gitm/wheel/gitm_labs-*.whl (uploaded via the
+#     rex-stage pod; re-upload after any local change worth shipping).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kimi-k25-int-maxseqs
+  namespace: default
+  labels:
+    app: kimi-int-maxseqs
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # 8 GPUs: never two pods at once
+  selector:
+    matchLabels:
+      app: kimi-int-maxseqs
+  template:
+    metadata:
+      labels:
+        app: kimi-int-maxseqs
+        kueue.x-k8s.io/queue-name: default
+    spec:
+      automountServiceAccountToken: false
+      # injection.clear_stale_shards judges shard liveness with os.kill(pid,0)
+      # across containers, and arm.sh restarts the server with pkill — both
+      # need one pid namespace. Correctness, not hygiene.
+      shareProcessNamespace: true
+      tolerations:
+        # GPU nodes are tainted amd.com/gpu=present:NoSchedule. Without this
+        # the marketplace never fulfills the request — the failure mode is
+        # "waiting for the market", indefinitely, with no error naming the taint.
+        - key: amd.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        supplementalGroups: [44, 110]   # video/render for /dev/kfd, /dev/dri
+      volumes:
+        - name: shared
+          hostPath:
+            path: /mnt/shared
+        - name: scratch          # trace shards + arm file + tool .so + logs
+          emptyDir: {}
+        - name: dshm             # RCCL/tensor-parallel shared memory
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      initContainers:
+        - name: gitm-tool
+          image: vllm/vllm-openai-rocm@sha256:e5e47f6aaab675c252c381f0dac237b31b10d87bb74d092b07fb4065efd7f5a1
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              mkdir -p /scratch/lib /scratch/trace /scratch/logs /scratch/results
+              pip install -q /mnt/shared/gitm/wheel/gitm_labs-*.whl
+              # Compiled here, against THIS image's rocprofiler-sdk — the same
+              # runtime that will dlopen it in the serving container.
+              python -m gitm.tracer._rocm.build
+              cp "$(python -c 'from gitm.tracer._rocm import lib_path; print(lib_path())')" /scratch/lib/
+              # The roctx forwarding shim (arm C preloads it into the server:
+              # torch emits markers through legacy libroctx64, which the sdk's
+              # marker service cannot see — ROCm 7.2.3, found live).
+              cp "$(python -c 'from gitm.tracer._rocm import shim_path; print(shim_path())')" /scratch/lib/
+              # Default arm: B (traced, no correlation). The tool is dormant
+              # until the sidecar arms a capture window, so B costs nothing
+              # while idle — but E1's A-arm still restarts without the env,
+              # because "dormant" is a claim E1 exists to measure, not assume.
+              cat > /scratch/arm.env <<'EOF'
+              export GITM_ARM=maxseqs
+              export ROCP_TOOL_LIBRARIES=/scratch/lib/libgitm_rocm_inject.so
+              export GITM_TRACE_OUT=/scratch/trace/kimi.jsonl
+              export GITM_TRACE_NVTX=0
+              export GITM_EXTRA_VLLM_ARGS="--max-num-seqs 512"
+              export LD_PRELOAD=
+              EOF
+          volumeMounts:
+            - name: shared
+              mountPath: /mnt/shared
+            - name: scratch
+              mountPath: /scratch
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai-rocm@sha256:e5e47f6aaab675c252c381f0dac237b31b10d87bb74d092b07fb4065efd7f5a1
+          command: ["/bin/bash", "-lc"]
+          # The supervisor: source the arm, launch, and relaunch on exit. The
+          # sidecar's arm.sh rewrites /scratch/arm.env and pkills the server;
+          # everything else about the deployment stays byte-identical across
+          # arms — which is the point: one variable per run.
+          # NOTE: each iteration re-sources with `set -a` so every arm file
+          # must assign ALL five variables (an omitted one would leak from the
+          # previous arm — the exact contamination apply_tracing_env exists to
+          # prevent in the CLI path).
+          args:
+            - |
+              set -uo pipefail
+              # Node/GPU telemetry plane (experiment plan): amd-smi at 1 Hz for
+              # the pod's whole life, timestamped JSONL on /scratch. It runs in
+              # THIS container because only the GPU container gets /dev/kfd —
+              # the sidecar cannot read GPU metrics. Energy comes from the
+              # accumulated-energy counter in these samples, never integrated
+              # from power. Analysis slices by capture-window timestamps.
+              mkdir -p /scratch/telemetry
+              ( while :; do
+                  printf '{"ts_ns":%s,"m":' "$(date +%s%N)"
+                  amd-smi metric --json 2>/dev/null | tr -d '\n'
+                  printf '}\n'
+                  sleep 1
+                done >> /scratch/telemetry/amdsmi.jsonl ) &
+              while true; do
+                set -a; source /scratch/arm.env; set +a
+                echo "==> arm ${GITM_ARM}: ROCP_TOOL_LIBRARIES='${ROCP_TOOL_LIBRARIES}' GITM_TRACE_NVTX='${GITM_TRACE_NVTX}' extra='${GITM_EXTRA_VLLM_ARGS}'"
+                vllm serve moonshotai/Kimi-K2.5 \
+                  --trust-remote-code \
+                  --tensor-parallel-size 8 \
+                  --gpu-memory-utilization 0.92 \
+                  --max-num-batched-tokens 8192 \
+                  --max-num-seqs 256 \
+                  --tool-call-parser kimi_k2 \
+                  --enable-auto-tool-choice \
+                  --reasoning-parser kimi_k2 \
+                  --host 0.0.0.0 --port 8000 \
+                  ${GITM_EXTRA_VLLM_ARGS} \
+                  2>&1 | tee -a "/scratch/logs/server_arm${GITM_ARM}.log"
+                echo "==> server exited; re-reading arm and relaunching in 5s"
+                sleep 5
+              done
+          env:
+            - name: HF_HOME
+              value: /mnt/shared/hf-cache
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: token
+                  optional: true
+            - name: VLLM_ROCM_USE_AITER
+              value: "1"
+          ports:
+            - containerPort: 8000
+          resources:
+            limits:
+              amd.com/gpu: 8
+          volumeMounts:
+            - name: shared
+              mountPath: /mnt/shared
+            - name: scratch
+              mountPath: /scratch
+            - name: dshm
+              mountPath: /dev/shm
+          startupProbe:
+            httpGet: { path: /health, port: 8000 }
+            # ~600 GB from the shared FS: rex needed up to 3600 s for first
+            # load. Arm restarts re-trip this probe too; keep it generous.
+            periodSeconds: 30
+            failureThreshold: 120
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+        - name: gitm
+          image: vllm/vllm-openai-rocm@sha256:e5e47f6aaab675c252c381f0dac237b31b10d87bb74d092b07fb4065efd7f5a1
+          # The harness + load generators. Runs are launched by hand or by
+          # scripts/kimi_loop/run_loop.sh:
+          #   kubectl exec -it deploy/kimi-k25-loop -c gitm -- bash
+          # guidellm drives the sweeps; gitm.traffic replays BurstGPT via
+          # `vllm bench serve` (the vllm CLI is in this image); capture() arms
+          # windows against the same /scratch the server writes.
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              pip install -q /mnt/shared/gitm/wheel/gitm_labs-*.whl guidellm
+              echo "gitm sidecar ready"
+              sleep infinity
+          env:
+            - name: GITM_TRACE_OUT
+              value: /scratch/trace/kimi.jsonl
+            - name: GITM_SCRATCH
+              value: /scratch
+            - name: HF_HOME
+              value: /mnt/shared/hf-cache
+          securityContext:
+            allowPrivilegeEscalation: false
+          resources:
+            limits:
+              cpu: "16"
+              memory: 64Gi
+          volumeMounts:
+            - name: shared
+              mountPath: /mnt/shared
+            - name: scratch
+              mountPath: /scratch
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kimi-int-maxseqs
+  namespace: default
+spec:
+  selector:
+    app: kimi-int-maxseqs
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
