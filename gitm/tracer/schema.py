@@ -20,6 +20,7 @@ class _TraceEventBase(BaseModel):
     stream_id: int
     device_id: int
     correlation_id: int | None = None
+    pid: int | None = None
 
 
 class KernelEvent(_TraceEventBase):

@@ -191,6 +191,21 @@ def classify_op(kernel_name: str) -> str | None:
             return op
     return None
 
+
+def observed_op(name: str, range_op: str | None = None) -> str | None:
+    """Resolve known NVTX ops; opaque module/container labels are not identities.
+
+    Standalone quantisation, norms and MoE data movement inside a projection
+    range have their own graph terms. Do not charge them to its GEMM as well.
+    """
+    guessed = classify_op(name)
+    if range_op not in _OP_RULES:
+        return guessed or range_op
+    if guessed in ("act_quant", "rms_norm", "moe_permute", "moe_combine",
+                   "tp_all_reduce", "moe_all_to_all"):
+        return guessed
+    return range_op
+
 @dataclass
 class DeviationResult:
     """Which observed kernels departed from the predicted graph, and how much it compresses."""
@@ -266,7 +281,7 @@ def deviating_kernel_indices(
 
     kept: list[int] = []
     for i, ok in enumerate(obs):
-        op = ok.range_op or classify_op(ok.name)
+        op = observed_op(ok.name, ok.range_op)
         pn = by_op.get(op) if op is not None else None
         if pn is None:
             kept.append(i)  # unmodeled op → keep as a departure
@@ -308,7 +323,7 @@ def deviation_summary(
     kept_ops: dict[str, int] = {}
     for i in dev.kept_indices:
         ok = obs[i]
-        op = ok.range_op or classify_op(ok.name) or "<unmodeled>"
+        op = observed_op(ok.name, ok.range_op) or "<unmodeled>"
         kept_ops[op] = kept_ops.get(op, 0) + 1
     return {
         "n_observed": dev.n_observed,
@@ -327,7 +342,8 @@ def write_deviation_jsonl(reduced: Trace, path: str | Path) -> None:
     """
     write_trace_jsonl(path, reduced)
 
-def stream_observed(path: str | Path) -> tuple[dict[str, list], int, int, int]:
+def stream_observed(path: str | Path, *, pid: int | None = None,
+                    device: int | None = None) -> tuple[dict[str, list], int, int, int]:
     """``(per_op, n_kernels, total_ns, span_ns)`` from a trace, without loading it.
 
     ``per_op`` maps a predicted-op name to ``[count, total_ns]``, with
@@ -341,7 +357,7 @@ def stream_observed(path: str | Path) -> tuple[dict[str, list], int, int, int]:
     n = total = 0
     t_min: int | None = None
     t_max: int | None = None
-    cache: dict[str, str | None] = {}
+    cache: dict[tuple[str, str | None], str | None] = {}
 
     with Path(path).open(encoding="utf-8") as fh:
         for line in fh:
@@ -349,17 +365,20 @@ def stream_observed(path: str | Path) -> tuple[dict[str, list], int, int, int]:
                 d = json.loads(line)
             except ValueError:
                 continue
-            if d.get("kind") != "kernel":
+            if not isinstance(d, dict) or d.get("kind") != "kernel":
+                continue
+            if pid is not None and d.get("pid") != pid:
+                continue
+            if device is not None and d.get("device_id") != device:
                 continue
             start, end = d.get("start_ns"), d.get("end_ns")
-            if start is None or end is None:
+            if not isinstance(start, int) or not isinstance(end, int) or end <= start:
                 continue
             name = d.get("name") or ""
-            op = d.get("range_op")
-            if not op:
-                if name not in cache:
-                    cache[name] = classify_op(name)
-                op = cache[name]
+            key = (name, d.get("range_op"))
+            if key not in cache:
+                cache[key] = observed_op(*key)
+            op = cache[key]
             slot = per_op.setdefault(op or "<unmodeled>", [0, 0])
             dur = max(0, end - start)
             slot[0] += 1
@@ -373,7 +392,29 @@ def stream_observed(path: str | Path) -> tuple[dict[str, list], int, int, int]:
     return per_op, n, total, span
 
 
-def phase_anchors(path: str | Path) -> list[tuple[int, str]]:
+def observed_scopes(path: str | Path, *, pid=None, device=None) -> set[tuple]:
+    """Worker/device identities, never inferred from a process-local device ID."""
+    import json
+
+    scopes = set()
+    with Path(path).open(encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict) or d.get("kind") != "kernel":
+                continue
+            if pid is not None and d.get("pid") != pid:
+                continue
+            if device is not None and d.get("device_id") != device:
+                continue
+            scopes.add((d.get("pid"), d.get("device_id")))
+    return scopes
+
+
+def phase_anchors(path: str | Path, *, pid: int | None = None,
+                  device: int | None = None) -> list[tuple[int, str]]:
     """``[(start_ns, phase)]`` for every kernel that names its own phase, sorted.
 
     These are the fixed points the rest of the timeline is inferred from. Gated
@@ -400,6 +441,12 @@ def phase_anchors(path: str | Path) -> list[tuple[int, str]]:
                 d = json.loads(line)
             except ValueError:
                 continue
+            if not isinstance(d, dict) or d.get("kind") != "kernel":
+                continue
+            if pid is not None and d.get("pid") != pid:
+                continue
+            if device is not None and d.get("device_id") != device:
+                continue
             name, start = d.get("name") or "", d.get("start_ns")
             if start is None:
                 continue
@@ -411,7 +458,8 @@ def phase_anchors(path: str | Path) -> list[tuple[int, str]]:
     return out
 
 
-def stream_by_phase(path: str | Path, *, propagate: bool = True):
+def stream_by_phase(path: str | Path, *, propagate: bool = True,
+                    pid: int | None = None, device: int | None = None):
     """``(by_phase, stats)`` — kernels bucketed by phase and taxonomy.
 
     ``by_phase`` is ``{phase: {bucket: [count, ns]}}``. ``stats`` reports how the
@@ -435,7 +483,10 @@ def stream_by_phase(path: str | Path, *, propagate: bool = True):
 
     from gitm.tracer.kernel_taxonomy import classify_kernel, classify_phase
 
-    anchors = phase_anchors(path) if propagate else []
+    # A nearby timestamp on another worker is not evidence for this one's phase.
+    scopes = observed_scopes(path, pid=pid, device=device)
+    anchors = (phase_anchors(path, pid=pid, device=device)
+               if propagate and len(scopes) <= 1 else [])
     times = [a[0] for a in anchors]
 
     by_phase: dict[str, dict[str, list]] = {}
@@ -450,10 +501,14 @@ def stream_by_phase(path: str | Path, *, propagate: bool = True):
                 d = json.loads(line)
             except ValueError:
                 continue
-            if d.get("kind") != "kernel":
+            if not isinstance(d, dict) or d.get("kind") != "kernel":
+                continue
+            if pid is not None and d.get("pid") != pid:
+                continue
+            if device is not None and d.get("device_id") != device:
                 continue
             start, end = d.get("start_ns"), d.get("end_ns")
-            if start is None or end is None:
+            if not isinstance(start, int) or not isinstance(end, int) or end <= start:
                 continue
             name = d.get("name") or ""
             if name not in ph_cache:
@@ -562,6 +617,8 @@ def render_deviation(
     out = [f"observed  {n_kernels:,} kernels, {obs_s:.3f} s device time{busy}"]
     if steps:
         out.append(f"window    {steps:,} steps -> {obs_s / steps * 1e3:.3f} ms/step observed")
+    elif pred is not None:
+        out.append("UNSCALED: --steps is missing; window totals vs one step are not a benchmark ratio.")
     out.append("")
 
     if pred is None:
@@ -585,7 +642,8 @@ def render_deviation(
                        "observed but not predicted")
             continue
         ratio = obs_ms / floor_ms
-        verdict = "within band" if ratio <= 1.0 + band else f"{ratio:.1f}x over floor"
+        verdict = ("below floor: check coverage" if ratio < 1.0 - band else
+                   "within band" if ratio <= 1.0 + band else f"{ratio:.1f}x over floor")
         out.append(f"  {op:24s} {obs_ms:9.1f} {floor_ms:9.1f} {ratio:7.2f} "
                    f"{count:11,}  {verdict}")
 
@@ -626,11 +684,13 @@ def add_deviate_arguments(ap):
                     help="How many prompts those tokens belong to — sets lm_head rows.")
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--ep", type=int, default=1)
+    ap.add_argument("--pid", type=int, default=None, help="Select one captured worker PID.")
+    ap.add_argument("--device", type=int, default=None, help="Select a worker-local device ID.")
     ap.add_argument("--no-graph", action="store_true",
                     help="Report observed op totals only, with no prediction.")
     ap.add_argument("--by-phase", dest="by_phase", action="store_true",
-                    help="Split kernels into prefill and decode instead of comparing "
-                         "against a predicted floor.")
+                    help="Include a diagnostic phase breakdown; with --model also "
+                         "compare the whole selected window against the graph.")
     ap.add_argument("--json", dest="as_json", action="store_true")
     return ap
 
@@ -646,6 +706,8 @@ def main(argv: list[str] | None = None) -> int:
         description="Subtract a predicted graph from a captured trace.",
     ))
     args = ap.parse_args(argv)
+    if args.steps is not None and args.steps <= 0:
+        ap.error("--steps must be positive")
 
     if not args.trace.is_file():
         print(f"cannot read trace: {args.trace}")
@@ -654,12 +716,24 @@ def main(argv: list[str] | None = None) -> int:
     # model — and requiring one would make the cheapest view the most awkward.
     if not args.model and not args.no_graph and not args.by_phase:
         ap.error("--model is required unless --no-graph or --by-phase")
+    if args.model and not args.no_graph:
+        scopes = observed_scopes(args.trace, pid=args.pid, device=args.device)
+        if len(scopes) > 1:
+            print("cannot compare merged workers to a per-rank graph; select --pid "
+                  "and/or --device. Workers: " + str(sorted(scopes, key=str)))
+            return 2
 
-    if args.by_phase:
-        print(render_by_phase(*stream_by_phase(args.trace)))
+    phase_report = (stream_by_phase(args.trace, pid=args.pid, device=args.device)
+                    if args.by_phase else None)
+    if args.by_phase and not args.model:
+        if args.as_json:
+            print(json.dumps({"by_phase": phase_report[0], "phase_stats": phase_report[1]}))
+        else:
+            print(render_by_phase(*phase_report))
         return 0
 
-    per_op, n_kernels, total_ns, span_ns = stream_observed(args.trace)
+    per_op, n_kernels, total_ns, span_ns = stream_observed(
+        args.trace, pid=args.pid, device=args.device)
     if not n_kernels:
         print(f"no kernel records in {args.trace} — nothing to subtract.")
         return 1
@@ -698,6 +772,10 @@ def main(argv: list[str] | None = None) -> int:
             "device_time_s": total_ns / 1e9,
             "window_s": span_ns / 1e9,
             "steps": args.steps,
+            "pid": args.pid,
+            "device": args.device,
+            "by_phase": phase_report[0] if phase_report else None,
+            "phase_stats": phase_report[1] if phase_report else None,
             "band_width": band,
             "ops": {
                 op: {
@@ -713,4 +791,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(render_deviation(per_op, pred, n_kernels=n_kernels, total_ns=total_ns,
                            span_ns=span_ns, steps=args.steps, band=band))
+    if phase_report:
+        print("\nPhase diagnostic (inferred phases do not isolate a decode-only window):")
+        print(render_by_phase(*phase_report))
     return 0

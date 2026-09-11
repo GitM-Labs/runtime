@@ -106,6 +106,7 @@ def decode_kernel(d: dict) -> KernelEvent:
         registers_per_thread=int(d.get("registers_per_thread", 0)),
         range_op=d.get("range_op"),
         range_layer=_opt_int(d.get("range_layer")),
+        pid=_opt_int(d.get("pid")),
     )
 
 
@@ -163,7 +164,7 @@ def decode_record(d: dict) -> TraceEvent | None:
 MARKER_START, MARKER_END = 0, 1
 
 #: vLLM's ``--enable-layerwise-nvtx-tracing`` names each range with the repr of a
-_VLLM_MODULE_RE = re.compile(r"'Module':\s*'([^']*)'")
+_VLLM_MODULE_RE = re.compile(r"[\"']Module[\"']:\s*[\"']([^\"']*)[\"']")
 
 
 def normalize_range_name(name: str) -> str:
@@ -258,6 +259,15 @@ def decode_records(records: list[dict]) -> list[TraceEvent]:
     Sorting by ``start_ns`` gives a stable timeline regardless of the order
     CUPTI flushed buffers (concurrent kernels on multiple streams interleave).
     """
+    # Both marker IDs and launch correlation IDs are process-local. Partition
+    # before pairing either; merging first silently borrows another rank's op.
+    pids = {d.get("pid") for d in records}
+    if len(pids) > 1:
+        by_pid: dict[int | None, list[dict]] = {}
+        for d in records:
+            by_pid.setdefault(d.get("pid"), []).append(d)
+        events = [e for group in by_pid.values() for e in decode_records(group)]
+        return sorted(events, key=lambda e: e.start_ns)
     correlated = correlate_kernels_to_ranges(pair_markers(records))
     enriched_kernels = iter(correlated)
     events: list[TraceEvent] = []

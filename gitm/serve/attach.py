@@ -442,7 +442,11 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
     from gitm.planner.context import build_planner_context, hardware_spec_for
 
     hw = hardware_spec_for(build_planner_context().peak)
-    if resolved.family == "hybrid":
+    if resolved.family == "glm_moe_dsa":
+        from gitm.planner.glm_graph import predict_glm_graph
+
+        g = predict_glm_graph(resolved.spec, hw, resolved.batch, resolved.sharding)
+    elif resolved.family == "hybrid":
         from gitm.planner.hybrid_graph import predict_hybrid_graph
 
         g = predict_hybrid_graph(resolved.spec, hw, resolved.batch, resolved.sharding)

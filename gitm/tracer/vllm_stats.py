@@ -562,6 +562,18 @@ _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?=\.|$)")
 #: land on the same node, or residuals would be split across two spellings of
 #: one op and each half would look healthier than the whole.
 _MODULE_OPS: dict[str, str] = {
+    "q_a_proj": "attn_q_a",
+    "q_b_proj": "attn_q_b",
+    "kv_a_proj_with_mqa": "attn_kv_a",
+    "kv_a_proj": "attn_kv_a",
+    "kv_b_proj": "attn_kv_b",
+    "q_a_layernorm": "rms_norm",
+    "kv_a_layernorm": "rms_norm",
+    "input_layernorm": "rms_norm",
+    "post_attention_layernorm": "rms_norm",
+    "norm": "rms_norm",
+    "embed_tokens": "embed_tokens",
+    "eh_proj": "mtp_eh_proj",
     # attention projections
     "qkv_proj": "qkv_proj",
     "q_proj": "qkv_proj",
@@ -618,6 +630,17 @@ def op_for_module(qualname: str) -> tuple[str, int | None] | None:
         return None
     leaf = qualname.rsplit(".", 1)[-1]
     op = _MODULE_OPS.get(leaf) or _CONTAINER_OPS.get(leaf)
+    parts = qualname.split(".")
+    if "indexer" in parts:
+        op = {"wq_b": "attn_index_proj", "wk": "attn_index_proj",
+              "weights_proj": "attn_index_proj", "indexer": "attn_index_score",
+              "k_norm": "rms_norm"}.get(leaf, op)
+    if leaf in ("gate_up_proj", "down_proj", "gate_proj", "up_proj"):
+        if any(p in ("shared_expert", "shared_experts", "_shared_expert",
+                     "_shared_experts") for p in parts):
+            op = "moe_shared"
+        elif "experts" in parts:
+            op = "moe_routed"
     if op is None:
         return None
     m = _LAYER_RE.search(qualname)
