@@ -40,6 +40,10 @@ _PEAKS: dict[str, tuple[float, float]] = {
     "B200": (2250e12, 8000e9),
     "H100": (989e12, 3350e9),
     "H200": (989e12, 4800e9),
+    # CDNA4. Dense matrix bf16 peak — AMD quotes 5 PFLOPS *with* 2:4 sparsity,
+    # which does not apply to a dense decode step. 288 GB HBM3E at 8 TB/s puts
+    # its decode roofline knee near B200's despite the different flops.
+    "MI355X": (2500e12, 8000e9),
     "A100-SXM": (312e12, 2039e9),
     "A100": (312e12, 1555e9),  # PCIe / 40GB fallback
     "L40": (181e12, 864e9),
@@ -76,6 +80,9 @@ _QUANT_PEAKS: dict[str, dict[str, float]] = {
     # H200 the difference is 3.4x on that node.
     "H100": {"fp8": 1979e12, "fp32": 67e12},
     "H200": {"fp8": 1979e12, "fp32": 67e12},
+    # CDNA4 dense rates; fp4 is the FP6/FP4 shared path. fp32 is the vector
+    # rate, present for the same router-scoring reason as Hopper's.
+    "MI355X": {"fp8": 5000e12, "fp4": 10000e12, "fp32": 157e12},
 }
 
 
@@ -92,6 +99,7 @@ _INTERCONNECT: dict[str, float] = {
     "H100": 900e9,  # NVLink 4
     "H200": 900e9,
     "A100": 600e9,  # NVLink 3
+    "MI355X": 1075e9,  # xGMI / Infinity Fabric, 7 links, aggregate bidirectional
 }
 
 

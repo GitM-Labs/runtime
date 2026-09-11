@@ -759,3 +759,93 @@ def test_missing_required_field_refuses_default():
     broken = {k: v for k, v in GLM_CONFIG.items() if k != "kv_lora_rank"}
     with pytest.raises(ValueError, match="kv_lora_rank"):
         spec_from_hf_config(broken)
+
+
+# ── Kimi K2.5: the family with the indexer switched off exactly ──────────────
+#
+# moonshotai/Kimi-K2.5's text config is DeepseekV3ForCausalLM — dense MLA + MoE
+# with NO sparse-attention indexer and NO MTP head (both absent from the weight
+# map, not just the config). The catalogue entry models it as glm_moe_dsa with
+# every layer 'shared' and index_topk = max_position_embeddings, which must
+# degrade to *exactly* dense attention: these tests pin that reduction, because
+# an indexer node or a topk bound that silently bit would be a plausible-looking
+# graph of a model that does not exist.
+
+
+def test_kimi_catalogue_entry_loads_and_predicts():
+    assert "kimi-k2.5" in available()
+    spec = load_spec("kimi-k2.5")
+    assert spec.n_layers == 61
+    assert spec.n_full_indexer_layers == 0  # no layer computes an index
+    assert spec.num_nextn_predict_layers == 0  # no MTP weights shipped
+    assert spec.first_k_dense_replace == 1
+    assert (spec.n_routed_experts, spec.num_experts_per_tok) == (384, 8)
+    assert isinstance(spec.op_dtype_overrides, tuple) and hash(spec)
+    g, family = predict("kimi-k2.5", batch=BatchConfig(batch=1, kv_cache_len=4096))
+    assert family == "glm_moe_dsa"
+    assert g.total_pred_s > 0
+
+
+def test_kimi_weight_bytes_match_published_checkpoint():
+    """595.15 GB published; int4 experts are most of why it is not 2.05 TB."""
+    published = 595_148_192_736  # model.safetensors.index.json total_size
+    spec = load_spec("kimi-k2.5")
+    assert abs(model_weight_bytes(spec) / published - 1.0) < 0.005
+    # The int4 entry in _WEIGHT_BYTES is load-bearing: the same shape priced
+    # bf16 (the fallback an unknown dtype gets) would be ~2 TB — a 3.4x error
+    # on the dominant decode traffic term.
+    naive = replace(spec, expert_dtype="bf16")
+    assert model_weight_bytes(naive) / model_weight_bytes(spec) > 3.0
+
+
+def test_kimi_graph_has_no_indexer_and_no_mtp_nodes():
+    g, _ = predict("kimi-k2.5", batch=BatchConfig(batch=32, kv_cache_len=8192))
+    ops = {n.op for n in g.nodes}
+    assert not any("index" in op for op in ops), ops
+    assert not any("mtp" in op or "draft" in op for op in ops), ops
+    # The MLA path is present and complete.
+    assert {"attn_q_a", "attn_q_b", "attn_kv_a", "attn_kv_b",
+            "attn_score_value", "attn_out_proj"} <= ops
+    # No indexer weights and no index keys: the footprint is attention + MoE
+    # + embeddings only, and kv bytes carry no per-full-layer index key term.
+    spec = load_spec("kimi-k2.5")
+    assert spec.n_full_indexer_layers == 0
+
+
+def test_kimi_attention_is_dense_in_context():
+    """min(kv_len, index_topk) must never bind below max_position_embeddings.
+
+    Decode: qk pairs and cache reads scale linearly with kv_len (16x context ->
+    16x cost), where a live topk bound would flatten them. Prefill: the capped
+    prefix-sum must equal the dense causal count — the same number
+    BatchConfig.attention_qk_pairs computes — not the DSA-bounded one.
+    """
+    from gitm.planner.glm_graph import core_qk_pairs
+
+    spec = load_spec("kimi-k2.5")
+    d1 = BatchConfig(batch=1, kv_cache_len=4096)
+    d2 = BatchConfig(batch=1, kv_cache_len=65536)
+    assert core_qk_pairs(spec, d2) / core_qk_pairs(spec, d1) == pytest.approx(16.0)
+    assert core_read_entries(spec, d2) / core_read_entries(spec, d1) == pytest.approx(16.0)
+
+    pre = BatchConfig(batch=0, kv_cache_len=0, prefill_tokens=8192,
+                      prefill_context=32768, prefill_requests=1)
+    assert core_qk_pairs(spec, pre) == pytest.approx(pre.attention_qk_pairs())
+
+
+def test_int4_weight_bytes_and_peak_are_not_a_fallback():
+    """W4A16: int4 weight traffic, bf16 MACs — and neither is a guess.
+
+    weight_bytes('int4') prices payload + one bf16 scale per group of 32; an
+    absent entry would silently fall back to 2.0 B/weight. resolve_peak lands
+    int4 on the fp16 tensor-core rate and must NOT flag it as a fallback —
+    dequantised int4 genuinely runs at that rate, and a spurious flag would
+    mark every Kimi prediction as unreliable.
+    """
+    from gitm.planner.roofline import HardwareSpec, roofline, weight_bytes
+
+    assert weight_bytes("int4") == pytest.approx(0.5 + 2.0 / 32)
+    hw = HardwareSpec()
+    pred = roofline("moe_routed", flops=1e12, bytes_moved=1e9, hw=hw, dtype="int4")
+    assert pred.peak_dtype == "fp16"
+    assert not pred.peak_is_fallback

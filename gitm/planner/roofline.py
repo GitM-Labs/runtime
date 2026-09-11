@@ -33,6 +33,9 @@ _WEIGHT_BYTES: dict[str, float] = {
     "fp8": 1.0 + 4.0 / (128 * 128),
     # MXFP4: one e8m0 (1 byte) scale per 32 values.
     "mxfp4": 0.5 + 1.0 / 32,
+    # compressed-tensors W4A16 pack-quantised (Kimi K2.5's routed experts):
+    # int4 payload with one bf16 scale per group of 32 along the input dim.
+    "int4": 0.5 + 2.0 / 32,
     # NVFP4: one e4m3 (1 byte) scale per 16 values.
     "nvfp4": 0.5 + 1.0 / 16,
     "fp4" :  0.5 + 1.0 / 32,
@@ -663,7 +666,11 @@ class RooflinePrediction:
 
 def _canon_dtype(dtype: str) -> str:
     d = dtype.lower()
-    if d in ("bf16", "float16", "fp16", "half"):
+    # int4 (W4A16 pack-quantised) canonicalises to fp16: the weights are
+    # dequantised into bf16 MACs, so the fp16/bf16 tensor-core rate is the
+    # op's *correct* ceiling, not a fallback — mapping it here keeps
+    # ``peak_is_fallback`` from flagging a prediction that is right.
+    if d in ("bf16", "float16", "fp16", "half", "int4", "w4a16"):
         return "fp16"
     if d in ("fp4", "mxfp4", "nvfp4"):
         return "fp4"
