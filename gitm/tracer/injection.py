@@ -71,6 +71,19 @@ def rocm_lib_path() -> Path:
     return _rocm.lib_path()
 
 
+def _rocm_shim_path() -> Path | None:
+    """The built roctx forwarding shim, or None when it is not built.
+
+    None rather than a path to a missing file: LD_PRELOAD of a nonexistent
+    library makes the loader print a warning into every child process's
+    stderr, which for a server means thousands of them.
+    """
+    from gitm.tracer import _rocm
+
+    p = _rocm.shim_path()
+    return p if p.exists() else None
+
+
 def active_vendor() -> str | None:
     """``"nvidia"``/``"amd"`` when this run is collected by OUR injected library,
     else ``None``.
@@ -145,17 +158,30 @@ def run_env(
     not make NVTX hand them over — verified on a B200, where markers stayed at
     zero until this was set.
 
-    On AMD there is deliberately no third variable: rocTX push/pop (what
-    ``torch.cuda.nvtx`` maps to under ROCm) is delivered to the SAME injected
-    tool by rocprofiler-sdk's marker tracing service, so ``GITM_TRACE_NVTX=1``
-    alone flips correlation on. ``vendor`` overrides autodetection for tests
-    and for rendering an env on a machine other than the one that will run it.
+    On AMD the collection side needs no third variable — rocTX push/pop is
+    delivered to the SAME injected tool by rocprofiler-sdk's marker tracing
+    service — but the EMISSION side has its own B200-class gotcha, found live
+    on ROCm 7.2.3 / MI355X: PyTorch's ROCm build links ``torch.cuda.nvtx`` to
+    the *legacy* ``libroctx64`` (roctracer lineage), whose calls never reach
+    rocprofiler-sdk's marker service. A direct sdk-roctx push produced a
+    marker record; a libroctx64 push produced nothing, silently. So with
+    ``nvtx`` the AMD env also sets ``LD_PRELOAD`` to the forwarding shim
+    (roctx_shim.c), which interposes the legacy symbols in the emitting
+    process and hands them to the sdk's roctx. ``vendor`` overrides
+    autodetection for tests and for rendering an env on a machine other than
+    the one that will run it.
     """
     out = str(Path(out_path).resolve())
     if (vendor or detect_vendor()) == "amd":
-        return {ENV_ROCP: str(rocm_lib_path()), ENV_OUT: out} | (
-            {ENV_NVTX: "1"} if nvtx else {}
-        )
+        env = {ENV_ROCP: str(rocm_lib_path()), ENV_OUT: out}
+        if nvtx:
+            env[ENV_NVTX] = "1"
+            shim = _rocm_shim_path()
+            if shim is not None:
+                # Prepend so an existing preload chain survives.
+                prior = os.environ.get("LD_PRELOAD", "")
+                env["LD_PRELOAD"] = f"{shim}:{prior}" if prior else str(shim)
+        return env
     env = {ENV_LIB: str(lib_path()), ENV_OUT: out}
     if nvtx:
         env[ENV_NVTX] = "1"

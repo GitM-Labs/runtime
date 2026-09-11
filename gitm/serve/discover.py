@@ -239,21 +239,36 @@ def classify(pid: int, proc: Path = PROC, *, base_url: str | None = None) -> Tar
     target.inject_lib = lib
     target.trace_out = out
 
-    if not lib:
+    # Vendor-neutral: the target is ours if EITHER hook points at our library.
+    # ROCP_TOOL_LIBRARIES is a colon-separated list (rocprofiler-register loads
+    # every entry), so ours may ride alongside another tool's.
+    from gitm.tracer._rocm import LIB_NAME as ROCM_LIB_NAME
+
+    rocp = env.get(injection.ENV_ROCP, "")
+    rocm_entries = [e for e in rocp.split(":") if e]
+    rocm_ours = [e for e in rocm_entries if Path(e).name == ROCM_LIB_NAME]
+    cuda_ours = bool(lib) and Path(lib).name == injection.LIB_NAME
+
+    if not lib and not rocm_entries:
         target.reason = (
-            f"PID {pid} started without {injection.ENV_LIB}: nothing is collecting "
+            f"PID {pid} started without {injection.ENV_LIB} (NVIDIA) or "
+            f"{injection.ENV_ROCP} (AMD): nothing is collecting "
             "inside it, and nothing can be made to."
         )
         return target
-    if Path(lib).name != injection.LIB_NAME:
-        # nsys sets this variable too. Arming a window against a profiler that is not
-        # ours would produce no shards and look identical to a broken install.
+    if not cuda_ours and not rocm_ours:
+        # nsys sets CUDA_INJECTION64_PATH too; rocprofv3 sets ROCP_TOOL_LIBRARIES.
+        # Arming a window against a profiler that is not ours would produce no
+        # shards and look identical to a broken install.
+        holder = f"{injection.ENV_LIB}={lib}" if lib else f"{injection.ENV_ROCP}={rocp}"
         target.reason = (
             f"PID {pid} is being collected by another profiler "
-            f"({injection.ENV_LIB}={lib}), not by {injection.LIB_NAME}. Two CUPTI "
+            f"({holder}), not by {injection.LIB_NAME} / {ROCM_LIB_NAME}. Two "
             "activity collectors cannot share a process."
         )
         return target
+    if rocm_ours:
+        target.inject_lib = rocm_ours[0]
     if not out:
         target.reason = (
             f"PID {pid} has {injection.ENV_LIB} set but no {injection.ENV_OUT}: the "

@@ -23,6 +23,11 @@ import os
 from pathlib import Path
 
 LIB_NAME = "libgitm_rocm_inject.so"
+#: The roctx forwarding shim (see roctx_shim.c): PyTorch's ROCm build emits
+#: torch.cuda.nvtx through the LEGACY libroctx64, which rocprofiler-sdk's
+#: marker service cannot see; LD_PRELOADing this shim in the EMITTING process
+#: forwards those calls to the sdk's roctx. Correlation-arm only.
+SHIM_NAME = "libgitm_roctx_shim.so"
 
 _ROCM_HOMES = ("/opt/rocm",)  # versioned installs symlink /opt/rocm -> rocm-X.Y
 
@@ -30,6 +35,11 @@ _ROCM_HOMES = ("/opt/rocm",)  # versioned installs symlink /opt/rocm -> rocm-X.Y
 def lib_path() -> Path:
     """Where the injection tool is built, whether or not it exists yet."""
     return Path(__file__).resolve().parent / LIB_NAME
+
+
+def shim_path() -> Path:
+    """Where the roctx forwarding shim is built, whether or not it exists yet."""
+    return Path(__file__).resolve().parent / SHIM_NAME
 
 
 def _sdk_lib_candidates() -> list[Path]:
