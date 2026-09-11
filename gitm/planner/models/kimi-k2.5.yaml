@@ -1,0 +1,193 @@
+# moonshotai/Kimi-K2.5 — KimiK25ForConditionalGeneration; text_config is
+# DeepseekV3ForCausalLM (model_type kimi_k2): classic dense MLA + sparse MoE.
+# Source: https://huggingface.co/moonshotai/Kimi-K2.5/blob/main/config.json
+# Read from config.json and model.safetensors.index.json only — no traces.
+#
+# Family note: `glm_moe_dsa` is the graph that models MLA + MoE; the DSA
+# indexer is the one piece Kimi does not have, and it is switched off exactly,
+# not approximately: every layer is 'shared' (zero indexer nodes, weights and
+# cache keys — the weight map carries no indexer tensors to model), and
+# index_topk equals max_position_embeddings (262144), so min(kv_len, topk)
+# never binds and both core_qk_pairs and the capped prefill prefix-sum reduce
+# to the dense causal count. What remains is precisely DeepSeek-V3-style dense
+# MLA attention over the full history.
+
+name: moonshotai/Kimi-K2.5
+family: glm_moe_dsa
+description: >
+  61 layers, hidden 7168, ~1T total / ~32B active per token. Dense MLA
+  attention (kv_lora_rank 512, one latent shared across 64 query heads, no
+  sparse-attention indexer). First layer dense FFN, remaining 60 MoE (384
+  experts, sigmoid top-8, one shared). Routed experts int4 (compressed-tensors
+  W4A16, group 32); everything else bf16. No MTP weights in this checkpoint.
+  Vision tower out of scope for a text decode step.
+
+spec:
+  hidden: 7168
+  n_layers: 61
+  vocab: 163840
+
+  # MLA attention, the unmodified DeepSeek-V3 shape. num_key_value_heads is 64
+  # in the config but is the usual MLA red herring: the cache holds one
+  # kv_lora_rank latent (plus the shared 64-wide RoPE key) per token, shared
+  # across all 64 query heads.
+  n_heads: 64
+  q_lora_rank: 1536
+  kv_lora_rank: 512
+  qk_nope_head_dim: 128
+  qk_rope_head_dim: 64
+  v_head_dim: 128
+
+  # No DeepSeek Sparse Attention. index_topk = max_position_embeddings so the
+  # core's min(kv_len, index_topk) bound never binds — attention is dense in
+  # context, quadratic at prefill, which is this model's actual cost. All 61
+  # layers 'shared' means no layer computes an index: no indexer node is
+  # emitted, no indexer weights are counted, no index keys are cached. The
+  # weight map agrees — zero indexer tensors anywhere.
+  index_n_heads: 0
+  index_head_dim: 0
+  index_topk: 262144
+  indexer_types:
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+    - shared
+
+  # Mixture of experts. moe_intermediate_size 2048 per expert; only layer 0 is
+  # dense FFN (intermediate_size 18432) — the weight map shows experts on
+  # layers 1..60 and none on layer 0, matching first_k_dense_replace 1.
+  n_routed_experts: 384
+  n_shared_experts: 1
+  num_experts_per_tok: 8
+  moe_intermediate_size: 2048
+  intermediate_size: 18432
+  first_k_dense_replace: 1
+  routed_scaling_factor: 2.827
+
+  # num_nextn_predict_layers is 0 in the config AND the weight map carries no
+  # nextn/eh_proj tensors — this checkpoint ships no MTP head. Serving recipes
+  # that pass NextN/EAGLE speculative flags against it are drafting with
+  # something this checkpoint does not contain; the streamed
+  # avg_decoded_tokens_per_iter (1.0 = not engaged) is the ground truth.
+  num_nextn_predict_layers: 0
+
+  # Routed experts are the one quantised tensor class: compressed-tensors
+  # pack-quantised int4, symmetric, group 32 (weight_packed + bf16 weight_scale
+  # per group — the 2/32 in roofline's int4 entry). The quantization_config
+  # ignore list keeps attention, the shared expert, the dense FFN and lm_head
+  # at bf16, hence expert_dtype int4 with moe_shared pinned back to bf16.
+  weight_dtype: bf16
+  expert_dtype: int4
+  kv_dtype: bf16
+  act_dtype: bf16
+  op_dtype_overrides:
+    - [moe_shared, bf16]
+
+provenance:
+  verified:
+    - claim: no sparse-attention indexer and no MTP head, read from the weight map
+      detail: >
+        model.safetensors.index.json (208,550 tensors) contains zero indexer
+        tensors and zero nextn/mtp/eh_proj tensors. Layers run 0..60 with
+        exactly the seven DeepSeek-V3 MLA attention tensors each
+        (q_a/q_b/kv_a_with_mqa/kv_b/o_proj plus the two norms).
+    - claim: dense/sparse MLP split matches the tensor map
+      detail: >
+        Layer 0 carries no expert tensors (dense FFN); layers 1-60 carry
+        experts.*.{gate,up,down}_proj.weight_packed/_scale/_shape and
+        shared_experts.*. Matches first_k_dense_replace 1.
+    - claim: predicted weight bytes match the published checkpoint
+      detail: >
+        model.safetensors.index.json total_size is 595,148,192,736 B
+        (595.15 GB). model_weight_bytes with int4 experts (0.5 + 2/32 B/weight)
+        predicts 595.00 GB — -0.03%. The unmodelled vision tower (~0.9 GB) and
+        the omitted norms/weight_shape tensors nearly cancel against the coarse
+        per-group scale accounting; the same shape all-bf16 would be 2.054 TB,
+        so the int4 entry is doing real work here, not rounding.
+
+  estimated:
+    - field: MLA absorption (attn_kv_b vs attn_out_proj width)
+      value: unabsorbed — kv_b runs as its own GEMM, o_proj narrow
+      detail: >
+        Same reading as the glm-5.2 entry: the graph models MLA unabsorbed. A
+        serving engine that absorbs MLA (the common vLLM/SGLang decode path)
+        folds W^UK into the query and W^UV into the output, dropping attn_kv_b
+        and widening attn_out_proj's input to n_heads*kv_lora_rank
+        (32768 -> 7168). Same resident weights either way; the two readings
+        move attn_out_proj 2x — settle against the first MI355X capture.
+    - field: moe_router precision
+      value: bf16 (follows weight_dtype; no override)
+      detail: >
+        Unlike GLM-5.2 the config declares no moe_router_dtype, and the index
+        file does not carry dtypes, so the router (mlp.gate.weight +
+        e_score_correction_bias, sigmoid noaux_tc scoring) is left at
+        weight_dtype rather than asserted fp32. Engines typically score in
+        fp32 at run time; the node is ~2.75M weights per layer, so the choice
+        moves nothing the monitor can resolve — recorded here so a trace can
+        settle it.
+
+  unmodelled:
+    - The vision tower (27 ViT layers, hidden 1152, ~0.9 GB) and mm projector.
+      This entry prices the text decode step; vision tensors sit resident but
+      idle. Their weight bytes are the dominant term in the total_size residual.
+    - Activation dtype of expert GEMMs. W4A16 means int4 weights are
+      dequantised into bf16 MACs — the graph prices weight *traffic* at int4
+      and flops at the act dtype's peak, which is the right roofline for
+      Marlin-style kernels.
