@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from analyze_join import guidellm_point, _dig  # noqa: E402
+from analyze_join import guidellm_point  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 PRED = REPO / "evidence" / "kimi-mi355x" / "predicted" / "predicted_sweep.json"

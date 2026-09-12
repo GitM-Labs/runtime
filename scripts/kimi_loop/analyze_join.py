@@ -85,7 +85,7 @@ def guidellm_point(path: Path) -> dict:
                        "metrics.itl_ms.successful.percentiles.p95"),
     }.items():
         v = _dig(b, *paths)
-        out[name] = round(v, 2) if isinstance(v, (int, float)) else None
+        out[name] = round(v, 2) if isinstance(v, int | float) else None
     # Fallback throughput from totals when the metrics tree matched nothing.
     if out.get("out_tok_s") is None and s:
         req = _dig(b, "requests") or {}
