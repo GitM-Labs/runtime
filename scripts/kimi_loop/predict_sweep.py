@@ -27,9 +27,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from gitm.planner.model_catalogue import load_spec
 from gitm.planner.context import hardware_spec_for, peak_for_sku
 from gitm.planner.glm_graph import predict_glm_graph
+from gitm.planner.model_catalogue import load_spec
 from gitm.planner.roofline import BatchConfig, HardwareSpec, ShardingConfig
 
 MODEL = "kimi-k2.5"
