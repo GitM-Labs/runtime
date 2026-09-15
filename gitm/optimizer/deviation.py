@@ -682,8 +682,19 @@ def add_deviate_arguments(ap):
                     help="Context already cached before this chunk (0 for a first chunk).")
     ap.add_argument("--prefill-requests", type=int, default=1,
                     help="How many prompts those tokens belong to — sets lm_head rows.")
-    ap.add_argument("--tp", type=int, default=1)
-    ap.add_argument("--ep", type=int, default=1)
+    # No --acceptance-rate here, unlike `gitm plan`: no per-op floor reads it, and a
+    # flag that changes nothing in the output is a trap of its own.
+    ap.add_argument("--spec-tokens", type=int, default=0,
+                    help="Speculative draft tokens per decode step (3 for EAGLE3 with "
+                         "3 drafts). The floor then prices the 1+D verify rows, as "
+                         "`gitm plan --spec-tokens` does.")
+    ap.add_argument("--tp", type=int, default=1, help="Tensor-parallel size.")
+    # A TP-only server is ep=1: every rank holds a slice of every expert and the
+    # MoE closes with an all-reduce. ep>1 prices an all-to-all that server never
+    # runs, and the subtraction would report it as a finding.
+    ap.add_argument("--ep", type=int, default=1,
+                    help="Expert-parallel size. Keep 1 unless the server runs "
+                         "--enable-expert-parallel; >1 predicts moe_all_to_all.")
     ap.add_argument("--pid", type=int, default=None, help="Select one captured worker PID.")
     ap.add_argument("--device", type=int, default=None, help="Select a worker-local device ID.")
     ap.add_argument("--no-graph", action="store_true",
@@ -753,6 +764,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             g = _predict(spec, family, _hardware(args.gpu),
                          BatchConfig(batch=args.batch, kv_cache_len=args.kv_len,
+                                     speculative_tokens=args.spec_tokens,
                                      prefill_tokens=args.prefill_tokens,
                                      prefill_context=args.prefill_context,
                                      prefill_requests=args.prefill_requests),
@@ -774,6 +786,7 @@ def main(argv: list[str] | None = None) -> int:
             "steps": args.steps,
             "pid": args.pid,
             "device": args.device,
+            "speculative_tokens": args.spec_tokens,
             "by_phase": phase_report[0] if phase_report else None,
             "phase_stats": phase_report[1] if phase_report else None,
             "band_width": band,

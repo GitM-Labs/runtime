@@ -607,3 +607,34 @@ def test_anchors_are_found_whatever_the_json_spacing(tmp_path):
         "start_ns": 1, "end_ns": 2,
     }) + "\n")
     assert len(phase_anchors(p)) == 1
+
+
+# ── --spec-tokens ─────────────────────────────────────────────────────────────
+
+
+def test_spec_tokens_prices_the_verify_rows(tmp_path, capsys):
+    """With D drafts a decode step computes 1+D positions per sequence; a floor
+    priced for 1 makes every decode ratio read as headroom."""
+    import json
+
+    from gitm.optimizer.deviation import main
+
+    p = _write_trace(tmp_path / "t.jsonl", [("fused_moe_kernel", 1000, 4)])
+    base = [str(p), "--model", "qwen3.6-35b-a3b", "--gpu", "H200",
+            "--batch", "8", "--kv-len", "1024", "--json"]
+    main(base)
+    plain = json.loads(capsys.readouterr().out)
+    main(base + ["--spec-tokens", "3"])
+    spec = json.loads(capsys.readouterr().out)
+    assert (plain["speculative_tokens"], spec["speculative_tokens"]) == (0, 3)
+    assert spec["ops"]["moe_routed"]["floor_s"] > plain["ops"]["moe_routed"]["floor_s"]
+
+
+def test_spec_tokens_reaches_through_the_top_level_cli(tmp_path, capsys):
+    import json
+
+    from gitm.cli import main as cli_main
+
+    p = _write_trace(tmp_path / "t.jsonl", [("fused_moe_kernel", 1000, 4)])
+    assert cli_main(["deviate", str(p), "--no-graph", "--spec-tokens", "3", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["speculative_tokens"] == 3

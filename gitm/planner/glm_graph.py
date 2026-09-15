@@ -154,6 +154,10 @@ class GlmMoeDsaModelSpec:
     weight_dtype: str = "bf16"
     expert_dtype: str = "bf16"
     kv_dtype: str = "bf16"
+    #: Storage width of the decoupled RoPE key inside each cached entry. ``bf16``
+    #: is the DeepSeek ``fp8_ds_mla`` layout (latent quantised, RoPE kept wide) and
+    #: the default, so every existing entry prices exactly as before.
+    kv_rope_dtype: str = "bf16"
     act_dtype: str = "bf16"
     #: ``(op_name, dtype)`` for the ops that do not run in :attr:`weight_dtype`.
     #: A tuple, not a mapping, so the spec stays hashable. Read from the
@@ -231,9 +235,10 @@ def kv_entry_bytes(spec: GlmMoeDsaModelSpec) -> float:
     The latent plus the decoupled RoPE key. DeepSeek-family checkpoints keep the
     RoPE dimensions in bf16 while the latent may be quantised; on a pure-bf16
     checkpoint both are 2 bytes and this reduces to ``kv_entry_dim * 2``. The split
-    is kept so an fp8-KV *serving* config prices the two halves correctly.
+    is kept so an fp8-KV *serving* config prices the two halves correctly, and
+    :attr:`GlmMoeDsaModelSpec.kv_rope_dtype` says which of the two fp8 layouts it is.
     """
-    rope = spec.qk_rope_head_dim * weight_bytes("bf16")
+    rope = spec.qk_rope_head_dim * weight_bytes(spec.kv_rope_dtype)
     latent = spec.kv_lora_rank * weight_bytes(spec.kv_dtype)
     return latent + rope
 
