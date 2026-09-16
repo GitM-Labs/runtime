@@ -45,7 +45,7 @@ from typing import TYPE_CHECKING, Protocol
 from gitm.agents.policy import Policy, select_interventions
 from gitm.kernels.library import load_library
 from gitm.kernels.spec import Applicability, InterventionSpec, SafetyGate
-from gitm.optimizer.apply import ApplyResult, Applicator, EngineABResult, apply_intervention
+from gitm.optimizer.apply import Applicator, ApplyResult, EngineABResult, apply_intervention
 from gitm.optimizer.deviation import classify_op
 from gitm.optimizer.monitor import Residuals, _serialized_fraction
 from gitm.optimizer.vllm_knobs import KNOB_PREREQUISITES
