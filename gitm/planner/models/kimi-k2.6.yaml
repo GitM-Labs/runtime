@@ -1,0 +1,90 @@
+# nvidia/Kimi-K2.6-NVFP4 — the same text model as Kimi K2.5
+# (KimiK25ForConditionalGeneration wrapping DeepseekV3ForCausalLM); only the
+# precision differs.
+# Source: https://huggingface.co/nvidia/Kimi-K2.6-NVFP4/blob/main/config.json
+#
+# Everything shape-related is inherited from kimi-k2.5, including the exact DSA
+# switch-off (index_topk = max_position_embeddings, every layer 'shared'), so
+# the 61-entry indexer schedule is not duplicated here. This entry overrides
+# precision only. `op_dtype_overrides` replaces the parent's list rather than
+# merging with it, so moe_shared is restated.
+
+name: nvidia/Kimi-K2.6-NVFP4
+extends: kimi-k2.5
+description: >
+  61 layers, hidden 7168, dense MLA (kv_lora_rank 512, no sparse-attention
+  indexer), layer 0 dense FFN, layers 1-60 MoE (384 experts, top-8, one
+  shared). Routed experts NVFP4 (W4A4, group 16, e4m3 block scales);
+  attention, shared expert, dense FFN and lm_head bf16. Generic FP8 KV cache.
+  Production serves it with an EAGLE3 draft model, which this entry does not
+  price (see unmodelled).
+
+spec:
+  expert_dtype: nvfp4
+  # hf_quant_config.json kv_cache_quant_algo: FP8, served as
+  # --kv-cache-dtype fp8. On dense MLA vLLM keeps the generic layout, which
+  # stores the whole 576-dim entry at one byte.
+  kv_dtype: fp8
+  kv_rope_dtype: fp8
+  op_dtype_overrides:
+    - [moe_shared, bf16]
+
+provenance:
+  verified:
+    - claim: text shape is identical to kimi-k2.5
+      detail: >
+        config.json text_config (read 2026-09-10, re-read 2026-09-15):
+        hidden_size 7168, num_hidden_layers 61, num_attention_heads 64,
+        q_lora_rank 1536, kv_lora_rank 512, qk_nope/rope/v 128/64/128,
+        n_routed_experts 384, num_experts_per_tok 8, n_shared_experts 1,
+        moe_intermediate_size 2048, first_k_dense_replace 1, vocab_size 163840,
+        num_nextn_predict_layers 0. No index_topk and no compress_ratios.
+    - claim: predicted weight bytes match the published checkpoint
+      detail: >
+        595.19 GB summed over the 60 safetensors shards on the Hub (re-read
+        2026-09-15 via the Hub tree API: 595.185 GB); model_weight_bytes
+        predicts 595.00 GB (-0.03%). NVFP4 (0.5 + 1/16) and int4 (0.5 + 2/32)
+        are both 0.5625 B/weight, so K2.6 predicts the same footprint as K2.5.
+    - claim: precision layout
+      detail: >
+        hf_quant_config.json: quant_algo NVFP4, group_size 16,
+        kv_cache_quant_algo FP8. exclude_modules lists lm_head, layers.0*, and
+        every layer's self_attn* and mlp.shared_experts*, so attention, the
+        dense layer, the shared expert and lm_head stay bf16 (weight_dtype
+        bf16 plus the moe_shared override); only routed experts are NVFP4.
+    - claim: kv_rope_dtype fp8 (576 B per entry, not DeepSeek's fp8_ds_mla)
+      detail: >
+        vLLM (mla_attention.py, _canonicalize_sparse_mla_kv_cache_dtype) maps a
+        quantised KV dtype to fp8_ds_mla only on the sparse MLA backends
+        FLASHMLA_SPARSE and FLASHINFER_MLA_SPARSE_SM120. Kimi's attention is
+        dense, so --kv-cache-dtype fp8 keeps the generic layout: latent and
+        RoPE key both at one byte.
+
+  estimated:
+    - field: MLA absorption (attn_kv_b vs attn_out_proj width)
+      value: unabsorbed, carried from kimi-k2.5
+      detail: >
+        Right form for prefill (vLLM forward_mha up-projects K/V). At decode
+        vLLM absorbs W_UK/W_UV into per-head bmm's and launches no kv_b_proj
+        GEMM, so expect attn_kv_b predicted-but-not-observed at decode and
+        decode core FLOPs ~3.4x under. Decode is memory-bound, so the floor
+        barely moves.
+    - field: moe_router precision
+      value: bf16 (follows weight_dtype; no override), carried from kimi-k2.5
+      detail: Engines typically score in fp32 at run time; ~2.75M weights per layer.
+    - field: attn_score_value precision
+      value: bf16 (no override)
+      detail: >
+        Production runs use_prefill_query_quantization (FP8 QK^T at prefill,
+        FP8 decode query). Only compute moves and decode is memory-bound; add
+        [attn_score_value, fp8] for a prefill comparison, which halves that
+        node's prefill time.
+
+  unmodelled:
+    - The EAGLE3 draft model (lightseekorg/kimi-k2.6-eagle3-mla). With
+      --spec-tokens the graph prices the target's 1+D verify rows per sequence,
+      but none of the draft's own forward passes.
+    - NVFP4 W4A4 activation quantisation ahead of the routed experts. The
+      glm family emits act_quant only for fp8 GEMMs, so no node prices it here.
+    - The vision tower (MoonViT, 27 layers, hidden 1152) and mm_projector, run
+      data-parallel (--mm-encoder-tp-mode data). Text requests never enter them.

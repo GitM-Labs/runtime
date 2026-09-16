@@ -849,3 +849,87 @@ def test_int4_weight_bytes_and_peak_are_not_a_fallback():
     pred = roofline("moe_routed", flops=1e12, bytes_moved=1e9, hw=hw, dtype="int4")
     assert pred.peak_dtype == "fp16"
     assert not pred.peak_is_fallback
+
+
+# ── Kimi K2.6-NVFP4: K2.5's shape, different precision ────────────────────────
+#
+# The entry is `extends: kimi-k2.5` plus precision only: expert_dtype, kv_dtype,
+# kv_rope_dtype, and the restated moe_shared override. These pin that the
+# inheritance carries the shape (and the exact DSA switch-off) intact, and that
+# the precision differences land where they should.
+
+
+def _b300():
+    from gitm.planner.context import hardware_spec_for, peak_for_sku
+
+    return hardware_spec_for(peak_for_sku("B300"))
+
+
+def test_kimi_k26_inherits_the_k25_shape_and_overrides_precision():
+    assert "kimi-k2.6" in available()
+    assert load_entry("kimi-k2.6")["family"] == "glm_moe_dsa"
+    k26, k25 = load_spec("kimi-k2.6"), load_spec("kimi-k2.5")
+    shape = ("n_layers", "hidden", "n_heads", "kv_lora_rank", "n_routed_experts",
+             "first_k_dense_replace", "index_topk", "indexer_types")
+    assert all(getattr(k26, f) == getattr(k25, f) for f in shape)
+    assert (k26.expert_dtype, k26.kv_dtype, k26.kv_rope_dtype) == ("nvfp4", "fp8", "fp8")
+    # The child's override list replaces the parent's, so this must be restated.
+    assert k26.dtype_for("moe_shared", k26.expert_dtype) == "bf16"
+
+
+def test_kimi_k26_weight_bytes_match_published_checkpoint():
+    """595.19 GB over the Hub shards. nvfp4 and int4 both cost 0.5625 B/weight."""
+    assert abs(model_weight_bytes(load_spec("kimi-k2.6")) / 595.19e9 - 1.0) < 0.005
+
+
+def test_generic_fp8_kv_prices_the_rope_slice_at_one_byte():
+    """`--kv-cache-dtype fp8` on dense MLA stores the whole 576-dim entry at one
+    byte. The default keeps the RoPE key at bf16, 64 B more per entry — right
+    only for a layout that keeps RoPE wide. Every existing entry is unchanged."""
+    from gitm.planner.roofline import weight_bytes
+
+    fp8 = weight_bytes("fp8")
+    assert kv_entry_bytes(load_spec("kimi-k2.6")) == pytest.approx(576 * fp8)
+    assert kv_entry_bytes(load_spec("kimi-k2.5")) == pytest.approx(576 * 2.0)
+    wide_rope = replace(load_spec("kimi-k2.6"), kv_rope_dtype="bf16")
+    assert kv_entry_bytes(wide_rope) == pytest.approx(512 * fp8 + 64 * 2.0)
+
+
+def test_kimi_k26_plans_the_production_shape_on_b300():
+    """TP8, EP1, batch 32 at 8K, three speculative tokens: the verify is 4 rows
+    per sequence, the experts price against B300's fp4 peak, nothing falls back,
+    and no indexer, MTP or all-to-all node appears."""
+    g, family = predict(
+        "kimi-k2.6", hw=_b300(),
+        batch=BatchConfig(batch=32, kv_cache_len=8192, speculative_tokens=3),
+        sharding=ShardingConfig(tp=8),
+    )
+    ops = [n.op for n in g.nodes]
+    assert family == "glm_moe_dsa" and len(g.nodes) == 1037
+    assert not g.has_fallback_peaks and not g.has_unpriced_collectives
+    assert ops.count("moe_routed") == 60 and "moe_all_to_all" not in ops
+    assert not any("index" in op or "mtp" in op for op in ops)
+    routed = next(n for n in g.nodes if n.op == "moe_routed")
+    assert routed.prediction.peak_dtype == "fp4" and routed.prediction.bound == "memory"
+
+
+def test_plan_cli_forwards_spec_decode_and_launch_flags(capsys):
+    """`gitm plan` parsed --spec-tokens, --acceptance-rate and --launch-overhead and
+    then dropped them, so the floor silently priced a plain decode step."""
+    import re
+
+    from gitm.cli import main as cli_main
+
+    base = ["plan", "kimi-k2.6", "--gpu", "B300", "--batch", "32", "--kv-len", "8192",
+            "--tp", "8"]
+
+    def floor(extra):
+        assert cli_main(base + extra) == 0
+        out = capsys.readouterr().out
+        return float(re.search(r"floor ([\d.]+) ms/step", out).group(1)), out
+
+    plain, _ = floor([])
+    spec, out = floor(["--spec-tokens", "3", "--acceptance-rate", "0.6"])
+    assert "D=3 alpha=0.6" in out and spec > plain
+    eager, _ = floor(["--launch-overhead", "5e-6"])
+    assert eager > plain

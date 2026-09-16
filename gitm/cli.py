@@ -390,6 +390,7 @@ def main(argv: list[str] | None = None) -> int:
         for name, flag in (
             ("model", "--model"), ("gpu", "--gpu"), ("batch", "--batch"),
             ("kv_len", "--kv-len"), ("steps", "--steps"), ("tp", "--tp"), ("ep", "--ep"),
+            ("spec_tokens", "--spec-tokens"),
             ("prefill_tokens", "--prefill-tokens"),
             ("prefill_context", "--prefill-context"),
             ("prefill_requests", "--prefill-requests"),
@@ -414,6 +415,10 @@ def main(argv: list[str] | None = None) -> int:
             ("prefill_context", "--prefill-context"),
             ("prefill_requests", "--prefill-requests"),
             ("tp", "--tp"), ("ep", "--ep"), ("dp", "--dp"), ("sweep", "--sweep"),
+            # Parsed by add_plan_arguments but dropped here before, so `gitm plan
+            # --spec-tokens 3` silently priced a plain decode step.
+            ("spec_tokens", "--spec-tokens"), ("acceptance_rate", "--acceptance-rate"),
+            ("launch_overhead", "--launch-overhead"),
         ):
             val = getattr(args, name, None)
             if val is not None:
