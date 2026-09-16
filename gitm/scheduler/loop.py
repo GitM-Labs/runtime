@@ -49,6 +49,7 @@ from gitm.optimizer.verification_export import (
     write_verification,
 )
 from gitm.optimizer.vllm_knobs import (
+    KNOB_PREREQUISITES,
     expand_relative_candidates,
     knob_kind,
     unmet_prerequisite,
@@ -755,6 +756,19 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     else:
         applicator = DryRunApplicator()
 
+    def _find_motivating_cause(spec: Any) -> tuple[str, Any] | None:
+        for knob in spec.knob_values:
+            hit = next((sc for sc in sched_causes if knob in sc.motivates_knobs), None)
+            if hit is not None:
+                return ("scheduler", hit)
+            hit = next((cc for cc in coll_causes if knob in cc.motivates_knobs), None)
+            if hit is not None:
+                return ("collective", hit)
+        return None
+
+    def _has_structural_knob(spec: Any) -> bool:
+        return any(knob_kind(k) == "structural" for k in spec.knob_values)
+
     claims: list[Claim] = []
     rolled_back: list[str] = []
     rejected: list[str] = []
@@ -773,15 +787,19 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         # running engine, so it's "not evaluable here", not a regression. Mark it
         # rejected (honest) instead of attempting an apply that would roll back and
         # read as "tried and lost" — and skip the wasted baseline benchmark.
-        if cfg.engine is not None and live_restart_fn is None and knob_kind(c.spec.knob) == "structural":
+        if cfg.engine is not None and live_restart_fn is None and _has_structural_knob(c.spec):
             rejected.append(f"{c.spec.name} (structural knob: needs engine restart, no restart_fn)")
             continue
         # Snapshot the engine config BEFORE the apply: a hot-swap mutates these
         # kwargs in place and a restart replaces the engine outright, so reading
         # them afterwards would report the candidate on both sides of the diff.
-        baseline_cfg = dict(getattr(cfg.engine, "gitm_llm_kwargs", None) or {})
+        baseline_cfg = dict(getattr(getattr(applicator, "engine", cfg.engine), "gitm_llm_kwargs", None) or {})
         result = apply_intervention(c.spec, applicator, min_keep_delta=0.0)
-        ab = getattr(applicator, "last_result", None)
+        ab = (
+            getattr(applicator, "last_result", None)
+            if result.measured_delta is not None
+            else None
+        )
         if result.rolled_back:
             rolled_back.append(c.spec.name)
         if ab is not None:
@@ -813,11 +831,12 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             causal_evidence = ", ".join(
                 f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
             ) or "no strong causal signal"
-        # Attach the top scheduler cause that argues for *this* knob — the
-        # engine-level signal (C) tied to the specific lever it motivates (B).
-        motivating = next((sc for sc in sched_causes if c.spec.knob in sc.motivates_knobs), None)
+        if result.error is not None and result.measured_delta is None:
+            causal_evidence += f"; apply failed: {result.error}"
+        motivating = _find_motivating_cause(c.spec)
         if motivating is not None:
-            causal_evidence += f"; scheduler[{motivating.signal}]: {motivating.note}"
+            channel, cause = motivating
+            causal_evidence += f"; {channel}[{cause.signal}]: {cause.note}"
         claims.append(
             Claim(
                 summary=c.spec.summary,
@@ -845,10 +864,22 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             if (
                 cfg.engine is not None
                 and live_restart_fn is None
-                and knob_kind(spec.knob) == "structural"
+                and _has_structural_knob(spec)
             ):
                 return "structural knob: needs engine restart, no restart_fn"
-            return unmet_prerequisite(cfg.engine, spec.knob)
+            values = spec.knob_values
+            for k in values:
+                reason = unmet_prerequisite(cfg.engine, k)
+                if reason is None:
+                    continue
+                prereq = next(
+                    (p for needle, p in KNOB_PREREQUISITES if needle in k.lower()),
+                    None,
+                )
+                if prereq in values:
+                    continue
+                return reason
+            return None
 
         ar_run = autoresearch(
             trace,
@@ -862,7 +893,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     else:
         ar_run = AutoresearchRun(bottleneck_class=classify_bottleneck(trace, res), results=[])
 
-    ar_causal_evidence = ", ".join(
+    ar_granger_evidence = ", ".join(
         f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
     ) or "no strong causal signal"
     ar_residual = _ar_target_residual(ar_run, kt_residual)
@@ -872,13 +903,22 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             continue
         if r.rolled_back:
             rolled_back.append(r.spec.name)
-        # A rolled-back candidate with no measured_delta means the live apply
-        # itself raised (engine build/restart failure), not "measured and lost" —
-        # surface why directly in the report so that distinction isn't buried in
-        # autoresearch.json.
-        evidence = ar_causal_evidence
+        ar_ab = r.ab_result
+        if ar_ab is not None:
+            outcome = "rolled back" if r.rolled_back else "kept"
+            evidence = (
+                f"live A/B: {outcome} ({ar_ab.speedup - 1.0:+.1%} decode throughput, via {ar_ab.via}); "
+                f"baseline {ar_ab.baseline_tps:.1f} → candidate {ar_ab.candidate_tps:.1f} tok/s"
+            )
+        else:
+            evidence = ar_granger_evidence
         if r.measured_delta is None and r.apply_error:
             evidence += f"; apply failed: {r.apply_error}"
+        motivating = _find_motivating_cause(r.spec)
+        if motivating is not None:
+            channel, cause = motivating
+            evidence += f"; {channel}[{cause.signal}]: {cause.note}"
+        true_delta = (ar_ab.speedup - 1.0) if ar_ab is not None else r.measured_delta
         claims.append(
             Claim(
                 summary=r.spec.summary,
@@ -887,10 +927,18 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 causal_evidence=evidence,
                 intervention_name=r.spec.name,
                 predicted_delta=r.predicted_delta,
-                measured_delta=r.measured_delta,
+                measured_delta=true_delta,
                 rolled_back=r.rolled_back,
             )
         )
+        if ar_ab is not None and r.apply_result is not None:
+            verification.append(
+                build_record(
+                    r.spec, ar_ab, r.apply_result,
+                    baseline_config=r.baseline_config or {},
+                    candidate_config=r.candidate_config or {},
+                )
+            )
     (run_dir / "autoresearch.json").write_text(
         json.dumps(
             {
