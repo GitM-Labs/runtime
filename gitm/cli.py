@@ -152,6 +152,28 @@ def _parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="Probe environment, GPUs, and data locations.")
 
+    hist = sub.add_parser(
+        "history",
+        help="What previous runs measured, per lever.",
+        description=(
+            "Aggregate every past run's verification.json into a per-lever record: "
+            "how often each lever was tried, kept, or rolled back, and by how much. "
+            "Read-only — it runs no workload and touches no engine."
+        ),
+    )
+    hist.add_argument(
+        "--scratch",
+        default=None,
+        help="Override $GITM_SCRATCH (local ephemeral run dir; datasets stay in S3).",
+    )
+    hist.add_argument(
+        "--gpu",
+        default=None,
+        help="Only count runs measured on this GPU SKU (substring must match exactly).",
+    )
+    hist.add_argument("--top", type=int, default=20, help="Rows to show (default 20).")
+    hist.add_argument("--json", action="store_true", help="Emit the records as JSON.")
+
     add_plan_arguments(sub.add_parser(
         "plan",
         help="Predicted roofline floor for a checkpoint — no GPU, no server needed.",
@@ -434,6 +456,27 @@ def main(argv: list[str] | None = None) -> int:
 
         report = doctor()
         print(json.dumps(report, indent=2))
+        return 0
+
+    if args.cmd == "history":
+        from dataclasses import asdict
+
+        from gitm._paths import runs_dir
+        from gitm.optimizer.history import load_history, render_history
+
+        history = load_history(runs_dir(args.scratch), gpu_sku=args.gpu)
+        if args.json:
+            print(json.dumps({
+                "runs_read": history.runs_read,
+                "filtered": history.filtered,
+                "skipped": history.skipped,
+                "records": [
+                    {**asdict(r), "conflicted": r.conflicted}
+                    for r in history.records.values()
+                ],
+            }, indent=2))
+        else:
+            print(render_history(history, top=args.top))
         return 0
 
     if args.cmd == "analyze":
