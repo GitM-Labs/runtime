@@ -28,7 +28,11 @@ class KernelResidual:
     r_mt: float | None  # memory-traffic residual (None if bytes unavailable)
     t_obs_s: float | None = None
     t_pred_s: float | None = None
-    bound: str | None = None  # the matched op's roofline bound: "compute" | "memory"
+    #: The matched op's roofline bound: "compute" | "memory" | "launch". ``launch``
+    #: is real (roofline emits it when launch overhead dominates) and was missing
+    #: from this comment; :func:`gitm.optimizer.bound_classes.normalize_bound` maps
+    #: all three onto the bottleneck classes.
+    bound: str | None = None
     #: How many structurally distinct predictions the op has across layers. 1 for
     #: every dense model and for most ops of a heterogeneous one. Above 1 without
     #: a resolved ``layer`` means this residual was measured against an interval

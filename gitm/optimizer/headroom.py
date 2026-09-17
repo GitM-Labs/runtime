@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Literal
 
+from gitm.optimizer.bound_classes import COMPUTE_BOUND, IDLE_STALL, MEMORY_BOUND
 from gitm.optimizer.metrics import MetricsResult
 from gitm.tracer.schema import Trace
 
@@ -98,9 +99,9 @@ def build_headroom(
     mem_share = (metrics.mbu / denom) if denom > 0 else 0.5
     busy = max(0.0, 1.0 - idle)
     shares = {
-        "idle_stall": idle,
-        "memory_bound": busy * mem_share,
-        "compute_bound": busy * (1.0 - mem_share),
+        IDLE_STALL: idle,
+        MEMORY_BOUND: busy * mem_share,
+        COMPUTE_BOUND: busy * (1.0 - mem_share),
     }
     gap = {k: round(v * ceiling_distance, 4) for k, v in shares.items()}
 
