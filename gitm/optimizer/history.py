@@ -199,6 +199,20 @@ def record_for(
     return history.records.get((intervention_name, gpu_sku))
 
 
+def _fit(value: str, width: int) -> str:
+    """``value`` inside ``width``, marked when it did not fit.
+
+    A silent cut reads as the whole value, which is how a truncated SKU came to
+    name a board it was not measured on.
+    """
+    return value if len(value) <= width else value[: width - 1] + "\u2026"
+
+
+def _column(rows: list[LeverRecord], of, header: str, *, cap: int) -> int:
+    """Width of a column: the longest value shown, bounded by ``cap``."""
+    return min(max([len(header)] + [len(of(r)) for r in rows]), cap)
+
+
 def render_history(history: History, *, top: int = 20) -> str:
     """The record as a table, most-tried first."""
     head = f"read {history.runs_read} runs"
@@ -226,14 +240,23 @@ def render_history(history: History, *, top: int = 20) -> str:
             "Set GITM_GPU_SKU on boxes where NVML cannot name the device (any ROCm/AMD "
             "part) so these separate correctly."
         )
+    shown = rows[:top]
+    # Sized to what is actually on screen, because a fixed width silently ate the
+    # part of a SKU that identifies the board: "AMD Instinct MI355X" rendered as
+    # "MI355", and an H100 HBM3 and HBM3e came out byte-identical. Two boxes that
+    # look like one box is the exact confusion keying on gpu_sku exists to stop.
+    name_w = _column(shown, lambda r: r.intervention_name, "lever", cap=40)
+    gpu_w = _column(shown, lambda r: r.gpu_sku or "-", "gpu", cap=30)
+
     out.append("")
-    out.append(f"  {'lever':32s} {'gpu':18s} {'runs':>5s} {'a/b':>4s} {'won':>4s} "
-               f"{'lost':>5s} {'incon':>6s} {'mean':>8s}  last")
-    for r in rows[:top]:
+    out.append(f"  {'lever':{name_w}s} {'gpu':{gpu_w}s} {'runs':>5s} {'a/b':>4s} "
+               f"{'won':>4s} {'lost':>5s} {'incon':>6s} {'mean':>8s}  last")
+    for r in shown:
         flag = "  CONFLICTED" if r.conflicted else ""
         mean = f"{r.mean_delta:+.1%}" if r.mean_delta is not None else "n/a"
         out.append(
-            f"  {r.intervention_name[:32]:32s} {(r.gpu_sku or '-')[:18]:18s} "
+            f"  {_fit(r.intervention_name, name_w):{name_w}s} "
+            f"{_fit(r.gpu_sku or '-', gpu_w):{gpu_w}s} "
             f"{r.runs:5d} {r.attempts:4d} {r.wins:4d} {r.losses:5d} {r.inconclusive:6d} "
             f"{mean:>7s}  {(r.last_run_id or '-')[:8]}{flag}"
         )

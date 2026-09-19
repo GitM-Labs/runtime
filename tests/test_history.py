@@ -334,3 +334,35 @@ def test_a_measured_zero_is_not_the_same_as_no_measurement(tmp_path):
     r = record_for(load_history(tmp_path), "flat_lever", gpu_sku="NVIDIA H100 80GB")
 
     assert r.mean_delta == 0.0      # not None — this one was measured
+
+
+def test_the_table_never_cuts_a_sku_down_to_another_board(tmp_path):
+    """A fixed-width gpu column rendered "AMD Instinct MI355X" as "MI355", and an
+    H100 HBM3 and an HBM3e byte-identically. Two boxes that look like one box is
+    the exact confusion keying on gpu_sku exists to prevent, so the column sizes
+    to what it is showing and says so when it genuinely cannot fit."""
+    _run(tmp_path, "run-a", [_result("kv_cache_dtype_fp8")],
+         gpu_sku="NVIDIA H100 80GB HBM3")
+    _run(tmp_path, "run-b", [_result("kv_cache_dtype_fp8")],
+         gpu_sku="NVIDIA H100 80GB HBM3e")
+    _run(tmp_path, "run-c", [_result("enable_expert_parallel")],
+         gpu_sku="AMD Instinct MI355X")
+
+    out = render_history(load_history(tmp_path))
+
+    assert "AMD Instinct MI355X" in out
+    assert "NVIDIA H100 80GB HBM3e" in out
+    # the two H100s stay distinguishable on screen, not just in the data
+    assert out.count("NVIDIA H100 80GB HBM3 ") >= 1
+
+
+def test_a_value_too_long_for_its_column_is_marked_not_silently_cut(tmp_path):
+    """A silent cut reads as the whole value. Past the cap the row has to admit
+    it is showing a prefix."""
+    long_name = "an_intervention_with_a_truly_unreasonable_name_" + "x" * 40
+    _run(tmp_path, "run-a", [_result(long_name)], gpu_sku="AMD Instinct MI355X")
+
+    out = render_history(load_history(tmp_path))
+
+    assert long_name not in out
+    assert "\u2026" in out
