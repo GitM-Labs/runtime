@@ -200,12 +200,14 @@ def _rows_from_parts(
     # ``predicted_per_op`` sums all thirteen, so an unscoped row that took that
     # sum would be handed the layer predictions a second time.
     claimed: dict[tuple[str, str | None], set[int]] = {}
+    claimed_obs: dict[tuple[str, int, str | None], int] = {}
     unclaimed_obs: dict[tuple[str, str | None], int] = {}
     for (op, layer, phase), slot in per_key.items():
         sc = phase if scoped else None
         _, lfloors = _floor_sets(phase)
         if op != UNMODELED and layer is not None and (op, layer) in lfloors:
             claimed.setdefault((op, sc), set()).add(layer)
+            claimed_obs[(op, layer, sc)] = claimed_obs.get((op, layer, sc), 0) + slot[1]
         else:
             unclaimed_obs[(op, sc)] = unclaimed_obs.get((op, sc), 0) + slot[1]
 
@@ -225,7 +227,11 @@ def _rows_from_parts(
         denom = 0
         if op != UNMODELED:
             if layer is not None and (op, layer) in lfloors:
-                base, denom = lfloors[(op, layer)], ns
+                # Within the floor's own scope, not this row alone: a single
+                # graph prices one step across both phases, so one layer seen in
+                # prefill and again in decode is two rows sharing one prediction.
+                # Handing each the whole floor would price that layer twice.
+                base, denom = lfloors[(op, layer)], claimed_obs.get((op, layer, sc), ns)
             elif op in floors:
                 taken = sum(lfloors.get((op, ly), 0.0) for ly in claimed.get((op, sc), ()))
                 residual = floors[op] - taken

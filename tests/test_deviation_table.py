@@ -434,3 +434,29 @@ def test_an_op_priced_only_by_layer_leaves_nothing_for_an_unscoped_row(tmp_path)
     assert rows[None].predicted_ms is None
     assert rows[None].modeled is False
     assert rows[None].verdict == "unmodeled"
+
+
+def test_one_layer_seen_in_two_phases_splits_a_single_prediction(tmp_path):
+    """A single graph prices one step across both phases, so the same layer seen
+    in prefill and again in decode is two rows sharing one prediction. Handing
+    each of them the whole layer floor prices that layer twice and shrinks both
+    gaps."""
+    with open(tmp_path / "t.jsonl", "w", encoding="utf-8") as fh:
+        t = 0
+        for gdn in ("_causal_conv1d_fwd_kernel", "_causal_conv1d_update_kernel"):
+            for name, dur, layer in ((gdn, 300, None), ("fused_moe_kernel", 2000, 0)):
+                e = {"kind": "kernel", "name": name, "start_ns": t, "end_ns": t + dur,
+                     "stream_id": 7, "device_id": 0}
+                if layer is not None:
+                    e["range_layer"] = layer
+                fh.write(json.dumps(e) + "\n")
+                t += dur + 100
+
+    g = _graph(_node("moe_routed", 1000e-9, layer=0))
+    rows = {r.phase: r for r in from_trace(tmp_path / "t.jsonl", g, steps=1).rows
+            if r.op == "moe_routed"}
+
+    assert set(rows) == {"prefill", "decode"}
+    # the two phases ran for equal time, so they halve the one prediction
+    assert abs(sum(r.predicted_ms for r in rows.values()) - 1000e-9 * 1e3) < 1e-12
+    assert abs(rows["prefill"].predicted_ms - rows["decode"].predicted_ms) < 1e-12
