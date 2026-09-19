@@ -216,7 +216,7 @@ class EngineABResult:
     baseline_tps: float
     candidate_tps: float
     speedup: float  # candidate / baseline
-    # measure-time indicator (delta >= 0); the *authoritative* keep/rollback
+    # measure-time indicator (delta > noise_band); the *authoritative* keep/rollback
     # decision is ApplyResult.rolled_back from apply_intervention, which gates on
     # the caller's min_keep_delta. Report verdicts derive from ApplyResult, not this.
     kept: bool

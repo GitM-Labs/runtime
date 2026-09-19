@@ -45,7 +45,7 @@ from typing import TYPE_CHECKING, Protocol
 from gitm.agents.policy import Policy, select_interventions
 from gitm.kernels.library import load_library
 from gitm.kernels.spec import Applicability, InterventionSpec, SafetyGate
-from gitm.optimizer.apply import Applicator, apply_intervention
+from gitm.optimizer.apply import Applicator, ApplyResult, EngineABResult, apply_intervention
 from gitm.optimizer.deviation import classify_op
 from gitm.optimizer.monitor import Residuals, _serialized_fraction
 from gitm.optimizer.vllm_knobs import KNOB_PREREQUISITES
@@ -231,6 +231,10 @@ class AutoresearchResult:
     # distinguishes "the engine build/apply itself failed" from "measured and
     # lost" — both otherwise look identical (measured_delta=None) in the report.
     apply_error: str | None = None
+    apply_result: ApplyResult | None = None
+    ab_result: EngineABResult | None = None
+    baseline_config: dict | None = None
+    candidate_config: dict | None = None
 
 
 @dataclass
@@ -1102,11 +1106,22 @@ def autoresearch_v0(
         reason = c.rejected_reason
         if reason is None and reject is not None:
             reason = reject(c.spec)
-        applied = (
-            apply_intervention(c.spec, applicator, min_keep_delta=min_keep_delta)
-            if reason is None
-            else None
-        )
+        pre_cfg: dict | None = None
+        post_cfg: dict | None = None
+        if reason is None:
+            eng = getattr(applicator, "engine", None)
+            pre_cfg = dict(getattr(eng, "gitm_llm_kwargs", None) or {}) if eng else None
+            applied = apply_intervention(c.spec, applicator, min_keep_delta=min_keep_delta)
+            ab = (
+                getattr(applicator, "last_result", None)
+                if applied.measured_delta is not None
+                else None
+            )
+            if pre_cfg is not None:
+                post_cfg = {**pre_cfg, **(c.spec.knobs or {c.spec.knob: c.spec.value})}
+        else:
+            applied = None
+            ab = None
         results.append(
             AutoresearchResult(
                 spec=c.spec,
@@ -1118,6 +1133,10 @@ def autoresearch_v0(
                 rolled_back=applied.rolled_back if applied else False,
                 target_op=aimed_at,
                 apply_error=applied.error if applied else None,
+                apply_result=applied,
+                ab_result=ab,
+                baseline_config=pre_cfg,
+                candidate_config=post_cfg,
             )
         )
     return results
