@@ -135,11 +135,27 @@ def load_history(runs_dir: str | Path, *, gpu_sku: str | None = None) -> History
         if not isinstance(results, list):
             skipped[d.name] = "no results array"
             continue
-        sku = (doc.get("environment") or {}).get("gpu_sku")
+        # Shape is checked before the GPU filter so that "filtered" only ever
+        # means a sound export from another box, never a damaged one that was
+        # never really read.
+        env = doc.get("environment")
+        if env is not None and not isinstance(env, dict):
+            # Not tolerated the way a bad provenance is: run_id has a documented
+            # fallback and the SKU has none, and a record keyed under the wrong
+            # GPU is the one mistake this key exists to prevent.
+            skipped[d.name] = "malformed environment"
+            continue
+        if not all(isinstance(r, dict) for r in results):
+            # Reading the sound entries and dropping the rest would under-count
+            # attempts with nothing saying so, which is what skipped is for.
+            skipped[d.name] = "malformed result entry"
+            continue
+        sku = (env or {}).get("gpu_sku")
         if gpu_sku is not None and sku != gpu_sku:
             filtered += 1
             continue
-        run_id = (doc.get("provenance") or {}).get("run_id") or d.name
+        prov = doc.get("provenance")
+        run_id = (prov.get("run_id") if isinstance(prov, dict) else None) or d.name
         exports.append((path.stat().st_mtime, run_id, sku, results))
 
     exports.sort(key=lambda e: e[0])

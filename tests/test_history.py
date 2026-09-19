@@ -366,3 +366,52 @@ def test_a_value_too_long_for_its_column_is_marked_not_silently_cut(tmp_path):
 
     assert long_name not in out
     assert "\u2026" in out
+
+
+def test_one_damaged_export_does_not_take_the_readable_runs_with_it(tmp_path):
+    """Valid JSON with the wrong shape inside — a string where an object belongs —
+    reached an unguarded ``.get()`` and raised, so a single damaged export lost
+    every sound run beside it. That is the opposite of what ``skipped`` is for."""
+    _run(tmp_path, "good", [_result("kv_cache_dtype_fp8")], gpu_sku="AMD Instinct MI355X")
+    _run(tmp_path, "bad-env", None, body=json.dumps({
+        "provenance": {"run_id": "bad-env"}, "environment": "cuda",
+        "results": [_result("enforce_eager")]}))
+    _run(tmp_path, "bad-entry", None, body=json.dumps({
+        "provenance": {"run_id": "bad-entry"},
+        "environment": {"gpu_sku": "AMD Instinct MI355X"},
+        "results": ["kv_cache_dtype_fp8"]}))
+
+    h = load_history(tmp_path)
+
+    assert h.runs_read == 1
+    assert set(h.skipped) == {"bad-env", "bad-entry"}
+    assert record_for(h, "kv_cache_dtype_fp8", gpu_sku="AMD Instinct MI355X").wins == 1
+
+
+def test_a_malformed_provenance_still_reads(tmp_path):
+    """Unlike the SKU, ``run_id`` already falls back to the directory name when
+    provenance is absent. A bad one costs nothing, so it is not worth losing the
+    run's measurements over."""
+    _run(tmp_path, "run-x", None, body=json.dumps({
+        "provenance": "not-an-object",
+        "environment": {"gpu_sku": "AMD Instinct MI355X"},
+        "results": [_result("kv_cache_dtype_fp8")]}))
+
+    h = load_history(tmp_path)
+
+    assert h.runs_read == 1 and not h.skipped
+    rec = record_for(h, "kv_cache_dtype_fp8", gpu_sku="AMD Instinct MI355X")
+    assert rec.last_run_id == "run-x"
+
+
+def test_a_damaged_export_is_never_counted_as_filtered(tmp_path):
+    """``filtered`` means a sound export measured on another box. Checking shape
+    after the gpu filter would let a damaged file be counted as one, and a clean
+    read of one box would look identical to a damaged history."""
+    _run(tmp_path, "bad-env", None, body=json.dumps({
+        "environment": "cuda", "results": [_result("kv_cache_dtype_fp8")]}))
+
+    h = load_history(tmp_path, gpu_sku="AMD Instinct MI355X")
+
+    assert h.filtered == 0
+    assert h.skipped == {"bad-env": "malformed environment"}
