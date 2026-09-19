@@ -585,6 +585,117 @@ def render_by_phase(by_phase, stats) -> str:
     return "\n".join(out)
 
 
+def stream_observed_by_phase(
+    path: str | Path, *, propagate: bool = True,
+    pid: int | None = None, device: int | None = None,
+):
+    """``(per_key, stats, n_kernels, total_ns, span_ns)`` keyed by op *and* phase.
+
+    ``per_key`` maps ``(op, layer, phase)`` to ``[count, total_ns, direct_ns]``.
+
+    :func:`stream_observed` answers "which op", :func:`stream_by_phase` answers
+    "which phase" — but the second keys by taxonomy bucket (``attention``,
+    ``moe``), not by predicted op, so the two cannot be joined after the fact.
+    This does both in one pass so a row can carry an op *and* a phase.
+
+    ``direct_ns`` is the part of ``total_ns`` whose phase the kernel named
+    itself. The rest was inherited from the nearest anchor in time, which is an
+    inference and not an observation — roughly three quarters of device time on
+    a real capture, and wrong wherever a step genuinely mixes phases (chunked
+    prefill). Carrying it per key is what lets a caller say how much of a row's
+    phase it should believe, rather than presenting all rows as equally certain.
+
+    Phase is ``"unknown"`` when nothing can be inferred — multiple worker scopes
+    (a neighbouring timestamp on another worker is not evidence for this one) or
+    no anchors at all. That is the honest answer, not a failure.
+    """
+    import bisect
+    import json
+    import statistics
+
+    from gitm.tracer.kernel_taxonomy import classify_phase
+
+    scopes = observed_scopes(path, pid=pid, device=device)
+    anchors = (phase_anchors(path, pid=pid, device=device)
+               if propagate and len(scopes) <= 1 else [])
+    times = [a[0] for a in anchors]
+
+    per_key: dict[tuple[str, int | None, str], list] = {}
+    op_cache: dict[tuple[str, str | None], str | None] = {}
+    ph_cache: dict[str, str | None] = {}
+    gaps: list[int] = []
+    n = total = 0
+    n_direct = n_inferred = n_unknown = 0
+    t_min: int | None = None
+    t_max: int | None = None
+
+    with Path(path).open(encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict) or d.get("kind") != "kernel":
+                continue
+            if pid is not None and d.get("pid") != pid:
+                continue
+            if device is not None and d.get("device_id") != device:
+                continue
+            start, end = d.get("start_ns"), d.get("end_ns")
+            if not isinstance(start, int) or not isinstance(end, int) or end <= start:
+                continue
+
+            name = d.get("name") or ""
+            ident = (name, d.get("range_op"))
+            if ident not in op_cache:
+                op_cache[ident] = observed_op(*ident)
+            op = op_cache[ident] or "<unmodeled>"
+
+            layer = d.get("range_layer")
+            if not isinstance(layer, int):
+                layer = None
+
+            if name not in ph_cache:
+                ph_cache[name] = classify_phase(name)
+            phase = ph_cache[name]
+            direct = phase is not None
+            if direct:
+                n_direct += 1
+            elif times:
+                i = bisect.bisect_left(times, start)
+                cands = [j for j in (i - 1, i) if 0 <= j < len(times)]
+                j = min(cands, key=lambda j: abs(times[j] - start))
+                phase = anchors[j][1]
+                gaps.append(abs(times[j] - start))
+                n_inferred += 1
+            else:
+                phase = "unknown"
+                n_unknown += 1
+
+            dur = max(0, end - start)
+            slot = per_key.setdefault((op, layer, phase), [0, 0, 0])
+            slot[0] += 1
+            slot[1] += dur
+            if direct:
+                slot[2] += dur
+            n += 1
+            total += dur
+            t_min = start if t_min is None or start < t_min else t_min
+            t_max = end if t_max is None or end > t_max else t_max
+
+    stats = {
+        "n_direct": n_direct,
+        "n_inferred": n_inferred,
+        "n_unknown": n_unknown,
+        "n_anchors": len(anchors),
+        "n_scopes": len(scopes),
+        "gap_median_ns": int(statistics.median(gaps)) if gaps else 0,
+        "gap_max_ns": max(gaps) if gaps else 0,
+    }
+    span = (t_max - t_min) if (t_min is not None and t_max is not None) else 0
+    return per_key, stats, n, total, span
+
+
 def predicted_per_op(graph: Graph) -> dict[str, float]:
     """Predicted seconds per op, summed over layers — the shape ``stream_observed``
     produces, so the two can be differenced directly."""

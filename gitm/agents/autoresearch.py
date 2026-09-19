@@ -46,6 +46,12 @@ from gitm.agents.policy import Policy, select_interventions
 from gitm.kernels.library import load_library
 from gitm.kernels.spec import Applicability, InterventionSpec, SafetyGate
 from gitm.optimizer.apply import Applicator, apply_intervention
+from gitm.optimizer.bound_classes import (
+    BOUND_CLASSES,
+    COMPUTE_BOUND,
+    IDLE_STALL,
+    MEMORY_BOUND,
+)
 from gitm.optimizer.deviation import classify_op
 from gitm.optimizer.monitor import Residuals, _serialized_fraction
 from gitm.optimizer.vllm_knobs import KNOB_PREREQUISITES
@@ -94,10 +100,9 @@ __all__ = [
 #: truth shared by classify_bottleneck (the producer), the keyword-affinity map,
 #: and the fallback table, so the three can't drift (guarded by a test). These are
 #: workload-agnostic GPU-execution categories, not a per-workload vocabulary.
-IDLE_STALL = "idle_stall"
-MEMORY_BOUND = "memory_bound"
-COMPUTE_BOUND = "compute_bound"
-BOTTLENECK_CLASSES = (IDLE_STALL, MEMORY_BOUND, COMPUTE_BOUND)
+#: Re-exported from :mod:`gitm.optimizer.bound_classes`, which owns the names so
+#: the roofline's per-node bound and this trace-level class can't drift apart.
+BOTTLENECK_CLASSES = BOUND_CLASSES
 
 #: Serialized-concurrency fraction above this ⇒ kernels ran back-to-back on one
 #: stream instead of overlapping: scheduling gaps / launch-bound idle time.
