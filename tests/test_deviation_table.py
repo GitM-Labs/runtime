@@ -46,6 +46,41 @@ def _trace(path, rows):
     return path
 
 
+def _layered(path, rows, *, anchor=None):
+    """rows: (name, duration_ns, repeat, layer).
+
+    ``anchor`` names a phase-naming kernel written first, so the rows inherit a
+    real phase instead of "unknown" and the per-phase floor path is reachable.
+    """
+    with open(path, "w", encoding="utf-8") as fh:
+        t = 0
+        if anchor is not None:
+            fh.write(json.dumps({"kind": "kernel", "name": anchor, "start_ns": t,
+                                 "end_ns": t + 300, "stream_id": 7,
+                                 "device_id": 0}) + "\n")
+            t += 400
+        for name, dur, n, layer in rows:
+            for _ in range(n):
+                fh.write(json.dumps({"kind": "kernel", "name": name, "start_ns": t,
+                                     "end_ns": t + dur, "stream_id": 7,
+                                     "device_id": 0, "range_layer": layer}) + "\n")
+                t += dur + 100
+    return path
+
+
+def _mixed(path):
+    """One op either side of a phase boundary, both anchors present."""
+    with open(path, "w", encoding="utf-8") as fh:
+        t = 0
+        for gdn in ("_causal_conv1d_fwd_kernel", "_causal_conv1d_update_kernel"):
+            for name, dur in ((gdn, 300), ("fused_moe_kernel", 2000)):
+                fh.write(json.dumps({"kind": "kernel", "name": name, "start_ns": t,
+                                     "end_ns": t + dur, "stream_id": 7,
+                                     "device_id": 0}) + "\n")
+                t += dur + 100
+    return path
+
+
 def _interleaved(path, steps, prefill=False):
     gdn = "_causal_conv1d_fwd_kernel" if prefill else "_causal_conv1d_update_kernel"
     with open(path, "w", encoding="utf-8") as fh:
@@ -260,3 +295,103 @@ def test_render_names_the_rows_and_admits_inferred_phase(tmp_path):
 
     assert "moe_routed" in out
     assert "inferred" in out
+
+
+# --------------------------------------------------------------------------- #
+# the floor a row is actually measured against                                 #
+# --------------------------------------------------------------------------- #
+def test_a_layer_row_is_measured_against_its_own_layers_floor(tmp_path):
+    """``predicted_per_op`` sums over layers. A row keyed by ``(op, layer)``
+    measured against that sum reads far under its floor, lands ``below_floor``,
+    and drops out of the ranking — on a trace that carries NVTX layer ranges,
+    the table would rank nothing at all."""
+    p = _layered(tmp_path / "t.jsonl", [("fused_moe_kernel", 1000, 10, 0),
+                                        ("fused_moe_kernel", 1000, 10, 1)])
+    # deliberately lopsided: an op-wide floor split by observed share would give
+    # both layers the same number, since they ran for the same time.
+    g = _graph(_node("moe_routed", 100e-9, layer=0),
+               _node("moe_routed", 900e-9, layer=1))
+
+    rows = {r.layer: r for r in from_trace(p, g, steps=1).rows if r.op == "moe_routed"}
+
+    assert set(rows) == {0, 1}
+    assert rows[0].region == "moe_routed@L0"
+    assert abs(rows[0].predicted_ms - 100e-9 * 1e3) < 1e-12
+    assert abs(rows[1].predicted_ms - 900e-9 * 1e3) < 1e-12
+    assert all(r.verdict == "over_floor" for r in rows.values())
+
+
+def test_a_per_phase_graph_also_prices_layers_one_at_a_time(tmp_path):
+    """Same defect on the two-graph path, which has no observed-share divisor to
+    accidentally rescue it: every layer row took the whole multi-layer floor."""
+    p = _layered(tmp_path / "t.jsonl", [("fused_moe_kernel", 1000, 10, 0),
+                                        ("fused_moe_kernel", 1000, 10, 1)],
+                 anchor="_causal_conv1d_update_kernel")
+    g = _graph(_node("moe_routed", 100e-9, layer=0),
+               _node("moe_routed", 900e-9, layer=1))
+
+    rows = {r.layer: r for r in from_trace(p, {"decode": g}, steps=1).rows
+            if r.op == "moe_routed"}
+
+    assert {r.phase for r in rows.values()} == {"decode"}
+    assert abs(rows[0].predicted_ms - 100e-9 * 1e3) < 1e-12
+    assert abs(rows[1].predicted_ms - 900e-9 * 1e3) < 1e-12
+    assert all(r.floor_attribution == "graph" for r in rows.values())
+
+
+def test_each_phase_keeps_its_own_bound(tmp_path):
+    """An attention op is compute bound reading the prompt and memory bound
+    generating. Keying bounds by op alone let whichever graph came last in the
+    mapping answer for every phase — so the mapping's order decided the lever."""
+    p = _mixed(tmp_path / "t.jsonl")
+    pre = _graph(_node("moe_routed", 1e-6, "compute"))
+    dec = _graph(_node("moe_routed", 1e-6, "memory"))
+
+    rows = {r.phase: r for r in
+            from_trace(p, {"prefill": pre, "decode": dec}, steps=1).rows
+            if r.op == "moe_routed"}
+    assert rows["prefill"].bound == COMPUTE_BOUND
+    assert rows["decode"].bound == MEMORY_BOUND
+
+    reordered = {r.phase: r for r in
+                 from_trace(p, {"decode": dec, "prefill": pre}, steps=1).rows
+                 if r.op == "moe_routed"}
+    assert reordered["prefill"].bound == COMPUTE_BOUND
+    assert reordered["decode"].bound == MEMORY_BOUND
+
+
+def test_an_op_the_graph_never_predicts_is_not_modeled(tmp_path):
+    """Recognized by the trace, absent from the graph: the graph's coverage gap,
+    exactly as an unclassified kernel is. ``modeled=True`` with no floor and a
+    verdict of "unmodeled" is a row contradicting itself, and it let a coverage
+    consumer count unpriced work as priced."""
+    p = _trace(tmp_path / "t.jsonl", [("fused_moe_kernel", 1000, 10),
+                                      ("_causal_conv1d_update_kernel", 500, 10)])
+    t = from_trace(p, _graph(_node("moe_routed", 100e-9)), steps=1)
+    rows = {r.op: r for r in t.rows}
+
+    assert rows["moe_routed"].modeled is True
+    absent = rows["linattn_conv"]
+    assert absent.modeled is False
+    assert absent.predicted_ms is None
+    assert absent.verdict == "unmodeled"
+    assert absent.floor_attribution == "none"
+    assert absent not in rank_by_recoverable(t.rows)
+    assert absent.share_of_device > 0        # still in the denominator
+
+
+def test_a_zero_band_is_a_tolerance_not_a_missing_value():
+    """``or`` read an exact-zero tolerance as absent and widened it to the
+    default, silently flipping every verdict in the rehydrated table."""
+    doc = {"n_kernels": 1, "device_time_s": 0.0011, "window_s": 1.0, "steps": 1,
+           "ops": {"moe_routed": {"kernels": 1, "observed_s": 0.0011,
+                                  "floor_s": 0.001}}}
+
+    zero = from_deviate_json({**doc, "band_width": 0.0})
+    assert zero.band == 0.0
+    assert next(r for r in zero.rows if r.op == "moe_routed").verdict == "over_floor"
+
+    # absent is still the default band, under which 1.1x is within tolerance
+    default = from_deviate_json(doc)
+    assert default.band > 0.0
+    assert next(r for r in default.rows if r.op == "moe_routed").verdict == "within_band"

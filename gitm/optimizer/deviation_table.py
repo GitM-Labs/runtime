@@ -119,6 +119,48 @@ def _bound_per_op(graph: Graph) -> dict[str, tuple[str | None, bool]]:
     return out
 
 
+def _layer_floors(graph: Graph) -> dict[tuple[str, int], float]:
+    """Predicted seconds per ``(op, layer)`` for a graph that models layers apart.
+
+    :func:`predicted_per_op` sums over layers, which is the right shape for a row
+    keyed by op alone and the wrong one for a row keyed by ``(op, layer)`` — that
+    row would be measured against every layer's prediction at once, so a 32-layer
+    op reads ~32x under its floor and drops out of the ranking entirely. A graph
+    whose nodes carry no layer yields ``{}``, and the caller splits the op floor
+    by observed share instead.
+    """
+    out: dict[tuple[str, int], float] = {}
+    for node in graph.nodes:
+        if node.layer is None:
+            continue
+        key = (node.op, node.layer)
+        out[key] = out.get(key, 0.0) + node.prediction.t_pred_s
+    return out
+
+
+def _merge_bounds(
+    per_phase: dict[str, dict[str, tuple[str | None, bool]]],
+) -> dict[str, tuple[str | None, bool]]:
+    """One bound per op, for rows whose phase has no graph of its own.
+
+    Unanimous across phases is safe to carry; disagreement is not, so it reads
+    ``None`` and flags mixed rather than taking whichever graph came last in the
+    mapping. Attention is compute bound in prefill and memory bound in decode,
+    and handing a row the other phase's answer aims the search at the wrong
+    lever — silently, and differently if the mapping is reordered.
+    """
+    seen: dict[str, set[str | None]] = {}
+    mixed_any: dict[str, bool] = {}
+    for by_op in per_phase.values():
+        for op, (b, mixed) in by_op.items():
+            seen.setdefault(op, set()).add(b)
+            mixed_any[op] = mixed_any.get(op, False) or mixed
+    out: dict[str, tuple[str | None, bool]] = {}
+    for op, values in seen.items():
+        out[op] = (next(iter(values)), mixed_any[op]) if len(values) == 1 else (None, True)
+    return out
+
+
 def _verdict(observed_s: float, predicted_s: float | None, band: float) -> str:
     if predicted_s is None:
         return UNMODELED_VERDICT
@@ -136,34 +178,65 @@ def _rows_from_parts(
     per_key, *, predicted: dict[str, float] | None,
     bounds: dict[str, tuple[str | None, bool]],
     total_ns: int, span_ns: int, steps: int | None, band: float,
-    floor_attribution: str, phase_floors: dict[str, dict[str, float]] | None = None,
+    layer_floors: dict[tuple[str, int], float] | None = None,
+    phase_floors: dict[str, dict[str, float]] | None = None,
+    phase_layer_floors: dict[str, dict[tuple[str, int], float]] | None = None,
+    phase_bounds: dict[str, dict[str, tuple[str | None, bool]]] | None = None,
 ) -> list[DeviationRow]:
     scale = steps if steps else 1
-    # Observed time per op across all phases — the pro-rata weights.
-    op_total: dict[str, int] = {}
-    for (op, _layer, _phase), slot in per_key.items():
-        op_total[op] = op_total.get(op, 0) + slot[1]
+    # A per-phase graph prices only its own phase; a single graph prices them all.
+    # Observed totals are accumulated in whichever scope the floor being divided
+    # actually spans, so a share is never taken against time that floor does not
+    # cover.
+    scoped = phase_floors is not None
+    op_obs: dict[tuple[str, str | None], int] = {}
+    layer_obs: dict[tuple[str, int | None, str | None], int] = {}
+    for (op, layer, phase), slot in per_key.items():
+        sc = phase if scoped else None
+        op_obs[(op, sc)] = op_obs.get((op, sc), 0) + slot[1]
+        layer_obs[(op, layer, sc)] = layer_obs.get((op, layer, sc), 0) + slot[1]
 
     rows: list[DeviationRow] = []
     for (op, layer, phase), slot in per_key.items():
         count, ns, direct_ns = slot[0], slot[1], slot[2]
         observed_s = ns / 1e9
-        modeled = op != UNMODELED
+        sc = phase if scoped else None
+
+        # The floor, and the observed time that same floor prices. A row keyed by
+        # layer takes the layer's own prediction where the graph has one; where it
+        # does not, the op floor is divided by this row's share of the time it
+        # covers and the row reads ``prorata`` rather than claiming a graph number.
+        floors = (phase_floors.get(phase) or {}) if scoped else (predicted or {})
+        lfloors = (((phase_layer_floors or {}).get(phase) or {}) if scoped
+                   else (layer_floors or {}))
+        base: float | None = None
+        denom = 0
+        if op != UNMODELED:
+            if layer is not None and (op, layer) in lfloors:
+                base, denom = lfloors[(op, layer)], layer_obs.get((op, layer, sc), 0)
+            elif op in floors:
+                base, denom = floors[op], op_obs.get((op, sc), 0)
 
         pred_s: float | None = None
-        if modeled:
-            if phase_floors is not None:
-                per_step = (phase_floors.get(phase) or {}).get(op)
-                pred_s = per_step * scale if per_step is not None else None
-            elif predicted is not None and op in predicted:
-                # One graph for both phases: split its floor by this phase's
-                # share of the op's observed time. An assumption, flagged.
-                share = ns / op_total[op] if op_total.get(op) else 1.0
-                pred_s = predicted[op] * scale * share
+        attribution = "none"
+        if base is not None:
+            share = (ns / denom) if denom else 1.0
+            pred_s = base * scale * share
+            # "graph" only when a per-phase graph priced this row whole. A single
+            # graph cannot speak per phase at all, and a divided floor is an
+            # attribution either way, so both read "prorata".
+            attribution = "graph" if (scoped and share >= 1.0) else "prorata"
 
+        # A row has a floor or it does not. An op the trace recognizes but the
+        # graph never predicts is the graph's coverage gap exactly as an
+        # unclassified kernel is, and calling it modeled would let a coverage
+        # consumer count unpriced work as priced.
+        modeled = pred_s is not None
         gap_s = (observed_s - pred_s) if pred_s is not None else None
         recoverable_s = max(0.0, gap_s) if gap_s is not None else 0.0
-        bound_raw, mixed = bounds.get(op, (None, False))
+
+        by_op = (phase_bounds or {}).get(phase) if scoped else None
+        bound_raw, mixed = (by_op if by_op is not None else bounds).get(op, (None, False))
 
         rows.append(DeviationRow(
             region=op if layer is None else f"{op}@L{layer}",
@@ -182,7 +255,7 @@ def _rows_from_parts(
             gap_share=(recoverable_s * 1e9 / total_ns) if total_ns else 0.0,
             modeled=modeled,
             phase_confidence=(direct_ns / ns) if ns else 0.0,
-            floor_attribution=floor_attribution if pred_s is not None else "none",
+            floor_attribution=attribution,
             verdict=_verdict(observed_s, pred_s, band),
         ))
     return rows
@@ -224,24 +297,28 @@ def from_trace(
         path, propagate=propagate, pid=pid, device=device)
 
     predicted: dict[str, float] | None = None
+    layer_floors: dict[tuple[str, int], float] | None = None
     phase_floors: dict[str, dict[str, float]] | None = None
+    phase_layer_floors: dict[str, dict[tuple[str, int], float]] | None = None
+    phase_bounds: dict[str, dict[str, tuple[str | None, bool]]] | None = None
     bounds: dict[str, tuple[str | None, bool]] = {}
-    attribution = "none"
 
     if isinstance(graphs, dict):
         phase_floors = {ph: predicted_per_op(g) for ph, g in graphs.items()}
-        for g in graphs.values():
-            bounds.update(_bound_per_op(g))
-        attribution = "graph"
+        phase_layer_floors = {ph: _layer_floors(g) for ph, g in graphs.items()}
+        phase_bounds = {ph: _bound_per_op(g) for ph, g in graphs.items()}
+        # Only for a phase with no graph of its own, e.g. an unanchored capture.
+        bounds = _merge_bounds(phase_bounds)
     elif graphs is not None:
         predicted = predicted_per_op(graphs)
+        layer_floors = _layer_floors(graphs)
         bounds = _bound_per_op(graphs)
-        attribution = "prorata"
 
     rows = _rows_from_parts(
         per_key, predicted=predicted, bounds=bounds, total_ns=total_ns,
-        span_ns=span_ns, steps=steps, band=band,
-        floor_attribution=attribution, phase_floors=phase_floors)
+        span_ns=span_ns, steps=steps, band=band, layer_floors=layer_floors,
+        phase_floors=phase_floors, phase_layer_floors=phase_layer_floors,
+        phase_bounds=phase_bounds)
 
     return DeviationTable(
         rows=rows, observed_ms=total_ns / 1e6, window_ms=span_ns / 1e6,
@@ -258,7 +335,10 @@ def from_deviate_json(src: str | Path | dict, *, steps: int | None = None) -> De
     doc = src if isinstance(src, dict) else json.loads(Path(src).read_text(encoding="utf-8"))
     ops = doc.get("ops") or {}
     total_ns = int(float(doc.get("device_time_s") or 0.0) * 1e9)
-    band = float(doc.get("band_width") or _default_band())
+    # ``or`` would read an exact-zero tolerance as missing and silently widen it
+    # to the default, changing every verdict in the rehydrated table.
+    band_value = doc.get("band_width")
+    band = _default_band() if band_value is None else float(band_value)
     steps = steps if steps is not None else doc.get("steps")
 
     per_key: dict[tuple[str, int | None, str], list] = {}
@@ -273,8 +353,7 @@ def from_deviate_json(src: str | Path | dict, *, steps: int | None = None) -> De
     # floor_s in the artifact is ALREADY scaled by steps, so do not scale again.
     rows = _rows_from_parts(
         per_key, predicted=predicted or None, bounds={}, total_ns=total_ns,
-        span_ns=int(float(doc.get("window_s") or 0.0) * 1e9), steps=1, band=band,
-        floor_attribution="graph")
+        span_ns=int(float(doc.get("window_s") or 0.0) * 1e9), steps=1, band=band)
 
     return DeviationTable(
         rows=rows, observed_ms=total_ns / 1e6,
