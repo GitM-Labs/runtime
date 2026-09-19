@@ -184,17 +184,30 @@ def _rows_from_parts(
     phase_bounds: dict[str, dict[str, tuple[str | None, bool]]] | None = None,
 ) -> list[DeviationRow]:
     scale = steps if steps else 1
-    # A per-phase graph prices only its own phase; a single graph prices them all.
-    # Observed totals are accumulated in whichever scope the floor being divided
-    # actually spans, so a share is never taken against time that floor does not
-    # cover.
+    # A per-phase graph prices only its own phase; a single graph prices them all,
+    # so a share is never taken against time the floor being divided does not cover.
     scoped = phase_floors is not None
-    op_obs: dict[tuple[str, str | None], int] = {}
-    layer_obs: dict[tuple[str, int | None, str | None], int] = {}
+
+    def _floor_sets(phase: str):
+        floors = (phase_floors.get(phase) or {}) if scoped else (predicted or {})
+        lfloors = (((phase_layer_floors or {}).get(phase) or {}) if scoped
+                   else (layer_floors or {}))
+        return floors, lfloors
+
+    # Which rows the graph prices by layer on their own, and how much observed
+    # time is left for the rest of the op. A graph may hold both shapes at once —
+    # GLM prices a final ``rms_norm`` apart from its twelve per-layer norms — and
+    # ``predicted_per_op`` sums all thirteen, so an unscoped row that took that
+    # sum would be handed the layer predictions a second time.
+    claimed: dict[tuple[str, str | None], set[int]] = {}
+    unclaimed_obs: dict[tuple[str, str | None], int] = {}
     for (op, layer, phase), slot in per_key.items():
         sc = phase if scoped else None
-        op_obs[(op, sc)] = op_obs.get((op, sc), 0) + slot[1]
-        layer_obs[(op, layer, sc)] = layer_obs.get((op, layer, sc), 0) + slot[1]
+        _, lfloors = _floor_sets(phase)
+        if op != UNMODELED and layer is not None and (op, layer) in lfloors:
+            claimed.setdefault((op, sc), set()).add(layer)
+        else:
+            unclaimed_obs[(op, sc)] = unclaimed_obs.get((op, sc), 0) + slot[1]
 
     rows: list[DeviationRow] = []
     for (op, layer, phase), slot in per_key.items():
@@ -203,19 +216,24 @@ def _rows_from_parts(
         sc = phase if scoped else None
 
         # The floor, and the observed time that same floor prices. A row keyed by
-        # layer takes the layer's own prediction where the graph has one; where it
-        # does not, the op floor is divided by this row's share of the time it
-        # covers and the row reads ``prorata`` rather than claiming a graph number.
-        floors = (phase_floors.get(phase) or {}) if scoped else (predicted or {})
-        lfloors = (((phase_layer_floors or {}).get(phase) or {}) if scoped
-                   else (layer_floors or {}))
+        # layer takes the layer's own prediction where the graph has one; every
+        # other row of that op shares what is left of the op floor once the layer
+        # rows have taken theirs, divided by observed time, and reads ``prorata``
+        # rather than claiming a graph number.
+        floors, lfloors = _floor_sets(phase)
         base: float | None = None
         denom = 0
         if op != UNMODELED:
             if layer is not None and (op, layer) in lfloors:
-                base, denom = lfloors[(op, layer)], layer_obs.get((op, layer, sc), 0)
+                base, denom = lfloors[(op, layer)], ns
             elif op in floors:
-                base, denom = floors[op], op_obs.get((op, sc), 0)
+                taken = sum(lfloors.get((op, ly), 0.0) for ly in claimed.get((op, sc), ()))
+                residual = floors[op] - taken
+                # Nothing left means every prediction this op has is already on a
+                # layer row. Re-using one here would count it twice, and a floor
+                # of zero would read as a measured no-op, so the row has none.
+                if residual > 0:
+                    base, denom = residual, unclaimed_obs.get((op, sc), 0)
 
         pred_s: float | None = None
         attribution = "none"

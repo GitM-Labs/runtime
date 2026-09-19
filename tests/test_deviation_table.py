@@ -395,3 +395,42 @@ def test_a_zero_band_is_a_tolerance_not_a_missing_value():
     default = from_deviate_json(doc)
     assert default.band > 0.0
     assert next(r for r in default.rows if r.op == "moe_routed").verdict == "within_band"
+
+
+def test_a_layer_priced_apart_is_not_also_counted_in_the_unscoped_row(tmp_path):
+    """A graph can hold both shapes for one op: GLM prices a final ``rms_norm``
+    apart from its per-layer norms. ``predicted_per_op`` sums them all, so an
+    unscoped row taking that sum is handed the layer predictions a second time —
+    understating its gap and misranking recoverable time."""
+    p = _layered(tmp_path / "t.jsonl", [("rms_norm_kernel", 1000, 10, 0),
+                                        ("rms_norm_kernel", 1000, 10, 1),
+                                        ("rms_norm_kernel", 1000, 10, None)])
+    g = _graph(_node("rms_norm", 10e-9, layer=0),
+               _node("rms_norm", 10e-9, layer=1),
+               _node("rms_norm", 50e-9))          # the final norm, priced apart
+
+    rows = {r.layer: r for r in from_trace(p, g, steps=1).rows if r.op == "rms_norm"}
+
+    assert set(rows) == {0, 1, None}
+    assert abs(rows[0].predicted_ms - 10e-9 * 1e3) < 1e-12
+    assert abs(rows[1].predicted_ms - 10e-9 * 1e3) < 1e-12
+    # the unscoped row gets the final norm alone, not all three predictions
+    assert abs(rows[None].predicted_ms - 50e-9 * 1e3) < 1e-12
+    total = sum(r.predicted_ms for r in rows.values())
+    assert abs(total - (10e-9 + 10e-9 + 50e-9) * 1e3) < 1e-12   # priced exactly once
+
+
+def test_an_op_priced_only_by_layer_leaves_nothing_for_an_unscoped_row(tmp_path):
+    """Every prediction already sits on a layer row. Re-using one would count it
+    twice and a floor of zero would read as a measured no-op, so the leftover row
+    carries no floor rather than a wrong one."""
+    p = _layered(tmp_path / "t.jsonl", [("fused_moe_kernel", 1000, 10, 0),
+                                        ("fused_moe_kernel", 1000, 10, None)])
+    g = _graph(_node("moe_routed", 100e-9, layer=0))
+
+    rows = {r.layer: r for r in from_trace(p, g, steps=1).rows if r.op == "moe_routed"}
+
+    assert abs(rows[0].predicted_ms - 100e-9 * 1e3) < 1e-12
+    assert rows[None].predicted_ms is None
+    assert rows[None].modeled is False
+    assert rows[None].verdict == "unmodeled"
