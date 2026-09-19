@@ -1117,9 +1117,7 @@ def autoresearch_v0(
                 if applied.measured_delta is not None
                 else None
             )
-            eng = getattr(applicator, "engine", None) or eng
-            post_cfg = dict(getattr(eng, "gitm_llm_kwargs", None) or {}) if eng else None
-            if not post_cfg and pre_cfg:
+            if pre_cfg is not None:
                 post_cfg = {**pre_cfg, **(c.spec.knobs or {c.spec.knob: c.spec.value})}
         else:
             applied = None

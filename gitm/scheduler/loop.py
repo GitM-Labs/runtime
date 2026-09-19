@@ -803,13 +803,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         if result.rolled_back:
             rolled_back.append(c.spec.name)
         if ab is not None:
-            # Read the candidate config off whichever engine the applicator is
-            # holding now — for a restart A/B that is the rebuilt engine, not
-            # the original. Falls back to the knob delta over the baseline.
-            live_engine = getattr(applicator, "engine", cfg.engine)
-            candidate_cfg = dict(getattr(live_engine, "gitm_llm_kwargs", None) or {})
-            if not candidate_cfg and baseline_cfg:
-                candidate_cfg = {**baseline_cfg, **(c.spec.knobs or {c.spec.knob: c.spec.value})}
+            candidate_cfg = {**baseline_cfg, **(c.spec.knobs or {c.spec.knob: c.spec.value})}
             verification.append(
                 build_record(
                     c.spec, ab, result,
