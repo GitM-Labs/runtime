@@ -38,6 +38,7 @@ from gitm.optimizer.attribution import attribute
 from gitm.optimizer.collective_signal import collective_causes, worst_device_comm
 from gitm.optimizer.deviation import deviation_summary, deviation_trace, write_deviation_jsonl
 from gitm.optimizer.dr import attribute_dr
+from gitm.optimizer.history import load_history
 from gitm.optimizer.measure import measure_trace, measurement_claims, measurement_summary
 from gitm.optimizer.monitor import check_invariants, residuals
 from gitm.optimizer.qualification import qualify
@@ -161,6 +162,10 @@ class LoopConfig:
     target: float = 0.15
     scratch: str | None = None
     top_n_interventions: int = 5
+    #: Rank levers from what previous runs measured on this GPU, instead of from
+    #: the library's hand-authored estimates alone. Off by default: it changes
+    #: which experiments the run actually spends its budget on.
+    use_history: bool = False
     # Optional explicit driver for the embedded/engine path. When unset, the
     # loop looks up ``workload`` in the workload registry (gitm.workloads).
     workload_runner: WorkloadRunner | None = None
@@ -715,8 +720,22 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         for s in load_library(workload=workload)
         for resolved in expand_relative_candidates(s, cfg.engine)
     ]
-    policy = Policy(require_qualification_commit=qual.commit, skip_high_risk=not qual.commit)
-    ranked = select_interventions(trace, library, policy, top_n=cfg.top_n_interventions, ctx=pctx.gate)
+    policy = Policy(require_qualification_commit=qual.commit, skip_high_risk=not qual.commit,
+                    use_history=cfg.use_history)
+    # Read once per run, filtered to this box. A lever measured on another GPU is
+    # not evidence about this one, and load_history counts what it filtered out
+    # rather than letting a thin record look like a weak lever.
+    prior_runs = load_history(runs_dir(cfg.scratch), gpu_sku=pctx.sku) if cfg.use_history else None
+    if prior_runs is not None:
+        (run_dir / "history_read.json").write_text(json.dumps({
+            "runs_read": prior_runs.runs_read,
+            "filtered": prior_runs.filtered,
+            "skipped": prior_runs.skipped,
+            "levers": len(prior_runs.records),
+            "gpu_sku": pctx.sku,
+        }, indent=2))
+    ranked = select_interventions(trace, library, policy, top_n=cfg.top_n_interventions,
+                                  ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku)
     (run_dir / "ranked_candidates.json").write_text(
         json.dumps(
             [

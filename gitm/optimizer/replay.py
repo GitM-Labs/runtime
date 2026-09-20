@@ -19,12 +19,21 @@ from gitm.optimizer.deviation import classify_op
 from gitm.tracer.schema import Trace
 
 
-def predict_delta(trace: Trace, spec: InterventionSpec) -> float:
+def predict_delta(
+    trace: Trace, spec: InterventionSpec, *, delta_mean: float | None = None
+) -> float:
     """Predicted fractional delta in wall-clock time on this trace.
 
     v0 model: apply the spec's ``expected_delta_mean`` weighted by the
     fraction of trace time spent in ops the spec is applicable to. The
     trace-driven replay engine that replaces this v0 is on the roadmap.
+
+    ``delta_mean`` replaces the spec's estimate of the effect, leaving coverage —
+    which is a property of *this* trace — untouched. ``expected_delta_mean`` is
+    hand-authored and identical on every run; a delta this lever actually
+    measured on this GPU is a better estimate of the same quantity, so it
+    substitutes rather than being blended in against some weighting constant
+    nobody has calibrated.
     """
     total_ns = max(trace.duration_ns, 1)
     applicable_ns = 0
@@ -32,7 +41,8 @@ def predict_delta(trace: Trace, spec: InterventionSpec) -> float:
         if _applies(spec, k.name):
             applicable_ns += k.end_ns - k.start_ns
     coverage = applicable_ns / total_ns
-    return coverage * spec.expected_delta_mean
+    mean = spec.expected_delta_mean if delta_mean is None else delta_mean
+    return coverage * mean
 
 
 def _applies(spec: InterventionSpec, kernel_name: str) -> bool:
