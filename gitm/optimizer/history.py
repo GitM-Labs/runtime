@@ -103,7 +103,7 @@ def _finite(value: Any) -> float | None:
     ``bool`` is excluded deliberately: it is an ``int`` subclass, so ``True``
     would otherwise be read as a measured delta of 1.0.
     """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         return None
     return float(value) if math.isfinite(value) else None
 
