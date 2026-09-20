@@ -6,6 +6,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from gitm.optimizer.deviation import add_deviate_arguments
 from gitm.planner.registry import add_plan_arguments
@@ -84,6 +85,15 @@ def _parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="Run the autonomous optimization loop.")
     run.add_argument("--workload", required=True, help="Workload identifier, e.g. vllm-decode.")
     run.add_argument("--budget", default="24h", help="Wall-clock budget, e.g. 24h.")
+    hist = run.add_mutually_exclusive_group()
+    hist.add_argument(
+        "--use-history", dest="use_history", action="store_true", default=None,
+        help="Rank levers from what previous runs measured on this GPU, without asking.",
+    )
+    hist.add_argument(
+        "--no-history", dest="use_history", action="store_false",
+        help="Ignore previous runs' results and score from the catalog. Deletes nothing.",
+    )
     run.add_argument(
         "--target",
         default="15%",
@@ -264,6 +274,67 @@ def _parse_target(s: str) -> float:
 _HFT_WORKLOADS = {"hft", "hft-lob"}
 
 
+def _ask_use_history(n_runs: int, *, timeout_s: float = 60.0, stream: Any = None,
+                     tty: bool | None = None) -> bool:
+    """Ask whether this run should be scored from what previous runs measured.
+
+    Lives here, and not in the loop, because a prompt is a property of being run
+    by a person at a terminal. ``gitm.optimize`` never touches stdin, so an
+    embedded caller cannot be blocked by a question it did not ask for.
+
+    No answer means yes, for two reasons. An unattended run must not sit on a
+    prompt forever, and of the two answers using the record is the one that
+    discards nothing: declining only skips it for this run. Nothing is deleted
+    either way, since every run writes into its own ``runs/<uuid4>/`` and never
+    touches another run's export.
+
+    Without a terminal there is nobody to ask, so it takes the same default at
+    once rather than waiting out the timeout against a pipe that will not reply.
+    """
+    import select
+
+    stream = sys.stdin if stream is None else stream
+    interactive = tty if tty is not None else bool(getattr(stream, "isatty", lambda: False)())
+    if not interactive:
+        return True
+
+    print(
+        f"\n{n_runs} previous run(s) left measured results."
+        "\n  [Y] rank this run from them   [n] ignore them and score from the catalog"
+        f"\n  Nothing is deleted either way. No answer within {timeout_s:.0f}s uses them."
+        "\n> ",
+        end="", flush=True,
+    )
+    try:
+        ready, _, _ = select.select([stream], [], [], timeout_s)
+    except (OSError, ValueError):  # not a selectable stream
+        return True
+    if not ready:
+        print(f"\n  no answer in {timeout_s:.0f}s \u2014 using previous results.")
+        return True
+    answer = (stream.readline() or "").strip().lower()
+    if answer.startswith("n"):
+        print("  ignoring previous results for this run; they stay on disk.")
+        return False
+    return True
+
+
+def _resolve_use_history(args: Any) -> bool:
+    """What ``--use-history`` said, or the answer to the prompt.
+
+    An explicit flag is never second-guessed, which is what keeps scripted and
+    scheduled runs deterministic. With no flag and no previous results there is
+    nothing to ask about and nothing to rank from.
+    """
+    if getattr(args, "use_history", None) is not None:
+        return bool(args.use_history)
+    from gitm._paths import runs_dir
+    from gitm.optimizer.history import runs_with_results
+
+    n = runs_with_results(runs_dir(args.scratch))
+    return _ask_use_history(n) if n else False
+
+
 def _apply_hft_run_flags(args) -> None:
     """Map the hft-only run flags onto the ``GITM_BENCH_*`` env the workload
     factory reads. Errors if they're used with a non-hft workload, where they
@@ -354,11 +425,14 @@ def main(argv: list[str] | None = None) -> int:
         from gitm import optimize
 
         _apply_hft_run_flags(args)
+        # Asked here, before the loop starts any capture, so nobody answers a
+        # prompt that arrived an hour into a 24h run.
         result = optimize(
             workload=args.workload,
             budget=args.budget,
             target=_parse_target(args.target),
             scratch=args.scratch,
+            use_history=_resolve_use_history(args),
         )
         summary = result.get("summary", {})
         if args.report is not None:

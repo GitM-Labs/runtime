@@ -1,16 +1,19 @@
-"""Asking, once, whether a run should be scored from what previous runs measured."""
+"""Asking, once, whether a run should be scored from what previous runs measured.
+
+The question lives in the CLI, not the loop: a prompt is a property of being run
+by a person at a terminal, and ``gitm.optimize`` must stay usable from a process
+that has no stdin to answer with.
+"""
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 
-from gitm.scheduler.loop import (
-    LoopConfig,
-    _ask_use_history,
-    _prior_runs_with_results,
-    _resolve_use_history,
-)
+from gitm.cli import _ask_use_history, _resolve_use_history
+from gitm.optimizer.history import runs_with_results
+from gitm.scheduler.loop import LoopConfig
 
 
 def _pipe(text: str | None):
@@ -41,13 +44,17 @@ def test_only_runs_that_actually_recorded_something_count(tmp_path):
     _runs(tmp_path, 2)
     _runs(tmp_path / "other", 3, with_export=False)
 
-    assert _prior_runs_with_results(str(tmp_path)) == 2
-    assert _prior_runs_with_results(str(tmp_path / "other")) == 0
+    assert runs_with_results(tmp_path / "runs") == 2
+    assert runs_with_results(tmp_path / "other" / "runs") == 0
+
+
+def _args(scratch, use_history=None):
+    return argparse.Namespace(scratch=str(scratch), use_history=use_history)
 
 
 def test_no_previous_results_asks_nothing_and_uses_nothing(tmp_path):
     """There is no question to put, and no record to rank from."""
-    assert _resolve_use_history(LoopConfig(scratch=str(tmp_path))) is False
+    assert _resolve_use_history(_args(tmp_path)) is False
 
 
 # --------------------------------------------------------------------------- #
@@ -81,22 +88,36 @@ def test_without_a_terminal_it_does_not_wait_at_all():
 # --------------------------------------------------------------------------- #
 # the config still decides when it was told to                                 #
 # --------------------------------------------------------------------------- #
-def test_an_explicit_setting_is_not_second_guessed(tmp_path):
-    """A caller that said which way it wants this is never prompted — that is
-    what keeps scripted and scheduled runs deterministic."""
+def test_an_explicit_flag_is_not_second_guessed(tmp_path):
+    """``--use-history`` / ``--no-history`` are never re-litigated by a prompt —
+    that is what keeps scripted and scheduled runs deterministic."""
     _runs(tmp_path, 2)
 
-    assert _resolve_use_history(LoopConfig(scratch=str(tmp_path), use_history=False)) is False
-    assert _resolve_use_history(LoopConfig(scratch=str(tmp_path), use_history=True)) is True
+    assert _resolve_use_history(_args(tmp_path, use_history=False)) is False
+    assert _resolve_use_history(_args(tmp_path, use_history=True)) is True
 
 
-def test_declining_deletes_nothing(tmp_path):
-    """Answering no skips the record for this run. It does not throw away
-    measurements that cost GPU time to produce."""
-    _runs(tmp_path, 2)
-    before = sorted(p.name for p in (tmp_path / "runs").iterdir())
+def test_the_loop_cannot_reach_a_prompt(tmp_path):
+    """An embedded caller has no stdin to answer with, so the loop must not be
+    able to ask at all — not merely avoid asking today. This fails if a prompt
+    ever drifts back into the scheduler."""
+    import inspect
 
-    assert _ask_use_history(2, stream=_pipe("n\n"), tty=True) is False
+    from gitm.scheduler import loop as loop_mod
 
-    assert sorted(p.name for p in (tmp_path / "runs").iterdir()) == before
-    assert all((tmp_path / "runs" / d / "verification.json").exists() for d in before)
+    src = inspect.getsource(loop_mod)
+    assert "select.select" not in src
+    assert not hasattr(loop_mod, "_ask_use_history")
+    # and with nobody having said either way, history is simply off
+    assert LoopConfig(scratch=str(tmp_path)).use_history is None
+
+
+def test_optimize_does_not_ask_either():
+    """The public entry point takes the answer as an argument. If it grew a
+    prompt, an embedded vLLM process would hang on a question nobody sees."""
+    import inspect
+
+    from gitm.api import optimize
+
+    assert "use_history" in inspect.signature(optimize).parameters
+    assert "input(" not in inspect.getsource(optimize)

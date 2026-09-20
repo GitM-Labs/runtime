@@ -22,6 +22,7 @@ from typing import Any
 
 __all__ = [
     "LeverRecord",
+    "runs_with_results",
     "History",
     "load_history",
     "record_for",
@@ -100,6 +101,18 @@ def _verdict(result: dict[str, Any]) -> str:
     if not result.get("kept"):
         return "loss"
     return "win" if result.get("significant") else "inconclusive"
+
+
+def runs_with_results(runs_dir: str | Path) -> int:
+    """How many run folders under ``runs_dir`` left a verification export.
+
+    Cheap enough to call before deciding whether there is anything worth asking
+    the operator about: it stats each directory rather than parsing any of them.
+    """
+    runs_dir = Path(runs_dir)
+    if not runs_dir.is_dir():
+        return 0
+    return sum(1 for p in runs_dir.iterdir() if p.is_dir() and (p / EXPORT_NAME).exists())
 
 
 def load_history(runs_dir: str | Path, *, gpu_sku: str | None = None) -> History:

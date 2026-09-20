@@ -11,8 +11,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import select
-import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -40,7 +38,7 @@ from gitm.optimizer.attribution import attribute
 from gitm.optimizer.collective_signal import collective_causes, worst_device_comm
 from gitm.optimizer.deviation import deviation_summary, deviation_trace, write_deviation_jsonl
 from gitm.optimizer.dr import attribute_dr
-from gitm.optimizer.history import EXPORT_NAME, load_history
+from gitm.optimizer.history import load_history
 from gitm.optimizer.measure import measure_trace, measurement_claims, measurement_summary
 from gitm.optimizer.monitor import check_invariants, residuals
 from gitm.optimizer.qualification import qualify
@@ -165,9 +163,9 @@ class LoopConfig:
     scratch: str | None = None
     top_n_interventions: int = 5
     #: Rank levers from what previous runs measured on this GPU, instead of from
-    #: the library's hand-authored estimates alone. ``None`` asks, where there is
-    #: a record to ask about and someone to ask; ``True``/``False`` decide it
-    #: outright and skip the question.
+    #: the library's hand-authored estimates alone. ``None`` means nobody said,
+    #: which reads as off: the loop never asks. ``gitm run`` puts the question to
+    #: the operator and passes an explicit answer down.
     use_history: bool | None = None
     # Optional explicit driver for the embedded/engine path. When unset, the
     # loop looks up ``workload`` in the workload registry (gitm.workloads).
@@ -411,68 +409,12 @@ def _ar_target_residual(ar_run: AutoresearchRun, fallback: float = 0.0) -> float
     return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else fallback
 
 
-def _prior_runs_with_results(scratch: str | None) -> int:
-    """How many previous runs left a verification export under ``runs/``."""
-    d = runs_dir(scratch)
-    if not d.is_dir():
-        return 0
-    return sum(1 for p in d.iterdir() if p.is_dir() and (p / EXPORT_NAME).exists())
-
-
-def _ask_use_history(
-    n_runs: int, *, timeout_s: float = 60.0, stream: Any = None, tty: bool | None = None
-) -> bool:
-    """Ask whether to score this run from what previous runs measured.
-
-    No answer means yes, for two reasons. An unattended run — a 24h budget
-    started over ssh, a cron job — must not sit on a prompt forever, and of the
-    two choices, using the record is the one that discards nothing: declining
-    only skips it for this run. Nothing is deleted either way, because each run
-    writes into its own ``runs/<uuid>/`` and never touches another's export.
-
-    Without a terminal there is nobody to ask, so it takes the same default
-    rather than waiting out the timeout against a pipe that will never answer.
-    """
-    stream = sys.stdin if stream is None else stream
-    interactive = tty if tty is not None else bool(getattr(stream, "isatty", lambda: False)())
-    if not interactive:
-        return True
-
-    print(
-        f"\n{n_runs} previous run(s) left measured results."
-        "\n  [Y] rank this run from them   [n] ignore them and score from the catalog"
-        f"\n  Nothing is deleted either way. No answer within {timeout_s:.0f}s uses them."
-        "\n> ",
-        end="", flush=True,
-    )
-    try:
-        ready, _, _ = select.select([stream], [], [], timeout_s)
-    except (OSError, ValueError):  # not a selectable stream
-        return True
-    if not ready:
-        print(f"\n  no answer in {timeout_s:.0f}s — using previous results.")
-        return True
-    answer = (stream.readline() or "").strip().lower()
-    if answer.startswith("n"):
-        print("  ignoring previous results for this run; they stay on disk.")
-        return False
-    return True
-
-
-def _resolve_use_history(cfg: LoopConfig) -> bool:
-    """``cfg.use_history`` when it was set, otherwise the answer to the prompt."""
-    if cfg.use_history is not None:
-        return cfg.use_history
-    n = _prior_runs_with_results(cfg.scratch)
-    return _ask_use_history(n) if n else False
-
-
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     """Execute the 24-hour loop and return ``{summary, report_md, ...}``."""
     workload = cfg.workload or (getattr(cfg.engine, "workload_id", None) or "vllm-decode")
-    # Asked before the capture rather than after it, so nobody is answering a
-    # prompt that arrived an hour into their run.
-    use_history = _resolve_use_history(cfg)
+    # Never prompts. Deciding that is the CLI's job, because a library entry
+    # point that can block on stdin is one an embedded caller cannot use.
+    use_history = bool(cfg.use_history)
     run_id = uuid.uuid4().hex
     budget_s = _parse_budget_s(cfg.budget)
     started_ns = time.time_ns()
