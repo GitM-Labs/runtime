@@ -58,6 +58,7 @@ def select_interventions(
     ctx: GateContext | None = None,
     history: History | None = None,
     gpu_sku: str | None = None,
+    fingerprint: str | None = None,
 ) -> list[RankedCandidate]:
     """Rank the library for this trace, rejected candidates last.
 
@@ -83,7 +84,7 @@ def select_interventions(
         elif reason is None and (spec.safety.requires_qualification_commit and not policy.require_qualification_commit):
             reason = "safety.requires_qualification_commit"
         record = (
-            record_for(history, spec.name, gpu_sku=gpu_sku)
+            record_for(history, spec.name, gpu_sku=gpu_sku, fingerprint=fingerprint)
             if use_history and reason is None
             else None
         )

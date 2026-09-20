@@ -8,6 +8,7 @@ from gitm.optimizer.history import History, LeverRecord
 from gitm.tracer.schema import KernelEvent, Trace
 
 SKU = "AMD Instinct MI355X"
+FP = "kimi-k2.5"
 
 
 def _trace() -> Trace:
@@ -35,21 +36,24 @@ def _spec(name, kernels, *, mean=0.05) -> InterventionSpec:
     )
 
 
-def _record(name, *, mean, wins=1, losses=0, gpu=SKU) -> LeverRecord:
+def _record(name, *, mean, wins=1, losses=0, gpu=SKU, fp=FP) -> LeverRecord:
     return LeverRecord(
-        intervention_name=name, gpu_sku=gpu, runs=1, attempts=wins + losses,
+        intervention_name=name, gpu_sku=gpu, fingerprint=fp, runs=1,
+        attempts=wins + losses,
         wins=wins, losses=losses, inconclusive=0, mean_delta=mean,
         best_delta=mean, worst_delta=mean, last_run_id="r1",
     )
 
 
 def _history(*records) -> History:
-    return History(records={(r.intervention_name, r.gpu_sku): r for r in records},
+    return History(records={(r.intervention_name, r.gpu_sku, r.fingerprint): r
+                            for r in records},
                    runs_read=1)
 
 
 def _ranked(**kw):
     lib = [_spec("moe_lever", ["fused_moe_kernel"]), _spec("gemm_lever", ["gemm"])]
+    kw.setdefault("fingerprint", FP)
     return select_interventions(_trace(), lib, kw.pop("policy", Policy()), top_n=5, **kw)
 
 
@@ -134,7 +138,7 @@ def test_a_record_with_no_usable_delta_keeps_the_prior_and_the_demotion():
     """"Tried, and we have no number" is not "measured at zero" — the record
     still says the lever disagreed with itself, but carries nothing to rank on."""
     rec = LeverRecord(intervention_name="moe_lever", gpu_sku=SKU, runs=2, attempts=2,
-                      wins=1, losses=1, inconclusive=0, mean_delta=None,
+                      fingerprint=FP, wins=1, losses=1, inconclusive=0, mean_delta=None,
                       best_delta=None, worst_delta=None, last_run_id="r1")
     ranked = _ranked(policy=Policy(use_history=True), history=_history(rec), gpu_sku=SKU)
     by_name = {c.spec.name: c for c in ranked}
@@ -159,3 +163,24 @@ def test_a_known_loser_never_outranks_an_uncertain_candidate(tmp_path=None):
     assert by_name["gemm_lever"].demoted is False
     assert by_name["gemm_lever"].predicted_delta < 0
     assert ranked[0].spec.name == "moe_lever"      # demoted, but still the better bet
+
+
+def test_another_models_record_is_not_evidence_about_this_one():
+    """A shared scratch holds runs from several checkpoints on one box. A lever
+    measured on a sparse-MoE model says nothing about a dense one."""
+    h = _history(_record("moe_lever", mean=-0.30, fp="glm-5.2"))
+    ranked = _ranked(policy=Policy(use_history=True), history=h, gpu_sku=SKU)
+    by_name = {c.spec.name: c for c in ranked}
+
+    assert by_name["moe_lever"].delta_source == "prior"
+    assert by_name["moe_lever"].predicted_delta > 0
+
+
+def test_no_fingerprint_means_no_substitution():
+    """Same reasoning as an unnamed GPU: without knowing which workload the
+    record came from, the prior stands rather than a guess."""
+    h = _history(_record("moe_lever", mean=-0.30))
+    ranked = _ranked(policy=Policy(use_history=True), history=h, gpu_sku=SKU,
+                     fingerprint=None)
+
+    assert all(c.delta_source == "prior" for c in ranked)

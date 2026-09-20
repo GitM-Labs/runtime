@@ -223,8 +223,8 @@ def test_reads_an_export_written_by_the_real_writer(tmp_path):
     ])
 
     h = load_history(tmp_path)
-    won = record_for(h, "kv_cache_dtype_fp8", gpu_sku="NVIDIA H100 80GB")
-    lost = record_for(h, "cuda_graphs_enable", gpu_sku="NVIDIA H100 80GB")
+    won = record_for(h, "kv_cache_dtype_fp8", gpu_sku="NVIDIA H100 80GB", fingerprint="fp")
+    lost = record_for(h, "cuda_graphs_enable", gpu_sku="NVIDIA H100 80GB", fingerprint="fp")
 
     assert h.runs_read == 1
     assert (won.wins, won.losses) == (1, 0)
@@ -244,7 +244,8 @@ def test_gpu_sku_survives_the_real_writer(tmp_path):
     h = load_history(tmp_path, gpu_sku="AMD MI355X")
 
     assert h.runs_read == 1 and h.filtered == 0
-    assert record_for(h, "enable_expert_parallel", gpu_sku="AMD MI355X").wins == 1
+    assert record_for(h, "enable_expert_parallel", gpu_sku="AMD MI355X",
+                      fingerprint="fp").wins == 1
 
 
 def test_a_real_export_with_no_results_is_not_mistaken_for_a_crash(tmp_path):
@@ -415,3 +416,86 @@ def test_a_damaged_export_is_never_counted_as_filtered(tmp_path):
 
     assert h.filtered == 0
     assert h.skipped == {"bad-env": "malformed environment"}
+
+
+def test_two_models_on_one_box_do_not_average_into_one_number(tmp_path):
+    """A lever that helps a sparse-MoE checkpoint says nothing about a dense one.
+    Keyed on the GPU alone, a +40% on one model and a -20% on another merged into
+    a confident +10% describing neither — and not even flagged conflicted, since
+    both were kept and significant, so both counted as wins."""
+    for run_id, fp, delta in (("r1", "kimi-k2.5", 0.40), ("r2", "glm-5.2", -0.20)):
+        d = tmp_path / run_id
+        d.mkdir()
+        (d / "verification.json").write_text(json.dumps({
+            "provenance": {"run_id": run_id, "fingerprint": fp},
+            "environment": {"gpu_sku": "AMD Instinct MI355X"},
+            "results": [_result("kv_cache_dtype_fp8", delta=delta)],
+        }))
+
+    h = load_history(tmp_path)
+
+    assert len(h.records) == 2
+    kimi = record_for(h, "kv_cache_dtype_fp8", gpu_sku="AMD Instinct MI355X",
+                      fingerprint="kimi-k2.5")
+    glm = record_for(h, "kv_cache_dtype_fp8", gpu_sku="AMD Instinct MI355X",
+                     fingerprint="glm-5.2")
+    assert abs(kimi.mean_delta - 0.40) < 1e-9
+    assert abs(glm.mean_delta - (-0.20)) < 1e-9
+    # and asking for a model nobody measured returns nothing, not someone else's
+    assert record_for(h, "kv_cache_dtype_fp8", gpu_sku="AMD Instinct MI355X",
+                      fingerprint="mimi-v2.5") is None
+
+
+def test_the_workload_filter_is_counted_apart_from_damage(tmp_path):
+    _run(tmp_path, "keep", [_result("kv_cache_dtype_fp8")])
+    d = tmp_path / "other"
+    d.mkdir()
+    (d / "verification.json").write_text(json.dumps({
+        "provenance": {"run_id": "other", "fingerprint": "glm-5.2"},
+        "environment": {"gpu_sku": "NVIDIA H100 80GB"},
+        "results": [_result("kv_cache_dtype_fp8")],
+    }))
+
+    h = load_history(tmp_path, fingerprint="glm-5.2")
+
+    assert h.runs_read == 1 and h.filtered == 1 and not h.skipped
+
+
+def test_a_string_speedup_does_not_abort_the_whole_read(tmp_path):
+    """This runs in Phase 3, after the capture has been paid for. A malformed
+    number in one old export must not take the run down with it."""
+    _run(tmp_path, "good", [_result("kv_cache_dtype_fp8", delta=0.10)])
+    _run(tmp_path, "bad", [{**_result("enforce_eager"), "delta": None, "speedup": "1.1"}])
+
+    h = load_history(tmp_path)
+
+    assert h.runs_read == 2
+    assert record_for(h, "kv_cache_dtype_fp8", gpu_sku="NVIDIA H100 80GB").wins == 1
+    # the attempt still counts; only its unusable number is dropped
+    bad = record_for(h, "enforce_eager", gpu_sku="NVIDIA H100 80GB")
+    assert bad.attempts == 1 and bad.mean_delta is None
+
+
+def test_a_non_finite_delta_is_absent_rather_than_ranked(tmp_path):
+    """NaN survives a mean and reaches json.dumps, which emits the literal NaN —
+    not valid JSON, in an artifact written to be machine-read."""
+    _run(tmp_path, "nan", [_result("kv_cache_dtype_fp8", delta=float("nan"))])
+
+    rec = record_for(load_history(tmp_path), "kv_cache_dtype_fp8",
+                     gpu_sku="NVIDIA H100 80GB")
+
+    assert rec.attempts == 1
+    assert rec.mean_delta is None
+    json.dumps({"mean": rec.mean_delta})       # round-trips as null
+
+
+def test_true_is_not_a_measured_delta_of_one(tmp_path):
+    """``bool`` is an ``int`` subclass, so a sloppy check reads True as +100%."""
+    _run(tmp_path, "b", [{**_result("kv_cache_dtype_fp8"),
+                          "delta": True, "speedup": None}])
+
+    rec = record_for(load_history(tmp_path), "kv_cache_dtype_fp8",
+                     gpu_sku="NVIDIA H100 80GB")
+
+    assert rec.attempts == 1
+    assert rec.mean_delta is None

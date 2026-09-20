@@ -16,6 +16,7 @@ and the GPU it ran on.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,12 @@ class LeverRecord:
 
     intervention_name: str
     gpu_sku: str | None
+    #: The workload fingerprint the result was measured under — model plus
+    #: config, from :func:`gitm.optimizer.qualification.fingerprint`. Part of the
+    #: key for the same reason ``gpu_sku`` is: a lever that helps a sparse-MoE
+    #: checkpoint says nothing about a dense one, and averaging a +40% on one
+    #: model with a -20% on another reports a confident +10% describing neither.
+    fingerprint: str | None
     #: Distinct run folders this lever appears in. Kept apart from ``attempts``
     #: because five A/Bs inside one run is far weaker evidence than five across
     #: five runs, and a single count cannot tell those apart.
@@ -90,6 +97,34 @@ class History:
         return len(self.records)
 
 
+def _finite(value: Any) -> float | None:
+    """A real, finite number, or ``None``.
+
+    ``bool`` is excluded deliberately: it is an ``int`` subclass, so ``True``
+    would otherwise be read as a measured delta of 1.0.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def _delta_of(result: dict[str, Any]) -> float | None:
+    """The signed delta this A/B recorded, or ``None`` when it has none usable.
+
+    A value that is not a real finite number is treated as absent rather than
+    coerced, and the attempt still counts as won or lost. Two failures this
+    prevents, both of which land in Phase 3 *after* the capture has been paid
+    for: a string ``speedup`` raised ``TypeError`` out of the whole read, and a
+    NaN propagated through the mean into ``json.dumps``, which emits the literal
+    ``NaN`` \u2014 not valid JSON, in an artifact meant to be machine-read.
+    """
+    delta = _finite(result.get("delta"))
+    if delta is not None:
+        return delta
+    speedup = _finite(result.get("speedup"))
+    return None if speedup is None else speedup - 1.0
+
+
 def _verdict(result: dict[str, Any]) -> str:
     """win / loss / inconclusive for one A/B.
 
@@ -115,12 +150,16 @@ def runs_with_results(runs_dir: str | Path) -> int:
     return sum(1 for p in runs_dir.iterdir() if p.is_dir() and (p / EXPORT_NAME).exists())
 
 
-def load_history(runs_dir: str | Path, *, gpu_sku: str | None = None) -> History:
+def load_history(
+    runs_dir: str | Path, *, gpu_sku: str | None = None,
+    fingerprint: str | None = None,
+) -> History:
     """Aggregate every readable ``verification.json`` under ``runs_dir``.
 
-    ``gpu_sku`` filters to one GPU: a result measured on an H100 says nothing
-    about an MI355X, so a caller ranking for one box should not see the other's
-    record. Runs are ordered by the export's mtime — the export carries a
+    ``gpu_sku`` filters to one GPU and ``fingerprint`` to one workload: a result
+    measured on an H100 says nothing about an MI355X, and one measured on a
+    sparse-MoE checkpoint says nothing about a dense one. A caller ranking for a
+    particular box and model should see neither of the others' records. Runs are ordered by the export's mtime — the export carries a
     ``run_id`` but no timestamp, and the run directories are UUIDs, so the file
     is the only ordering available for ``last_run_id``.
     """
@@ -130,7 +169,7 @@ def load_history(runs_dir: str | Path, *, gpu_sku: str | None = None) -> History
     if not runs_dir.is_dir():
         return History(skipped={str(runs_dir): "runs dir does not exist"})
 
-    exports: list[tuple[float, str, str | None, list[dict[str, Any]]]] = []
+    exports: list[tuple[float, str, str | None, str | None, list[dict[str, Any]]]] = []
     for d in sorted(p for p in runs_dir.iterdir() if p.is_dir()):
         path = d / EXPORT_NAME
         if not path.exists():
@@ -163,23 +202,26 @@ def load_history(runs_dir: str | Path, *, gpu_sku: str | None = None) -> History
             # attempts with nothing saying so, which is what skipped is for.
             skipped[d.name] = "malformed result entry"
             continue
+        prov = doc.get("provenance") if isinstance(doc.get("provenance"), dict) else {}
         sku = (env or {}).get("gpu_sku")
-        if gpu_sku is not None and sku != gpu_sku:
+        fp = prov.get("fingerprint")
+        if (gpu_sku is not None and sku != gpu_sku) or (
+            fingerprint is not None and fp != fingerprint
+        ):
             filtered += 1
             continue
-        prov = doc.get("provenance")
-        run_id = (prov.get("run_id") if isinstance(prov, dict) else None) or d.name
-        exports.append((path.stat().st_mtime, run_id, sku, results))
+        run_id = prov.get("run_id") or d.name
+        exports.append((path.stat().st_mtime, run_id, sku, fp, results))
 
     exports.sort(key=lambda e: e[0])
 
-    acc: dict[tuple[str, str | None], dict[str, Any]] = {}
-    for _mtime, run_id, sku, results in exports:
+    acc: dict[tuple[str, str | None, str | None], dict[str, Any]] = {}
+    for _mtime, run_id, sku, fp, results in exports:
         for r in results:
             name = r.get("intervention_name")
             if not name:
                 continue
-            key = (name, sku)
+            key = (name, sku, fp)
             a = acc.setdefault(
                 key,
                 {"runs": set(), "attempts": 0, "win": 0, "loss": 0,
@@ -188,19 +230,18 @@ def load_history(runs_dir: str | Path, *, gpu_sku: str | None = None) -> History
             a["runs"].add(run_id)
             a["attempts"] += 1
             a[_verdict(r)] += 1
-            delta = r.get("delta")
-            if delta is None and r.get("speedup") is not None:
-                delta = r["speedup"] - 1.0
-            if isinstance(delta, (int | float)):
-                a["deltas"].append(float(delta))
+            delta = _delta_of(r)
+            if delta is not None:
+                a["deltas"].append(delta)
             a["last_run_id"] = run_id
 
     records = {}
-    for (name, sku), a in acc.items():
+    for (name, sku, fp), a in acc.items():
         deltas = a["deltas"]
-        records[(name, sku)] = LeverRecord(
+        records[(name, sku, fp)] = LeverRecord(
             intervention_name=name,
             gpu_sku=sku,
+            fingerprint=fp,
             runs=len(a["runs"]),
             attempts=a["attempts"],
             wins=a["win"],
@@ -217,15 +258,20 @@ def load_history(runs_dir: str | Path, *, gpu_sku: str | None = None) -> History
 
 
 def record_for(
-    history: History, intervention_name: str, *, gpu_sku: str | None = None
+    history: History, intervention_name: str, *, gpu_sku: str | None = None,
+    fingerprint: str | None = None,
 ) -> LeverRecord | None:
-    """The record for one lever, or ``None`` if no run ever tried it.
+    """The record for one lever on one box under one workload, or ``None``.
 
     ``None`` rather than a zeroed record on purpose: "never measured" and
     "measured, and it did nothing" must not look alike to a caller deciding
     whether this lever is worth an experiment. They point opposite ways.
+
+    Both ``gpu_sku`` and ``fingerprint`` are part of the key, so asking with the
+    wrong one returns nothing rather than another context's answer. A caller
+    that has no fingerprint gets records measured without one, not all of them.
     """
-    return history.records.get((intervention_name, gpu_sku))
+    return history.records.get((intervention_name, gpu_sku, fingerprint))
 
 
 def _fit(value: str, width: int) -> str:
@@ -276,9 +322,11 @@ def render_history(history: History, *, top: int = 20) -> str:
     # look like one box is the exact confusion keying on gpu_sku exists to stop.
     name_w = _column(shown, lambda r: r.intervention_name, "lever", cap=40)
     gpu_w = _column(shown, lambda r: r.gpu_sku or "-", "gpu", cap=30)
+    fp_w = _column(shown, lambda r: r.fingerprint or "-", "workload", cap=24)
 
     out.append("")
-    out.append(f"  {'lever':{name_w}s} {'gpu':{gpu_w}s} {'runs':>5s} {'a/b':>4s} "
+    out.append(f"  {'lever':{name_w}s} {'gpu':{gpu_w}s} {'workload':{fp_w}s} "
+               f"{'runs':>5s} {'a/b':>4s} "
                f"{'won':>4s} {'lost':>5s} {'incon':>6s} {'mean':>8s}  last")
     for r in shown:
         flag = "  CONFLICTED" if r.conflicted else ""
@@ -286,6 +334,7 @@ def render_history(history: History, *, top: int = 20) -> str:
         out.append(
             f"  {_fit(r.intervention_name, name_w):{name_w}s} "
             f"{_fit(r.gpu_sku or '-', gpu_w):{gpu_w}s} "
+            f"{_fit(r.fingerprint or '-', fp_w):{fp_w}s} "
             f"{r.runs:5d} {r.attempts:4d} {r.wins:4d} {r.losses:5d} {r.inconclusive:6d} "
             f"{mean:>7s}  {(r.last_run_id or '-')[:8]}{flag}"
         )

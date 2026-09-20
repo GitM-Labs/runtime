@@ -729,7 +729,8 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # Read once per run, filtered to this box. A lever measured on another GPU is
     # not evidence about this one, and load_history counts what it filtered out
     # rather than letting a thin record look like a weak lever.
-    prior_runs = load_history(runs_dir(cfg.scratch), gpu_sku=pctx.sku) if use_history else None
+    prior_runs = (load_history(runs_dir(cfg.scratch), gpu_sku=pctx.sku,
+                               fingerprint=qual.fingerprint) if use_history else None)
     if prior_runs is not None:
         (run_dir / "history_read.json").write_text(json.dumps({
             "runs_read": prior_runs.runs_read,
@@ -737,9 +738,11 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             "skipped": prior_runs.skipped,
             "levers": len(prior_runs.records),
             "gpu_sku": pctx.sku,
+            "fingerprint": qual.fingerprint,
         }, indent=2))
     ranked = select_interventions(trace, library, policy, top_n=cfg.top_n_interventions,
-                                  ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku)
+                                  ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
+                                  fingerprint=qual.fingerprint)
     (run_dir / "ranked_candidates.json").write_text(
         json.dumps(
             [
