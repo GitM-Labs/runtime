@@ -499,3 +499,70 @@ def test_true_is_not_a_measured_delta_of_one(tmp_path):
 
     assert rec.attempts == 1
     assert rec.mean_delta is None
+
+
+# --------------------------------------------------------------------------- #
+# identity fields: keys and set members, so the wrong type is not a bad value   #
+# but an unhashable one                                                         #
+# --------------------------------------------------------------------------- #
+def _doc(*, prov, env, results):
+    return json.dumps({"provenance": prov, "environment": env, "results": results})
+
+
+_OK_PROV = {"run_id": "ok", "fingerprint": "fp"}
+_OK_ENV = {"gpu_sku": "AMD Instinct MI355X"}
+
+
+def test_an_unhashable_identity_field_does_not_abort_the_read(tmp_path):
+    """gpu_sku, fingerprint and intervention_name become part of the record key;
+    run_id goes into a set. A list or a dict in any of them raised
+    ``unhashable type`` out of the whole read — after the capture, taking every
+    sound run with it. That is the failure this module exists to contain."""
+    cases = {
+        "bad-sku": _doc(prov=_OK_PROV, env={"gpu_sku": ["MI355X"]},
+                        results=[_result("kv_cache_dtype_fp8")]),
+        "bad-fp": _doc(prov={"run_id": "x", "fingerprint": {"a": 1}}, env=_OK_ENV,
+                       results=[_result("kv_cache_dtype_fp8")]),
+        "bad-name": _doc(prov=_OK_PROV, env=_OK_ENV,
+                         results=[{**_result("x"), "intervention_name": ["a"]}]),
+    }
+    _run(tmp_path, "good", [_result("kv_cache_dtype_fp8")],
+         gpu_sku="AMD Instinct MI355X")
+    (tmp_path / "good" / "verification.json").write_text(
+        _doc(prov=_OK_PROV, env=_OK_ENV, results=[_result("kv_cache_dtype_fp8")]))
+    for name, body in cases.items():
+        _run(tmp_path, name, None, body=body)
+
+    h = load_history(tmp_path)
+
+    assert h.runs_read == 1
+    assert set(h.skipped) == set(cases)
+    assert record_for(h, "kv_cache_dtype_fp8", gpu_sku="AMD Instinct MI355X",
+                      fingerprint="fp").wins == 1
+
+
+def test_a_number_where_a_sku_belongs_is_caught_at_load_not_at_render(tmp_path):
+    """An int is hashable, so it survived the load and broke render_history on
+    ``len()`` instead — a failure one screen further from its cause."""
+    _run(tmp_path, "bad", None,
+         body=_doc(prov=_OK_PROV, env={"gpu_sku": 42},
+                   results=[_result("kv_cache_dtype_fp8")]))
+
+    h = load_history(tmp_path)
+
+    assert h.skipped == {"bad": "malformed gpu_sku"}
+    render_history(h)          # renders rather than raising
+
+
+def test_a_malformed_run_id_falls_back_to_the_directory(tmp_path):
+    """The one identity field with a documented fallback: nothing is lost by
+    reading the run, so it is not worth skipping its measurements over."""
+    _run(tmp_path, "weird", None,
+         body=_doc(prov={"run_id": {"a": 1}, "fingerprint": "fp"}, env=_OK_ENV,
+                   results=[_result("kv_cache_dtype_fp8")]))
+
+    rec = record_for(load_history(tmp_path), "kv_cache_dtype_fp8",
+                     gpu_sku="AMD Instinct MI355X", fingerprint="fp")
+
+    assert rec.runs == 1
+    assert rec.last_run_id == "weird"

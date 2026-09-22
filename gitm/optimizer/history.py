@@ -97,6 +97,18 @@ class History:
         return len(self.records)
 
 
+def _named(value: Any) -> bool:
+    """True when ``value`` is usable as an identity field: a string, or absent.
+
+    These become part of the record key and of the run set, so a list or a dict
+    here raises ``unhashable type`` out of the whole read — one damaged export
+    taking every sound run with it, which is the failure this module exists to
+    contain rather than cause. A number is hashable and would survive the load,
+    then break the renderer on ``len()`` instead.
+    """
+    return value is None or isinstance(value, str)
+
+
 def _finite(value: Any) -> float | None:
     """A real, finite number, or ``None``.
 
@@ -202,15 +214,30 @@ def load_history(
             # attempts with nothing saying so, which is what skipped is for.
             skipped[d.name] = "malformed result entry"
             continue
+        if not all(_named(r.get("intervention_name")) for r in results):
+            skipped[d.name] = "malformed intervention name"
+            continue
         prov = doc.get("provenance") if isinstance(doc.get("provenance"), dict) else {}
         sku = (env or {}).get("gpu_sku")
         fp = prov.get("fingerprint")
+        # Both are keys and neither has a fallback: a record filed under the wrong
+        # box or the wrong model is the mistake the key exists to prevent, so a
+        # malformed one skips the run rather than keying under None.
+        if not _named(sku):
+            skipped[d.name] = "malformed gpu_sku"
+            continue
+        if not _named(fp):
+            skipped[d.name] = "malformed fingerprint"
+            continue
         if (gpu_sku is not None and sku != gpu_sku) or (
             fingerprint is not None and fp != fingerprint
         ):
             filtered += 1
             continue
-        run_id = prov.get("run_id") or d.name
+        # run_id is the one identity field with a documented fallback, so a
+        # malformed one costs the run nothing.
+        raw_run_id = prov.get("run_id")
+        run_id = raw_run_id if isinstance(raw_run_id, str) and raw_run_id else d.name
         exports.append((path.stat().st_mtime, run_id, sku, fp, results))
 
     exports.sort(key=lambda e: e[0])
