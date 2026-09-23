@@ -888,13 +888,25 @@ def main(argv: list[str] | None = None) -> int:
     band = next((i.band_width for i in INVARIANTS if i.id == "kernel_time"), 0.4)
 
     if args.as_json:
-        scale = args.steps or 1
+        # The graph prices ONE step. ``--steps`` says how many the window holds,
+        # and nothing here can derive it. ``steps or 1`` quietly left the floor at
+        # a single step while ``observed_s`` beside it covered the whole capture,
+        # so a 100-step window read 100x over budget with nothing in the payload
+        # saying why. ``render_deviation`` already refuses that comparison and
+        # prints UNSCALED instead of a ratio; this path never got the same
+        # treatment, and it is the one a tool reads without a human present.
+        #
+        # No step count means no floor to state. ``floors_scaled`` says which of
+        # the two reasons a null ``floor_s`` has: the op is unmodeled, or nothing
+        # could be scaled at all.
+        scaled = args.steps is not None
         print(json.dumps({
             "trace": str(args.trace),
             "n_kernels": n_kernels,
             "device_time_s": total_ns / 1e9,
             "window_s": span_ns / 1e9,
             "steps": args.steps,
+            "floors_scaled": scaled,
             "pid": args.pid,
             "device": args.device,
             "speculative_tokens": args.spec_tokens,
@@ -905,8 +917,8 @@ def main(argv: list[str] | None = None) -> int:
                 op: {
                     "kernels": c,
                     "observed_s": ns / 1e9,
-                    "floor_s": (pred.get(op, 0.0) * scale)
-                    if pred and op != "<unmodeled>" else None,
+                    "floor_s": (pred.get(op, 0.0) * args.steps)
+                    if (scaled and pred and op != "<unmodeled>") else None,
                 }
                 for op, (c, ns) in sorted(per_op.items(), key=lambda kv: -kv[1][1])
             },
