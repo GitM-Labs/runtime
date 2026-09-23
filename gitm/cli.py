@@ -85,6 +85,12 @@ def _parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="Run the autonomous optimization loop.")
     run.add_argument("--workload", required=True, help="Workload identifier, e.g. vllm-decode.")
     run.add_argument("--budget", default="24h", help="Wall-clock budget, e.g. 24h.")
+    run.add_argument(
+        "--rerank", choices=("off", "recapture"), default="off",
+        help="What to do with what the run learns between candidates. "
+             "'recapture' traces the workload again after each applied candidate "
+             "and re-ranks what is left against it; 'off' keeps the opening order.",
+    )
     hist = run.add_mutually_exclusive_group()
     hist.add_argument(
         "--use-history", dest="use_history", action="store_true", default=None,
@@ -433,6 +439,7 @@ def main(argv: list[str] | None = None) -> int:
             target=_parse_target(args.target),
             scratch=args.scratch,
             use_history=_resolve_use_history(args),
+            rerank=args.rerank,
         )
         summary = result.get("summary", {})
         if args.report is not None:
