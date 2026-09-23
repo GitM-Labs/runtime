@@ -124,12 +124,34 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
     pred = graph.nodes
 
     res = Residuals()
-    by_op_layer: dict[tuple[str, int], PredictedNode] = {}
+    # Every node of one (op, layer), in emission order. Usually one; more when a
+    # layer launches the same op more than once — the two expert GEMMs of an MoE
+    # layer are both ``moe_routed`` (one ``fused_moe_kernel`` per GEMM), GLM
+    # emits two ``moe_router`` nodes. Keeping only the first scored the down
+    # launch against the gate_up point, a systematic -50% ``check_invariants``
+    # reads as confirmation. An interval over the layer's nodes would hide a
+    # launch that is wrong for its own role but inside the span, so the k-th
+    # launch of the op in that layer (by start time) pairs with the k-th node,
+    # cycling across decode steps: a point residual against its own prediction.
+    by_op_layer: dict[tuple[str, int], list[PredictedNode]] = {}
     classes: dict[str, dict[tuple[float, float], PredictedNode]] = {}
     for pn in pred:
         if pn.layer is not None:
-            by_op_layer.setdefault((pn.op, pn.layer), pn)
+            by_op_layer.setdefault((pn.op, pn.layer), []).append(pn)
         classes.setdefault(pn.op, {}).setdefault(_class_key(pn), pn)
+
+    ordinal: dict[int, PredictedNode] = {}
+    seen: dict[tuple[str, int], int] = {}
+    for ok in sorted(obs, key=lambda k: k.start_ns):
+        op_k = observed_op(ok.name, ok.range_op)
+        if ok.range_layer is None or op_k is None:
+            continue
+        key = (op_k, ok.range_layer)
+        seq = by_op_layer.get(key)
+        if seq:
+            i = seen.get(key, 0)
+            seen[key] = i + 1
+            ordinal[id(ok)] = seq[i % len(seq)]
 
     for ok in obs:
         op = observed_op(ok.name, ok.range_op)
@@ -146,9 +168,7 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
             else None
         )
 
-        pn: PredictedNode | None = None
-        if ok.range_layer is not None:
-            pn = by_op_layer.get((op, ok.range_layer))
+        pn: PredictedNode | None = ordinal.get(id(ok))
         if pn is None and len(cls) == 1:
             pn = cls[0]
 

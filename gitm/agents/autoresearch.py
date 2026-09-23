@@ -52,12 +52,13 @@ from gitm.optimizer.bound_classes import (
     IDLE_STALL,
     MEMORY_BOUND,
 )
-from gitm.optimizer.deviation import classify_op
+from gitm.optimizer.deviation import observed_op
 from gitm.optimizer.monitor import Residuals, _serialized_fraction
 from gitm.optimizer.vllm_knobs import KNOB_PREREQUISITES
 from gitm.tracer.schema import Trace
 
 if TYPE_CHECKING:
+    from gitm.optimizer.history import History
     from gitm.optimizer.preconditions import GateContext
 
 #: The module's public surface: the bottleneck vocabulary, the ``KnobSource`` and
@@ -196,11 +197,13 @@ def _op_present(trace: Trace, op: str) -> bool:
     """True if some kernel in the trace classifies to ``op``.
 
     The op label is synthetic (from the predicted graph), never a literal
-    substring of a real kernel name, so classify by identity like
-    ``residuals()`` does — otherwise an untargeted proposal would get tagged
-    anyway and rank as worthless (zero ``predict_delta`` coverage).
+    substring of a real kernel name, so classify by identity exactly as
+    ``residuals()`` does — NVTX range first, then the name. The target comes out
+    of ``residuals()``, so checking it by name alone dropped every target whose
+    kernels only an NVTX range identifies (the bare projection GEMMs), and the
+    search went out unaimed.
     """
-    return any(classify_op(k.name) == op for k in trace.kernels())
+    return any(observed_op(k.name, k.range_op) == op for k in trace.kernels())
 
 
 # --- candidate table --------------------------------------------------------
@@ -1065,6 +1068,9 @@ def autoresearch_v0(
     proposer: Proposer | None = None,
     ctx: GateContext | None = None,
     reject: Callable[[InterventionSpec], str | None] | None = None,
+    history: History | None = None,
+    gpu_sku: str | None = None,
+    fingerprint: str | None = None,
 ) -> list[AutoresearchResult]:
     """Propose → gate → (apply + measure + rollback) for one bottleneck class.
 
@@ -1097,8 +1103,14 @@ def autoresearch_v0(
     if not proposals:
         return []
 
+    # ``history``/``gpu_sku``/``fingerprint`` are what the catalog is ranked
+    # with. Autoresearch results are exported to the same verification.json the
+    # history reader aggregates, under stable candidate names, so without them a
+    # candidate measured at -30% on this box last run ranked from its flat
+    # unproven prior again, every run.
     ranked = select_interventions(
-        trace, proposals, policy or Policy(), top_n=len(proposals), ctx=ctx
+        trace, proposals, policy or Policy(), top_n=len(proposals), ctx=ctx,
+        history=history, gpu_sku=gpu_sku, fingerprint=fingerprint,
     )
     aimed_at = target.op if target is not None else None
 
@@ -1109,6 +1121,12 @@ def autoresearch_v0(
         # candidates are recorded but never applied; survivors go through the
         # rollback-gated apply. Both land in one result shape.
         reason = c.rejected_reason
+        # Autoresearch applies every survivor, not a top-N, so the ranking alone
+        # cannot stop a known loser: sorted last, it still ran. A candidate this
+        # box already measured at no gain is a result in hand, not an experiment,
+        # and re-running it spends an A/B (often a restart) to learn it again.
+        if reason is None and c.delta_source == "measured" and c.predicted_delta <= 0:
+            reason = f"history: measured {c.predicted_delta:+.1%} on this box; not re-run"
         if reason is None and reject is not None:
             reason = reject(c.spec)
         pre_cfg: dict | None = None
@@ -1157,6 +1175,9 @@ def autoresearch(
     proposer: Proposer | None = None,
     ctx: GateContext | None = None,
     reject: Callable[[InterventionSpec], str | None] | None = None,
+    history: History | None = None,
+    gpu_sku: str | None = None,
+    fingerprint: str | None = None,
 ) -> AutoresearchRun:
     """Classify the trace's bottleneck, then run the full propose→gate→apply pass.
 
@@ -1169,7 +1190,8 @@ def autoresearch(
     from the real EngineArgs surface rather than a frozen list. ``ctx`` forwards
     the precondition gate context (same applicability gate as the catalog);
     ``reject`` is an optional per-candidate veto (the loop's structural-knob
-    guard). See :func:`autoresearch_v0`.
+    guard). ``history``/``gpu_sku``/``fingerprint`` rank candidates from what they
+    measured before, exactly as the catalog is ranked. See :func:`autoresearch_v0`.
 
     When ``residuals`` (from :func:`gitm.optimizer.monitor.residuals`) are passed,
     the bottleneck class weighs the roofline-predicted memory-bound fraction too,
@@ -1191,5 +1213,8 @@ def autoresearch(
             proposer=proposer,
             ctx=ctx,
             reject=reject,
+            history=history,
+            gpu_sku=gpu_sku,
+            fingerprint=fingerprint,
         ),
     )

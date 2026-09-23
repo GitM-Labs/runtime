@@ -58,7 +58,6 @@ from gitm.optimizer.vllm_knobs import (
 from gitm.planner.context import build_planner_context, hardware_spec_for
 from gitm.planner.graph import predict_graph
 from gitm.planner.moe_graph import (
-    is_sparse_moe_config,
     predict_moe_graph,
     spec_from_hf_config,
 )
@@ -331,6 +330,12 @@ def _moe_fields_from_hf(hf: Any) -> dict[str, Any]:
     """
     # Attention shape is independent of the FFN, so it survives the MoE gate.
     out: dict[str, Any] = _read_int_aliases(hf, _ATTN_ALIASES)
+    # Weight width is independent of the FFN too. It used to be read only past
+    # the MoE gate below, so a dense fp8 checkpoint priced every projection at
+    # the bf16 width — a decode floor ~2x too slow, i.e. hidden headroom.
+    wb = _quant_weight_bytes(getattr(hf, "quantization_config", None))
+    if wb:
+        out["weight_dtype_bytes"] = wb
     moe = _read_int_aliases(hf, _MOE_ALIASES)
 
     # Only a routed-expert count *and* a top-k make the FFN a mixture; without
@@ -338,40 +343,86 @@ def _moe_fields_from_hf(hf: Any) -> dict[str, Any]:
     if not (moe.get("num_experts") and moe.get("experts_per_token")):
         return out
     out.update(moe)
-
-    quant = getattr(hf, "quantization_config", None)
-    method = None
-    if isinstance(quant, dict):
-        method = quant.get("quant_method")
-    elif quant is not None:
-        method = getattr(quant, "quant_method", None)
-    if isinstance(method, str):
-        wb = _QUANT_WEIGHT_BYTES.get(method.lower())
-        if wb:
-            out["weight_dtype_bytes"] = wb
     return out
 
 
-def _execution_graph(engine: Any, hw: Any, batch: Any):
-    """The predicted graph for the model that actually ran, and whether it is the
-    sparse-MoE one.
+def _quant_weight_bytes(quant: Any) -> int | None:
+    """Bytes per stored weight a ``quantization_config`` declares, or ``None``.
 
-    A DeepSeek-V4-class checkpoint gets :func:`predict_moe_graph` — mixed fp4/fp8
-    precision, compressed/selected attention, MTP — none of which the dense graph
-    can represent; everything else gets the dense graph, whose FFN already prices a
-    mixture (:func:`_moe_fields_from_hf`). Sharding stays whole-model so the MoE
-    prediction shares the dense path's comparison basis against the in-process
-    trace, rather than predicting one rank against an all-rank capture.
+    ``None`` falls back to the activation width, which over-counts weight
+    traffic and so predicts a slower floor — the direction that can't invent
+    headroom. ``compressed-tensors`` is a container, not a width: it is 1 byte
+    only when every weight group declares 8 bits. A W4A16 pack (Kimi's experts)
+    is half a byte, which an integer ``weight_dtype_bytes`` cannot say, so it
+    takes the conservative fallback rather than being priced as fp8.
     """
+    if quant is None:
+        return None
+    q = quant if isinstance(quant, dict) else (
+        quant.to_dict() if hasattr(quant, "to_dict") else dict(vars(quant)))
+    method = q.get("quant_method")
+    if not isinstance(method, str):
+        return None
+    wb = _QUANT_WEIGHT_BYTES.get(method.lower())
+    if wb and method.lower() == "compressed-tensors":
+        groups = q.get("config_groups")
+        bits = [
+            (g.get("weights") or {}).get("num_bits")
+            for g in (groups.values() if isinstance(groups, dict) else ())
+            if isinstance(g, dict)
+        ]
+        if not bits or any(b != 8 for b in bits):
+            return None
+    return wb
+
+
+def _execution_graph_family(engine: Any, hw: Any, batch: Any):
+    """The predicted graph for the model that actually ran, and its family.
+
+    The family comes from :func:`gitm.planner.registry.detect_family` — the same
+    dispatch ``gitm plan`` and ``gitm deviate`` use — so the live loop can never
+    price a checkpoint with a different graph than the offline tools do. That
+    order matters: a GLM-5.2 (``glm_moe_dsa``) config carries ``index_topk`` and
+    ``n_routed_experts`` exactly like a DeepSeek-V4 one, so testing
+    :func:`is_sparse_moe_config` alone sent GLM to the V4 graph (compressed-KV,
+    fp4 experts, no MLA absorb) and scored every GLM kernel against the wrong
+    model. A Mixtral still falls through to the dense graph, whose FFN already
+    prices a mixture (:func:`_moe_fields_from_hf`).
+
+    Sharding stays whole-model so every family shares the dense path's
+    comparison basis against the in-process trace, rather than predicting one
+    rank against an all-rank capture.
+    """
+    from gitm.planner.registry import detect_family
+    from gitm.planner.registry import spec_from_hf_config as family_spec
     from gitm.planner.roofline import ShardingConfig
 
     hf = _hf_config_from_engine(engine)
     if hf is not None:
         cfg = _hf_config_dict(hf)
-        if is_sparse_moe_config(cfg):
-            spec = spec_from_hf_config(cfg, name=str(cfg.get("model_type") or "sparse-moe"))
-            return predict_moe_graph(spec, hw, batch, ShardingConfig()), True
-    return predict_graph(model=_model_spec_from_hf(hf), hw=hw, batch=batch), False
+        family = detect_family(cfg)
+        name = str(cfg.get("model_type") or family)
+        if family == "sparse_moe":
+            spec = spec_from_hf_config(cfg, name=name)
+            return predict_moe_graph(spec, hw, batch, ShardingConfig()), family
+        if family == "glm_moe_dsa":
+            from gitm.planner.glm_graph import predict_glm_graph
+
+            return predict_glm_graph(family_spec(cfg, name=name), hw, batch,
+                                     ShardingConfig()), family
+        if family == "hybrid":
+            from gitm.planner.hybrid_graph import predict_hybrid_graph
+
+            return predict_hybrid_graph(family_spec(cfg, name=name), hw, batch,
+                                        ShardingConfig()), family
+    return predict_graph(model=_model_spec_from_hf(hf), hw=hw, batch=batch), "dense"
+
+
+def _execution_graph(engine: Any, hw: Any, batch: Any):
+    """``(graph, is_sparse)`` — :func:`_execution_graph_family` with the family
+    collapsed to "anything but the dense graph"."""
+    graph, family = _execution_graph_family(engine, hw, batch)
+    return graph, family != "dense"
 
 
 def _clamp_pct(value: float) -> float:
@@ -630,19 +681,24 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # expert traffic ~12x. Read the real concurrency off the sampled scheduler
     # rather than defaulting.
     _batch = _batch_config_from_stats(sched_summary)
-    graph, is_moe = _execution_graph(cfg.engine, _hw, _batch)
+    graph, family = _execution_graph_family(cfg.engine, _hw, _batch)
+    is_moe = family != "dense"
     _graph_summary: dict[str, Any] = {
         "graph": "moe" if is_moe else "dense",
+        "family": family,
         "nodes": len(graph.nodes),
         "total_pred_s": graph.total_pred_s,
         "hardware": _hw.name,
     }
     if is_moe:
         m = graph.model
+        # Read duck-typed: the GLM and hybrid specs spell their dtypes their own
+        # way, and a summary field must never be the thing that crashes a run.
         _graph_summary.update(
-            model=m.name,
+            model=getattr(m, "name", family),
             sharding="whole-model",
-            dtypes={"weight": m.weight_dtype, "expert": m.expert_dtype, "kv": m.kv_dtype},
+            dtypes={k: getattr(m, attr, None) for k, attr in (
+                ("weight", "weight_dtype"), ("expert", "expert_dtype"), ("kv", "kv_dtype"))},
             has_unpriced_collectives=graph.has_unpriced_collectives,
         )
     (run_dir / "predicted_graph.json").write_text(json.dumps(_graph_summary, indent=2))
@@ -888,8 +944,12 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             ):
                 return "structural knob: needs engine restart, no restart_fn"
             values = spec.knob_values
+            # The engine running *now*: a Phase-4 restart that was kept has
+            # replaced cfg.engine, and a prerequisite it turned on (or off) is
+            # visible only on the engine the applicator holds.
+            engine_now = getattr(applicator, "engine", None) or cfg.engine
             for k in values:
-                reason = unmet_prerequisite(cfg.engine, k)
+                reason = unmet_prerequisite(engine_now, k)
                 if reason is None:
                     continue
                 prereq = next(
@@ -909,6 +969,9 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             proposer=proposer,
             ctx=pctx.gate,
             reject=_unenactable,
+            history=prior_runs,
+            gpu_sku=pctx.sku,
+            fingerprint=qual.fingerprint,
         )
     else:
         ar_run = AutoresearchRun(bottleneck_class=classify_bottleneck(trace, res), results=[])

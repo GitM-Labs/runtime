@@ -92,7 +92,18 @@ def select_interventions(
         # tried and how it fared, but carries no number to rank on. The prior
         # stands in that case and only the demotion applies.
         measured = record.mean_delta if record is not None else None
-        delta = predict_delta(trace, spec, delta_mean=measured) if reason is None else 0.0
+        # A measured delta is the A/B's end-to-end ``speedup - 1``: the answer to
+        # the question predict_delta *estimates*, already net of how much of the
+        # step the lever touches. Scaling it by coverage again discounted a proven
+        # result by the lever's scope — a +10% win on a lever scoped to 20% of the
+        # trace ranked as +2%, below an untested 5% prior with full coverage, and a
+        # measured win on a lever with an empty scope ranked as exactly zero.
+        if reason is not None:
+            delta = 0.0
+        elif measured is not None:
+            delta = measured
+        else:
+            delta = predict_delta(trace, spec)
         candidates.append(RankedCandidate(
             spec=spec,
             predicted_delta=delta,
