@@ -8,18 +8,17 @@
 #
 # applies_to_kernels scopes each vLLM entry to the canonical per-decode-step op
 # vocabulary predict_graph()/classify_op() share — NOT raw kernel-name
-# substrings, which drift across backends/vendors/torch.compile. Whole-step
-# levers use &all_ops; empty means 0 coverage (not 100%) for levers the
-# decode-only predicted graph can't represent (prefill-side, orchestration).
-# Non-vLLM entries (edge/HFT) keep their own vocabulary via substring fallback.
-_decode_step_ops: &all_ops
-  - qkv_proj
-  - attn_score_value
-  - attn_out_proj
-  - mlp_gate_up
-  - mlp_down
-  - lm_head
-
+# substrings, which drift across backends/vendors/torch.compile.
+#
+# A lever that acts on the whole step — batch shape, admission order, graph
+# capture, sharding degree — sets whole_step: true instead. It used to list the
+# dense model's six ops, which made every one of those levers score zero
+# coverage on a sparse-MoE checkpoint, where the knob applies just as much and
+# none of those op names occur.
+#
+# Empty means 0 coverage (not 100%) for levers the decode-only predicted graph
+# can't represent (prefill-side, orchestration). Non-vLLM entries (edge/HFT)
+# keep their own vocabulary via substring fallback.
 # Shared multiplier ladder for sweeping relative levers — same as
 # autoresearch's _GRID_MULTIPLIERS, one canonical convention.
 _relative_sweep: &sweep_grid [0.5, 2.0, 4.0]
@@ -70,7 +69,7 @@ interventions:
     knob: max_num_batched_tokens
     value: 8192  # offline/predict-only fallback when there's no live engine to scale
     value_multiplier_grid: *sweep_grid  # right value depends on model/GPU/workload
-    applies_to_kernels: *all_ops  # batch-shape lever: touches every op's batch dim
+    whole_step: true  # batch-shape lever: touches every op's batch dim
     expected_delta_mean: 0.05
     expected_delta_lo: 0.01
     expected_delta_hi: 0.10
@@ -90,7 +89,7 @@ interventions:
     knob: max_num_seqs
     value: 256  # offline/predict-only fallback when there's no live engine to scale
     value_multiplier_grid: *sweep_grid
-    applies_to_kernels: *all_ops  # concurrency lever: touches every op's batch dim
+    whole_step: true  # concurrency lever: touches every op's batch dim
     expected_delta_mean: 0.04
     expected_delta_lo: 0.00
     expected_delta_hi: 0.09
@@ -133,7 +132,7 @@ interventions:
     # invalid here, so a gentler one, clamped below 1.0.
     value_multiplier_grid: [0.95, 1.03, 1.10]
     value_max: 0.97
-    applies_to_kernels: *all_ops  # raises the batch-slot ceiling for every op
+    whole_step: true  # raises the batch-slot ceiling for every op
     expected_delta_mean: 0.04
     expected_delta_lo: 0.01
     expected_delta_hi: 0.08
@@ -189,7 +188,7 @@ interventions:
       idle/launch-bound gaps between decode steps.
     knob: async_scheduling
     value: true
-    applies_to_kernels: *all_ops  # closes idle gaps around every op's launch
+    whole_step: true  # closes idle gaps around every op's launch
     expected_delta_mean: 0.02
     expected_delta_lo: -0.02
     expected_delta_hi: 0.05
@@ -207,7 +206,7 @@ interventions:
     summary: Chunk prefill so it overlaps with decode instead of stalling it.
     knob: enable_chunked_prefill
     value: true
-    applies_to_kernels: *all_ops  # changes the prefill/decode mix every step runs
+    whole_step: true  # changes the prefill/decode mix every step runs
     expected_delta_mean: 0.08
     expected_delta_lo: 0.02
     expected_delta_hi: 0.15
@@ -242,7 +241,7 @@ interventions:
     summary: Enable 5-token n-gram speculative decoding to cut decode steps.
     knob: num_speculative_tokens
     value: 5
-    applies_to_kernels: *all_ops  # changes the whole per-step decode cadence
+    whole_step: true  # changes the whole per-step decode cadence
     expected_delta_mean: 0.12
     expected_delta_lo: -0.05
     expected_delta_hi: 0.30
@@ -261,7 +260,7 @@ interventions:
     summary: Switch the scheduler to priority policy for mixed-SLO traffic.
     knob: scheduling_policy
     value: priority
-    applies_to_kernels: *all_ops  # admission order changes every step's batch
+    whole_step: true  # admission order changes every step's batch
     expected_delta_mean: 0.03
     expected_delta_lo: -0.02
     expected_delta_hi: 0.08
@@ -318,7 +317,7 @@ interventions:
     summary: Reshape to TP=2 to fit larger batches / longer context per replica.
     knob: tensor_parallel_size
     value: 2
-    applies_to_kernels: *all_ops  # every layer's op gets sharded
+    whole_step: true  # every layer's op gets sharded
     expected_delta_mean: 0.00
     expected_delta_lo: -0.15
     expected_delta_hi: 0.20
@@ -358,7 +357,7 @@ interventions:
     summary: Disable enforce_eager so CUDA graphs capture and replay the decode step.
     knob: enforce_eager
     value: false
-    applies_to_kernels: *all_ops  # graph capture wraps the whole decode step
+    whole_step: true  # graph capture wraps the whole decode step
     expected_delta_mean: 0.09
     expected_delta_lo: 0.02
     expected_delta_hi: 0.18
@@ -378,7 +377,7 @@ interventions:
     knob: max_seq_len_to_capture
     value: 8192  # offline/predict-only fallback when there's no live engine to scale
     value_multiplier_grid: *sweep_grid
-    applies_to_kernels: *all_ops  # extends graph-capture scope for the whole step
+    whole_step: true  # extends graph-capture scope for the whole step
     expected_delta_mean: 0.04
     expected_delta_lo: -0.02
     expected_delta_hi: 0.10
@@ -397,7 +396,7 @@ interventions:
     summary: Split layers across 2 pipeline stages to fit a model that won't shard on TP alone.
     knob: pipeline_parallel_size
     value: 2
-    applies_to_kernels: *all_ops  # every layer's op is split across stages
+    whole_step: true  # every layer's op is split across stages
     expected_delta_mean: -0.02
     expected_delta_lo: -0.20
     expected_delta_hi: 0.15
@@ -525,7 +524,7 @@ interventions:
     summary: Overlap two micro-batches so collectives hide behind compute.
     knob: enable_dbo
     value: true
-    applies_to_kernels: *all_ops  # overlap reshapes the whole step's execution
+    whole_step: true  # overlap reshapes the whole step's execution
     expected_delta_mean: 0.04
     expected_delta_lo: -0.03
     expected_delta_hi: 0.12
