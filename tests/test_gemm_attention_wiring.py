@@ -216,7 +216,24 @@ def test_autoresearch_candidates_are_scored_from_what_they_measured():
     run = autoresearch(t, applicator=DryRunApplicator(), policy=Policy(use_history=True),
                        proposer=_OneShot(loser), history=_history(loser.name, -0.30),
                        gpu_sku=SKU, fingerprint=FP)
-    assert [r.predicted_delta for r in run.results] == [pytest.approx(-0.30)]
+    [r] = run.results
+    assert r.predicted_delta == pytest.approx(-0.30)
+    # A known loser is recorded with its reason, never applied again.
+    assert not r.applicable and r.apply_result is None
+    assert r.rejected_reason.startswith("history: measured -30.0%")
+
+
+def test_a_measured_winner_is_still_applied():
+    from gitm.agents.autoresearch import autoresearch
+    from gitm.agents.policy import Policy
+    from gitm.optimizer.apply import DryRunApplicator
+
+    winner = _spec("autoresearch:compute_bound:x=1", ["attn_score_value"])
+    t = _trace(("flash_fwd_splitkv_kernel", 1000, None))
+    run = autoresearch(t, applicator=DryRunApplicator(), policy=Policy(use_history=True),
+                       proposer=_OneShot(winner), history=_history(winner.name, 0.08),
+                       gpu_sku=SKU, fingerprint=FP)
+    assert run.results[0].applicable and run.results[0].rejected_reason is None
 
 
 def test_without_history_autoresearch_keeps_its_prior():
@@ -308,7 +325,27 @@ def test_a_known_layer_with_two_expert_gemms_scores_each_launch_fairly():
                   vendor="nvidia", captured_at_ns=0, duration_ns=t, events=ev)
     res = residuals(trace, g)
     assert [kr.r_kt for kr in res.per_kernel] == [pytest.approx(0.0, abs=1e-3)] * 2
-    assert all(kr.layer == 0 and kr.interval_based for kr in res.per_kernel)
+    assert all(kr.layer == 0 and not kr.interval_based for kr in res.per_kernel)
+
+
+def test_a_repeated_launch_wrong_for_its_own_role_is_not_hidden():
+    """A down launch at 2x its own prediction sits near the gate_up prediction,
+    inside the layer's [down, gate_up] span — an interval would score it 0.
+    Paired by launch order it is scored against its own node: +100%."""
+    g = predict_graph(_MOE, H100, BatchConfig(batch=8))
+    gu, dn = [n.prediction.t_pred_s for n in g.nodes if n.op == "moe_routed" and n.layer == 0]
+    assert dn < 2 * dn <= gu * 1.05  # the slow down launch lies inside the span
+    ev, t = [], 0
+    for i, dur in enumerate((int(gu * 1e9), int(2 * dn * 1e9))):
+        ev.append(KernelEvent(name="fused_moe_kernel", start_ns=t, end_ns=t + dur,
+                              stream_id=7, device_id=0, correlation_id=i + 1,
+                              range_op="moe_routed", range_layer=0))
+        t += dur
+    trace = Trace(workload_id="vllm-decode", fingerprint="fp", run_id="r", device_count=1,
+                  vendor="nvidia", captured_at_ns=0, duration_ns=t, events=ev)
+    r_gu, r_dn = (kr.r_kt for kr in residuals(trace, g).per_kernel)
+    assert r_gu == pytest.approx(0.0, abs=1e-3)
+    assert r_dn == pytest.approx(1.0, rel=1e-2)
 
 
 def test_a_known_layer_with_one_node_still_gets_a_point_residual():

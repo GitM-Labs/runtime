@@ -1121,6 +1121,12 @@ def autoresearch_v0(
         # candidates are recorded but never applied; survivors go through the
         # rollback-gated apply. Both land in one result shape.
         reason = c.rejected_reason
+        # Autoresearch applies every survivor, not a top-N, so the ranking alone
+        # cannot stop a known loser: sorted last, it still ran. A candidate this
+        # box already measured at no gain is a result in hand, not an experiment,
+        # and re-running it spends an A/B (often a restart) to learn it again.
+        if reason is None and c.delta_source == "measured" and c.predicted_delta <= 0:
+            reason = f"history: measured {c.predicted_delta:+.1%} on this box; not re-run"
         if reason is None and reject is not None:
             reason = reject(c.spec)
         pre_cfg: dict | None = None
