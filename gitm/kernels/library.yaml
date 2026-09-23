@@ -298,8 +298,11 @@ interventions:
     summary: Fall back to NCCL all-reduce when custom all-reduce stalls comm overlap.
     knob: disable_custom_all_reduce
     value: true
-    # Comm-path change, not one of the modeled per-op decode kernels — honest 0.
-    applies_to_kernels: []
+    # The custom all-reduce and NCCL kernels it swaps between both classify to
+    # tp_all_reduce (deviation._OP_RULES), which the sharded graphs price. An empty
+    # scope made this score exactly 0 on every trace, so it could never rank into
+    # a run; on a single-GPU trace there are no such kernels and it still scores 0.
+    applies_to_kernels: [tp_all_reduce]
     expected_delta_mean: 0.02
     expected_delta_lo: -0.04
     expected_delta_hi: 0.08
@@ -446,7 +449,10 @@ interventions:
     summary: Select the DeepGEMM fused-MoE backend for the fp8 expert GEMMs.
     knob: moe_backend
     value: deep_gemm
-    applies_to_kernels: [mlp_gate_up, mlp_down]  # the routed-expert GEMMs
+    # The routed-expert GEMMs: fused_moe_kernel and the grouped-GEMM kernels
+    # classify to moe_routed, never to the dense mlp_* ops, so a dense-op scope
+    # covered nothing on a real MoE trace.
+    applies_to_kernels: [moe_routed]
     expected_delta_mean: 0.05
     expected_delta_lo: -0.05
     expected_delta_hi: 0.20
@@ -474,7 +480,7 @@ interventions:
     summary: Shard whole experts across ranks (EP) instead of slicing each one (TP).
     knob: enable_expert_parallel
     value: true
-    applies_to_kernels: [mlp_gate_up, mlp_down]  # MoE layers only, per vLLM docs
+    applies_to_kernels: [moe_routed]  # MoE layers only, per vLLM docs
     expected_delta_mean: 0.00
     expected_delta_lo: -0.20
     expected_delta_hi: 0.25
@@ -501,7 +507,7 @@ interventions:
     summary: Rebalance expert placement across ranks to cut routing-induced stragglers.
     knob: enable_eplb
     value: true
-    applies_to_kernels: [mlp_gate_up, mlp_down]  # expert load is the FFN path
+    applies_to_kernels: [moe_routed]  # expert load is the routed-expert GEMMs
     expected_delta_mean: 0.03
     expected_delta_lo: -0.02
     expected_delta_hi: 0.15

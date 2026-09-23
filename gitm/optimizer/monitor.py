@@ -38,16 +38,22 @@ class KernelResidual:
     #: a resolved ``layer`` means this residual was measured against an interval
     #: rather than a point — see :func:`residuals`.
     n_classes: int = 1
+    #: Set when ``layer`` is known but holds several distinct nodes for this op,
+    #: so the residual is an interval over that layer's nodes.
+    same_layer_interval: bool = False
 
     @property
     def interval_based(self) -> bool:
-        """True when the op's layers disagree and this kernel's layer is unknown.
+        """True when this residual was scored against an interval, not a point.
 
-        Such a residual is *conservative*: zero anywhere inside the span of the
-        op's per-layer predictions. It cannot be read as "this kernel matched
-        prediction", only as "it was not outside every prediction".
+        Either the op's layers disagree and this kernel's layer is unknown, or
+        the layer is known but launches the op more than once with different
+        predictions (an MoE layer's two expert GEMMs). Such a residual is
+        *conservative*: zero anywhere inside the span of the predictions it
+        could belong to. It cannot be read as "this kernel matched prediction",
+        only as "it was not outside every prediction".
         """
-        return self.n_classes > 1 and self.layer is None
+        return self.n_classes > 1 and (self.layer is None or self.same_layer_interval)
 
 
 @dataclass
@@ -124,11 +130,18 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
     pred = graph.nodes
 
     res = Residuals()
-    by_op_layer: dict[tuple[str, int], PredictedNode] = {}
+    # Distinct structural classes *within* one (op, layer). Usually one; more
+    # when a layer launches the same op twice — the two expert GEMMs of an MoE
+    # layer are both ``moe_routed`` (one ``fused_moe_kernel`` per GEMM), GLM
+    # emits two ``moe_router`` nodes. Keeping only the first made the layer
+    # known and the answer wrong: the down launch was scored against the
+    # gate_up point, a systematic -50% that ``check_invariants`` then reads as
+    # confirmation. Same remedy as the unknown-layer case: the interval.
+    by_op_layer: dict[tuple[str, int], dict[tuple[float, float], PredictedNode]] = {}
     classes: dict[str, dict[tuple[float, float], PredictedNode]] = {}
     for pn in pred:
         if pn.layer is not None:
-            by_op_layer.setdefault((pn.op, pn.layer), pn)
+            by_op_layer.setdefault((pn.op, pn.layer), {}).setdefault(_class_key(pn), pn)
         classes.setdefault(pn.op, {}).setdefault(_class_key(pn), pn)
 
     for ok in obs:
@@ -147,9 +160,13 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
         )
 
         pn: PredictedNode | None = None
-        if ok.range_layer is not None:
-            pn = by_op_layer.get((op, ok.range_layer))
-        if pn is None and len(cls) == 1:
+        layer_cls = (list(by_op_layer.get((op, ok.range_layer), {}).values())
+                     if ok.range_layer is not None else [])
+        if len(layer_cls) == 1:
+            pn = layer_cls[0]
+        elif layer_cls:
+            cls = layer_cls  # interval over this layer's own nodes, layer kept
+        elif len(cls) == 1:
             pn = cls[0]
 
         if pn is not None:
@@ -171,12 +188,14 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
             # average of layers that don't resemble each other.
             nearest = min(cls, key=lambda c: abs(c.prediction.t_pred_s - t_obs))
             t_pred = nearest.prediction.t_pred_s
-            layer, bound = None, nearest.prediction.bound
+            layer = ok.range_layer if layer_cls else None
+            bound = nearest.prediction.bound
 
         res.per_kernel.append(
             KernelResidual(
                 op=op, layer=layer, r_kt=r_kt, r_mt=r_mt,
-                t_obs_s=t_obs, t_pred_s=t_pred, bound=bound, n_classes=len(cls),
+                t_obs_s=t_obs, t_pred_s=t_pred, bound=bound,
+                n_classes=len(cls), same_layer_interval=pn is None and bool(layer_cls),
             )
         )
 
