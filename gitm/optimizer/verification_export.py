@@ -160,14 +160,30 @@ def build_export(
         },
         "environment": _environment(gpu_sku),
         "protocol": {
-            "metric": "decode throughput (tokens/sec)",
+            # Per record, because a harness-converted comparison measures
+            # requests/sec over a serving window and derives ``kept`` from the
+            # number rather than from a rollback gate. One blanket description
+            # over both would misstate the units for one of them.
+            "metric": "per record: see `via` — 'hot-swap'/'restart' are decode "
+                      "throughput (tokens/sec) under the rollback gate; "
+                      "'harness' is serving goodput (requests/sec), kept "
+                      "derived from the measured delta",
             "reps": "each side benchmarked `reps` times; std is the sample stdev",
             "agreement_band": (
                 "relative band around our numbers within which a re-measurement "
                 f"agrees; floored at {MIN_NOISE_BAND:.0%} because a single-rep A/B "
                 "reports zero scatter"
             ),
-            "kept": "decided by the rollback gate (min_keep_delta), not by delta >= 0",
+            # Same split as `metric`: the gate is what decides `kept` for a
+            # run this process supervised, and there is no gate behind a
+            # harness arm — it ran standalone on a cluster, so there was
+            # nothing to roll back and the measured delta is the whole
+            # decision. Saying "the gate decided" over both would claim a
+            # provenance half these records do not have.
+            "kept": "per record: see `via` — 'hot-swap'/'restart' are decided by "
+                    "the rollback gate (min_keep_delta), not by delta >= 0; "
+                    "'harness' has no gate behind it and is decided by the "
+                    "measured delta clearing `agreement_band`",
         },
         "results": [r.to_dict() for r in records],
     }
