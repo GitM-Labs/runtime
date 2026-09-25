@@ -1990,6 +1990,73 @@ def test_mimo_step_time_is_strongly_sublinear_in_batch(mimo):
     assert t32.total_pred_s / t1.total_pred_s < 32 / 2
 
 
+# ── DeepSeek-V4.1-Flash: the V4 graph, without engram or KV sharing ───────────
+#
+# deepseek-ai/DeepSeek-V4.1-Flash keeps V4's compressed sparse attention and fp4
+# experts, and adds two engram n-gram tables (203.07 GB, 39.8% of the
+# checkpoint) and cross-layer KV sharing (four source layers own a cache).
+# sparse_moe has no term for either. These pin the backbone the entry does
+# carry, and pin both known gaps so that a later "fix" which fits a number to
+# this checkpoint fails loudly instead of passing as a validation.
+
+
+def test_v41_flash_catalogue_entry_loads_and_predicts():
+    assert "deepseek-v4.1-flash" in available()
+    assert load_entry("deepseek-v4.1-flash")["family"] == "sparse_moe"
+    spec = load_spec("deepseek-v4.1-flash")
+    assert spec.n_layers == 40
+    assert len(spec.compress_ratios) == 43  # 40 layers + 3 window-only DSpark blocks
+    assert spec.compress_ratios[40:] == (0, 0, 0)
+    assert spec.num_hash_layers == 0  # every layer carries gate.bias
+    assert spec.dspark_layer_ids == ()  # 37-39 are hidden-state taps, not extra weights
+    assert (spec.n_routed_experts, spec.num_experts_per_tok) == (384, 6)
+
+
+def test_v41_flash_footprint_gap_is_the_engram_tables():
+    """510.29 GB published; the entry predicts 316.40 GB (-38%).
+
+    The shortfall is the engram tables the family cannot express: 203.07 GB,
+    read from the shard headers. Pinning the gap to that term, not the total to
+    the checkpoint, is what keeps this from reading as a fit.
+    """
+    published = 510_286_023_000  # model.safetensors.index.json total_size
+    engram = 203_073_076_240  # every layers.*.engram.* tensor, from the headers
+    shortfall = published - model_weight_bytes(load_spec("deepseek-v4.1-flash"))
+    assert shortfall == pytest.approx(engram, rel=0.06)
+
+
+def test_v41_flash_kv_rate_overcounts_the_shared_cache():
+    """Only layers 2, 8, 14 and 20 own a compressed cache; the rest read it.
+
+    kv_bytes_per_token charges every compressed layer its own, 22,276.5 B per
+    token against 1,600 B for the four real sources at fp8. Pinned as an upper
+    bound, so the day cross-layer sharing is modelled this test is the one that
+    has to change.
+    """
+    assert kv_bytes_per_token(load_spec("deepseek-v4.1-flash")) > 10 * 1_600
+
+
+def test_v41_flash_plans_the_recipe_shape_on_b200():
+    """The recipe's B200 shape, TP2, batch 32 at 8K. Routed experts price against
+    B200's fp4 peak and nothing falls back. On H200, which has no fp4 path, the
+    same entry falls back — stated so the H200 floor is read as optimistic."""
+    g, family = predict(
+        "deepseek-v4.1-flash", hw=hardware_spec_for(peak_for_sku("B200")),
+        batch=BatchConfig(batch=32, kv_cache_len=8192),
+        sharding=ShardingConfig(tp=2),
+    )
+    assert family == "sparse_moe" and len(g.nodes) == 631
+    assert not g.has_fallback_peaks and not g.has_unpriced_collectives
+    routed = next(n for n in g.nodes if n.op == "moe_routed")
+    assert routed.prediction.peak_dtype == "fp4" and routed.prediction.bound == "memory"
+    h200, _ = predict(
+        "deepseek-v4.1-flash", hw=hardware_spec_for(peak_for_sku("H200")),
+        batch=BatchConfig(batch=32, kv_cache_len=8192),
+        sharding=ShardingConfig(tp=4),
+    )
+    assert h200.has_fallback_peaks
+
+
 # ── import hygiene between the two families ──────────────────────────────────
 
 
