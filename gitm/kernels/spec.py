@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -67,6 +68,14 @@ class InterventionSpec(BaseModel):
     applicability: Applicability = Field(default_factory=Applicability)
     safety: SafetyGate = Field(default_factory=SafetyGate)
     review: str | None = None  # reviewer sign-off note (None until reviewed)
+    # An accuracy sentinel the apply path runs after measuring and before
+    # keeping: None to pass, else the reason. The live keep gate sees throughput
+    # alone, so a lever that can change model output carries its own check here
+    # and apply_intervention rolls back on failure whatever applicator is used.
+    # Runtime-only: a callable, never read from or written to library YAML.
+    correctness_gate: Callable[[Any], str | None] | None = Field(
+        default=None, exclude=True, repr=False
+    )
 
     @property
     def knob_values(self) -> dict[str, Any]:
