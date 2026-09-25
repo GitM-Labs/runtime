@@ -65,8 +65,13 @@ from gitm.planner.roofline import (
     BatchConfig,
     HardwareSpec,
     ShardingConfig,
-    _canon_dtype,
+    WeightExecution,
+    act_quant_bytes,
     distinct_experts,
+    expert_pad_factor,
+    kv_elem_bytes,
+    linear_traffic,
+    resolve_execution,
     roofline,
     weight_bytes,
 )
@@ -238,8 +243,8 @@ def kv_entry_bytes(spec: GlmMoeDsaModelSpec) -> float:
     is kept so an fp8-KV *serving* config prices the two halves correctly, and
     :attr:`GlmMoeDsaModelSpec.kv_rope_dtype` says which of the two fp8 layouts it is.
     """
-    rope = spec.qk_rope_head_dim * weight_bytes(spec.kv_rope_dtype)
-    latent = spec.kv_lora_rank * weight_bytes(spec.kv_dtype)
+    rope = spec.qk_rope_head_dim * kv_elem_bytes(spec.kv_rope_dtype)
+    latent = spec.kv_lora_rank * kv_elem_bytes(spec.kv_dtype)
     return latent + rope
 
 
@@ -321,9 +326,17 @@ def index_scan_entries(batch: BatchConfig) -> float:
 
 
 def model_weight_bytes(
-    spec: GlmMoeDsaModelSpec, sharding: ShardingConfig | None = None
+    spec: GlmMoeDsaModelSpec,
+    sharding: ShardingConfig | None = None,
+    hw: HardwareSpec | None = None,
 ) -> float:
     """Resident weight bytes on one rank.
+
+    Without ``hw`` this is the checkpoint's own storage, which is what the
+    published-size checks compare against. With ``hw`` the routed experts are
+    priced as the engine holds them after load, padding included
+    (:func:`~gitm.planner.roofline.expert_pad_factor`) — the figure a fit
+    decision needs.
 
     Decides whether a deployment shape fits at all, which the timing graph cannot.
     Experts dominate overwhelmingly: 75 sparse layers x 256 experts x three
@@ -338,6 +351,11 @@ def model_weight_bytes(
     tp = max(1, sh.tp)
     es = max(1, sh.expert_shards)
     ew = weight_bytes(spec.dtype_for("moe_routed", spec.expert_dtype))
+    if hw is not None:
+        ex = resolve_execution(spec.dtype_for("moe_routed", spec.expert_dtype), hw)
+        ew = ex.resident_bytes * expert_pad_factor(
+            ex, spec.hidden, spec.moe_intermediate_size
+        )
     sw = weight_bytes(spec.dtype_for("moe_shared", spec.expert_dtype))
     ww = weight_bytes(spec.weight_dtype)
     rw = weight_bytes(spec.dtype_for("moe_router", spec.weight_dtype))
@@ -363,7 +381,13 @@ def model_weight_bytes(
     experts = n_sparse * spec.n_routed_experts * 3 * h * inter * ew / es
     shared_exp = n_sparse * spec.n_shared_experts * 3 * h * inter * sw / tp
     router = n_sparse * h * spec.n_routed_experts * rw  # replicated
-    dense_ffn = n_dense * 3 * h * spec.intermediate_size * ww / tp
+    # gate+up (two matrices) and down priced at their own op's precision, as the
+    # graph prices them. A checkpoint that quantises the dense layer (the AMD
+    # MXFP4 Kimi releases do; NVIDIA's NVFP4 one does not) is otherwise charged
+    # bf16 here while the timing graph streams it at 4 bits.
+    gw = weight_bytes(spec.dtype_for("mlp_gate_up", spec.weight_dtype))
+    dw = weight_bytes(spec.dtype_for("mlp_down", spec.weight_dtype))
+    dense_ffn = n_dense * h * spec.intermediate_size * (2 * gw + dw) / tp
 
     # MLA projections, per attention layer. q_a and kv_a are replicated (they
     # produce the shared latent, which has nothing to split); q_b, o_proj and the
@@ -396,7 +420,77 @@ def model_weight_bytes(
         + router
         + n_full_idx * indexer_per_full * iw
         + embed
-        + (n_attn * attn_per_layer + dense_ffn) * ww
+        + n_attn * attn_per_layer * ww
+        + dense_ffn
+    )
+
+
+@dataclass(frozen=True)
+class MemoryFit:
+    """Per-rank HBM accounting for one deployment shape.
+
+    One ledger, used for both questions a fit answers — does the baseline fit,
+    and how many tokens of KV does the rest hold — so the two cannot disagree
+    about what else is resident. The Kimi K2.6 case subtracted 4.5 GB of
+    workspace in the first and not in the second (10.9 GB "available for KV"
+    that was really 6.4); this is the fix, kept in code.
+    """
+
+    capacity: float
+    budget: float  # capacity x gpu_memory_utilization: what vLLM will allocate
+    weights: float
+    workspace: float  # activations, CUDA-graph pools, comm buffers — stated, not derived
+    kv_needed: float
+    kv_bytes_per_token: float
+
+    @property
+    def kv_available(self) -> float:
+        return self.budget - self.weights - self.workspace
+
+    @property
+    def fits(self) -> bool:
+        return self.kv_available >= self.kv_needed
+
+    @property
+    def kv_tokens(self) -> float:
+        """Tokens of context the leftover holds on this rank."""
+        return max(0.0, self.kv_available) / self.kv_bytes_per_token
+
+
+def _kv_tokens_resident(batch: BatchConfig) -> float:
+    """Cache entries the step needs allocated: every decoding sequence's history
+    plus, on a prefill step, the prefilling requests' cached context and the
+    chunk being written. Counting decode only reported zero KV need for an
+    empty-cache prefill that writes ~288 MB per 8,192-token chunk on Kimi."""
+    tokens = float(batch.batch * batch.kv_cache_len)
+    if batch.is_prefill:
+        tokens += float(batch.prefill_context + batch.prefill_tokens)
+    return tokens
+
+
+def memory_fit(
+    spec: GlmMoeDsaModelSpec,
+    hw: HardwareSpec,
+    batch: BatchConfig,
+    sharding: ShardingConfig | None = None,
+    *,
+    gpu_memory_utilization: float = 0.9,
+    workspace_bytes: float = 0.0,
+) -> MemoryFit:
+    """Whether ``batch`` fits on one rank, with one consistent ledger.
+
+    KV is charged *unsharded*: MLA's single latent cannot be split across heads,
+    so every TP rank holds every sequence's whole cache. ``workspace_bytes`` has
+    no default worth trusting — vLLM measures it in a profile run — so it is an
+    input, and 0 means the caller has not stated it.
+    """
+    return MemoryFit(
+        capacity=hw.memory_bytes,
+        budget=hw.memory_bytes * gpu_memory_utilization,
+        weights=model_weight_bytes(spec, sharding, hw),
+        workspace=workspace_bytes,
+        kv_needed=_kv_tokens_resident(batch) * kv_bytes_per_token(spec),
+        kv_bytes_per_token=kv_bytes_per_token(spec),
     )
 
 
@@ -407,20 +501,23 @@ def kv_bytes_per_token(spec: GlmMoeDsaModelSpec) -> float:
     Flat across layers — there is no compression schedule to sum over — but the
     indexer key is only cached where an indexer runs.
     """
-    kw = weight_bytes(spec.kv_dtype)
+    kw = kv_elem_bytes(spec.kv_dtype)
     latent = spec.n_layers * kv_entry_bytes(spec)
     index_keys = spec.n_full_indexer_layers * spec.index_head_dim * kw
     return latent + index_keys
 
 
-def _linear(rows: float, k: int, n: int, act_b: float, w_b: float) -> tuple[float, float]:
-    """(flops, bytes) for a ``(rows, k) @ (k, n)`` projection.
+def _linear(
+    rows: float, k: int, n: int, act_b: float, ex: WeightExecution
+) -> tuple[float, float]:
+    """(flops, HBM bytes) for a ``(rows, k) @ (k, n)`` projection under ``ex``.
 
-    Bytes count the activation in, the weights, and the activation out. At decode
-    ``rows`` is small and the weight term dominates — which is why weight dtype,
-    not activation dtype, sets the floor for every projection here.
+    Bytes count the activation in, the weights as the backend streams them
+    (payload, scales and any dequantisation scratch), and the activation out. At
+    decode ``rows`` is small and the weight term dominates — which is why the
+    weight's *execution* format, not the activation dtype, sets the floor here.
     """
-    return 2.0 * rows * k * n, act_b * rows * k + w_b * k * n + act_b * rows * n
+    return 2.0 * rows * k * n, linear_traffic(rows, k, n, ex, act_b).hbm
 
 
 def _pointwise(rows: float, elems: float, act_b: float, *, ops: float = 1.0) -> tuple[float, float]:
@@ -495,9 +592,9 @@ def _emit_layer(
             )
         )
 
-    def w_bytes(op: str, default: str) -> float:
-        """Bytes per stored weight for ``op``, after any precision override."""
-        return weight_bytes(spec.dtype_for(op, default))
+    def w_exec(op: str, default: str) -> WeightExecution:
+        """How ``op``'s weights execute on this SKU, after any precision override."""
+        return resolve_execution(spec.dtype_for(op, default), hw)
 
     def add_pointwise(op: str, elems: float, *, ops: float = 1.0) -> None:
         f_p, b_p = _pointwise(rows, elems, aw, ops=ops)
@@ -523,21 +620,23 @@ def _emit_layer(
         f_p, b_p = _pointwise(rows, elems, aw, ops=3.0)
         add("rms_norm", f_p, b_p, spec.act_dtype)
 
-    def add_act_quant(op: str, elems: float, gemm_op: str) -> None:
-        """Dynamic FP8 activation scaling ahead of a quantised GEMM.
+    def add_act_quant(op: str, elems: float, gemm_op: str, default: str = wd) -> None:
+        """Dynamic activation quantisation ahead of a quantised GEMM.
 
-        GLM-5.2-FP8 declares ``activation_scheme: "dynamic"``, so the activation
-        is quantised at run time — a pointwise pass plus a per-row reduction for
-        the scale, as its own kernel, once per group of fp8 GEMMs that share an
-        input. Emitted only where the consuming GEMM is actually fp8: on the bf16
-        checkpoint there is nothing to quantise and the kernel does not exist,
-        which is the sort of difference a single model-wide dtype cannot express.
+        Emitted only where the consuming GEMM's *execution* quantises its input:
+        block fp8 (GLM-5.2-FP8, ``activation_scheme: "dynamic"``) and NVFP4 W4A4
+        on Blackwell. A weight-only path — Marlin NVFP4 on H200, W4A16 int4 —
+        multiplies bf16 activations and launches no such kernel, which is the sort
+        of difference a single model-wide dtype cannot express.
+
+        Bytes follow the activation format: block fp8 writes one fp32 scale per
+        128 channels (vLLM ``GroupShape(1, 128)``), not one per row — 192 B a row
+        at GLM's 6144, where the old per-row figure charged 4.
         """
-        if _canon_dtype(spec.dtype_for(gemm_op, wd)) != "fp8":
+        ex = w_exec(gemm_op, default)
+        if ex.act_format is None:
             return
-        # Read the bf16 activation, write the fp8 one plus its scales.
-        add(op, 2.0 * rows * elems,
-            rows * elems * (aw + 1.0) + rows * 4.0, spec.act_dtype)
+        add(op, 2.0 * rows * elems, act_quant_bytes(ex, rows, elems, aw), spec.act_dtype)
 
     # ── MLA attention: low-rank query, compressed KV latent ──────────────────
     add_rms_norm(with_residual=layer > 0)
@@ -546,18 +645,18 @@ def _emit_layer(
     # q_a and kv_a are replicated across TP ranks: they produce the shared latent,
     # which has nothing to split when there is one KV latent. Every rank pays them
     # in full, so TP's speedup on attention is strictly less than ``tp``.
-    f, b = _linear(rows, h, spec.q_lora_rank, aw, w_bytes("attn_q_a", wd))
+    f, b = _linear(rows, h, spec.q_lora_rank, aw, w_exec("attn_q_a", wd))
     add("attn_q_a", f, b, wd)
 
     f, b = _linear(
         rows, spec.q_lora_rank, spec.n_heads * spec.q_head_dim // tp, aw,
-        w_bytes("attn_q_b", wd),
+        w_exec("attn_q_b", wd),
     )
     add("attn_q_b", f, b, wd)
 
     # The compressed latent plus the decoupled RoPE key, and the cache write for
     # the positions just computed. One projection (no CSA/HCA overlap here).
-    f, b = _linear(rows, h, spec.kv_entry_dim, aw, w_bytes("attn_kv_a", wd))
+    f, b = _linear(rows, h, spec.kv_entry_dim, aw, w_exec("attn_kv_a", wd))
     add("attn_kv_a", f, b + rows * kv_entry_bytes(spec), wd)
 
     # Reconstruct per-head K_nope and V from the cached latent (W^UK, W^UV),
@@ -567,7 +666,7 @@ def _emit_layer(
     f, b = _linear(
         rows, spec.kv_lora_rank,
         spec.n_heads * (spec.qk_nope_head_dim + spec.v_head_dim) // tp, aw,
-        w_bytes("attn_kv_b", wd),
+        w_exec("attn_kv_b", wd),
     )
     add("attn_kv_b", f, b, wd)
 
@@ -586,7 +685,7 @@ def _emit_layer(
         # per-head gate (``weights_proj``). Not divided by ``tp``: vLLM builds the
         # indexer as ReplicatedLinear, so every rank runs the whole thing. bf16 on
         # the FP8 checkpoint — the indexer is named in ``modules_to_not_convert``.
-        idx_w = w_bytes("attn_index_proj", wd)
+        idx_w = w_exec("attn_index_proj", wd)
         f_q, b_q = _linear(
             rows, spec.q_lora_rank, spec.index_n_heads * spec.index_head_dim, aw, idx_w
         )
@@ -595,7 +694,7 @@ def _emit_layer(
         add(
             "attn_index_proj",
             f_q + f_k + f_g,
-            b_q + b_k + b_g + rows * spec.index_head_dim * weight_bytes(spec.kv_dtype),
+            b_q + b_k + b_g + rows * spec.index_head_dim * kv_elem_bytes(spec.kv_dtype),
             wd,
         )
 
@@ -615,7 +714,7 @@ def _emit_layer(
             # prefilling request), not per position, and replicated across ranks
             # alongside the KV latent.
             index_scan_entries(batch) * spec.index_head_dim
-            * weight_bytes(spec.kv_dtype),
+            * kv_elem_bytes(spec.kv_dtype),
             spec.dtype_for("attn_index_proj", wd),
         )
 
@@ -654,7 +753,7 @@ def _emit_layer(
     # On the FP8 checkpoint this one *is* quantised — the opposite of the
     # fp8-backbone checkpoints that keep o_proj wide.
     f, b = _linear(
-        rows, spec.n_heads * spec.v_head_dim // tp, h, aw, w_bytes("attn_out_proj", wd)
+        rows, spec.n_heads * spec.v_head_dim // tp, h, aw, w_exec("attn_out_proj", wd)
     )
     add("attn_out_proj", f, b, wd)
 
@@ -670,10 +769,10 @@ def _emit_layer(
         # SwiGLU stays inside ``mlp_gate_up``: ``silu_and_mul`` is already one of
         # that op's needles in ``deviation._OP_RULES``, so a separate node would
         # be a prediction the pairing has no way to receive.
-        f_gu, b_gu = _linear(rows, h, 2 * inter // tp, aw, w_bytes("mlp_gate_up", wd))
+        f_gu, b_gu = _linear(rows, h, 2 * inter // tp, aw, w_exec("mlp_gate_up", wd))
         f_act, b_act = _pointwise(rows, inter / tp, aw, ops=4.0)
         add("mlp_gate_up", f_gu + f_act, b_gu + b_act, wd)
-        f_d, b_d = _linear(rows, inter // tp, h, aw, w_bytes("mlp_down", wd))
+        f_d, b_d = _linear(rows, inter // tp, h, aw, w_exec("mlp_down", wd))
         add("mlp_down", f_d, b_d, wd)
         _emit_collective(g, spec, hw, layer, "tp_all_reduce_mlp", rows, sh, prefix)
         return
@@ -681,7 +780,7 @@ def _emit_layer(
     # Router is replicated: every rank scores every expert to know what to keep.
     # fp32 on every GLM-5.2 variant (``moe_router_dtype``) — a model fact, not a
     # quantisation choice, and the reason this op carries its own dtype.
-    f, b = _linear(rows, h, spec.n_routed_experts, aw, w_bytes("moe_router", wd))
+    f, b = _linear(rows, h, spec.n_routed_experts, aw, w_exec("moe_router", wd))
     add("moe_router", f, b, wd)
 
     # vLLM's fused gating kernel (sigmoid + noaux_tc bias + top-8 + renorm): a
@@ -698,15 +797,18 @@ def _emit_layer(
         spec.act_dtype,
     )
 
-    add_act_quant("act_quant", h, "moe_routed")
+    add_act_quant("act_quant", h, "moe_routed", ed)
 
     inter = spec.moe_intermediate_size
     per_expert_weights = 3.0 * h * inter
     per_position_flops = 6.0 * h * inter  # 2 * (gate + up + down) * h * inter
-    ew = w_bytes("moe_routed", ed)
+    ex_routed = w_exec("moe_routed", ed)
+    ew = ex_routed.bytes_per_use * expert_pad_factor(
+        ex_routed, h, spec.moe_intermediate_size
+    )
 
     if spec.n_shared_experts > 0:
-        sw = w_bytes("moe_shared", ed)
+        sw = w_exec("moe_shared", ed).bytes_per_use
         add(
             "moe_shared",
             per_position_flops * rows * spec.n_shared_experts / tp,
@@ -904,8 +1006,8 @@ def predict_glm_graph(
         )
     )
 
-    lm_w = weight_bytes(spec.dtype_for("lm_head", spec.weight_dtype))
     lm_dtype = spec.dtype_for("lm_head", spec.weight_dtype)
+    lm_w = resolve_execution(lm_dtype, hw)
 
     def add_lm_head(rows: float, layer: int | None) -> None:
         f, b = _linear(rows, spec.hidden, spec.vocab // max(1, sh.tp), aw, lm_w)
@@ -984,7 +1086,7 @@ def predict_glm_graph(
             # state with the embedding of the token just drafted. bf16 on the FP8
             # checkpoint (named in ``modules_to_not_convert``), and replicated per
             # rank unless the engine shards it.
-            eh_w = weight_bytes(spec.dtype_for("mtp_eh_proj", spec.weight_dtype))
+            eh_w = resolve_execution(spec.dtype_for("mtp_eh_proj", spec.weight_dtype), hw)
             f, b = _linear(draft_batch.batch, 2 * spec.hidden, spec.hidden, aw, eh_w)
             g.nodes.append(
                 PredictedNode(

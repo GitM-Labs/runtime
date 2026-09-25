@@ -885,27 +885,33 @@ def test_kimi_k26_weight_bytes_match_published_checkpoint():
 def test_generic_fp8_kv_prices_the_rope_slice_at_one_byte():
     """`--kv-cache-dtype fp8` on dense MLA stores the whole 576-dim entry at one
     byte. The default keeps the RoPE key at bf16, 64 B more per entry — right
-    only for a layout that keeps RoPE wide. Every existing entry is unchanged."""
-    from gitm.planner.roofline import weight_bytes
+    only for a layout that keeps RoPE wide. Every existing entry is unchanged.
 
-    fp8 = weight_bytes("fp8")
-    assert kv_entry_bytes(load_spec("kimi-k2.6")) == pytest.approx(576 * fp8)
+    The cache carries one k_scale/v_scale per layer (vLLM kv_cache.py rejects
+    anything but a per-tensor scale), so an fp8 element is exactly one byte, not
+    the 1.000244 of a 128x128-block fp8 *weight*."""
+    assert kv_entry_bytes(load_spec("kimi-k2.6")) == 576.0
     assert kv_entry_bytes(load_spec("kimi-k2.5")) == pytest.approx(576 * 2.0)
     wide_rope = replace(load_spec("kimi-k2.6"), kv_rope_dtype="bf16")
-    assert kv_entry_bytes(wide_rope) == pytest.approx(512 * fp8 + 64 * 2.0)
+    assert kv_entry_bytes(wide_rope) == 512 + 64 * 2.0
 
 
 def test_kimi_k26_plans_the_production_shape_on_b300():
     """TP8, EP1, batch 32 at 8K, three speculative tokens: the verify is 4 rows
     per sequence, the experts price against B300's fp4 peak, nothing falls back,
-    and no indexer, MTP or all-to-all node appears."""
+    and no indexer, MTP or all-to-all node appears.
+
+    1097 = 1037 + 60: on Blackwell the TRT-LLM NVFP4 MoE is W4A4, so each of
+    the 60 MoE layers launches one scaled_fp4_quant on its input (vLLM
+    fused_moe/oracle/nvfp4.py). The catalogue entry listed it as unmodelled."""
     g, family = predict(
         "kimi-k2.6", hw=_b300(),
         batch=BatchConfig(batch=32, kv_cache_len=8192, speculative_tokens=3),
         sharding=ShardingConfig(tp=8),
     )
     ops = [n.op for n in g.nodes]
-    assert family == "glm_moe_dsa" and len(g.nodes) == 1037
+    assert family == "glm_moe_dsa" and len(g.nodes) == 1097
+    assert ops.count("act_quant") == 60
     assert not g.has_fallback_peaks and not g.has_unpriced_collectives
     assert ops.count("moe_routed") == 60 and "moe_all_to_all" not in ops
     assert not any("index" in op or "mtp" in op for op in ops)

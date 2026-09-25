@@ -63,13 +63,22 @@ _PEAKS: dict[str, tuple[float, float]] = {
 #
 _QUANT_PEAKS: dict[str, dict[str, float]] = {
     # Blackwell Ultra: 15 PFLOPS dense fp4, with fp8/bf16 carried over from B200.
-    "GB300": {"fp8": 4500e12, "fp4": 15000e12},
-    "B300": {"fp8": 4500e12, "fp4": 15000e12},
-    "GB200": {"fp8": 4500e12, "fp4": 9000e12},
-    "B200": {"fp8": 4500e12, "fp4": 9000e12},
-    # Hopper has fp8 tensor cores; it has no fp4 path (MXFP4 runs dequantised
-    # through Marlin, which is why an fp4 checkpoint traced on H100/H200 prices
-    # against fp8 and still shows a compute-bound expert GEMM).
+    # fp32 is the CUDA-core rate: HGX B200 and HGX B300 both list 600 TFLOPS
+    # FP32 across eight GPUs (NVIDIA HGX datasheets; Lenovo Press LP2226), and
+    # GB200/GB300 are the same silicon per GPU. Without it an fp32 router on
+    # B200 priced at A100's 19.5 TF/s and the K2.6 case's planner run carried
+    # 0.54 ms of router compute that the hardware does not impose. Unlike a
+    # missing fp8/fp4 peak this fallback is NOT flagged, so every Blackwell
+    # entry carries the figure rather than one.
+    "GB300": {"fp8": 4500e12, "fp4": 15000e12, "fp32": 75e12},
+    "B300": {"fp8": 4500e12, "fp4": 15000e12, "fp32": 75e12},
+    "GB200": {"fp8": 4500e12, "fp4": 9000e12, "fp32": 75e12},
+    "B200": {"fp8": 4500e12, "fp4": 9000e12, "fp32": 75e12},
+    # Hopper has fp8 tensor cores and no fp4 path. An fp4 checkpoint does not
+    # therefore price against fp8: vLLM runs it through Marlin, which dequantises
+    # in registers and multiplies in bf16, so ``resolve_execution`` sends it to
+    # the fp16/bf16 peak. The fp8 figure is only the ladder fallback for a SKU
+    # whose arch is unknown.
     #
     # ``fp32`` is the *vector* (non-tensor-core) rate, and it is here because
     # mixed-precision checkpoints run a genuinely fp32 op: the MoE router casts
@@ -101,6 +110,55 @@ _INTERCONNECT: dict[str, float] = {
     "A100": 600e9,  # NVLink 3
     "MI355X": 1075e9,  # xGMI / Infinity Fabric, 7 links, aggregate bidirectional
 }
+
+
+# Tensor-core generation per SKU substring, same first-match ordering as
+# ``_PEAKS``. It decides what a quantised checkpoint *executes* as, which the
+# peak tables alone cannot: Hopper has fp8 tensor cores and no fp4 or
+# microscaling path, so an NVFP4 or MXFP4 expert runs through Marlin at bf16
+# (see ``roofline.resolve_execution``); CDNA4 has MX fp4/fp8 but no NVFP4.
+_ARCH: dict[str, str] = {
+    "GB300": "blackwell",
+    "B300": "blackwell",
+    "GB200": "blackwell",
+    "B200": "blackwell",
+    "H100": "hopper",
+    "H200": "hopper",
+    "MI355X": "cdna4",
+    "A100": "ampere",
+    "L40": "ada",
+    "L4": "ada",
+    "T4": "turing",
+    "V100": "volta",
+}
+
+# HBM per GPU (bytes), for deployment fit. Vendor figures: H200 SXM 141 GB, H100
+# SXM 80 GB, HGX B200 1,440 GB / 8, HGX B300 2.3 TB / 8, GB200 NVL72 13.4 TB / 72,
+# GB300 NVL72 20.7 TB / 72, MI355X 288 GB.
+_MEMORY: dict[str, float] = {
+    "GB300": 288e9,
+    "B300": 288e9,
+    "GB200": 186e9,
+    "B200": 180e9,
+    "H100": 80e9,
+    "H200": 141e9,
+    "MI355X": 288e9,
+    "A100-SXM": 80e9,
+    "A100": 40e9,
+    "L40": 48e9,
+    "L4": 24e9,
+    "T4": 16e9,
+    "V100": 32e9,
+}
+
+
+def _first_match(table: dict[str, Any], sku: str | None, default: Any) -> Any:
+    if not sku:
+        return default
+    for key, value in table.items():
+        if key.lower() in sku.lower():
+            return value
+    return default
 
 
 def quant_peaks_for_sku(sku: str | None) -> dict[str, float]:
@@ -198,6 +256,8 @@ def hardware_spec_for(peak: HardwarePeak | None) -> HardwareSpec:
         peak_flops_fp32_per_s=quant.get("fp32", HardwareSpec.peak_flops_fp32_per_s),
         peak_mem_bw_bytes_per_s=peak.peak_bw_bytes_s,
         interconnect_bw_bytes_per_s=interconnect_bw_for_sku(peak.name),
+        arch=_first_match(_ARCH, peak.name, ""),
+        memory_bytes=_first_match(_MEMORY, peak.name, 0.0),
     )
 
 

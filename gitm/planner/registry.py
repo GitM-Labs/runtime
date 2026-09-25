@@ -130,6 +130,18 @@ def add_plan_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="Seconds per dependent kernel launch. Default 2e-6 "
                          "(CUDA-graph replay); eager is nearer 5e-6, and the "
                          "2.5x moves where launch-bound work crosses over.")
+    ap.add_argument("--gpu-mem-util", type=float, default=0.9,
+                    help="vLLM --gpu-memory-utilization, for the fit ledger (default 0.9).")
+    ap.add_argument("--workspace-gb", type=float, default=0.0,
+                    help="Per-rank activation workspace + graph pools + comm buffers, "
+                         "GB. Charged in the same ledger as KV; 0 prints as unstated.")
+    ap.add_argument("--kv-cache-dtype", default="auto",
+                    choices=("auto", "bf16", "fp16", "fp8"),
+                    help="vLLM --kv-cache-dtype. 'auto' (the default) prices the "
+                         "catalogue's kv_dtype, which records what vLLM resolves auto "
+                         "to for that checkpoint: fp8 when its quantization_config "
+                         "declares a static fp8 kv_cache_scheme, the model dtype "
+                         "otherwise. 'fp8' is the generic one-byte layout.")
     ap.add_argument("--tp", type=int, default=1, help="Tensor-parallel size.")
     ap.add_argument("--ep", type=int, default=1, help="Expert-parallel size.")
     ap.add_argument("--dp", type=int, default=1, help="Data-parallel size.")
@@ -341,6 +353,21 @@ def main(argv: list[str] | None = None) -> int:
               "config reader. Build a ModelSpec and call predict_graph directly.")
         return 2
 
+    if args.kv_cache_dtype != "auto":
+        from dataclasses import fields as _fields
+        from dataclasses import replace as _replace_spec
+
+        # vLLM resolves 'auto' from the checkpoint (engine/arg_utils.py:1567-1570
+        # -> utils/torch_utils.py:324-342), which is what the catalogue records.
+        # An explicit dtype overrides the cache on every family, and both halves
+        # of an MLA entry where the spec splits them.
+        names = {f.name for f in _fields(spec)}
+        kv = {n: args.kv_cache_dtype for n in ("kv_dtype", "kv_rope_dtype") if n in names}
+        if not kv:
+            print(f"cannot plan: --kv-cache-dtype does not apply to the {family} family")
+            return 2
+        spec = _replace_spec(spec, **kv)
+
     hw = _hardware(args.gpu)
     if args.launch_overhead is not None:
         from dataclasses import replace as _replace
@@ -417,4 +444,51 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print(_render_table(g, hw, spec, family, note))
+    if family == "glm_moe_dsa":
+        print(_render_precision_and_fit(spec, hw, batch, sharding, args))
     return 0
+
+
+def _render_precision_and_fit(spec, hw: HardwareSpec, batch, sharding, args) -> str:
+    """What the expert weights execute as, and the per-rank memory ledger.
+
+    The expert bank is most of a decode step on every MoE entry, so its stored
+    format, the backend it lands on and the rows at which it turns compute-bound
+    are printed rather than left implicit in a bytes column.
+    """
+    from gitm.planner.glm_graph import memory_fit
+    from gitm.planner.roofline import critical_rows, distinct_experts, resolve_execution
+
+    dtype = spec.dtype_for("moe_routed", spec.expert_dtype)
+    ex = resolve_execution(dtype, hw)
+    fmt = ex.stored
+    distinct = distinct_experts(batch.positions_per_step, spec.n_routed_experts,
+                                spec.num_experts_per_tok)
+    rows_per_expert = (batch.positions_per_step * spec.num_experts_per_tok / distinct
+                       if distinct else 0.0)
+    knee = critical_rows(dtype, hw, spec.hidden, spec.moe_intermediate_size)
+    out = [
+        f"  experts   {fmt.name}: {fmt.bytes_per_elem:.4f} B/weight stored "
+        f"({fmt.scale_overhead:.1%} scales) -> {ex.backend}, {ex.compute_dtype} MACs, "
+        f"{ex.bytes_per_use:.4f} B/weight per use"
+        + (" [estimated rule]" if ex.estimated else ""),
+        f"            {rows_per_expert:.2f} rows/expert at this batch; compute-bound "
+        f"above {knee:.0f}",
+    ]
+    if hw.memory_bytes <= 0:
+        return "\n".join(out + ["  fit       no HBM capacity in the catalogue for this SKU"])
+    fit = memory_fit(spec, hw, batch, sharding,
+                     gpu_memory_utilization=args.gpu_mem_util,
+                     workspace_bytes=args.workspace_gb * 1e9)
+    ws = (f"{fit.workspace / 1e9:.1f} GB workspace" if fit.workspace
+          else "workspace unstated (0)")
+    out += [
+        f"  fit       {fit.budget / 1e9:.1f} GB budget ({args.gpu_mem_util:g} x "
+        f"{fit.capacity / 1e9:.0f}) - {fit.weights / 1e9:.1f} GB weights - {ws} = "
+        f"{fit.kv_available / 1e9:.1f} GB for KV",
+        f"            need {fit.kv_needed / 1e9:.1f} GB KV "
+        f"({fit.kv_bytes_per_token:,.0f} B/token, replicated per rank): "
+        + ("fits" if fit.fits else "DOES NOT FIT")
+        + f"; holds {fit.kv_tokens:,.0f} tokens",
+    ]
+    return "\n".join(out)

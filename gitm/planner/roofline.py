@@ -20,36 +20,185 @@ surfaces as ``peak_is_fallback`` rather than as a confident wrong number.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
+
+
+@dataclass(frozen=True)
+class QuantFormat:
+    """How one tensor class is *stored*: a payload plus the scales riding with it.
+
+    Storage is one of four questions a quantised checkpoint raises, and the only
+    one a checkpoint answers by itself. The other three depend on the engine and
+    the SKU (see :class:`WeightExecution`): what the MACs run in, what is resident
+    after load, and what extra traffic the kernel generates. Keeping them apart is
+    what lets an NVFP4 checkpoint be priced correctly on a part with no FP4 path.
+
+    Bytes per element are exact, not fitted:
+
+        bytes = payload_bits / 8 + scale_bytes / block_elems
+
+    ``tensor_scales`` counts per-matrix fp32 scalars (NVFP4's ``weight_scale_2``
+    and ``input_scale``, an fp8 cache's ``k_scale``/``v_scale``). They are 8 bytes
+    against a matrix of ~10^7 weights, so they are carried for the record and left
+    out of the per-element figure.
+    """
+
+    name: str
+    payload_bits: int
+    #: Elements sharing one block scale. 0 means no per-block scale at all.
+    block_elems: int = 0
+    #: Width of one block scale in bytes: 1 for e4m3/e8m0, 2 for bf16, 4 for fp32.
+    scale_bytes: float = 0.0
+    tensor_scales: int = 0
+    #: What a *native* kernel multiplies in — the tensor-core family the format
+    #: was designed for. Whether a given SKU has that path is decided elsewhere.
+    native_compute: str = "fp16"
+    source: str = ""
+
+    @property
+    def payload_bytes(self) -> float:
+        return self.payload_bits / 8.0
+
+    @property
+    def scale_bytes_per_elem(self) -> float:
+        return self.scale_bytes / self.block_elems if self.block_elems else 0.0
+
+    @property
+    def bytes_per_elem(self) -> float:
+        return self.payload_bytes + self.scale_bytes_per_elem
+
+    @property
+    def scale_overhead(self) -> float:
+        """Fraction of this format's bytes that are scales rather than payload."""
+        return self.scale_bytes_per_elem / self.bytes_per_elem
+
+
+#: Every storage format the catalogue entries use, with where its layout is read.
+QUANT_FORMATS: dict[str, QuantFormat] = {
+    f.name: f
+    for f in (
+        QuantFormat("fp32", 32, native_compute="fp32"),
+        QuantFormat("fp16", 16),
+        QuantFormat("bf16", 16),
+        # DeepSeek-V3 / GLM-5.2-FP8: ``weight_block_size: [128, 128]``, one fp32
+        # ``weight_scale_inv`` per block. 4 / 16,384 = 0.000244 B per weight.
+        QuantFormat(
+            "fp8_block128", 8, 128 * 128, 4.0, native_compute="fp8",
+            source="zai-org/GLM-5.2-FP8 config.json quantization_config "
+                   "weight_block_size [128, 128]; one F32 weight_scale_inv per block",
+        ),
+        # OCP Microscaling v1.0 §5.2: 32 elements share one E8M0 (1 byte) scale.
+        QuantFormat(
+            "mxfp8", 8, 32, 1.0, native_compute="fp8",
+            source="OCP Microscaling Formats (MX) v1.0, Table 1: MXFP8 k=32, E8M0 scale",
+        ),
+        QuantFormat(
+            "mxfp4", 4, 32, 1.0, native_compute="fp4",
+            source="OCP Microscaling Formats (MX) v1.0, Table 1: MXFP4 k=32, E8M0 scale",
+        ),
+        # DeepSeek-V4's unlabelled "fp4" experts: MXFP4's bytes, but no engine
+        # has been pinned for them, so no execution rule claims to know the
+        # backend and the peak stays on the ladder.
+        QuantFormat(
+            "fp4", 4, 32, 1.0, native_compute="fp4",
+            source="DeepSeek-V4 catalogue label; bytes as MXFP4, backend unpinned",
+        ),
+        # Read off the K2.6 shard headers: gate_proj.weight U8 [2048, 3584] (two
+        # e2m1 per byte) beside weight_scale F8_E4M3 [2048, 448] (7168 / 16), plus
+        # F32 [] weight_scale_2 and input_scale per matrix.
+        QuantFormat(
+            "nvfp4", 4, 16, 1.0, tensor_scales=2, native_compute="fp4",
+            source="nvidia/Kimi-K2.6-NVFP4 hf_quant_config.json group_size 16; "
+                   "shard headers U8 [2048,3584] + F8_E4M3 [2048,448]",
+        ),
+        # compressed-tensors pack-quantized, symmetric (no zero point): int4
+        # ``weight_packed`` with a bf16 ``weight_scale`` per group of 32.
+        QuantFormat(
+            "int4_g32", 4, 32, 2.0, native_compute="fp16",
+            source="moonshotai/Kimi-K2.5 config.json quantization_config "
+                   "num_bits 4, group_size 32, symmetric, pack-quantized",
+        ),
+        # Cache-side formats. A generic fp8 KV cache carries one k_scale and one
+        # v_scale per layer and nothing per element; DeepSeek's fp8_ds_mla layout
+        # keeps one fp32 scale per 128 latent elements (656 B per 576-dim entry
+        # once the bf16 RoPE key is added — see ``kv_elem_bytes``).
+        QuantFormat(
+            "fp8_tensor", 8, tensor_scales=2, native_compute="fp8",
+            source="vLLM v0.19.1 quantization/kv_cache.py: per-layer k_scale/v_scale",
+        ),
+        QuantFormat(
+            "fp8_ds_mla", 8, 128, 4.0, native_compute="fp8",
+            source="vLLM v0.19.1 attention/mla_attention.py: fp8_ds_mla on sparse MLA",
+        ),
+        # Activation-side block fp8: dynamic, one fp32 scale per 128 channels of
+        # each row (``GroupShape(1, weight_block_size[0])``), not one per row.
+        QuantFormat(
+            "fp8_group128", 8, 128, 4.0, native_compute="fp8",
+            source="vLLM v0.19.1 quantization/fp8.py:317; utils/fp8_utils.py:931-932",
+        ),
+    )
+}
+
+#: Names the catalogue and older call sites use. Each keeps the byte cost it had
+#: before the table existed: ``fp8`` is DeepSeek-style block fp8 and ``int4`` is
+#: W4A16 group 32.
+_WEIGHT_ALIASES: dict[str, str] = {
+    "fp8": "fp8_block128",
+    "e4m3": "fp8_block128",
+    "fp8_e4m3": "fp8_block128",
+    "float8_e4m3fn": "fp8_block128",
+    "int4": "int4_g32",
+    "w4a16": "int4_g32",
+    "float32": "fp32",
+    "float16": "fp16",
+    "half": "fp16",
+}
+
+#: A KV cache is not a weight: ``fp8`` there means one scale per layer, not one
+#: per 128x128 block.
+_KV_ALIASES: dict[str, str] = {"fp8": "fp8_tensor", "fp8_e4m3": "fp8_tensor", "e4m3": "fp8_tensor"}
+
+
+def quant_format(dtype: str) -> QuantFormat | None:
+    """The storage format a weight dtype label names, or ``None`` if unknown."""
+    d = dtype.lower()
+    return QUANT_FORMATS.get(_WEIGHT_ALIASES.get(d, d))
+
 
 # Bytes of HBM traffic per stored weight, including the quantisation scales that
-# ride alongside the payload. Scales are a real fraction of the bytes a decode
-# step moves — at fp4 they are 6% of expert traffic, which is larger than several
-# effects the monitor is expected to resolve.
+# ride alongside the payload. Derived from ``QUANT_FORMATS`` so there is one
+# owner for every layout. Scales are a real fraction of the bytes a decode step
+# moves: NVFP4's are 11% of expert traffic, larger than several effects the
+# monitor is expected to resolve.
 _WEIGHT_BYTES: dict[str, float] = {
-    "fp32": 4.0,
-    "fp16": 2.0,
-    "bf16": 2.0,
-    # One fp32 scale per 128x128 block (DeepSeek-style block quantisation).
-    "fp8": 1.0 + 4.0 / (128 * 128),
-    # MXFP4: one e8m0 (1 byte) scale per 32 values.
-    "mxfp4": 0.5 + 1.0 / 32,
-    # compressed-tensors W4A16 pack-quantised (Kimi K2.5's routed experts):
-    # int4 payload with one bf16 scale per group of 32 along the input dim.
-    "int4": 0.5 + 2.0 / 32,
-    # NVFP4: one e4m3 (1 byte) scale per 16 values.
-    "nvfp4": 0.5 + 1.0 / 16,
-    "fp4" :  0.5 + 1.0 / 32,
+    **{name: f.bytes_per_elem for name, f in QUANT_FORMATS.items()},
+    **{alias: QUANT_FORMATS[name].bytes_per_elem for alias, name in _WEIGHT_ALIASES.items()},
 }
 
 
 def weight_bytes(dtype: str) -> float:
-    """Bytes moved per stored weight for ``dtype``, scales included.
+    """Bytes per *stored* weight for ``dtype``, scales included.
 
     Unknown dtypes fall back to bf16 (2 bytes) — the conservative direction,
     since over-counting weight traffic predicts a *slower* floor and so cannot
-    manufacture headroom.
+    manufacture headroom. What a kernel actually streams can differ from what is
+    stored; :func:`resolve_execution` answers that per SKU.
     """
     return _WEIGHT_BYTES.get(dtype.lower(), 2.0)
+
+
+def kv_elem_bytes(dtype: str) -> float:
+    """Bytes per cached KV element for a cache dtype label.
+
+    Distinct from :func:`weight_bytes` because the same label means a different
+    layout on the two sides. ``fp8`` weights carry a 128x128 block scale
+    (1.000244 B); an ``fp8`` cache carries one scale per layer (1.0 B). Pricing
+    the cache with the weight constant overstated GLM-5.2's fp8 KV by 10 B per
+    token, the gap its design note flags against 52,608.
+    """
+    d = dtype.lower()
+    fmt = QUANT_FORMATS.get(_KV_ALIASES.get(d, d))
+    return fmt.bytes_per_elem if fmt is not None else weight_bytes(d)
 
 
 @dataclass(frozen=True)
@@ -84,6 +233,12 @@ class HardwareSpec:
     kernel_launch_overhead_s: float = 2.0e-6
     eff_lo: float = 0.55
     eff_hi: float = 0.95
+    #: Tensor-core generation, which decides what a quantised format *executes*
+    #: as (see :func:`resolve_execution`). Empty means unknown, and the old
+    #: precision-ladder fallback applies.
+    arch: str = ""
+    #: HBM capacity per GPU, for deployment fit. ``0.0`` means unknown.
+    memory_bytes: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -652,6 +807,9 @@ class RooflinePrediction:
     #: Dependent kernel launches this op costs. Non-zero only for iterative work
     #: that cannot be overlapped with itself; see ``bound == "launch"``.
     serial_launches: int = 0
+    #: The dtype the MACs ran in once the stored ``dtype`` was resolved against
+    #: the SKU (``bf16`` for Marlin NVFP4 on H200). Empty means "same as dtype".
+    compute_dtype: str = ""
 
     @property
     def peak_is_fallback(self) -> bool:
@@ -661,7 +819,356 @@ class RooflinePrediction:
         known direction (too low for a dtype faster than the fallback), so the
         report must not present it as a clean roofline.
         """
-        return _canon_dtype(self.dtype) != self.peak_dtype
+        return _canon_dtype(self.compute_dtype or self.dtype) != self.peak_dtype
+
+
+# ── Execution: what a stored format becomes on a given SKU ────────────────────
+#
+# Every rule below was read from vLLM v0.19.1 (commit b1388b1f), the engine the
+# Kimi K2.6 case pinned. Paths are relative to ``vllm/model_executor/layers/``.
+# A backend choice is an engine fact, not a checkpoint fact: a different vLLM
+# version, or an env override, can move it, which is why the backend is named on
+# every result and can be forced with ``backend=``.
+
+Backend = Literal["native", "marlin", "emulation"]
+
+
+class UnsupportedExecution(ValueError):
+    """The pinned engine has no kernel for this format on this architecture."""
+
+
+@dataclass(frozen=True)
+class WeightExecution:
+    """A stored format resolved against a SKU and an engine backend.
+
+    Four quantities a single bytes-per-weight number conflates:
+
+    * ``resident_bytes`` — HBM held per weight after load. Decides *fit*.
+    * ``streamed_bytes`` — HBM read per weight each time the GEMM runs. Decides
+      the *memory* term. Equal to storage unless the backend re-lays it out.
+    * ``temp_bytes`` — scratch written and read back per weight per use, when a
+      backend materialises a dequantised copy (emulation). Pure overhead.
+    * ``compute_dtype`` — the tensor-core rate the MACs run at. Decides the
+      *compute* term and the ridge. Marlin stores 4 bits and multiplies in bf16.
+
+    ``act_format`` is the format the activation is quantised into ahead of the
+    GEMM (``None`` for weight-only W4A16 paths): a separate kernel on the
+    activation, priced per element in :func:`act_quant_bytes`.
+
+    ``pad_hidden``/``pad_inter`` are the multiples the backend rounds an expert's
+    hidden and intermediate dims up to at load; see :func:`expert_pad_factor`.
+    """
+
+    stored: QuantFormat
+    backend: str
+    compute_dtype: str
+    resident_bytes: float
+    streamed_bytes: float
+    temp_bytes: float = 0.0
+    act_format: QuantFormat | None = None
+    pad_hidden: int = 1
+    pad_inter: int = 1
+    #: True when a rule is inferred rather than read from engine source.
+    estimated: bool = False
+    source: str = ""
+
+    @property
+    def bytes_per_use(self) -> float:
+        """HBM bytes per weight each time the GEMM runs: streamed plus scratch."""
+        return self.streamed_bytes + self.temp_bytes
+
+    @property
+    def is_upcast(self) -> bool:
+        """True when the MACs run wider than the stored payload's native path."""
+        return _canon_dtype(self.compute_dtype) != _canon_dtype(self.stored.native_compute)
+
+
+@dataclass(frozen=True)
+class _Rule:
+    backend: str
+    compute: str
+    act: str | None = None
+    pad_hidden: int = 1
+    pad_inter: int = 1
+    temp_bytes: float = 0.0
+    estimated: bool = False
+    source: str = ""
+
+
+_MARLIN_W4A16_FP4 = (
+    "fused_moe/fused_marlin_moe.py:567 (sm75+); quantization/utils/"
+    "marlin_utils_fp4.py:135 (bf16/fp16 activations only), :335-344 (payload "
+    "repacked, K*N/2 bytes kept), :84-110 (e4m3 scales stay 1 byte)"
+)
+_MARLIN_W4A16_INT4 = (
+    "quantization/compressed_tensors/compressed_tensors_moe.py:176-197 "
+    "(WNA16 Marlin MoE), :1249 (bf16 group scales), :1159-1161 (symmetric, no "
+    "zero points); _custom_ops.py:1238-1242 (repack keeps K*N/2 bytes)"
+)
+_BLOCK_FP8 = (
+    "quantization/fp8.py:317 (activation group 128), utils/fp8_utils.py:1512-1518 "
+    "(fp32 scale per 128x128 block); fused_moe/flashinfer_cutlass_moe.py:161-168 "
+    "(block fp8 MoE on sm90)"
+)
+
+#: (stored format, arch) -> what vLLM v0.19.1 runs by default.
+_EXECUTION_RULES: dict[tuple[str, str], _Rule] = {
+    ("fp8_block128", "hopper"): _Rule("native", "fp8", "fp8_group128", source=_BLOCK_FP8),
+    ("fp8_block128", "blackwell"): _Rule("native", "fp8", "fp8_group128", source=_BLOCK_FP8),
+    ("fp8_block128", "cdna4"): _Rule(
+        "native", "fp8", "fp8_group128", estimated=True,
+        source="fused_moe/oracle/fp8.py:68-80 lists AITER first; ROCm kernels not read",
+    ),
+    # NVFP4. Blackwell: TRT-LLM FP4 grouped GEMM, W4A4 with one scaled_fp4_quant
+    # per MoE input. Hopper: no FP4 tensor cores and no W4A8 for NVFP4
+    # (marlin_utils_fp4.py:305-307), so Marlin W4A16.
+    ("nvfp4", "blackwell"): _Rule(
+        "native", "fp4", "nvfp4",
+        source="fused_moe/oracle/nvfp4.py:140-146; experts/trtllm_nvfp4_moe.py:87 "
+               "(sm100 family); _custom_ops.py:78,1633 (activation e2m1 + e4m3/16)",
+    ),
+    ("nvfp4", "hopper"): _Rule("marlin", "bf16", source=_MARLIN_W4A16_FP4),
+    ("nvfp4", "ampere"): _Rule("marlin", "bf16", source=_MARLIN_W4A16_FP4),
+    ("nvfp4", "ada"): _Rule("marlin", "bf16", source=_MARLIN_W4A16_FP4),
+    # MXFP4. The default MoE backend on Blackwell is FLASHINFER_TRTLLM_MXFP4_BF16:
+    # bf16 activations, so the MACs are bf16 even where fp4 tensor cores exist.
+    ("mxfp4", "blackwell"): _Rule(
+        "native", "bf16", pad_hidden=256, pad_inter=256,
+        source="fused_moe/oracle/mxfp4.py:174-182 (TRTLLM_MXFP4_BF16 first), "
+               ":386-388 (hidden and intermediate padded to 256); "
+               "experts/trtllm_mxfp4_moe.py:81",
+    ),
+    ("mxfp4", "hopper"): _Rule(
+        "native", "bf16", estimated=True,
+        source="fused_moe/gpt_oss_triton_kernels_moe.py:564 (Triton on sm90-sm10x); "
+               "the upcast and any scale padding live in triton_kernels, not read",
+    ),
+    ("mxfp4", "cdna4"): _Rule(
+        "native", "fp4", estimated=True,
+        source="fused_moe/oracle/mxfp4.py:174-182 lists CK second; ROCm kernels not read",
+    ),
+    # MXFP8: Blackwell only. There is no sm90 path in this version.
+    ("mxfp8", "blackwell"): _Rule(
+        "native", "fp8", "mxfp8",
+        source="fused_moe/oracle/mxfp8.py:18-22,44-45; quantization/mxfp8.py:77-78",
+    ),
+    ("int4_g32", "hopper"): _Rule("marlin", "bf16", source=_MARLIN_W4A16_INT4),
+    ("int4_g32", "blackwell"): _Rule("marlin", "bf16", source=_MARLIN_W4A16_INT4),
+    ("int4_g32", "ampere"): _Rule("marlin", "bf16", source=_MARLIN_W4A16_INT4),
+    ("int4_g32", "cdna4"): _Rule(
+        "native", "bf16", estimated=True,
+        source="W4A16 by construction; the ROCm MoE kernel was not read",
+    ),
+}
+
+#: Architectures that have no kernel for a format in vLLM v0.19.1.
+_UNSUPPORTED: dict[tuple[str, str], str] = {
+    ("mxfp8", "hopper"): "quantization/mxfp8.py:77-78 and modelopt.py:1501-1503 "
+                         "require sm100",
+}
+
+#: Forced backends (``backend=``), per format. Marlin is the upcast path every
+#: 4-bit format has on sm75+; emulation dequantises the whole matrix each forward.
+_FORCED: dict[tuple[str, str], _Rule] = {
+    ("nvfp4", "marlin"): _Rule("marlin", "bf16", source=_MARLIN_W4A16_FP4),
+    ("int4_g32", "marlin"): _Rule("marlin", "bf16", source=_MARLIN_W4A16_INT4),
+    ("mxfp4", "marlin"): _Rule(
+        "marlin", "bf16", pad_hidden=256, pad_inter=128,
+        source="fused_moe/oracle/mxfp4.py:336-343 (VLLM_MXFP4_USE_MARLIN), :380-385 "
+               "(hidden padded to 256, intermediate to 128); quantization/utils/"
+               "marlin_utils_fp4.py:122 (e8m0 scales stay 1 byte)",
+    ),
+    # nvfp4_emulation_utils.py:57-65,140: the payload is unpacked to an fp32
+    # M x K tensor (write 4), scaled into a second fp32 tensor (read 4, write 4),
+    # cast to bf16 (read 4, write 2) and read by the matmul (read 2): 20 B per
+    # weight of scratch on top of the 0.5625 B read from storage.
+    ("nvfp4", "emulation"): _Rule(
+        "emulation", "bf16", temp_bytes=20.0,
+        source="quantization/utils/nvfp4_emulation_utils.py:57-65,130-141",
+    ),
+    # mxfp8_utils.py:71-82 follows the same fp32-then-bf16 chain.
+    ("mxfp8", "emulation"): _Rule(
+        "emulation", "bf16", temp_bytes=20.0, estimated=True,
+        source="quantization/utils/mxfp8_utils.py:71-82,157",
+    ),
+}
+
+
+#: With no rule for the SKU, an 8-bit format is assumed to run as designed, with
+#: its dynamic activation quantisation. 4-bit formats are not: whether they run
+#: W4A4 or W4A16 is exactly what an unpinned backend leaves open.
+_NATIVE_ACT: dict[str, str] = {"fp8_block128": "fp8_group128", "mxfp8": "mxfp8"}
+
+
+def resolve_execution(
+    dtype: str, hw: HardwareSpec, *, backend: str | None = None
+) -> WeightExecution:
+    """What a weight stored as ``dtype`` executes as on ``hw``.
+
+    Unknown formats and unknown architectures fall back to the precision ladder
+    of :func:`_ladder_peak` with ``backend="unknown"`` and ``estimated=True``: the
+    storage bytes are still exact, and only the compute rate is a guess.
+
+    Raises :class:`UnsupportedExecution` when the pinned engine has no kernel at
+    all (MXFP8 on Hopper), because pricing a checkpoint that will not load would
+    be a prediction for a deployment that cannot exist.
+    """
+    fmt = quant_format(dtype)
+    if fmt is None:
+        # An unrecognised label keeps weight_bytes' conservative 2 B/weight, and
+        # says it is guessing rather than claiming a native bf16 path.
+        return WeightExecution(
+            stored=QuantFormat(dtype.lower(), 16), backend="unknown",
+            compute_dtype=_ladder_peak(hw, dtype)[1],
+            resident_bytes=weight_bytes(dtype), streamed_bytes=weight_bytes(dtype),
+            estimated=True,
+        )
+    if backend is not None and backend != "native":
+        rule = _FORCED.get((fmt.name, backend))
+        if rule is None:
+            raise UnsupportedExecution(f"no {backend!r} backend for {fmt.name}")
+    else:
+        why = _UNSUPPORTED.get((fmt.name, hw.arch))
+        if why is not None:
+            raise UnsupportedExecution(f"{fmt.name} has no kernel on {hw.arch}: {why}")
+        rule = _EXECUTION_RULES.get((fmt.name, hw.arch))
+    if rule is None:
+        native = fmt.payload_bits >= 16
+        act = _NATIVE_ACT.get(fmt.name)
+        return WeightExecution(
+            stored=fmt,
+            backend="native" if native else "unknown",
+            compute_dtype=fmt.name if native else _ladder_peak(hw, fmt.native_compute)[1],
+            resident_bytes=fmt.bytes_per_elem,
+            streamed_bytes=fmt.bytes_per_elem,
+            act_format=QUANT_FORMATS[act] if act else None,
+            estimated=not native,
+        )
+    return WeightExecution(
+        stored=fmt,
+        backend=rule.backend,
+        compute_dtype=rule.compute,
+        resident_bytes=fmt.bytes_per_elem,
+        streamed_bytes=fmt.bytes_per_elem,
+        temp_bytes=rule.temp_bytes,
+        act_format=QUANT_FORMATS[rule.act] if rule.act else None,
+        pad_hidden=rule.pad_hidden,
+        pad_inter=rule.pad_inter,
+        estimated=rule.estimated,
+        source=rule.source,
+    )
+
+
+def _round_up(x: int, m: int) -> int:
+    return -(-x // m) * m
+
+
+def expert_pad_factor(ex: WeightExecution, hidden: int, inter: int) -> float:
+    """Resident-and-streamed bytes multiplier from backend shape padding.
+
+    Every expert matrix is ``hidden x inter`` (gate and up are ``inter x hidden``,
+    down is ``hidden x inter``), so padding both dims scales all three by the same
+    ratio. 1.0 for Kimi (7168 = 28 x 256, 2048 = 8 x 256) and GLM-5.2; 1.090 for a
+    gpt-oss-shaped expert (2880 x 2880) under Marlin, whose 2880 rounds to 3072
+    and 2944 — padding the format does not show and the planner must.
+    """
+    ph = _round_up(hidden, ex.pad_hidden)
+    pi = _round_up(inter, ex.pad_inter)
+    return (ph * pi) / float(hidden * inter)
+
+
+def act_quant_bytes(ex: WeightExecution, rows: float, elems: float, act_b: float) -> float:
+    """HBM bytes of the activation-quantisation kernel ahead of the GEMM.
+
+    Reads the wide activation once and writes the quantised copy with its block
+    scales. Zero for weight-only (W4A16) execution, where no such kernel runs.
+    """
+    if ex.act_format is None:
+        return 0.0
+    return rows * elems * (act_b + ex.act_format.bytes_per_elem)
+
+
+@dataclass(frozen=True)
+class TierTraffic:
+    """Bytes one GEMM moves, by where they come from.
+
+    ``weight_payload`` and ``weight_scales`` split the streamed weight so the
+    scale overhead of a format is visible as its own line; ``temporary`` is
+    scratch a backend writes and reads back; ``interconnect`` never touches HBM
+    and answers to the link ridge instead.
+    """
+
+    weight_payload: float = 0.0
+    weight_scales: float = 0.0
+    activations: float = 0.0
+    temporary: float = 0.0
+    interconnect: float = 0.0
+
+    @property
+    def hbm(self) -> float:
+        return self.weight_payload + self.weight_scales + self.activations + self.temporary
+
+
+def linear_traffic(
+    rows: float, k: int, n: int, ex: WeightExecution, act_b: float
+) -> TierTraffic:
+    """Per-tier bytes for a ``(rows, k) @ (k, n)`` projection under ``ex``.
+
+    Weights are read once per use regardless of ``rows``, which is why at decode
+    the weight format sets the floor and the activation width barely matters.
+    """
+    weights = k * n
+    return TierTraffic(
+        weight_payload=weights * ex.stored.payload_bytes,
+        weight_scales=weights * (ex.streamed_bytes - ex.stored.payload_bytes),
+        activations=act_b * rows * (k + n),
+        temporary=weights * ex.temp_bytes,
+    )
+
+
+def ridge(hw: HardwareSpec, dtype: str, *, tier: str = "hbm") -> float:
+    """FLOP/byte at which work in ``dtype`` stops being bound by ``tier``.
+
+    ``dtype`` is the *stored* label; the rate is the one it executes at (Marlin
+    NVFP4 on H200 answers to 989/4.8 = 206, not to an fp4 or fp8 figure). The
+    ``link`` tier prices bytes that cross NVLink/xGMI, whose ridge is 5.3x the HBM
+    one on H200: a collective is never compute-bound, and a GEMM fed over the link
+    would need 5x the intensity to hide it.
+    """
+    peak, _ = resolve_peak(hw, dtype)
+    bw = hw.interconnect_bw_bytes_per_s if tier == "link" else hw.peak_mem_bw_bytes_per_s
+    return peak / bw if bw > 0 else 0.0
+
+
+def critical_rows(
+    dtype: str, hw: HardwareSpec, k: int, n: int, *,
+    act_b: float = 2.0, backend: str | None = None,
+) -> float:
+    """Rows per weight matrix at which a GEMM crosses from memory- to compute-bound.
+
+    With weights streamed once per use, a ``(r, k) @ (k, n)`` GEMM has
+
+        AI(r) = 2 r k n / (w k n + a r (k + n))
+
+    where ``w`` is bytes per weight per use and ``a`` the activation width.
+    Setting AI = R (the ridge) and solving for r:
+
+        r* = R w k n / (2 k n - R a (k + n))  ~=  R w / 2   for k, n >> R a
+
+    So the knee is set by the *execution* ridge times the *streamed* bytes: NVFP4
+    through Marlin on H200 turns compute-bound near 206 x 0.5625 / 2 = 58 rows
+    per expert, and at 67 once a Kimi expert's own activation traffic is counted
+    (k=7168, n=2048: the ``R a (k + n)`` term is 13% of ``2 k n``). Block fp8 on
+    the same part runs at the fp8 rate and needs ~412 x 1.0 / 2 = 206. For MoE, rows per
+    expert is ``batch * top_k / distinct_experts``, so this is the batch that makes
+    an expert bank compute-bound. ``inf`` when no finite row count gets there.
+    """
+    ex = resolve_execution(dtype, hw, backend=backend)
+    r = ridge(hw, dtype) if backend is None else (
+        _ladder_peak(hw, ex.compute_dtype)[0] / hw.peak_mem_bw_bytes_per_s
+    )
+    denom = 2.0 * k * n - r * act_b * (k + n)
+    return r * ex.bytes_per_use * k * n / denom if denom > 0 else float("inf")
 
 
 def _canon_dtype(dtype: str) -> str:
@@ -670,24 +1177,55 @@ def _canon_dtype(dtype: str) -> str:
     # dequantised into bf16 MACs, so the fp16/bf16 tensor-core rate is the
     # op's *correct* ceiling, not a fallback — mapping it here keeps
     # ``peak_is_fallback`` from flagging a prediction that is right.
-    if d in ("bf16", "float16", "fp16", "half", "int4", "w4a16"):
+    if d in ("bf16", "float16", "fp16", "half", "int4", "int4_g32", "w4a16"):
         return "fp16"
     if d in ("fp4", "mxfp4", "nvfp4"):
         return "fp4"
-    if d in ("fp8", "e4m3", "e5m2"):
+    if d in ("fp8", "e4m3", "e5m2", "fp8_e4m3", "fp8_e5m2", "float8_e4m3fn",
+             "fp8_block128", "fp8_group128", "fp8_tensor", "fp8_ds_mla", "mxfp8"):
         return "fp8"
     if d in ("fp32", "float32", "tf32"):
         return "fp32"
     return d
 
 
+def _execution_dtype(hw: HardwareSpec, dtype: str) -> str:
+    """The dtype ``dtype``'s MACs actually run in on ``hw``, or ``dtype`` itself.
+
+    Only a known architecture and a known quantised format resolve; anything
+    else keeps the label, so the ladder below decides and flags it as before.
+    """
+    fmt = quant_format(dtype)
+    if not hw.arch or fmt is None or fmt.payload_bits >= 16:
+        return dtype
+    try:
+        ex = resolve_execution(dtype, hw)
+    except UnsupportedExecution:
+        return dtype
+    return dtype if ex.backend == "unknown" else ex.compute_dtype
+
+
 def resolve_peak(hw: HardwareSpec, dtype: str) -> tuple[float, str]:
     """(peak FLOP/s, the dtype that peak belongs to) for ``dtype`` on ``hw``.
 
-    Falls back down the precision ladder — fp4 → fp8 → fp16 — because a missing
-    low-precision peak means the catalogue is incomplete, not that the op is
-    free. Falling back *upward* in precision understates the ceiling, which is
-    the safe direction: it under-reports headroom rather than inventing it.
+    ``dtype`` is the *stored* label. On a SKU whose architecture is known it is
+    first resolved to what the pinned engine executes (:func:`resolve_execution`):
+    NVFP4 or MXFP4 on Hopper runs Marlin/Triton W4A16, so its rate is bf16 —
+    not fp4, which Hopper lacks, and not fp8, which the old ladder picked and
+    which overstated the expert GEMM's compute ceiling 2x.
+    """
+    return _ladder_peak(hw, _execution_dtype(hw, dtype))
+
+
+def _ladder_peak(hw: HardwareSpec, dtype: str) -> tuple[float, str]:
+    """The peak for ``dtype``'s tensor-core family, falling back up the ladder.
+
+    fp4 → fp8 → fp16: a missing low-precision peak means the catalogue is
+    incomplete, not that the op is free. Only for a format/arch pair with no
+    execution rule; ``resolve_peak`` resolves the rest first. The fallback is
+    safe only when the op really runs at the requested precision: when the
+    engine upcasts (Marlin runs 4-bit weights at bf16), fp8 is 2x *too fast*,
+    which is the error ``_EXECUTION_RULES`` exists to remove.
     """
     d = _canon_dtype(dtype)
     if d == "fp32":
@@ -725,7 +1263,8 @@ def roofline(
     because each iteration consumes the previous one's output. Ignoring it does
     not make the prediction slightly optimistic — it makes it absent.
     """
-    peak_flops, peak_dtype = resolve_peak(hw, dtype)
+    compute_dtype = _execution_dtype(hw, dtype)
+    peak_flops, peak_dtype = _ladder_peak(hw, compute_dtype)
     t_c = flops / peak_flops if peak_flops > 0 else 0.0
     t_m = bytes_moved / hw.peak_mem_bw_bytes_per_s if hw.peak_mem_bw_bytes_per_s > 0 else 0.0
     t_l = max(0, serial_launches) * hw.kernel_launch_overhead_s
@@ -746,4 +1285,5 @@ def roofline(
         peak_flops_per_s=peak_flops,
         estimated=estimated,
         serial_launches=max(0, serial_launches),
+        compute_dtype=compute_dtype,
     )
