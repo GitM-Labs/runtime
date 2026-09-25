@@ -933,3 +933,71 @@ def test_plan_cli_forwards_spec_decode_and_launch_flags(capsys):
     assert "D=3 alpha=0.6" in out and spec > plain
     eager, _ = floor(["--launch-overhead", "5e-6"])
     assert eager > plain
+
+
+# ── GLM-5.3-Flash: KDA + MLA, priced as all-MLA ──────────────────────────────
+#
+# zai-org/GLM-5.3-Flash interleaves 34 KDA linear-attention layers with 11 MLA
+# layers. No family holds both, so the entry takes glm_moe_dsa and prices every
+# layer as MLA. These pin what the entry does get right — the 11-layer indexer
+# schedule read from the weight map (the config says 45), the dense prefix, the
+# fp8 split — and pin the known footprint gap so nobody reads it as a fit.
+
+
+def _gb200():
+    from gitm.planner.context import hardware_spec_for, peak_for_sku
+
+    return hardware_spec_for(peak_for_sku("GB200"))
+
+
+def test_glm53_flash_catalogue_entry_loads_and_predicts():
+    assert "glm-5.3-flash" in available()
+    assert load_entry("glm-5.3-flash")["family"] == "glm_moe_dsa"
+    spec = load_spec("glm-5.3-flash")
+    assert spec.n_layers == 45
+    assert spec.n_full_indexer_layers == 11  # the MLA layers only, per the weight map
+    assert spec.n_sparse_mlp_layers == 42  # layers 0-2 dense
+    assert spec.qk_rope_head_dim == 0  # no decoupled RoPE key on this MLA
+    assert spec.num_nextn_predict_layers == 1
+    assert (spec.n_routed_experts, spec.num_experts_per_tok) == (288, 8)
+
+
+def test_glm53_flash_weight_bytes_against_published_checkpoint():
+    """328.33 GB published. The entry lands at -2.06%, and the gap is known.
+
+    KDA priced as MLA (-5.37 GB) and the unmodelled vision tower (-1.13 GB) are
+    most of it; the design note itemises the rest to the byte. Pinned loosely
+    enough to survive a planner refinement, tightly enough that a dtype
+    regression (bf16 experts would double the total) fails.
+    """
+    published = 328_326_771_576  # model.safetensors.index.json total_size
+    assert model_weight_bytes(load_spec("glm-5.3-flash")) / published == pytest.approx(1.0, abs=0.03)
+
+
+def test_glm53_flash_indexer_follows_the_weight_map_not_the_config():
+    """config.json lists indexer_types as 45 x 'full'; indexer tensors exist on 11
+    layers. Taking the config at its word would price 34 indexers that are not
+    in the checkpoint."""
+    g, _ = predict("glm-5.3-flash", batch=BatchConfig(batch=32, kv_cache_len=8192))
+    ops = [n.op for n in g.nodes]
+    assert ops.count("attn_index_proj") == 11
+    assert ops.count("attn_index_score") == 11
+
+
+def test_glm53_flash_plans_the_recipe_shape_on_gb200():
+    """The vLLM recipe's shape: a GB200 tray, TP4, batch 32 at 8K. Experts price
+    against the fp8 peak, no peak is flagged as a fallback, and the MoE runs on
+    42 layers. GB200 has no fp32 figure in context.py, so the fp32 router takes
+    the HardwareSpec default unflagged, as resolve_peak documents; the design
+    note's G4 carries what that costs at prefill."""
+    g, family = predict(
+        "glm-5.3-flash", hw=_gb200(),
+        batch=BatchConfig(batch=32, kv_cache_len=8192),
+        sharding=ShardingConfig(tp=4),
+    )
+    ops = [n.op for n in g.nodes]
+    assert family == "glm_moe_dsa" and len(g.nodes) == 869
+    assert not g.has_fallback_peaks and not g.has_unpriced_collectives
+    assert ops.count("moe_routed") == 42
+    routed = next(n for n in g.nodes if n.op == "moe_routed")
+    assert routed.prediction.peak_dtype == "fp8" and routed.prediction.bound == "memory"
