@@ -579,3 +579,18 @@ def test_plan_json_includes_fit_and_resolved_cache(capsys, dtype, bpt):
     assert fit["kv_needed"] == 32 * 8192 * bpt
     assert fit["kv_available"] == fit["budget"] - fit["weights"] - fit["workspace"]
     assert fit["fits"] == (fit["kv_available"] >= fit["kv_needed"])
+
+
+def test_plan_json_leaves_fit_unavailable_without_capacity(capsys):
+    """An unknown SKU falls back to a spec with memory_bytes 0. The text output
+    says the capacity is unknown; the JSON must not turn that into fits: false."""
+    from gitm.planner.registry import main
+
+    argv = ["kimi-k2.6", "--gpu", "NOTAGPU", "--batch", "32", "--kv-len", "8192", "--tp", "8"]
+    assert main(argv + ["--json"]) == 0
+    out = capsys.readouterr().out
+    data = json.loads(out[out.index("{"):])
+    assert data["memory_fit"] is None
+    assert "no HBM capacity" in data["memory_fit_unavailable_reason"]
+    assert main(argv) == 0
+    assert "fit       no HBM capacity" in capsys.readouterr().out

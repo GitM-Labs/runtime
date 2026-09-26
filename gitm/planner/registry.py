@@ -419,15 +419,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.as_json:
-        fit_data = None
+        fit_data, fit_why = None, f"fit ledger unsupported for {family}"
         if family == "glm_moe_dsa":
-            from gitm.planner.glm_graph import memory_fit
-
-            fit = memory_fit(spec, hw, batch, sharding,
-                             gpu_memory_utilization=args.gpu_mem_util,
-                             workspace_bytes=args.workspace_gb * 1e9)
-            fit_data = {**asdict(fit), "kv_available": fit.kv_available,
-                        "kv_tokens": fit.kv_tokens, "fits": fit.fits}
+            fit, fit_why = _fit_ledger(spec, hw, batch, sharding, args)
+            if fit is not None:
+                fit_data = {**asdict(fit), "kv_available": fit.kv_available,
+                            "kv_tokens": fit.kv_tokens, "fits": fit.fits}
         print(json.dumps({
             "model": getattr(spec, "name", None),
             "family": family,
@@ -444,8 +441,7 @@ def main(argv: list[str] | None = None) -> int:
             "gpu_memory_utilization": args.gpu_mem_util,
             "workspace_bytes": args.workspace_gb * 1e9,
             "memory_fit": fit_data,
-            "memory_fit_unavailable_reason": (None if fit_data is not None
-                                               else f"fit ledger unsupported for {family}"),
+            "memory_fit_unavailable_reason": None if fit_data is not None else fit_why,
             "total_pred_s": g.total_pred_s,
             "has_unpriced_collectives": g.has_unpriced_collectives,
             "has_fallback_peaks": g.has_fallback_peaks,
@@ -471,6 +467,25 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+_NO_CAPACITY = "no HBM capacity in the catalogue for this SKU"
+
+
+def _fit_ledger(spec, hw: HardwareSpec, batch, sharding, args):
+    """The per-rank ledger, or the one reason it cannot be built.
+
+    Text and JSON output both come through here, so an unknown SKU (the fallback
+    spec carries ``memory_bytes`` 0) reads as unknown capacity in both rather
+    than as a zero-capacity deployment that does not fit.
+    """
+    if hw.memory_bytes <= 0:
+        return None, _NO_CAPACITY
+    from gitm.planner.glm_graph import memory_fit
+
+    return memory_fit(spec, hw, batch, sharding,
+                      gpu_memory_utilization=args.gpu_mem_util,
+                      workspace_bytes=args.workspace_gb * 1e9), None
+
+
 def _render_precision_and_fit(spec, hw: HardwareSpec, batch, sharding, args) -> str:
     """What the expert weights execute as, and the per-rank memory ledger.
 
@@ -478,7 +493,6 @@ def _render_precision_and_fit(spec, hw: HardwareSpec, batch, sharding, args) -> 
     format, the backend it lands on and the rows at which it turns compute-bound
     are printed rather than left implicit in a bytes column.
     """
-    from gitm.planner.glm_graph import memory_fit
     from gitm.planner.roofline import critical_rows, distinct_experts, resolve_execution
 
     dtype = spec.dtype_for("moe_routed", spec.expert_dtype)
@@ -497,11 +511,9 @@ def _render_precision_and_fit(spec, hw: HardwareSpec, batch, sharding, args) -> 
         f"            {rows_per_expert:.2f} rows/expert at this batch; compute-bound "
         f"above {knee:.0f}",
     ]
-    if hw.memory_bytes <= 0:
-        return "\n".join(out + ["  fit       no HBM capacity in the catalogue for this SKU"])
-    fit = memory_fit(spec, hw, batch, sharding,
-                     gpu_memory_utilization=args.gpu_mem_util,
-                     workspace_bytes=args.workspace_gb * 1e9)
+    fit, why = _fit_ledger(spec, hw, batch, sharding, args)
+    if fit is None:
+        return "\n".join(out + [f"  fit       {why}"])
     ws = (f"{fit.workspace / 1e9:.1f} GB workspace" if fit.workspace
           else "workspace unstated (0)")
     out += [
