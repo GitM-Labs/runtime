@@ -515,6 +515,10 @@ def main(argv: list[str] | None = None) -> int:
             # --spec-tokens 3` silently priced a plain decode step.
             ("spec_tokens", "--spec-tokens"), ("acceptance_rate", "--acceptance-rate"),
             ("launch_overhead", "--launch-overhead"),
+            # Same omission a second time: added to add_plan_arguments and not
+            # here, so `gitm plan --kv-cache-dtype bf16` priced the fp8 cache.
+            ("kv_cache_dtype", "--kv-cache-dtype"),
+            ("workspace_gb", "--workspace-gb"), ("gpu_mem_util", "--gpu-mem-util"),
         ):
             val = getattr(args, name, None)
             if val is not None:

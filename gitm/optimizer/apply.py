@@ -67,7 +67,9 @@ def apply_intervention(
 
     ``min_keep_delta`` is the regression threshold: a measured delta below it
     (e.g. a slowdown) is rolled back. With no measurement (``measure`` returns
-    ``None``) the change is kept — apply-only mode.
+    ``None``) the change is kept — apply-only mode. A spec carrying a
+    ``correctness_gate`` is additionally rolled back when that gate fails,
+    regardless of the measured delta.
 
     When an ``audit`` log is supplied, every live mutation and every rollback is
     recorded to the durable safety trail (best-effort — a broken audit sink never
@@ -96,6 +98,30 @@ def apply_intervention(
                knobs=_knob_values(spec))
         return ApplyResult(False, rolled_back=True, measured_delta=None,
                            error=f"measure failed, restored: {exc}")
+
+    # Step 3b: the spec's own correctness gate, before any keep decision. A
+    # faster candidate that fails it is restored with the reason, so the
+    # throughput number alone can never keep a change that alters output.
+    if spec.correctness_gate is not None:
+        # The gate is a benchmark against a live server: it can time out, lose
+        # the connection, or crash. Any of those is "not judged", and an
+        # unjudged change is restored exactly like a failed one — the same
+        # shape as the measure step above, so a crash mid-gate can never leave
+        # the candidate applied.
+        try:
+            why = spec.correctness_gate(spec)
+        except Exception as exc:
+            applicator.restore(snapshot)
+            _audit(audit, "revert", spec, knobs=_knob_values(spec),
+                   cause=f"correctness gate crashed, restored: {exc}")
+            return ApplyResult(True, rolled_back=True, measured_delta=delta,
+                               error=f"correctness gate crashed, restored: {exc}")
+        if why is not None:
+            applicator.restore(snapshot)
+            _audit(audit, "revert", spec, knobs=_knob_values(spec),
+                   cause=f"correctness gate failed: {why}")
+            return ApplyResult(True, rolled_back=True, measured_delta=delta,
+                               error=f"correctness gate failed: {why}, restored")
 
     # Step 4: keep-or-rollback on the regression threshold.
     if delta is not None and delta < min_keep_delta:

@@ -12,6 +12,7 @@ from gitm.planner.roofline import (
     HardwareSpec,
     ShardingConfig,
     distinct_experts,
+    kv_elem_bytes,
     roofline,
     weight_bytes,
 )
@@ -448,7 +449,7 @@ def kv_bytes_per_token(spec: HybridMoEModelSpec) -> float:
     model: 9 full-attention layers grow with context and 39 windowed ones do
     not, giving ``11,520 x S + 12.78M`` elements rather than a rate 4x higher.
     """
-    kw = weight_bytes(spec.kv_dtype)
+    kw = kv_elem_bytes(spec.kv_dtype)
     return sum(
         spec.kv_entry_elems(i) * kw
         for i in range(spec.n_layers)
@@ -467,7 +468,7 @@ def kv_fixed_bytes_per_sequence(spec: HybridMoEModelSpec) -> float:
     Zero for a checkpoint with no windowed layers, which is every checkpoint this
     family carried before MiMo.
     """
-    kw = weight_bytes(spec.kv_dtype)
+    kw = kv_elem_bytes(spec.kv_dtype)
     return sum(
         spec.attention_window(i) * spec.kv_entry_elems(i) * kw
         for i in range(spec.n_layers)
@@ -484,7 +485,7 @@ def attention_page_bytes(spec: HybridMoEModelSpec, block_size: int) -> float:
     from the config is the cheapest available check that the state arithmetic in
     this module is right.
     """
-    return block_size * 2.0 * spec.kv_dim * weight_bytes(spec.kv_dtype)
+    return block_size * 2.0 * spec.kv_dim * kv_elem_bytes(spec.kv_dtype)
 
 
 def mamba_page_bytes(spec: HybridMoEModelSpec) -> float:
@@ -607,7 +608,7 @@ def _emit_full_attention(
         "attn_qnorm_rope_insert",
         3.0 * normed + 6.0 * roped,
         2.0 * normed * aw + 2.0 * roped * aw
-        + rows * kv_heads * (head_dim + v_head_dim) * weight_bytes(spec.kv_dtype),
+        + rows * kv_heads * (head_dim + v_head_dim) * kv_elem_bytes(spec.kv_dtype),
         spec.act_dtype,
     )
 
@@ -615,7 +616,7 @@ def _emit_full_attention(
     # chunk, linear at decode. Traffic follows the cached entries read, which is
     # what makes a wide step amortise cache reads across many queries and is the
     # reason prefill flips this node from memory-bound to compute-bound.
-    kw = weight_bytes(spec.kv_dtype)
+    kw = kv_elem_bytes(spec.kv_dtype)
     # QK contracts over ``head_dim``; PV contracts over ``v_head_dim``. Equal
     # unless the checkpoint splits them.
     qk = 2.0 * qk_pairs * heads * head_dim
