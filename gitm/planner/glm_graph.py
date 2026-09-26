@@ -354,7 +354,7 @@ def model_weight_bytes(
     if hw is not None:
         ex = resolve_execution(spec.dtype_for("moe_routed", spec.expert_dtype), hw)
         ew = ex.resident_bytes * expert_pad_factor(
-            ex, spec.hidden, spec.moe_intermediate_size, es
+            ex, spec.hidden, spec.moe_intermediate_size, 1 if sh.ep > 1 else tp
         )
     sw = weight_bytes(spec.dtype_for("moe_shared", spec.expert_dtype))
     ww = weight_bytes(spec.weight_dtype)
@@ -809,7 +809,7 @@ def _emit_layer(
     per_position_flops = 6.0 * h * inter  # 2 * (gate + up + down) * h * inter
     ex_routed = w_exec("moe_routed", ed)
     ew = ex_routed.bytes_per_use * expert_pad_factor(
-        ex_routed, h, spec.moe_intermediate_size, es
+        ex_routed, h, spec.moe_intermediate_size, 1 if sh.ep > 1 else tp
     )
 
     if spec.n_shared_experts > 0:

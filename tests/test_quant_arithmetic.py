@@ -499,3 +499,25 @@ def test_plan_json_carries_estimated_per_node(capsys, tmp_path):
                  "--tp", "8", "--json"]) == 0
     nodes = json.loads(capsys.readouterr().out)["nodes"]
     assert {n["estimated"] for n in nodes if n["op"] == "moe_routed"} == {True}
+
+
+@pytest.mark.parametrize("tp", [1, 8])
+def test_expert_parallel_memory_pads_whole_experts(tp):
+    spec = replace(load_spec("kimi-k2.6"), hidden=2880, moe_intermediate_size=2880,
+                   expert_dtype="mxfp4")
+    sharding = ShardingConfig(tp=tp, ep=8)
+    padding_bytes = (model_weight_bytes(spec, sharding, B200)
+                     - model_weight_bytes(spec, sharding))
+    expected = ((spec.n_sparse_mlp_layers + spec.num_nextn_predict_layers)
+                * spec.n_routed_experts * 3 * (3072**2 - 2880**2) * 0.53125 / 8)
+    assert padding_bytes == pytest.approx(expected)
+
+
+def test_expert_parallel_traffic_uses_whole_expert_padding():
+    spec = replace(load_spec("kimi-k2.6"), hidden=2880, moe_intermediate_size=2880,
+                   expert_dtype="mxfp4")
+    baseline = predict_glm_graph(spec, B200, BASELINE, ShardingConfig(tp=1))
+    parallel = predict_glm_graph(spec, B200, BASELINE, ShardingConfig(tp=1, ep=8))
+    before = next(n.prediction.bytes for n in baseline.nodes if n.op == "moe_routed")
+    after = next(n.prediction.bytes for n in parallel.nodes if n.op == "moe_routed")
+    assert after == pytest.approx(before / 8)

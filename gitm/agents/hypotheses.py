@@ -312,6 +312,9 @@ def _mla_backends(w: Workload) -> tuple[str, str, bool] | str:
                 "(platforms/rocm.py:324-326); the prediction is for ROCM_AITER_MLA")
     default, fp8, same = _MLA_BACKENDS[w.hw.arch]
     forced = str(w.serving.get("attention_backend", "") or "").upper()
+    if forced == default and default != fp8:
+        return (f"attention_backend={forced} is explicitly pinned; the fp8 intervention "
+                f"does not switch it to {fp8}")
     if not forced or forced == default:
         return default, fp8, same
     if forced == fp8:

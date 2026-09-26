@@ -427,3 +427,12 @@ def test_h002_unsupported_configs_never_reach_the_proposal_path(case):
     assert proposer.propose("memory_bound") == []
     assert proposer.predictions == {}
     assert proposer.skipped == [("H-002", H002.applies(workload))]
+
+
+
+def test_h002_rejects_forced_backend_that_cannot_follow_fp8_switch():
+    workload = _k25("H200", serving={"attention_backend": "FLASH_ATTN_MLA"})
+    proposer = _prop(workload, hypotheses=(H002,))
+    assert proposer.propose("memory_bound") == []
+    assert "explicitly pinned" in dict(proposer.skipped)["H-002"]
+    assert proposer.predictions == {}
