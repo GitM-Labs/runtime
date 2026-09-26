@@ -45,7 +45,8 @@ At the registered operating point (128 sequences, 1,024 cached tokens, TP8, MI35
 
 - **Total overhead.** The routed experts' scale stream is 0.926 ms of floor per step (1.234 ms on a measured-time basis at mid-band efficiency 0.75).
 - **Recoverable by this intervention.** At most half of it: 0.462 ms of floor. The bundled shared-expert and dense-layer requant adds 0.008 ms, because at TP8 those nodes sit at their launch floor.
-- **Cost the intervention adds.** The AMD checkpoint quantises activations too (`input_tensors`: fp4, dynamic). A W4A4 MLP needs two quantised inputs: the MLP input and the SiLU output that feeds the down projection. If the backend runs those as separate kernels, that is 2 x 61 = 122 launches, 0.244 ms. The low end of the band charges all of it, the mean half, and the high end assumes both fuse into the GEMMs.
+- **Cost the intervention adds.** The AMD checkpoint quantises activations too (`input_tensors`: fp4, dynamic). AITER runs that as its own kernel (fused with the MoE sort below 1,024 tokens, `aiter/fused_moe.py:966-976`) before stage 1, and again before stage 2 (`:1066-1090`): 2 x 61 = 122 launches, 0.244 ms, read from source rather than assumed. The low end of the band charges all of it, the mean half, and the high end assumes the launches hide behind the GEMMs.
+- **A path the arithmetic does not cover.** For `token x top_k <= 384` (M <= 48 on Kimi) with shuffled weights, AITER routes MXFP4 to a `cktile` 2-stage path that takes bf16 activations and no activation scale (`aiter/fused_moe.py:803-827, :944-954`), which is W4A16, not W4A4. The registered point (128 sequences, 1,024 rows) is above that threshold and takes the A4W4 CK path. The 32-sequence row is not, and its arm B would run a different kernel from the one priced; whether the `is_shuffled` attribute survives vLLM's custom-op boundary could not be verified from source. Rejection 1's byte check is unaffected either way.
 
 ## Applicability conditions
 
@@ -66,9 +67,11 @@ Metric: primary, the summed duration and HBM read bytes of the MoE kernels per d
 
 | Sequences | Cached tokens | Step floor INT4 (ms) | Step floor MXFP4 (ms) | Routed bytes per layer per rank | Recoverable lo / mean / hi (ms, measured basis) | ITL reduction lo / mean / hi |
 |---:|---:|---:|---:|---:|---:|---:|
-| **128** | **1,024** | **11.62** | **11.14** | **1,110.9 MB -> 1,049.3 MB (-5.55%)** | **-5.87 / 0.51 / 6.98** | **-44.8% / 3.3% / 35.6%** |
-| 64 | 4,352 | 11.02 | 10.64 | | -4.72 / 0.38 / 5.56 | -36.9% / 2.6% / 30.9% |
-| 32 | 8,192 | 8.62 | 8.37 | | -3.24 / 0.21 / 3.72 | -31.7% / 1.9% / 27.2% |
+| **128** | **1,024** | **11.62** | **11.27** | **1,110.9 MB -> 1,049.3 MB (-5.55%)** | **-5.87 / 0.51 / 6.98** | **-44.8% / 3.3% / 35.6%** |
+| 64 | 4,352 | 11.02 | 10.76 | | -4.72 / 0.38 / 5.56 | -36.9% / 2.6% / 30.9% |
+| 32 | 8,192 | 8.62 | 8.49 | | -3.24 / 0.21 / 3.72 | -31.7% / 1.9% / 27.2% |
+
+The MXFP4 floor includes the activation-quant kernel per MoE layer that AITER runs separately (`aiter/fused_moe.py:966-990`); the INT4 arm has none.
 
 The row at 128 sequences is registered because the experts are the largest share of the step there: the cache is short and the effect is largest. The 64 x 4,352 row is the team loop's `rag` headline, for comparison.
 
@@ -78,10 +81,10 @@ Why the band dwarfs the mean. The two arms run different MoE kernels: INT4 W4A16
 
 Two arms on the MI355X loop deployment (`deploy/k8s/mi355x-kimi-loop.yaml`: TP8, `VLLM_ROCM_USE_AITER=1`, `--max-num-batched-tokens 8192`), with only the checkpoint changed:
 
-| Arm | Model | Quantisation as served |
+| Arm | Model | Quantisation as served (read from vLLM b1388b1f + AITER v0.1.10.post2) |
 |---|---|---|
-| A | `moonshotai/Kimi-K2.5` | compressed-tensors INT4 W4A16 |
-| B | `amd/Kimi-K2.5-MXFP4` (rev `42c6da36`) | Quark MXFP4 W4A4, native on gfx950 |
+| A | `moonshotai/Kimi-K2.5` | compressed-tensors INT4 W4A16: Triton `fused_moe_kernel_gptq_awq`, int4 dequantised per tile in-kernel, bf16 MACs, no activation quant, no repack (`compressed_tensors_moe.py:177-190`, `fused_moe.py:288-289`) |
+| B | `amd/Kimi-K2.5-MXFP4` (rev `42c6da36`) | Quark MXFP4 W4A4 on gfx950: CK 2-stage MoE typed A:mxfp4 B:mxfp4 on the scaled f8f6f4 MFMA, e8m0 scales kept at 1 B per 32, MXFP4 activation quant in its own kernel fused with the MoE sort (`quark_moe.py:703-707`, `aiter/fused_moe.py:966-990`, `ck/.../warp_gemm_attribute_mfma_impl.hpp:1642`) |
 
 1. Load test. Use the team's `guide` helper (`scripts/kimi_loop/run_loop.sh`) at 128 streams with prompt 1,024 and output 256, for 180 s, with 3 repetitions per arm.
 2. Kernel plane. Take one `rocprofv3 --kernel-trace` window per arm and sum the MoE kernel durations per decode step. Then replay one layer's MoE kernel offline with memory counters, as the Tier-2 work in `docs/mi355x_experiment_plan.md` describes, to read its HBM bytes. Counters stay out of the serving runs.
@@ -115,4 +118,5 @@ Two arms on the MI355X loop deployment (`deploy/k8s/mi355x-kimi-loop.yaml`: TP8,
 | GSM8K on both arms | about 1 h | |
 | Total GPU time | about 3 node-hours (24 GPU-hours); arm A can reuse the loop's existing arm-A run if the config matches | Abhiram approves |
 | Noise floor for MoE kernel time and ITL on MI355X | not yet measured | Isaiah |
-| Which ROCm kernel runs INT4 W4A16 MoE, and AITER's MXFP4 scale layout | not read (ROCm sources are outside the pinned checkout) | Tarun, before the run |
+| Which ROCm kernel runs INT4 W4A16 MoE, and AITER's MXFP4 scale layout | read (see the arm table): Triton W4A16, and e8m0 scales stay 1 B per 32 through `e8m0_shuffle` | done |
+| Does the M <= 48 `cktile` W4A16 path fire under vLLM (the `is_shuffled` attribute) | not verifiable from source; check the server log or a trace for `moe_cktile2stages` vs `ck_moe_stage1` kernel names at 32 sequences | Tarun, before the run |

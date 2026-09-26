@@ -10,7 +10,7 @@
 
 ## Claim
 
-On the team's 8xMI355X Kimi K2.5 deployment at TP8, adding `--kv-cache-dtype fp8` reduces decode inter-token latency (ITL) by 11.1% at the loop's headline point (`rag`, 64 concurrent), with a derived range of 9.2% to 14.0%. The saving in ms is proportional to the cached tokens read per step, and it does not shrink with tensor parallelism.
+On the team's 8xMI355X Kimi K2.5 deployment at TP8, adding `--kv-cache-dtype fp8` reduces decode inter-token latency (ITL) by 11.1% at the loop's headline point (`rag`, 64 concurrent), with a derived range of 2.5% to 19.9% (the bf16 and fp8 arms run different AITER asm kernels, so each end of the planner's efficiency band is independent). The saving in ms is proportional to the cached tokens read per step, and it does not shrink with tensor parallelism.
 
 This is the lever the loop runbook already plans for its `e8` arm (`INTERVENTION='--kv-cache-dtype fp8'`). This spec registers the prediction before that run.
 
@@ -38,8 +38,8 @@ At the headline point, the attention core's cache read above an fp8 cache is 1.2
 
 The intervention can recover all of those bytes. How much time comes back depends on whether the kernel changes:
 
-- **MI355X keeps the kernel.** With AITER enabled, `ROCM_AITER_MLA` is first for MLA (`platforms/rocm.py:317-322`) and accepts both bf16 and fp8 (`v1/attention/backends/mla/rocm_aiter_mla.py:32-38`). One efficiency prices both sides, so the kernel's time halves anywhere in the band. The band only moves the attention core's share of the step.
-- **Blackwell keeps the kernel.** `FLASHINFER_MLA` serves both (`flashinfer_mla.py:40-45`, `:65-66`).
+- **MI355X keeps the backend, not the kernel.** With AITER enabled, `ROCM_AITER_MLA` is first for MLA (`platforms/rocm.py:317-322`) and accepts both bf16 and fp8 (`v1/attention/backends/mla/rocm_aiter_mla.py:30-38`). But AITER dispatches a hand-written asm kernel per dtype pair (`aiter/csrc/py_itfs_cu/asm_mla.cu:253-287`): with a bf16 cache the trace shows `mla_a16w16_qh16_*`, with fp8 it shows `mla_a8w8_qh16_qseqlen1_gqaratio16` and vLLM quantises the query to fp8 first (`mla_attention.py:669-674`, `:2099`). Two kernels, so each end of the band is independent, as on Hopper. The kernel's time still halves at the mean. One more read fact: at TP8 Kimi has 8 heads per rank, under AITER's minimum of 16, so the query is repeated 2x in heads (`rocm_aiter_mla.py:368`, `:413-414`); that pads FLOPs, not cache bytes, and the core stays memory-bound.
+- **Blackwell keeps the backend.** `FLASHINFER_MLA` serves both (`flashinfer_mla.py:40-45`, `:65-66`). Whether its fp8 path is the same kernel was not read, so it is priced as a switch, the wider band.
 - **Hopper switches the kernel.** `FLASH_ATTN_MLA`, first on sm90 (`platforms/cuda.py:92-97`), has no fp8 path (`flashattn_mla.py:45-49`, `:322-323`), so fp8 moves the core to `FLASHMLA` (`flashmla.py:48-53`, `:73-74`). The old and new kernels may then land at different efficiencies. In the worst case in the band, the kernel's time falls by only 13.6% instead of 50%.
 
 What the intervention does not recover: the core's launch floor, and the unchanged bf16 query and output traffic. A second benefit, twice the cache capacity per rank, is real but is not a per-step latency effect and is not part of this prediction.
@@ -67,19 +67,19 @@ Metric: decode ITL p50, ms per step, over the steady-state window. Baseline: the
 
 | SKU | Sequences | Cached tokens | Floor bf16 (ms) | Floor fp8 (ms) | Total overhead, measured (ms) | Recoverable lo / mean / hi (ms) | ITL reduction lo / mean / hi |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| MI355X | 64 | 1,152 (`chat`) | 9.22 | 8.89 | 0.43 | 0.34 / 0.43 / 0.59 | 2.8% / 3.5% / 4.7% |
-| **MI355X** | **64** | **4,352 (`rag`, headline)** | **11.02** | **9.79** | **1.63** | **1.29 / 1.63 / 2.22** | **9.2% / 11.1% / 14.0%** |
-| MI355X | 128 | 4,352 | 15.36 | 12.91 | 3.26 | 2.58 / 3.26 / 4.45 | 13.5% / 15.9% / 19.5% |
+| MI355X | 64 | 1,152 (`chat`) | 9.22 | 8.89 | 0.43 | 0.09 / 0.43 / 0.84 | 0.8% / 3.5% / 6.6% |
+| **MI355X** | **64** | **4,352 (`rag`, headline)** | **11.02** | **9.79** | **1.63** | **0.35 / 1.63 / 3.16** | **2.5% / 11.1% / 19.9%** |
+| MI355X | 128 | 4,352 | 15.36 | 12.91 | 3.26 | 0.70 / 3.26 / 6.32 | 3.7% / 15.9% / 27.7% |
 | H200 | 32 | 8,192 | 13.32 | 11.40 | 2.56 | 0.55 / 2.56 / 4.96 | 3.3% / 14.4% / 25.3% |
-| B200 | 32 | 8,192 | 8.61 | 7.46 | 1.54 | 1.21 / 1.54 / 2.09 | 11.2% / 13.4% / 16.6% |
+| B200 | 32 | 8,192 | 8.61 | 7.46 | 1.54 | 0.33 / 1.54 / 2.97 | 3.1% / 13.4% / 23.6% |
 
 Arithmetic for the headline row. The core reads 64 x 4,352 entries x 61 layers per rank per step. At 1,152 B that is 19.57 GB, or 2.447 ms at 8 TB/s; at 576 B it is 1.223 ms. The step floor falls from 11.017 to 9.794 ms.
 
 - **Mean.** The unchanged rest of the step is (11.017 - 2.447) / 0.75 = 11.43 ms on the measured basis. The core is 2.447 / 0.75 = 3.26 ms, and it halves, saving 1.63 ms of 14.69, which is 11.1%.
-- **lo.** Both kernels run at 0.95: 1.29 ms saved out of 11.43 + 2.58.
-- **hi.** Both kernels run at 0.55: 2.22 ms saved out of 11.43 + 4.45.
+- **lo.** The bf16 asm kernel at 0.95 and the fp8 asm kernel at 0.55: 2.447 / 0.95 - 1.223 / 0.55 = 0.35 ms saved out of 11.43 + 2.58.
+- **hi.** The reverse: 2.447 / 0.55 - 1.223 / 0.95 = 3.16 ms saved out of 11.43 + 4.45.
 
-The kernel's own time falls by exactly 50% at every end. That covered-op figure is what `expected_delta_*` carries on the emitted spec, because `replay.predict_delta` multiplies it by the trace's attention coverage.
+The kernel's own time falls by 50% at the mean and by 13.6% to 71.1% across the band, because the two arms run different asm kernels. That covered-op figure is what `expected_delta_*` carries on the emitted spec, because `replay.predict_delta` multiplies it by the trace's attention coverage.
 
 The `rag` point fits comfortably. The fit ledger (`memory_fit`, the loop's 0.92 utilisation, 4.5 GB workspace) leaves 184 GB per MI355X rank for KV, and the bf16 cache needs 19.6 GB.
 
@@ -87,14 +87,16 @@ The `rag` point fits comfortably. The fit ledger (`memory_fit`, the loop's 0.92 
 
 On the loop deployment (`deploy/k8s/mi355x-kimi-loop.yaml`: TP8, `VLLM_ROCM_USE_AITER=1`, `--gpu-memory-utilization 0.92`, `--max-num-batched-tokens 8192`), two arms, changed by `arm.sh` in-pod:
 
-| Arm | Extra flags | MLA backend |
+| Arm | Extra flags | MLA backend and kernel |
 |---|---|---|
-| A | none (the loop's existing headline run) | ROCM_AITER_MLA, bf16 |
-| C | `--kv-cache-dtype fp8` | ROCM_AITER_MLA, fp8 |
+| A | none (the loop's existing headline run) | ROCM_AITER_MLA; `mla_decode_stage1_asm_fwd` running `mla_a16w16_qh16_*`, then `mla_reduce_v1` |
+| C | `--kv-cache-dtype fp8` | ROCM_AITER_MLA; `mla_a8w8_qh16_qseqlen1_gqaratio16`, then `mla_reduce_v1`; query quantised to fp8 |
+
+There is no bf16-cache arm on the fp8 kernel here, unlike H200's arm B, because AITER's kernel choice follows the cache dtype and cannot be forced.
 
 1. **Load.** Run `INTERVENTION='--kv-cache-dtype fp8' bash run_loop.sh e8`. It re-runs the headline (`rag`, c=64) under the lever. Add the `chat` config at c=64 for the scaling check, with 3 repetitions each.
 2. **Kernel plane.** Take one GITM-traced window per arm (the loop's arm B tracer, not during the timed runs) and read the per-layer MLA decode kernel duration.
-3. **Pre-run check.** Confirm that the AITER MLA decode kernel's name contains one of the spec's `kernel_scope` substrings (`flash_mla`, `flashmla`, `cutlass_mla`, `flashinfer_mla`, `mla_decode`, `aiter_mla`, `mla_fwd`). The replay credits only those, deliberately: `classify_op` also files `reshape_and_cache` and `slot_mapping` under `attn_score_value`, and an fp8 cache does not halve them. If the AITER name matches none, add it to the scope; otherwise `predict_delta` sees zero coverage and ranks this candidate at nothing.
+3. **Pre-run check.** The spec's `kernel_scope` now carries AITER's names read from source (`mla_a16w16`, `mla_a8w8`, `mla_decode`, `mla_reduce`, from `aiter/aiter/mla.py:318-349` and `asm_mla.cu`). Confirm on the first trace that the captured symbols contain them; the replay credits only those, deliberately, because `classify_op` also files `reshape_and_cache` and `slot_mapping` under `attn_score_value` and an fp8 cache does not halve them.
 
 On H200, run a third arm to separate the backend switch from the byte halving. Arm B is `--attention-backend FLASHMLA` with a bf16 cache (`engine/arg_utils.py:597`). Its fp8-vs-bf16 comparison on the same kernel then isolates the mechanism.
 
@@ -111,7 +113,7 @@ The loop's keep decision (`optimizer/apply.py`) measures throughput only, so a f
 ## Rejection conditions
 
 1. **Effect.** If the ITL reduction at the headline is below 9.2% minus the noise floor, reject at this operating point.
-2. **Mechanism.** The kernel is unchanged on MI355X, so the MLA decode kernel's own time should halve. If it falls by less than 25% (half the predicted reduction), the kernel is not HBM-bound at head size 576 on gfx950. Reject the mechanism, and record the measured time as a fixture.
+2. **Mechanism.** The two arms run different asm kernels, so kernel time alone cannot isolate the byte mechanism (the same reasoning as H-001's rejection 2). Take the mechanism from the traced kernel's duration against its bytes: if the fp8 kernel's time is not below the bf16 kernel's by at least 13.6% (the band's worst case), the fp8 asm kernel is less efficient than the bf16 one by more than the band allows, and the measured pair of efficiencies replaces the band for this node. If the byte reduction is not seen in `vllm:gpu_cache_usage_perc` (the fp8 arm should show half the occupancy for the same load), the layout assumption is wrong.
 3. **Scaling.** The predicted saving at `rag` is 3.8x the saving at `chat` (4,352 against 1,152 cached tokens at the same concurrency). If the measured ratio is below 2, the saving is not cache traffic.
 4. **Correctness.** A gate failure rejects the lever for this family with uncalibrated scales. Reconsider it with `--calculate-kv-scales` (`engine/arg_utils.py:1007`) or a checkpoint that ships scales.
 
@@ -131,6 +133,6 @@ The loop's keep decision (`optimizer/apply.py`) measures throughput only, so a f
 | GSM8K and needle, 2 arms | about 1.5 h | |
 | Total | about 3.5 node-hours (28 GPU-hours); arm A reuses the loop's headline run if the config matches | Abhiram approves |
 | Noise floor for ITL p50 and p99 at the headline point | not yet measured; rejection 1 and the proposer's `noise_floor` need it | Isaiah |
-| AITER MLA kernel name in `classify_op` | not checked | Tarun, before the run |
+| AITER MLA kernel names | read from source and in the spec's `kernel_scope`; confirm against the first trace | Tarun, at the run |
 
 A local test is not a measured win. The tests in `tests/test_hypotheses.py` show only that the candidate is generated, gated and rolled back correctly.

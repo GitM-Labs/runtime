@@ -259,17 +259,22 @@ H001 = Hypothesis(
 
 # ── H-002: a bf16 MLA cache where the engine could store fp8 ──────────────────
 
-#: (default backend with a bf16 cache, backend with an fp8 cache) per arch, in
+#: (backend with a bf16 cache, backend with fp8, same kernel?) per arch, in
 #: vLLM v0.19.1. Hopper switches: FLASH_ATTN_MLA (first on sm90, platforms/
 #: cuda.py:92-97) has no fp8 path (flashattn_mla.py:45-49, :322-323), so fp8
 #: lands on FLASHMLA (flashmla.py:48-53, :73-74). Blackwell keeps FLASHINFER_MLA
-#: (flashinfer_mla.py:40-45, :65-66). CDNA4 keeps ROCM_AITER_MLA only when AITER
-#: MLA is enabled (platforms/rocm.py:317-322; rocm_aiter_mla.py:32-38); without
-#: it the list is TRITON_MLA alone (:324-326), whose fp8 path is not read.
-_MLA_BACKENDS: dict[str, tuple[str, str]] = {
-    "hopper": ("FLASH_ATTN_MLA", "FLASHMLA"),
-    "blackwell": ("FLASHINFER_MLA", "FLASHINFER_MLA"),
-    "cdna4": ("ROCM_AITER_MLA", "ROCM_AITER_MLA"),
+#: (flashinfer_mla.py:40-45, :65-66); whether its fp8 path is the same kernel
+#: was not read, so it is priced as a switch, the wider band. CDNA4 keeps the
+#: ROCM_AITER_MLA backend (platforms/rocm.py:317-322; rocm_aiter_mla.py:30-38)
+#: but not the kernel: AITER picks a hand-written asm kernel per dtype pair
+#: (aiter/csrc/py_itfs_cu/asm_mla.cu:253-287), mla_a16w16_qh16_* for bf16 and
+#: mla_a8w8_qh16_qseqlen1_gqaratio16 for fp8, after vLLM quantises the query to
+#: fp8 too (mla_attention.py:669-674, :2099). A different kernel, so a switch.
+#: Without AITER the ROCm list is TRITON_MLA alone (:324-326), not priced.
+_MLA_BACKENDS: dict[str, tuple[str, str, bool]] = {
+    "hopper": ("FLASH_ATTN_MLA", "FLASHMLA", False),
+    "blackwell": ("FLASHINFER_MLA", "FLASHINFER_MLA", False),
+    "cdna4": ("ROCM_AITER_MLA", "ROCM_AITER_MLA", False),
 }
 
 
@@ -290,27 +295,30 @@ def _executed_kv(w: Workload) -> str:
     return w.spec.kv_dtype if flag == "auto" else flag
 
 
-def _mla_backends(w: Workload) -> tuple[str, str] | str:
-    """(backend with the executed cache, backend with fp8), or why not.
+def _mla_backends(w: Workload) -> tuple[str, str, bool] | str:
+    """(backend with the executed cache, backend with fp8, same kernel), or why not.
 
     The derivation prices one specific kernel pair per arch: vLLM's default
     choice. An explicit ``attention_backend`` in the serving config is honoured
-    only when it is one of that pair (the fp8-capable one on both sides is the
-    same-kernel case); anything else is a kernel the arithmetic never priced.
+    only when it is one of that pair. Forcing the fp8-capable backend on the
+    bf16 side is the same-kernel case only where that backend runs one kernel
+    for both dtypes (Hopper's FLASHMLA); on CDNA4 the backend class is shared
+    and the asm kernel is not, so it stays a switch.
     """
     if w.hw.arch not in _MLA_BACKENDS:
         return f"no fp8 MLA decode backend pinned for arch {w.hw.arch or 'unknown'!r}"
     if w.hw.arch == "cdna4" and not _aiter_enabled(w):
         return ("CDNA4 without VLLM_ROCM_USE_AITER=1 selects TRITON_MLA "
                 "(platforms/rocm.py:324-326); the prediction is for ROCM_AITER_MLA")
-    default, fp8 = _MLA_BACKENDS[w.hw.arch]
+    default, fp8, same = _MLA_BACKENDS[w.hw.arch]
     forced = str(w.serving.get("attention_backend", "") or "").upper()
-    if not forced:
-        return default, fp8
+    if not forced or forced == default:
+        return default, fp8, same
     if forced == fp8:
-        return fp8, fp8
-    if forced == default:
-        return default, fp8
+        # One backend both sides. Same kernel only if the backend is one kernel
+        # family for both dtypes, which is true where the default differs from
+        # it (Hopper: forcing FLASHMLA at bf16 keeps FLASHMLA at fp8).
+        return fp8, fp8, default != fp8
     return (f"attention_backend={forced} is not the pair the derivation prices "
             f"on {w.hw.arch} ({default} -> {fp8})")
 
@@ -346,10 +354,8 @@ def _h002_predict(w: Workload) -> Prediction:
     pair = _mla_backends(w)
     if isinstance(pair, str):
         raise ValueError(f"H-002 does not apply: {pair}")
-    old_b, new_b = pair
-    saved, op, step = _effect(
-        g_old, g_new, ("attn_score_value",), w.hw, same_kernel=old_b == new_b
-    )
+    old_b, new_b, same = pair
+    saved, op, step = _effect(g_old, g_new, ("attn_score_value",), w.hw, same_kernel=same)
     mid = (w.hw.eff_lo + w.hw.eff_hi) / 2.0
     old_attn = _op_time(g_old, "attn_score_value")
     new_attn = _op_time(g_new, "attn_score_value")
@@ -362,8 +368,8 @@ def _h002_predict(w: Workload) -> Prediction:
         f"floor: attn_score_value {old_attn * 1e3:.3f} -> {new_attn * 1e3:.3f} ms; "
         f"step {g_old.total_pred_s * 1e3:.3f} -> {g_new.total_pred_s * 1e3:.3f} ms",
         f"backend {old_b} -> {new_b}"
-        + (" (same kernel: one efficiency for both)" if old_b == new_b
-           else " (switch: each end of the band independent)"),
+        + (" (same kernel: one efficiency for both)" if same
+           else " (different kernel: each end of the band independent)"),
         "saved " + " / ".join(f"{x * 1e3:.3f}" for x in saved) + " ms (lo/mean/hi)",
     )
     return Prediction(
@@ -388,8 +394,12 @@ H002 = Hypothesis(
     target_ops=("attn_score_value",),
     # MLA decode kernels only. ``reshape_and_cache`` and ``slot_mapping`` also
     # classify to attn_score_value, and a narrower cache does not halve them.
+    # CUDA names, plus AITER's persistent-mode pair (aiter/aiter/mla.py:318-349:
+    # mla_decode_stage1_asm_fwd then mla_reduce_v1) and its asm symbols
+    # (mla_a16w16_*, mla_a8w8_*).
     kernel_scope=("flash_mla", "flashmla", "cutlass_mla", "flashinfer_mla",
-                  "mla_decode", "aiter_mla", "mla_fwd"),
+                  "mla_decode", "aiter_mla", "mla_fwd", "mla_a16w16", "mla_a8w8",
+                  "mla_reduce"),
     applies=_h002_applies,
     predict=_h002_predict,
     requires_correctness_gate=True,

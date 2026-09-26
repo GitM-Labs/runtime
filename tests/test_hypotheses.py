@@ -85,15 +85,18 @@ def test_h002_cache_entry_halves():
     assert "1152 B stored vs 576 B as generic fp8" in p.arithmetic[0]
 
 
-def test_h002_same_kernel_band_halves_the_core_at_every_end():
-    """On MI355X (and Blackwell) the backend does not change with the cache
-    dtype, so one efficiency prices both sides and the kernel time halves
-    whatever that efficiency is. Only the step share moves across the band."""
+def test_h002_cdna4_is_a_kernel_switch_not_a_same_kernel_case():
+    """The ROCM_AITER_MLA backend serves both dtypes, but AITER picks a different
+    asm kernel per dtype pair (asm_mla.cu:253-287: mla_a16w16_* for bf16,
+    mla_a8w8_* for fp8, with the query quantised to fp8 too). So each end of the
+    band is independent, as on Hopper; the mean still halves the kernel."""
     p = H002.predict(_k25())
-    assert p.op_delta == pytest.approx((0.5, 0.5, 0.5))
-    lo, mean, hi = p.step_delta
-    assert lo < mean < hi
-    assert mean == pytest.approx(0.111, abs=0.001)
+    lo, mean, hi = p.op_delta
+    assert mean == pytest.approx(0.5)
+    assert lo == pytest.approx(1 - (0.5 / 0.55) / (1 / 0.95))
+    assert hi == pytest.approx(1 - (0.5 / 0.95) / (1 / 0.55))
+    assert "different kernel" in p.arithmetic[3]
+    assert p.step_delta[1] == pytest.approx(0.111, abs=0.001)
 
 
 def test_h002_switch_band_on_hopper():
@@ -385,13 +388,29 @@ def test_h002_refuses_configs_the_derivation_does_not_price(serving, fragment):
 
 def test_h002_honours_an_explicit_backend_inside_the_priced_pair():
     """On H200 an explicit FLASHMLA with a bf16 cache is arm B of the spec: the
-    fp8 switch then keeps the kernel, so the band is the same-kernel one."""
+    fp8 switch then keeps the kernel, so the band is the same-kernel one. On
+    CDNA4 forcing ROCM_AITER_MLA changes nothing: it is the default, and the
+    asm kernel still differs per dtype."""
     forced = _k25("H200", batch=32, kv_len=8192, serving={"attention_backend": "FLASHMLA"})
     assert H002.applies(forced) is None
     p = H002.predict(forced)
     assert p.op_delta == pytest.approx((0.5, 0.5, 0.5))
     default = H002.predict(_k25("H200", batch=32, kv_len=8192))
     assert default.op_delta[0] < 0.5 < default.op_delta[2]
+    rocm_forced = _k25(serving={"VLLM_ROCM_USE_AITER": "1", "attention_backend": "ROCM_AITER_MLA"})
+    assert H002.predict(rocm_forced).op_delta == pytest.approx(H002.predict(_k25()).op_delta)
+
+
+def test_h002_replay_scope_matches_aiter_kernel_names():
+    from gitm.optimizer.replay import predict_delta as _pd
+
+    spec = _prop(_k25()).propose("memory_bound")[0]
+    aiter_trace = make_trace(events=[
+        make_kernel("_ZN5aiter42mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_psE", start_ns=0, end_ns=250),
+        make_kernel("aiter::mla_reduce_v1", start_ns=250, end_ns=300),
+        make_kernel("fmoe_fp8_blockscale_g1u1", start_ns=300, end_ns=1000),
+    ])
+    assert _pd(aiter_trace, spec) == pytest.approx(0.3 * 0.5, abs=1e-3)
 
 
 @pytest.mark.parametrize("case", ["sparse_mla", "unsupported_backend", "unsupported_cache"])

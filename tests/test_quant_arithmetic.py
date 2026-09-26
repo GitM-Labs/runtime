@@ -393,14 +393,30 @@ def test_resident_weights_equal_storage_when_nothing_pads():
         assert model_weight_bytes(spec, hw=sku) == pytest.approx(model_weight_bytes(spec))
 
 
-def test_mi355x_rules_are_marked_unverified():
-    """CDNA4 kernels live in ROCm/AITER, which the pinned sources do not cover. The
-    arithmetic still runs, and every rule says it is inferred. NVFP4 has no CDNA4
-    rule pinned at all, so it falls back to the ladder and is flagged."""
+def test_mi355x_rules_are_read_from_aiter_and_vllm_rocm_sources():
+    """CDNA4 rules come from vLLM b1388b1f plus the AITER tag its ROCm image pins
+    (v0.1.10.post2) and CK; none is inferred. INT4 g32 runs the Triton W4A16
+    kernel (compressed_tensors_moe.py:177-190; fused_moe.py:288-289 dequantises
+    in-kernel), block fp8 runs AITER with per-token group-128 fp32 activation
+    scales, MXFP4 runs the CK 2-stage scaled-f8f6f4 MFMA with a separate MXFP4
+    activation quant and per-rank padding to 256. NVFP4 has no ROCm backend."""
     assert MI355X.arch == "cdna4" and MI355X.memory_bytes == 288e9
+    int4 = resolve_execution("int4", MI355X)
+    assert (int4.backend, int4.compute_dtype, int4.act_format, int4.estimated) == (
+        "triton_wna16", "bf16", None, False)
+    assert int4.bytes_per_use == 0.5625
+    fp8 = resolve_execution("fp8", MI355X)
+    assert (fp8.backend, fp8.compute_dtype, fp8.estimated) == ("aiter", "fp8", False)
+    assert fp8.act_format.name == "fp8_group128"
+    mx = resolve_execution("mxfp4", MI355X)
+    assert (mx.backend, mx.compute_dtype, mx.estimated) == ("aiter_ck2stages", "fp4", False)
+    assert mx.act_format.name == "mxfp4" and (mx.pad_hidden, mx.pad_inter) == (256, 256)
     for dtype in ("fp8", "mxfp4", "int4"):
-        assert resolve_execution(dtype, MI355X).estimated, dtype
-    assert resolve_execution("nvfp4", MI355X).backend == "unknown"
+        assert "aiter/" in resolve_execution(dtype, MI355X).source or "rocm" in resolve_execution(dtype, MI355X).source
+    with pytest.raises(UnsupportedExecution, match="no NvFp4 MoE backend"):
+        resolve_execution("nvfp4", MI355X)
+    with pytest.raises(UnsupportedExecution, match="is_cuda"):
+        resolve_execution("int4", MI355X, backend="marlin")
 
 
 def test_plan_prices_an_explicit_cache_dtype_over_the_resolved_default(capsys):
@@ -454,23 +470,32 @@ def test_fp32_peak_is_carried_by_every_blackwell_entry():
 
 
 def test_estimated_backend_rules_reach_the_prediction():
-    """Finding 3 of Jalon's review. A CDNA4 execution rule inferred rather than
-    read from source is estimated=True on the rule; before the fix the graph
-    node it priced said estimated=False, so the report presented an inferred
-    kernel as a derived floor."""
-    g = predict_glm_graph(load_spec("kimi-k2.5"), MI355X, BASELINE, ShardingConfig(tp=8))
+    """Finding 3 of Jalon's review. An execution rule inferred rather than read
+    from source is estimated=True on the rule; before the fix the graph node it
+    priced said estimated=False, so the report presented an inferred kernel as
+    a derived floor. MXFP4 on Hopper (Triton, triton_kernels not read) is the
+    remaining inferred rule."""
+    mx = replace(load_spec("kimi-k2.6"), expert_dtype="mxfp4")
+    assert resolve_execution("mxfp4", H200).estimated is True
+    g = predict_glm_graph(mx, H200, BASELINE, ShardingConfig(tp=8))
     routed = [n for n in g.nodes if n.op == "moe_routed"]
-    assert resolve_execution("int4", MI355X).estimated is True
     assert routed and all(n.prediction.estimated for n in routed)
-    g = predict_glm_graph(load_spec("kimi-k2.5"), H200, BASELINE, ShardingConfig(tp=8))
+    # A read rule stays a clean floor.
+    g = predict_glm_graph(load_spec("kimi-k2.5"), MI355X, BASELINE, ShardingConfig(tp=8))
     assert not any(n.prediction.estimated for n in g.nodes if n.op == "moe_routed")
 
 
-def test_plan_json_carries_estimated_per_node(capsys):
+def test_plan_json_carries_estimated_per_node(capsys, tmp_path):
+    """The flag has to survive to `gitm plan --json`, the report's input."""
+    import yaml
+
     from gitm.planner.registry import main
 
-    assert main(["kimi-k2.5", "--gpu", "MI355X", "--batch", "32", "--kv-len", "8192",
+    entry = yaml.safe_load(open("gitm/planner/models/kimi-k2.6.yaml"))
+    entry["spec"]["expert_dtype"] = "mxfp4"
+    p = tmp_path / "kimi-mxfp4.yaml"
+    p.write_text(yaml.safe_dump(entry))
+    assert main([str(p), "--gpu", "H200", "--batch", "32", "--kv-len", "8192",
                  "--tp", "8", "--json"]) == 0
     nodes = json.loads(capsys.readouterr().out)["nodes"]
-    est = {n["op"]: n["estimated"] for n in nodes if n["op"] == "moe_routed"}
-    assert est == {"moe_routed": True}
+    assert {n["estimated"] for n in nodes if n["op"] == "moe_routed"} == {True}
