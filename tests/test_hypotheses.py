@@ -346,6 +346,7 @@ def test_a_crashing_gate_rolls_back_instead_of_leaving_the_change_applied(exc):
     config = {"kv_cache_dtype": "auto"}
     res = apply_intervention(spec, DictApplicator(config, measure_fn=lambda s: 0.3))
     assert res.rolled_back and res.applied
+    assert res.measured_delta == pytest.approx(0.3)
     assert "correctness gate crashed" in (res.error or "") and str(exc) in (res.error or "")
     assert config == {"kv_cache_dtype": "auto"}
 
@@ -391,3 +392,19 @@ def test_h002_honours_an_explicit_backend_inside_the_priced_pair():
     assert p.op_delta == pytest.approx((0.5, 0.5, 0.5))
     default = H002.predict(_k25("H200", batch=32, kv_len=8192))
     assert default.op_delta[0] < 0.5 < default.op_delta[2]
+
+
+@pytest.mark.parametrize("case", ["sparse_mla", "unsupported_backend", "unsupported_cache"])
+def test_h002_unsupported_configs_never_reach_the_proposal_path(case):
+    workload = _k25()
+    if case == "sparse_mla":
+        workload = replace(workload, spec=load_spec("glm-5.2"))
+    elif case == "unsupported_backend":
+        workload = _k25(serving={"VLLM_ROCM_USE_AITER": "1", "attention_backend": "TRITON_MLA"})
+    else:
+        workload = _k25(serving={"VLLM_ROCM_USE_AITER": "1", "kv_cache_dtype": "fp32"})
+    proposer = _prop(workload, hypotheses=(H002,))
+
+    assert proposer.propose("memory_bound") == []
+    assert proposer.predictions == {}
+    assert proposer.skipped == [("H-002", H002.applies(workload))]

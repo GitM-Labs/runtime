@@ -460,7 +460,8 @@ def test_estimated_backend_rules_reach_the_prediction():
     kernel as a derived floor."""
     g = predict_glm_graph(load_spec("kimi-k2.5"), MI355X, BASELINE, ShardingConfig(tp=8))
     routed = [n for n in g.nodes if n.op == "moe_routed"]
-    assert routed and all(n.prediction.estimated for n in routed) == resolve_execution("int4", MI355X).estimated
+    assert resolve_execution("int4", MI355X).estimated is True
+    assert routed and all(n.prediction.estimated for n in routed)
     g = predict_glm_graph(load_spec("kimi-k2.5"), H200, BASELINE, ShardingConfig(tp=8))
     assert not any(n.prediction.estimated for n in g.nodes if n.op == "moe_routed")
 
@@ -472,4 +473,4 @@ def test_plan_json_carries_estimated_per_node(capsys):
                  "--tp", "8", "--json"]) == 0
     nodes = json.loads(capsys.readouterr().out)["nodes"]
     est = {n["op"]: n["estimated"] for n in nodes if n["op"] == "moe_routed"}
-    assert est == {"moe_routed": resolve_execution("int4", MI355X).estimated}
+    assert est == {"moe_routed": True}
