@@ -925,7 +925,9 @@ _AITER_FP8 = (
     "intermediate_pad are 0). Note: for token*topk <= n_experts AITER splits K "
     "(aiter/fused_moe.py:502-524) and stage 1 writes an fp32 tmp_out plus a "
     "separate silu_and_mul (:1486-1518); at 32 x 8 rows that is ~0.5 MB per layer "
-    "per rank, not modelled."
+    "per rank, not modelled. Estimated because the rule assumes VLLM_ROCM_USE_AITER=1: "
+    "the planner has no serving config to check the flag, and without it "
+    "fused_moe/oracle/fp8.py:372-379 selects the Triton block-fp8 path, not read here."
 )
 _ROCM_WNA16 = (
     "quantization/compressed_tensors/compressed_tensors_moe.py:177-190 (is_rocm -> "
@@ -965,7 +967,9 @@ _AITER_MXFP4 = (
 _EXECUTION_RULES: dict[tuple[str, str], _Rule] = {
     ("fp8_block128", "hopper"): _Rule("native", "fp8", "fp8_group128", source=_BLOCK_FP8),
     ("fp8_block128", "blackwell"): _Rule("native", "fp8", "fp8_group128", source=_BLOCK_FP8),
-    ("fp8_block128", "cdna4"): _Rule("aiter", "fp8", "fp8_group128", source=_AITER_FP8),
+    ("fp8_block128", "cdna4"): _Rule(
+        "aiter", "fp8", "fp8_group128", estimated=True, source=_AITER_FP8,
+    ),
     # NVFP4. Blackwell: TRT-LLM FP4 grouped GEMM, W4A4 with one scaled_fp4_quant
     # per MoE input. Hopper: no FP4 tensor cores and no W4A8 for NVFP4
     # (marlin_utils_fp4.py:305-307), so Marlin W4A16.
@@ -991,7 +995,7 @@ _EXECUTION_RULES: dict[tuple[str, str], _Rule] = {
                "the upcast and any scale padding live in triton_kernels, not read",
     ),
     ("mxfp4", "cdna4"): _Rule(
-        "aiter_ck2stages", "fp4", "mxfp4", pad_hidden=256, pad_inter=256,
+        "aiter_ck2stages", "fp4", "mxfp4", pad_hidden=256, pad_inter=256, estimated=True,
         source=_AITER_MXFP4,
     ),
     # MXFP8: Blackwell only. There is no sm90 path in this version.

@@ -410,7 +410,18 @@ def test_h002_replay_scope_matches_aiter_kernel_names():
         make_kernel("aiter::mla_reduce_v1", start_ns=250, end_ns=300),
         make_kernel("fmoe_fp8_blockscale_g1u1", start_ns=300, end_ns=1000),
     ])
-    assert _pd(aiter_trace, spec) == pytest.approx(0.3 * 0.5, abs=1e-3)
+    assert _pd(aiter_trace, spec) == pytest.approx(0.25 * 0.5, abs=1e-3)
+
+
+def test_h002_replay_does_not_credit_aiter_mla_reduce():
+    from gitm.optimizer.replay import predict_delta as _pd
+
+    spec = _prop(_k25()).propose("memory_bound")[0]
+    reduction_only = make_trace(events=[
+        make_kernel("aiter::mla_reduce_v1", start_ns=0, end_ns=50),
+        make_kernel("fmoe_fp8_blockscale_g1u1", start_ns=50, end_ns=1000),
+    ])
+    assert _pd(reduction_only, spec) == 0.0
 
 
 @pytest.mark.parametrize("case", ["sparse_mla", "unsupported_backend", "unsupported_cache"])

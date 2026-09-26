@@ -58,6 +58,7 @@ Known limits, stated rather than hidden:
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from math import isfinite
 from typing import Any
 
 from gitm.planner.graph import Graph, PredictedNode
@@ -484,6 +485,10 @@ def memory_fit(
     no default worth trusting — vLLM measures it in a profile run — so it is an
     input, and 0 means the caller has not stated it.
     """
+    if not isfinite(gpu_memory_utilization) or not 0 < gpu_memory_utilization <= 1:
+        raise ValueError("gpu_memory_utilization must be finite and in (0, 1]")
+    if not isfinite(workspace_bytes) or workspace_bytes < 0:
+        raise ValueError("workspace_bytes must be finite and nonnegative")
     return MemoryFit(
         capacity=hw.memory_bytes,
         budget=hw.memory_bytes * gpu_memory_utilization,
@@ -641,7 +646,8 @@ def _emit_layer(
         ex = w_exec(gemm_op, default)
         if ex.act_format is None:
             return
-        add(op, 2.0 * rows * elems, act_quant_bytes(ex, rows, elems, aw), spec.act_dtype)
+        add(op, 2.0 * rows * elems, act_quant_bytes(ex, rows, elems, aw), spec.act_dtype,
+            estimated=ex.estimated)
 
     # ── MLA attention: low-rank query, compressed KV latent ──────────────────
     add_rms_norm(with_residual=layer > 0)

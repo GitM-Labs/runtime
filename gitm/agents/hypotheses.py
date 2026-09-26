@@ -395,14 +395,14 @@ H002 = Hypothesis(
     knob="kv_cache_dtype",
     value="fp8",
     target_ops=("attn_score_value",),
-    # MLA decode kernels only. ``reshape_and_cache`` and ``slot_mapping`` also
-    # classify to attn_score_value, and a narrower cache does not halve them.
+    # MLA cache-reading decode kernels only. ``reshape_and_cache`` and
+    # ``slot_mapping`` also classify to attn_score_value, and a narrower cache
+    # does not halve them; mla_reduce does not read the cached KV either.
     # CUDA names, plus AITER's persistent-mode pair (aiter/aiter/mla.py:318-349:
     # mla_decode_stage1_asm_fwd then mla_reduce_v1) and its asm symbols
     # (mla_a16w16_*, mla_a8w8_*).
     kernel_scope=("flash_mla", "flashmla", "cutlass_mla", "flashinfer_mla",
-                  "mla_decode", "aiter_mla", "mla_fwd", "mla_a16w16", "mla_a8w8",
-                  "mla_reduce"),
+                  "mla_decode", "aiter_mla", "mla_fwd", "mla_a16w16", "mla_a8w8"),
     applies=_h002_applies,
     predict=_h002_predict,
     requires_correctness_gate=True,

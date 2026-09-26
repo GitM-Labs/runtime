@@ -79,7 +79,7 @@ Arithmetic for the headline row. The core reads 64 x 4,352 entries x 61 layers p
 - **lo.** The bf16 asm kernel at 0.95 and the fp8 asm kernel at 0.55: 2.447 / 0.95 - 1.223 / 0.55 = 0.35 ms saved out of 11.43 + 2.58.
 - **hi.** The reverse: 2.447 / 0.55 - 1.223 / 0.95 = 3.16 ms saved out of 11.43 + 4.45.
 
-The kernel's own time falls by 50% at the mean and by 13.6% to 71.1% across the band, because the two arms run different asm kernels. That covered-op figure is what `expected_delta_*` carries on the emitted spec, because `replay.predict_delta` multiplies it by the trace's attention coverage.
+The kernel's own time falls by 50% at the mean and by 13.6% to 71.1% across the band, because the two arms run different asm kernels. That covered-op figure is what `expected_delta_*` carries on the emitted spec, because `replay.predict_delta` multiplies it by the trace's attention coverage. Replay credits only the cache-reading MLA decode stage; `mla_reduce` does not read the cached KV and receives no cache-halving credit.
 
 The `rag` point fits comfortably. The fit ledger (`memory_fit`, the loop's 0.92 utilisation, 4.5 GB workspace) leaves 184 GB per MI355X rank for KV, and the bf16 cache needs 19.6 GB.
 
@@ -96,7 +96,7 @@ There is no bf16-cache arm on the fp8 kernel here, unlike H200's arm B, because 
 
 1. **Load.** Run `INTERVENTION='--kv-cache-dtype fp8' bash run_loop.sh e8`. It re-runs the headline (`rag`, c=64) under the lever. Add the `chat` config at c=64 for the scaling check, with 3 repetitions each.
 2. **Kernel plane.** Take one GITM-traced window per arm (the loop's arm B tracer, not during the timed runs) and read the per-layer MLA decode kernel duration.
-3. **Pre-run check.** The spec's `kernel_scope` now carries AITER's names read from source (`mla_a16w16`, `mla_a8w8`, `mla_decode`, `mla_reduce`, from `aiter/aiter/mla.py:318-349` and `asm_mla.cu`). Confirm on the first trace that the captured symbols contain them; the replay credits only those, deliberately, because `classify_op` also files `reshape_and_cache` and `slot_mapping` under `attn_score_value` and an fp8 cache does not halve them.
+3. **Pre-run check.** The spec's `kernel_scope` carries AITER's cache-reading decode names read from source (`mla_a16w16`, `mla_a8w8`, `mla_decode`, from `aiter/aiter/mla.py:318-349` and `asm_mla.cu`). Confirm on the first trace that the captured symbols contain them. Replay excludes `mla_reduce`, `reshape_and_cache`, and `slot_mapping`: none represents reading the cached KV bytes whose size is halved by fp8.
 
 On H200, run a third arm to separate the backend switch from the byte halving. Arm B is `--attention-backend FLASHMLA` with a bf16 cache (`engine/arg_utils.py:597`). Its fp8-vs-bf16 comparison on the same kernel then isolates the mechanism.
 
@@ -112,7 +112,7 @@ The loop's keep decision (`optimizer/apply.py`) measures throughput only, so a f
 
 ## Rejection conditions
 
-1. **Effect.** If the ITL reduction at the headline is below 9.2% minus the noise floor, reject at this operating point.
+1. **Effect.** The registered efficiency band predicts a 2.5% to 19.9% ITL reduction at the headline. If the observed reduction is below the registered 2.5% lower bound minus the noise floor, reject at this operating point. This threshold is fixed from the registered band; do not raise or lower it based on the observed result or replay estimate.
 2. **Mechanism.** The two arms run different asm kernels, so kernel time alone cannot isolate the byte mechanism (the same reasoning as H-001's rejection 2). Take the mechanism from the traced kernel's duration against its bytes: if the fp8 kernel's time is not below the bf16 kernel's by at least 13.6% (the band's worst case), the fp8 asm kernel is less efficient than the bf16 one by more than the band allows, and the measured pair of efficiencies replaces the band for this node. If the byte reduction is not seen in `vllm:gpu_cache_usage_perc` (the fp8 arm should show half the occupancy for the same load), the layout assumption is wrong.
 3. **Scaling.** The predicted saving at `rag` is 3.8x the saving at `chat` (4,352 against 1,152 cached tokens at the same concurrency). If the measured ratio is below 2, the saving is not cache traffic.
 4. **Correctness.** A gate failure rejects the lever for this family with uncalibrated scales. Reconsider it with `--calculate-kv-scales` (`engine/arg_utils.py:1007`) or a checkpoint that ships scales.

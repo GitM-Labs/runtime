@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -324,6 +326,10 @@ def main(argv: list[str] | None = None) -> int:
         description="Predicted roofline floor for a checkpoint, without running it.",
     ))
     args = ap.parse_args(argv)
+    if not isfinite(args.gpu_mem_util) or not 0 < args.gpu_mem_util <= 1:
+        ap.error("--gpu-mem-util must be finite and in (0, 1]")
+    if not isfinite(args.workspace_gb) or args.workspace_gb < 0:
+        ap.error("--workspace-gb must be finite and nonnegative")
 
     from gitm.planner.model_catalogue import available
 
@@ -413,6 +419,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.as_json:
+        fit_data = None
+        if family == "glm_moe_dsa":
+            from gitm.planner.glm_graph import memory_fit
+
+            fit = memory_fit(spec, hw, batch, sharding,
+                             gpu_memory_utilization=args.gpu_mem_util,
+                             workspace_bytes=args.workspace_gb * 1e9)
+            fit_data = {**asdict(fit), "kv_available": fit.kv_available,
+                        "kv_tokens": fit.kv_tokens, "fits": fit.fits}
         print(json.dumps({
             "model": getattr(spec, "name", None),
             "family": family,
@@ -424,6 +439,13 @@ def main(argv: list[str] | None = None) -> int:
                       "prefill_tokens": args.prefill_tokens,
                       "prefill_context": args.prefill_context,
                       "prefill_requests": args.prefill_requests},
+            "kv_cache_dtype": getattr(spec, "kv_dtype", None),
+            "requested_kv_cache_dtype": args.kv_cache_dtype,
+            "gpu_memory_utilization": args.gpu_mem_util,
+            "workspace_bytes": args.workspace_gb * 1e9,
+            "memory_fit": fit_data,
+            "memory_fit_unavailable_reason": (None if fit_data is not None
+                                               else f"fit ledger unsupported for {family}"),
             "total_pred_s": g.total_pred_s,
             "has_unpriced_collectives": g.has_unpriced_collectives,
             "has_fallback_peaks": g.has_fallback_peaks,

@@ -395,7 +395,8 @@ def test_resident_weights_equal_storage_when_nothing_pads():
 
 def test_mi355x_rules_are_read_from_aiter_and_vllm_rocm_sources():
     """CDNA4 rules come from vLLM b1388b1f plus the AITER tag its ROCm image pins
-    (v0.1.10.post2) and CK; none is inferred. INT4 g32 runs the Triton W4A16
+    (v0.1.10.post2) and CK; none is inferred, though the AITER-gated ones stay
+    estimated because the flag is a serving choice the planner cannot see. INT4 g32 runs the Triton W4A16
     kernel (compressed_tensors_moe.py:177-190; fused_moe.py:288-289 dequantises
     in-kernel), block fp8 runs AITER with per-token group-128 fp32 activation
     scales, MXFP4 runs the CK 2-stage scaled-f8f6f4 MFMA with a separate MXFP4
@@ -406,10 +407,12 @@ def test_mi355x_rules_are_read_from_aiter_and_vllm_rocm_sources():
         "triton_wna16", "bf16", None, False)
     assert int4.bytes_per_use == 0.5625
     fp8 = resolve_execution("fp8", MI355X)
-    assert (fp8.backend, fp8.compute_dtype, fp8.estimated) == ("aiter", "fp8", False)
+    # AITER is flag-selected (VLLM_ROCM_USE_AITER=1) and the planner cannot see the
+    # flag, so the rule is read from source but still marked estimated.
+    assert (fp8.backend, fp8.compute_dtype, fp8.estimated) == ("aiter", "fp8", True)
     assert fp8.act_format.name == "fp8_group128"
     mx = resolve_execution("mxfp4", MI355X)
-    assert (mx.backend, mx.compute_dtype, mx.estimated) == ("aiter_ck2stages", "fp4", False)
+    assert (mx.backend, mx.compute_dtype, mx.estimated) == ("aiter_ck2stages", "fp4", True)
     assert mx.act_format.name == "mxfp4" and (mx.pad_hidden, mx.pad_inter) == (256, 256)
     for dtype in ("fp8", "mxfp4", "int4"):
         assert "aiter/" in resolve_execution(dtype, MI355X).source or "rocm" in resolve_execution(dtype, MI355X).source
@@ -485,7 +488,8 @@ def test_estimated_backend_rules_reach_the_prediction():
     assert not any(n.prediction.estimated for n in g.nodes if n.op == "moe_routed")
 
 
-def test_plan_json_carries_estimated_per_node(capsys, tmp_path):
+@pytest.mark.parametrize("sku", ["H200", "MI355X"])
+def test_plan_json_carries_estimated_per_node(capsys, tmp_path, sku):
     """The flag has to survive to `gitm plan --json`, the report's input."""
     import yaml
 
@@ -495,10 +499,12 @@ def test_plan_json_carries_estimated_per_node(capsys, tmp_path):
     entry["spec"]["expert_dtype"] = "mxfp4"
     p = tmp_path / "kimi-mxfp4.yaml"
     p.write_text(yaml.safe_dump(entry))
-    assert main([str(p), "--gpu", "H200", "--batch", "32", "--kv-len", "8192",
+    assert main([str(p), "--gpu", sku, "--batch", "32", "--kv-len", "8192",
                  "--tp", "8", "--json"]) == 0
     nodes = json.loads(capsys.readouterr().out)["nodes"]
     assert {n["estimated"] for n in nodes if n["op"] == "moe_routed"} == {True}
+    if sku == "MI355X":
+        assert any(n["estimated"] for n in nodes if n["op"] == "act_quant")
 
 
 @pytest.mark.parametrize("tp", [1, 8])
@@ -521,3 +527,55 @@ def test_expert_parallel_traffic_uses_whole_expert_padding():
     before = next(n.prediction.bytes for n in baseline.nodes if n.op == "moe_routed")
     after = next(n.prediction.bytes for n in parallel.nodes if n.op == "moe_routed")
     assert after == pytest.approx(before / 8)
+
+
+@pytest.mark.parametrize("sku,model", [("MI355X", "kimi-k2.6"), ("A100", "glm-5.2-fp8")])
+def test_uncertain_rules_mark_activation_and_consumer(sku, model):
+    spec = load_spec(model)
+    if sku == "MI355X":
+        spec = replace(spec, expert_dtype="mxfp4")
+        assert resolve_execution("mxfp4", MI355X).estimated
+    graph = predict_glm_graph(spec, _hw(sku), BASELINE, ShardingConfig(tp=8))
+    assert all(n.prediction.estimated for n in graph.nodes if n.op == "moe_routed")
+    activation = [n for n in graph.nodes if n.op == "act_quant" and n.layer == 1]
+    assert activation and any(n.prediction.estimated for n in activation)
+
+
+@pytest.mark.parametrize("util,workspace", [
+    (0, 0), (-1, 0), (2, 0), (float("nan"), 0), (float("inf"), 0),
+    (0.9, -1), (0.9, float("nan")), (0.9, float("inf")),
+])
+def test_memory_fit_rejects_invalid_inputs(util, workspace):
+    with pytest.raises(ValueError):
+        memory_fit(load_spec("kimi-k2.6"), H200, BASELINE,
+                   gpu_memory_utilization=util, workspace_bytes=workspace)
+
+
+@pytest.mark.parametrize("flag,value", [
+    ("--gpu-mem-util", "2"), ("--gpu-mem-util", "0"), ("--gpu-mem-util", "nan"),
+    ("--workspace-gb", "-1"), ("--workspace-gb", "inf"),
+])
+def test_plan_rejects_invalid_fit_inputs(flag, value):
+    from gitm.planner.registry import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(["kimi-k2.6", "--gpu", "H200", flag, value, "--json"])
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("dtype,bpt", [("auto", 35136), ("bf16", 70272)])
+def test_plan_json_includes_fit_and_resolved_cache(capsys, dtype, bpt):
+    from gitm.planner.registry import main
+
+    assert main(["kimi-k2.6", "--gpu", "H200", "--batch", "32", "--kv-len", "8192",
+                 "--tp", "8", "--workspace-gb", "4.5", "--gpu-mem-util", "1",
+                 "--kv-cache-dtype", dtype, "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["kv_cache_dtype"] == ("fp8" if dtype == "auto" else dtype)
+    assert data["gpu_memory_utilization"] == 1
+    fit = data["memory_fit"]
+    assert fit["budget"] == fit["capacity"] == H200.memory_bytes
+    assert fit["workspace"] == 4.5e9
+    assert fit["kv_needed"] == 32 * 8192 * bpt
+    assert fit["kv_available"] == fit["budget"] - fit["weights"] - fit["workspace"]
+    assert fit["fits"] == (fit["kv_available"] >= fit["kv_needed"])
