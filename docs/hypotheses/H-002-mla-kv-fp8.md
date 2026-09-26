@@ -53,10 +53,11 @@ What the intervention does not recover: the core's launch floor, and the unchang
 Checked in code before a candidate is emitted (`_h002_applies`), each with a reason when it fails:
 
 1. The model uses MLA (`kv_lora_rank > 0`). A GQA cache splits across TP ranks, and the effect would divide by TP.
-2. The executed cache is not already fp8. An explicit `serving["kv_cache_dtype"]` wins. Otherwise it is the catalogue's `kv_dtype`, which records what `auto` resolves to.
-3. The architecture has an fp8 MLA decode backend pinned: Hopper, Blackwell, or CDNA4 with `VLLM_ROCM_USE_AITER=1` in the serving config (the loop deployment sets it). Without AITER, ROCm selects `TRITON_MLA` (`platforms/rocm.py:324-326`), which this prediction does not price.
-4. The step is decode.
-5. The mean predicted step reduction clears the measured noise floor (`HypothesisProposer(noise_floor=...)`).
+2. The model is *dense* MLA: no DSA indexer on any layer. On sparse MLA (GLM-5.2) an fp8 cache takes the `fp8_ds_mla` layout, 656 B per entry with per-128 fp32 scales on a sparse backend (`mla_attention.py:341-362`), which is not the 576 B this derivation prices.
+3. The executed cache is bf16 or fp16, and not already any fp8 flavour (`fp8`, `fp8_e4m3`, `fp8_e5m2`). An explicit `serving["kv_cache_dtype"]` wins. Otherwise it is the catalogue's `kv_dtype`, which records what `auto` resolves to.
+4. The attention kernel is one the derivation priced. With no `attention_backend` in the serving config that is vLLM's default pair for the arch (Hopper `FLASH_ATTN_MLA` to `FLASHMLA`, Blackwell `FLASHINFER_MLA` both sides, CDNA4 `ROCM_AITER_MLA` both sides, requiring `VLLM_ROCM_USE_AITER=1`; without AITER ROCm selects `TRITON_MLA`, `platforms/rocm.py:324-326`, which is not priced). An explicit backend is accepted only if it is one of that pair; forcing the fp8-capable one on the bf16 side (the H200 arm B) makes it a same-kernel prediction with the narrower band. Anything else is refused with the reason.
+5. The step is decode.
+6. The mean predicted step reduction clears the measured noise floor (`HypothesisProposer(noise_floor=...)`).
 
 The emitted `InterventionSpec` carries `requires_hardware` (H100, H200, B200, B300, GB200, GB300, MI355X), `requires_dtype` (bf16) and `workloads` (vllm-decode). The existing precondition gate in `select_interventions` checks those.
 
@@ -99,7 +100,7 @@ On H200, run a third arm to separate the backend switch from the byte halving. A
 
 ## Gates
 
-The loop's keep decision (`optimizer/apply.py`) measures throughput only, so a faster but wrong cache could be kept. `HypothesisProposer` therefore refuses to emit this candidate unless it is built with a `correctness_gate`, and the emitted `InterventionSpec` carries that gate in its `correctness_gate` field. `apply_intervention` runs it after measuring and before keeping, with whatever applicator the caller passed, so there is no wrapper to forget. A failing gate restores the change and puts the reason in `ApplyResult.error`. `tests/test_hypotheses.py::test_a_faster_but_wrong_candidate_is_rolled_back` and `::test_the_gate_is_on_the_spec_not_the_proposer` pin that. The gate itself is the sentinel below; wiring it to lm-eval is the loop's job, not this spec's.
+The loop's keep decision (`optimizer/apply.py`) measures throughput only, so a faster but wrong cache could be kept. `HypothesisProposer` therefore refuses to emit this candidate unless it is built with a `correctness_gate`, and the emitted `InterventionSpec` carries that gate in its `correctness_gate` field. `apply_intervention` runs it after measuring and before keeping, with whatever applicator the caller passed, so there is no wrapper to forget. A failing gate restores the change and puts the reason in `ApplyResult.error`. A gate that *crashes* (the benchmark times out, the server drops) is treated the same way: the change is restored and the error recorded as "not judged", because an unjudged candidate must never stay applied. `tests/test_hypotheses.py::test_a_faster_but_wrong_candidate_is_rolled_back` and `::test_the_gate_is_on_the_spec_not_the_proposer` pin that. The gate itself is the sentinel below; wiring it to lm-eval is the loop's job, not this spec's.
 
 **Correctness.** Kimi K2.5 ships no `k_scale`/`v_scale`, so vLLM stores with scale 1.0 (`quantization/kv_cache.py:71-75`). Run on arms A and C:
 - GSM8K (lm-eval-harness `gsm8k`, 5-shot, all 1,319 items, `local-completions` against the server). Arm C may not score more than 1.0 point below arm A.

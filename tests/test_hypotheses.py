@@ -29,6 +29,7 @@ from gitm.planner.context import hardware_spec_for, peak_for_sku
 from gitm.planner.glm_graph import model_weight_bytes
 from gitm.planner.model_catalogue import load_spec
 from gitm.planner.roofline import BatchConfig, ShardingConfig
+from gitm.planner.roofline import BatchConfig as _BC  # noqa: F401
 
 from .conftest import make_kernel, make_trace
 
@@ -327,3 +328,66 @@ def test_h002_replay_credits_only_mla_decode_kernels():
     ])
     assert predict_delta(insert_only, spec) == 0.0
     assert predict_delta(_attention_heavy_trace(), spec) == pytest.approx(0.15, abs=1e-3)
+
+
+# ── Jalon's review: regression tests ─────────────────────────────────────────
+
+
+@pytest.mark.parametrize("exc", [TimeoutError("lm-eval hung"), ConnectionError("server gone"),
+                                 RuntimeError("harness crashed")])
+def test_a_crashing_gate_rolls_back_instead_of_leaving_the_change_applied(exc):
+    """Finding 1. The gate is a live benchmark and can raise. Before the fix the
+    exception escaped apply_intervention after `apply` had already run, so the
+    fp8 cache stayed on with nobody having judged it."""
+    def gate(spec):
+        raise exc
+
+    spec = _prop(_k25()).propose("memory_bound")[0].model_copy(update={"correctness_gate": gate})
+    config = {"kv_cache_dtype": "auto"}
+    res = apply_intervention(spec, DictApplicator(config, measure_fn=lambda s: 0.3))
+    assert res.rolled_back and res.applied
+    assert "correctness gate crashed" in (res.error or "") and str(exc) in (res.error or "")
+    assert config == {"kv_cache_dtype": "auto"}
+
+
+def test_a_crashing_gate_is_reported_through_autoresearch():
+    prop = HypothesisProposer(_k25(), correctness_gate=lambda s: (_ for _ in ()).throw(TimeoutError("x")))
+    config = {"kv_cache_dtype": "auto"}
+    results = autoresearch_v0(
+        _attention_heavy_trace(), "memory_bound",
+        applicator=DictApplicator(config, measure_fn=lambda s: 0.12),
+        policy=Policy(), proposer=prop, ctx=_ctx(),
+    )
+    assert results[0].rolled_back and "crashed" in (results[0].apply_error or "")
+    assert config == {"kv_cache_dtype": "auto"}
+
+
+def test_h002_refuses_sparse_mla():
+    """Finding 4. GLM-5.2 has kv_lora_rank > 0 too, but its DSA indexer puts an
+    fp8 cache on the fp8_ds_mla layout (656 B, not 576) and a sparse backend."""
+    glm = replace(_k25("H200", batch=32, kv_len=8192), spec=load_spec("glm-5.2"))
+    why = H002.applies(glm)
+    assert why is not None and "sparse MLA" in why
+
+
+@pytest.mark.parametrize(
+    ("serving", "fragment"),
+    [
+        ({"VLLM_ROCM_USE_AITER": "1", "attention_backend": "TRITON_MLA"}, "not the pair"),
+        ({"VLLM_ROCM_USE_AITER": "1", "kv_cache_dtype": "fp8_e5m2"}, "already storing an fp8"),
+        ({"VLLM_ROCM_USE_AITER": "1", "kv_cache_dtype": "fp32"}, "neither bf16/fp16 nor fp8"),
+    ],
+)
+def test_h002_refuses_configs_the_derivation_does_not_price(serving, fragment):
+    assert fragment in H002.applies(_k25(serving=serving))
+
+
+def test_h002_honours_an_explicit_backend_inside_the_priced_pair():
+    """On H200 an explicit FLASHMLA with a bf16 cache is arm B of the spec: the
+    fp8 switch then keeps the kernel, so the band is the same-kernel one."""
+    forced = _k25("H200", batch=32, kv_len=8192, serving={"attention_backend": "FLASHMLA"})
+    assert H002.applies(forced) is None
+    p = H002.predict(forced)
+    assert p.op_delta == pytest.approx((0.5, 0.5, 0.5))
+    default = H002.predict(_k25("H200", batch=32, kv_len=8192))
+    assert default.op_delta[0] < 0.5 < default.op_delta[2]

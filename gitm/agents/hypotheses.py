@@ -290,18 +290,50 @@ def _executed_kv(w: Workload) -> str:
     return w.spec.kv_dtype if flag == "auto" else flag
 
 
-def _h002_applies(w: Workload) -> str | None:
-    s = w.spec
-    if s.kv_lora_rank <= 0:
-        return "not MLA: the cache is not one shared latent per token"
-    if _canon_dtype(_executed_kv(w)) == "fp8":
-        return ("already storing an fp8 cache (an explicit flag, or a checkpoint "
-                "whose kv_cache_scheme vLLM resolves 'auto' to fp8)")
+def _mla_backends(w: Workload) -> tuple[str, str] | str:
+    """(backend with the executed cache, backend with fp8), or why not.
+
+    The derivation prices one specific kernel pair per arch: vLLM's default
+    choice. An explicit ``attention_backend`` in the serving config is honoured
+    only when it is one of that pair (the fp8-capable one on both sides is the
+    same-kernel case); anything else is a kernel the arithmetic never priced.
+    """
     if w.hw.arch not in _MLA_BACKENDS:
         return f"no fp8 MLA decode backend pinned for arch {w.hw.arch or 'unknown'!r}"
     if w.hw.arch == "cdna4" and not _aiter_enabled(w):
         return ("CDNA4 without VLLM_ROCM_USE_AITER=1 selects TRITON_MLA "
                 "(platforms/rocm.py:324-326); the prediction is for ROCM_AITER_MLA")
+    default, fp8 = _MLA_BACKENDS[w.hw.arch]
+    forced = str(w.serving.get("attention_backend", "") or "").upper()
+    if not forced:
+        return default, fp8
+    if forced == fp8:
+        return fp8, fp8
+    if forced == default:
+        return default, fp8
+    return (f"attention_backend={forced} is not the pair the derivation prices "
+            f"on {w.hw.arch} ({default} -> {fp8})")
+
+
+def _h002_applies(w: Workload) -> str | None:
+    s = w.spec
+    if s.kv_lora_rank <= 0:
+        return "not MLA: the cache is not one shared latent per token"
+    # Sparse MLA (a DSA indexer on any layer) takes the fp8_ds_mla layout on
+    # its own backends: 656 B per entry with per-128 fp32 scales, not the
+    # generic 576 B this derivation prices (mla_attention.py:341-362).
+    if s.n_full_indexer_layers > 0 or s.index_n_heads > 0:
+        return ("sparse MLA (DSA indexer present): fp8 becomes the fp8_ds_mla "
+                "layout on a sparse backend, which this derivation does not price")
+    executed = _executed_kv(w)
+    if _canon_dtype(executed) == "fp8":
+        return ("already storing an fp8 cache (an explicit flag, or a checkpoint "
+                "whose kv_cache_scheme vLLM resolves 'auto' to fp8)")
+    if _canon_dtype(executed) != "fp16":
+        return f"executed cache dtype {executed!r} is neither bf16/fp16 nor fp8"
+    pair = _mla_backends(w)
+    if isinstance(pair, str):
+        return pair
     if w.batch.is_prefill or w.batch.batch <= 0:
         return "decode-only prediction; prefill steps are out of scope"
     return None
@@ -311,7 +343,10 @@ def _h002_predict(w: Workload) -> Prediction:
     executed = replace(w.spec, kv_dtype=_executed_kv(w), kv_rope_dtype=_executed_kv(w))
     candidate = replace(w.spec, kv_dtype="fp8", kv_rope_dtype="fp8")
     g_old, g_new = _floor(executed, w), _floor(candidate, w)
-    old_b, new_b = _MLA_BACKENDS[w.hw.arch]
+    pair = _mla_backends(w)
+    if isinstance(pair, str):
+        raise ValueError(f"H-002 does not apply: {pair}")
+    old_b, new_b = pair
     saved, op, step = _effect(
         g_old, g_new, ("attn_score_value",), w.hw, same_kernel=old_b == new_b
     )

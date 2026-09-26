@@ -152,15 +152,39 @@ def test_mxfp4_with_and_without_marlin_upcast_differ_in_padding_not_bytes():
     assert (marlin.pad_hidden, marlin.pad_inter) == (256, 128)
 
 
-def test_backend_padding_on_a_gpt_oss_shaped_expert():
-    """2880 is not a multiple of 128 or 256: Marlin rounds it to 3072 x 2944, TRT-LLM
-    to 3072 x 3072. Kimi's 7168 x 2048 is untouched by either."""
-    marlin = resolve_execution("mxfp4", H200, backend="marlin")
+def test_backend_padding_is_applied_to_each_ranks_slice():
+    """Finding 2 of Jalon's review. vLLM splits intermediate across TP ranks first
+    (fused_moe/layer.py:426) and pads the per-rank width afterwards (:537-538).
+    Width 2,880 across 8 ranks with a 256 multiple: split-then-pad is 360 -> 512
+    per rank; pad-then-split is 3,072 / 8 = 384, which the kernel pads again.
+    The old order under-counted by 25% (384 / 512). Hidden is not split."""
     trtllm = resolve_execution("mxfp4", B200)
-    assert expert_pad_factor(marlin, 2880, 2880) == pytest.approx(3072 * 2944 / 2880**2)
+    per_rank = expert_pad_factor(trtllm, 2880, 2880, shards=8)
+    assert per_rank == pytest.approx((3072 * 512) / (2880 * 360))
+    wrong_order = (3072 * (3072 / 8)) / (2880 * 360)
+    assert wrong_order / per_rank == pytest.approx(384 / 512)
+    marlin = resolve_execution("mxfp4", H200, backend="marlin")
+    assert expert_pad_factor(marlin, 2880, 2880, shards=8) == pytest.approx((3072 * 384) / (2880 * 360))
+    # Unsharded, the old numbers still hold.
     assert expert_pad_factor(trtllm, 2880, 2880) == pytest.approx((3072 / 2880) ** 2)
-    assert expert_pad_factor(marlin, 7168, 2048) == 1.0
-    assert expert_pad_factor(trtllm, 7168, 2048) == 1.0
+    # Kimi and GLM are exact multiples per rank at TP8, so nothing moves there.
+    assert expert_pad_factor(trtllm, 7168, 2048, shards=8) == 1.0
+    assert expert_pad_factor(marlin, 7168, 2048, shards=8) == 1.0
+    assert expert_pad_factor(trtllm, 6144, 2048, shards=8) == 1.0
+
+
+def test_padded_expert_bytes_flow_through_the_graph_per_rank():
+    """The graph divides expert bytes by the shard count; the pad factor must
+    already be per rank or the two cancel into the wrong order."""
+    gpt_oss_like = replace(load_spec("kimi-k2.6"), hidden=2880, moe_intermediate_size=2880,
+                           expert_dtype="mxfp4")
+    g8 = predict_glm_graph(gpt_oss_like, B200, BASELINE, ShardingConfig(tp=8))
+    g1 = predict_glm_graph(gpt_oss_like, B200, BASELINE, ShardingConfig(tp=1))
+    r8 = next(n for n in g8.nodes if n.op == "moe_routed").prediction.bytes
+    r1 = next(n for n in g1.nodes if n.op == "moe_routed").prediction.bytes
+    # Weight bytes per rank at TP8 = (whole-model padded-per-rank) / 8, so the
+    # ratio to TP1 is the padding ratio between the two orders, not exactly 1/8.
+    assert r8 / r1 > (1 / 8) * 1.2
 
 
 def test_mxfp8_has_no_hopper_kernel():
@@ -427,3 +451,25 @@ def test_fp32_peak_is_carried_by_every_blackwell_entry():
     number: GB200 priced its router at A100's 19.5 TF/s while B200 used 75."""
     for sku in ("B200", "GB200", "B300", "GB300"):
         assert _hw(sku).peak_flops_fp32_per_s == 75e12, sku
+
+
+def test_estimated_backend_rules_reach_the_prediction():
+    """Finding 3 of Jalon's review. A CDNA4 execution rule inferred rather than
+    read from source is estimated=True on the rule; before the fix the graph
+    node it priced said estimated=False, so the report presented an inferred
+    kernel as a derived floor."""
+    g = predict_glm_graph(load_spec("kimi-k2.5"), MI355X, BASELINE, ShardingConfig(tp=8))
+    routed = [n for n in g.nodes if n.op == "moe_routed"]
+    assert routed and all(n.prediction.estimated for n in routed) == resolve_execution("int4", MI355X).estimated
+    g = predict_glm_graph(load_spec("kimi-k2.5"), H200, BASELINE, ShardingConfig(tp=8))
+    assert not any(n.prediction.estimated for n in g.nodes if n.op == "moe_routed")
+
+
+def test_plan_json_carries_estimated_per_node(capsys):
+    from gitm.planner.registry import main
+
+    assert main(["kimi-k2.5", "--gpu", "MI355X", "--batch", "32", "--kv-len", "8192",
+                 "--tp", "8", "--json"]) == 0
+    nodes = json.loads(capsys.readouterr().out)["nodes"]
+    est = {n["op"]: n["estimated"] for n in nodes if n["op"] == "moe_routed"}
+    assert est == {"moe_routed": resolve_execution("int4", MI355X).estimated}

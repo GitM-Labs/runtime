@@ -354,7 +354,7 @@ def model_weight_bytes(
     if hw is not None:
         ex = resolve_execution(spec.dtype_for("moe_routed", spec.expert_dtype), hw)
         ew = ex.resident_bytes * expert_pad_factor(
-            ex, spec.hidden, spec.moe_intermediate_size
+            ex, spec.hidden, spec.moe_intermediate_size, es
         )
     sw = weight_bytes(spec.dtype_for("moe_shared", spec.expert_dtype))
     ww = weight_bytes(spec.weight_dtype)
@@ -582,6 +582,11 @@ def _emit_layer(
         prediction slightly optimistic — it makes a whole bound label absent.
         """
         name = f"{prefix}{op}"
+        # A backend rule that was inferred rather than read from engine source
+        # (WeightExecution.estimated) makes this node an estimate, whatever the
+        # caller said: the flag has to reach the prediction or the report calls
+        # an inferred CDNA4 kernel a derived floor.
+        estimated = estimated or w_exec(op, dtype).estimated
         g.nodes.append(
             PredictedNode(
                 name, layer,
@@ -804,7 +809,7 @@ def _emit_layer(
     per_position_flops = 6.0 * h * inter  # 2 * (gate + up + down) * h * inter
     ex_routed = w_exec("moe_routed", ed)
     ew = ex_routed.bytes_per_use * expert_pad_factor(
-        ex_routed, h, spec.moe_intermediate_size
+        ex_routed, h, spec.moe_intermediate_size, es
     )
 
     if spec.n_shared_experts > 0:
@@ -1014,7 +1019,8 @@ def predict_glm_graph(
         g.nodes.append(
             PredictedNode(
                 "lm_head", layer,
-                roofline("lm_head", f, b, hw, lm_dtype, serial_launches=1),
+                roofline("lm_head", f, b, hw, lm_dtype, serial_launches=1,
+                         estimated=lm_w.estimated),
             )
         )
 

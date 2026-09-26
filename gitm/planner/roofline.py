@@ -1063,18 +1063,31 @@ def _round_up(x: int, m: int) -> int:
     return -(-x // m) * m
 
 
-def expert_pad_factor(ex: WeightExecution, hidden: int, inter: int) -> float:
-    """Resident-and-streamed bytes multiplier from backend shape padding.
+def expert_pad_factor(
+    ex: WeightExecution, hidden: int, inter: int, shards: int = 1
+) -> float:
+    """Resident-and-streamed bytes multiplier from backend shape padding, per rank.
 
-    Every expert matrix is ``hidden x inter`` (gate and up are ``inter x hidden``,
-    down is ``hidden x inter``), so padding both dims scales all three by the same
-    ratio. 1.0 for Kimi (7168 = 28 x 256, 2048 = 8 x 256) and GLM-5.2; 1.090 for a
-    gpt-oss-shaped expert (2880 x 2880) under Marlin, whose 2880 rounds to 3072
-    and 2944 — padding the format does not show and the planner must.
+    vLLM splits an expert across tensor-parallel ranks along the intermediate
+    dim first and pads what each rank holds afterwards (``fused_moe/layer.py:426``
+    computes ``intermediate_size_per_partition = intermediate_size // tp_size``,
+    then ``:537-538`` calls ``maybe_roundup_sizes(hidden_size,
+    intermediate_size_per_partition)``). The hidden dim is not split for the
+    expert GEMM, so it pads on its full width.
+
+    Padding the whole matrix and then dividing is not the same thing. A width of
+    2,880 across eight ranks: pad-then-split gives 3,072 / 8 = 384 per rank, and
+    384 is not a multiple of 256, so the kernel pads it again to 512. Split-then-
+    pad gives 360 -> 512 directly. The first order under-counts that rank's
+    expert bytes by 25%. Kimi (7,168 x 2,048, TP8: 256 per rank) and GLM-5.2
+    (6,144 x 2,048) are exact multiples either way, which is why the error was
+    invisible on the models this was first tested on.
     """
+    n = max(1, shards)
+    inter_per_rank = inter / n
     ph = _round_up(hidden, ex.pad_hidden)
-    pi = _round_up(inter, ex.pad_inter)
-    return (ph * pi) / float(hidden * inter)
+    pi = _round_up(int(inter_per_rank), ex.pad_inter) if ex.pad_inter > 1 else inter_per_rank
+    return (ph * pi) / float(hidden * inter_per_rank)
 
 
 def act_quant_bytes(ex: WeightExecution, rows: float, elems: float, act_b: float) -> float:
