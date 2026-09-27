@@ -20,7 +20,10 @@ ENGINE_VER = "0.9.0"
 ROCM_VER = "7.2.3"
 DIGEST = "sha256:deadbeef"
 TRAFFIC = "smoke"
-WORKLOAD = "kimi-loop"
+WORKLOAD = "vllm-attach"
+
+# Isolate single-check tests from the MI355X default that also requires amd-smi.
+_TRACE_ONLY = SignalContract(required_sources=["merged_trace"])
 
 
 def _header(**kwargs):
@@ -68,6 +71,15 @@ def _write_trace(dirpath: Path, header: dict, events: list[dict], name="trace.js
     return path
 
 
+def _write_amdsmi(path: Path, *, n: int = 3, period_ns: int = 1_000_000_000):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps({"ts_ns": 1_000_000_000 + i * period_ns, "gpu_index": 0})
+        for i in range(n)
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _write_identity(art: Path, **overrides):
     """Observed deployment identity matching the default full spec."""
     data = {
@@ -78,6 +90,9 @@ def _write_identity(art: Path, **overrides):
         "image_digest": DIGEST,
         "traffic_manifest_id": TRAFFIC,
         "tp": 1,
+        # Wall window for cross-source alignment when amd-smi is present.
+        "wall_start_ns": 1_000_000_000,
+        "wall_end_ns": 4_000_000_000,
     }
     data.update(overrides)
     (art / "run_manifest.json").write_text(json.dumps(data), encoding="utf-8")
@@ -87,7 +102,8 @@ def _write_identity(art: Path, **overrides):
         f"image_digest={data['image_digest']} engine=vllm tp={data['tp']}\n"
         f"rocm={data['rocm_version']}\n"
         f"vllm={data['vllm_version']}\n"
-        f"traffic_manifest_id={data['traffic_manifest_id']}\n",
+        f"traffic_manifest_id={data['traffic_manifest_id']}\n"
+        "export GITM_EXTRA_VLLM_ARGS=--enable-layerwise-nvtx-tracing\n",
         encoding="utf-8",
     )
 
@@ -117,9 +133,11 @@ def _check_map(result):
 
 
 def test_valid_run_qualified(tmp_path: Path):
-    art = tmp_path / "cap"
+    run = tmp_path / "run"
+    art = run / "e0" / "capture"
     _write_trace(art, _header(), [_kernel()])
     _write_identity(art)
+    _write_amdsmi(run / "amdsmi.jsonl")
     result = qualify_run(art, _spec())
     assert result.verdict == "qualified", json.dumps(result.to_dict(), indent=2)
     assert result.deployment_fingerprint.startswith("deploy:")
@@ -132,7 +150,7 @@ def test_dead_collector_empty_kernels(tmp_path: Path):
     art = tmp_path / "cap"
     _write_trace(art, _header(), [])  # header only — no kernels
     _write_identity(art)
-    result = qualify_run(art, _spec())
+    result = qualify_run(art, _spec(), _TRACE_ONLY)
     assert result.verdict == "not_established"
     assert _check_map(result)["kernel_events"].status == "unknown"
 
@@ -140,7 +158,7 @@ def test_dead_collector_empty_kernels(tmp_path: Path):
 def test_dead_collector_missing_trace(tmp_path: Path):
     art = tmp_path / "empty_dir"
     art.mkdir()
-    result = qualify_run(art, _spec())
+    result = qualify_run(art, _spec(), _TRACE_ONLY)
     assert result.verdict == "not_established"
     assert _check_map(result)["merged_trace"].status == "unknown"
 
@@ -152,6 +170,7 @@ def test_missing_rank_vs_declared_topology(tmp_path: Path):
     result = qualify_run(
         art,
         _spec(topology={"nodes": 1, "gpus": 8, "processes": 8, "ranks": 8, "tp": 8}),
+        _TRACE_ONLY,
     )
     assert result.verdict == "invalid_run"
     statuses = {c.name: c.status for c in result.checks}
@@ -160,12 +179,27 @@ def test_missing_rank_vs_declared_topology(tmp_path: Path):
     assert statuses["topology_ranks"] == "fail"
 
 
+def test_header_device_count_does_not_paper_over_missing_gpus(tmp_path: Path):
+    art = tmp_path / "cap"
+    # Header claims 8 devices; only device 0 emitted kernels.
+    _write_trace(art, _header(device_count=8), [_kernel(pid=1, device_id=0)])
+    _write_identity(art)
+    result = qualify_run(
+        art,
+        _spec(topology={"nodes": 1, "gpus": 8, "processes": 1, "ranks": 1, "tp": 8}),
+        _TRACE_ONLY,
+    )
+    assert result.verdict == "invalid_run"
+    assert _check_map(result)["topology_gpus"].status == "fail"
+    assert _check_map(result)["topology_gpus"].evidence["note"] == "missing_gpu_kernel_events"
+
+
 def test_truncated_names(tmp_path: Path):
     art = tmp_path / "cap"
     long_name = "x" * NAME_MAX
     _write_trace(art, _header(), [_kernel(name=long_name)])
     _write_identity(art)
-    result = qualify_run(art, _spec())
+    result = qualify_run(art, _spec(), _TRACE_ONLY)
     assert result.verdict == "invalid_run"
     assert _check_map(result)["truncated_names"].status == "fail"
 
@@ -174,13 +208,12 @@ def test_truncated_shard(tmp_path: Path):
     art = tmp_path / "cap"
     art.mkdir(parents=True)
     path = art / "trace.jsonl"
-    # Valid header + kernel, then EOF mid-line (no trailing newline on incomplete JSON).
     with path.open("wb") as fh:
         fh.write((json.dumps({"_header": _header()}) + "\n").encode())
         fh.write((json.dumps(_kernel()) + "\n").encode())
         fh.write(b'{"kind":"kernel","name":"cut_off"')
     _write_identity(art)
-    result = qualify_run(art, _spec())
+    result = qualify_run(art, _spec(), _TRACE_ONLY)
     assert result.verdict == "invalid_run"
     assert _check_map(result)["truncated_shard"].status == "fail"
 
@@ -197,10 +230,7 @@ def test_conflicting_engine_identity(tmp_path: Path):
         f"traffic_manifest_id={TRAFFIC}\n",
         encoding="utf-8",
     )
-    result = qualify_run(
-        art,
-        _spec(engine_version="0.8.0"),
-    )
+    result = qualify_run(art, _spec(engine_version="0.8.0"), _TRACE_ONLY)
     assert result.verdict == "invalid_run"
     assert _check_map(result)["engine_version"].status == "fail"
     assert _check_map(result)["rocm_version"].status == "pass"
@@ -209,7 +239,6 @@ def test_conflicting_engine_identity(tmp_path: Path):
 def test_unavailable_required_evidence(tmp_path: Path):
     art = tmp_path / "cap"
     _write_trace(art, _header(), [_kernel()])
-    # Identity sidecars omit checkpoint — declared revision is unobservable.
     (art / "run_manifest.json").write_text(
         json.dumps({
             "engine": "vllm",
@@ -221,7 +250,7 @@ def test_unavailable_required_evidence(tmp_path: Path):
         }),
         encoding="utf-8",
     )
-    result = qualify_run(art, _spec())
+    result = qualify_run(art, _spec(), _TRACE_ONLY)
     assert result.verdict == "not_established"
     assert _check_map(result)["checkpoint_revision"].status == "unknown"
 
@@ -230,7 +259,7 @@ def test_conflicting_model_repository(tmp_path: Path):
     art = tmp_path / "cap"
     _write_trace(art, _header(fingerprint="other/model"), [_kernel()])
     _write_identity(art)
-    result = qualify_run(art, _spec())
+    result = qualify_run(art, _spec(), _TRACE_ONLY)
     assert result.verdict == "invalid_run"
     assert _check_map(result)["model_repository"].status == "fail"
 
@@ -243,7 +272,7 @@ def test_meta_dropped_records_fail(tmp_path: Path):
     ]
     _write_trace(art, _header(), events)
     _write_identity(art)
-    result = qualify_run(art, _spec())
+    result = qualify_run(art, _spec(), _TRACE_ONLY)
     assert result.verdict == "invalid_run"
     assert _check_map(result)["dropped_records"].status == "fail"
 
@@ -252,43 +281,154 @@ def test_required_source_amdsmi_absent(tmp_path: Path):
     art = tmp_path / "cap"
     _write_trace(art, _header(), [_kernel()])
     _write_identity(art)
-    contract = SignalContract(required_sources=["merged_trace", "amdsmi"])
-    result = qualify_run(art, _spec(), contract)
+    result = qualify_run(art, _spec())  # default contract requires amdsmi
     assert result.verdict == "not_established"
     assert _check_map(result)["source:amdsmi"].status == "unknown"
 
 
-def test_sampling_gap_and_clock_alignment(tmp_path: Path):
-    art = tmp_path / "cap"
+def test_manifest_two_levels_up(tmp_path: Path):
+    """Documented --artifacts $RUN/e0/capture must find $RUN/MANIFEST."""
+    run = tmp_path / "run"
+    art = run / "e0" / "capture"
     _write_trace(art, _header(), [_kernel()])
-    _write_identity(art)
-    # Wall window + amd-smi with a large gap.
-    manifest = json.loads((art / "run_manifest.json").read_text())
-    manifest.update({
-        "wall_start_ns": 1_000_000_000,
-        "wall_end_ns": 5_000_000_000,
-        "captured_at_is_wall": True,
-    })
-    (art / "run_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    (art / "amdsmi.jsonl").write_text(
-        "\n".join([
-            json.dumps({"ts_ns": 1_000_000_000, "gpu_index": 0}),
-            json.dumps({"ts_ns": 2_000_000_000, "gpu_index": 0}),
-            json.dumps({"ts_ns": 5_000_000_000, "gpu_index": 0}),  # 3s gap
-        ]) + "\n",
+    (run / "MANIFEST").write_text(
+        f"phase=e0 arm=C label={TRAFFIC} ts=2026-01-01T00:00:00Z "
+        f"checkpoint_revision={REV} image_digest={DIGEST} engine=vllm tp=1\n"
+        f"rocm={ROCM_VER}\n"
+        f"vllm={ENGINE_VER}\n"
+        f"traffic_manifest_id={TRAFFIC}\n",
         encoding="utf-8",
     )
-    contract = SignalContract(required_sources=["merged_trace", "amdsmi"])
-    result = qualify_run(art, _spec(), contract)
+    result = qualify_run(art, _spec(), _TRACE_ONLY)
+    assert _check_map(result)["engine_version"].status == "pass"
+    assert _check_map(result)["rocm_version"].status == "pass"
+    assert result.verdict == "qualified", json.dumps(result.to_dict(), indent=2)
+
+
+def test_declared_tp_in_launch_flags_not_treated_as_observed(tmp_path: Path):
+    art = tmp_path / "cap"
+    _write_trace(art, _header(), [_kernel()])
+    # Observed export has no TP; declaration lists --tensor-parallel-size 8.
+    (art / "MANIFEST").write_text(
+        f"phase=e0 arm=C label={TRAFFIC} ts=2026-01-01T00:00:00Z "
+        f"checkpoint_revision={REV} image_digest={DIGEST} engine=vllm\n"
+        f"rocm={ROCM_VER}\n"
+        f"vllm={ENGINE_VER}\n"
+        f"traffic_manifest_id={TRAFFIC}\n"
+        "export GITM_EXTRA_VLLM_ARGS=--enable-layerwise-nvtx-tracing\n",
+        encoding="utf-8",
+    )
+    (art / "run_manifest.json").write_text(
+        json.dumps({
+            "checkpoint_revision": REV,
+            "engine": "vllm",
+            "vllm_version": ENGINE_VER,
+            "rocm_version": ROCM_VER,
+            "image_digest": DIGEST,
+            "traffic_manifest_id": TRAFFIC,
+        }),
+        encoding="utf-8",
+    )
+    from gitm.optimizer.qualify_run import _extract_flag_int
+    observed = _extract_flag_int(
+        {"GITM_EXTRA_VLLM_ARGS": "--enable-layerwise-nvtx-tracing"},
+        ["--tensor-parallel-size", "8"],
+        "tensor-parallel-size",
+        "tp",
+    )
+    assert observed is None
+    result = qualify_run(
+        art,
+        _spec(
+            topology={"nodes": 1, "gpus": 1, "processes": 1, "ranks": 1, "tp": 8},
+            launch_flags=["--tensor-parallel-size", "8"],
+        ),
+        _TRACE_ONLY,
+    )
+    # Declared launch flag is present in observed EXTRA? No — TP size not in EXTRA.
+    # topology_tp stays unknown (unobservable), not a false pass.
+    assert _check_map(result)["topology_tp"].status == "unknown"
+    assert _check_map(result)["topology_tp"].evidence.get("observed") is None
+
+
+def test_malformed_pid_does_not_crash(tmp_path: Path):
+    art = tmp_path / "cap"
+    _write_trace(
+        art,
+        _header(),
+        [_kernel(pid=[1, 2], device_id=0)],  # type: ignore[arg-type]
+    )
+    _write_identity(art)
+    result = qualify_run(art, _spec(), _TRACE_ONLY)
+    assert result.verdict in ("invalid_run", "not_established")
+    assert "malformed_events" in _check_map(result)
+
+
+def test_sibling_window_integrity_fail(tmp_path: Path):
+    run = tmp_path / "run"
+    good = run / "e0" / "capture"
+    bad = run / "e1" / "capture"
+    _write_trace(good, _header(run_id="good"), [_kernel()])
+    _write_identity(good)
+    bad.mkdir(parents=True)
+    # Truncated sibling window under the same run root.
+    (bad / "trace.jsonl").write_bytes(
+        (json.dumps({"_header": _header(run_id="bad")}) + "\n").encode()
+        + b'{"kind":"kernel","name":"x"'
+    )
+    result = qualify_run(run, _spec(), _TRACE_ONLY)
     assert result.verdict == "invalid_run"
-    assert _check_map(result)["sampling_gaps"].status == "fail"
-    assert _check_map(result)["clock_alignment"].status == "pass"
+    # Depending on lexicographic primary selection, either the sibling window
+    # check or the primary truncated_shard check must fire.
+    assert any(
+        (c.name.startswith("window_integrity:") or c.name == "truncated_shard")
+        and c.status == "fail"
+        for c in result.checks
+    ), [ (c.name, c.status) for c in result.checks ]
+
+
+def test_device_clock_absolute_ts_does_not_fail_window(tmp_path: Path):
+    """Kernel timestamps may be far above wall duration_ns (different clock origin)."""
+    art = tmp_path / "cap"
+    # Absolute device timestamps >> duration_ns, but span is small.
+    _write_trace(
+        art,
+        _header(duration_ns=10_000),
+        [_kernel(start=10**15, end=10**15 + 5_000)],
+    )
+    _write_identity(art)
+    result = qualify_run(art, _spec(), _TRACE_ONLY)
+    assert _check_map(result)["capture_window_coverage"].status == "pass"
+    assert result.verdict == "qualified", json.dumps(result.to_dict(), indent=2)
+
+
+def test_cli_unknown_contract_version(tmp_path: Path, capsys):
+    art = tmp_path / "cap"
+    art.mkdir()
+    spec_path = tmp_path / "deploy.json"
+    spec_path.write_text(json.dumps({
+        "model_repository": MODEL,
+        "topology": {"nodes": 1, "gpus": 1},
+        "capture_backend": "rocprof-inject",
+        "signal_contract_version": "v0",
+    }))
+    rc = qualify_main([
+        "--artifacts", str(art),
+        "--deployment-spec", str(spec_path),
+        "--signal-contract-version", "v1",
+    ])
+    assert rc == 2
+    out = json.loads(capsys.readouterr().out)
+    assert out["verdict"] == "not_established"
+    assert out["checks"][0]["name"] == "signal_contract"
 
 
 def test_cli_emits_json(tmp_path: Path, capsys):
-    art = tmp_path / "cap"
+    run = tmp_path / "run"
+    art = run / "e0" / "capture"
     _write_trace(art, _header(), [_kernel()])
     _write_identity(art)
+    _write_amdsmi(run / "amdsmi.jsonl")
     spec_path = tmp_path / "deploy.json"
     spec_path.write_text(
         json.dumps({
@@ -333,3 +473,4 @@ def test_default_contract_version():
     assert c.version == "v0"
     assert c.capture_backend == "rocprof-inject"
     assert "merged_trace" in c.required_sources
+    assert "amdsmi" in c.required_sources

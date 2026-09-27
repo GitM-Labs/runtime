@@ -149,7 +149,7 @@ PY
 | Check | Expected |
 |---|---|
 | `source` | `rocprof` (injected ROCm path) |
-| `device_count` | `8` for full TP=8 node (or declared topology) |
+| `workload_id` | `vllm-attach` (what `capture attach` writes; example deployment_spec matches) |
 
 ---
 

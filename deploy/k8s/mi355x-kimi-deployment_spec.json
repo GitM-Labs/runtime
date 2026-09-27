@@ -17,7 +17,7 @@
     "ep": null,
     "dp": null
   },
-  "workload_id": "kimi-loop",
+  "workload_id": "vllm-attach",
   "traffic_manifest_id": "smoke",
   "capture_backend": "rocprof-inject",
   "signal_contract_version": "v0"

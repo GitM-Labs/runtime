@@ -33,7 +33,7 @@ from gitm.optimizer.replay import _load_trace_jsonl
 from gitm.tracer.kernel_taxonomy import NAME_MAX
 from gitm.tracer.schema import Trace
 
-QUALIFY_RUN_REVISION = "0.2.0"
+QUALIFY_RUN_REVISION = "0.2.1"
 
 CheckStatus = Literal["pass", "fail", "unknown"]
 Verdict = Literal["qualified", "invalid_run", "not_established"]
@@ -73,11 +73,13 @@ class QualifyRunResult:
         }
 
 
-def _find_trace_jsonl(artifacts_dir: Path) -> Path | None:
+def _find_trace_jsonls(artifacts_dir: Path) -> list[Path]:
+    """All capture traces under ``artifacts_dir`` (excludes amd-smi streams)."""
     if artifacts_dir.is_file() and artifacts_dir.suffix == ".jsonl":
-        return artifacts_dir
+        if "amdsmi" in artifacts_dir.name.lower():
+            return []
+        return [artifacts_dir]
     candidates = sorted(artifacts_dir.rglob("*.jsonl"))
-    # Prefer capture/trace naming; fall back to last jsonl (matches E0 habit).
     preferred = [
         p
         for p in candidates
@@ -87,7 +89,28 @@ def _find_trace_jsonl(artifacts_dir: Path) -> Path | None:
     pool = preferred or [
         p for p in candidates if "amdsmi" not in p.name.lower()
     ]
+    return pool
+
+
+def _find_trace_jsonl(artifacts_dir: Path) -> Path | None:
+    pool = _find_trace_jsonls(artifacts_dir)
     return pool[-1] if pool else None
+
+
+def _safe_id(value: Any) -> Any | None:
+    """Return a hashable scalar id, or None if missing/malformed (never crash)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, str)):
+        return value
+    # Arrays / dicts / floats are not valid pid/device provenance on the wire.
+    return None
+
+
+def _id_sort_key(x: Any):
+    return (x is None, type(x).__name__, str(x))
 
 
 def _scan_jsonl(path: Path) -> dict[str, Any]:
@@ -112,6 +135,7 @@ def _scan_jsonl(path: Path) -> dict[str, Any]:
     min_start: int | None = None
     max_end: int | None = None
     truncated_shard = False
+    content_hasher = hashlib.sha256()
     raw = path.read_bytes()
     if raw and not raw.endswith(b"\n"):
         # EOF mid-line is the truncated-shard failure mode.
@@ -147,7 +171,9 @@ def _scan_jsonl(path: Path) -> dict[str, Any]:
         start, end = rec.get("start_ns"), rec.get("end_ns")
         if not isinstance(start, int) or not isinstance(end, int) or end <= start:
             invalid_ts += 1
+            start_i, end_i = None, None
         else:
+            start_i, end_i = start, end
             min_start = start if min_start is None else min(min_start, start)
             max_end = end if max_end is None else max(max_end, end)
         name = rec.get("name")
@@ -157,23 +183,34 @@ def _scan_jsonl(path: Path) -> dict[str, Any]:
             anonymous += 1
         if isinstance(name, str) and len(name.encode("utf-8")) >= NAME_MAX:
             truncated += 1
-        pid, device = rec.get("pid"), rec.get("device_id")
+        pid = _safe_id(rec.get("pid"))
+        device = _safe_id(rec.get("device_id"))
+        if rec.get("pid") is not None and pid is None:
+            malformed += 1
+        if rec.get("device_id") is not None and device is None:
+            malformed += 1
         workers[(pid, device)] = workers.get((pid, device), 0) + 1
         if pid is not None:
             pids.add(pid)
         if device is not None:
             devices.add(device)
-        if rec.get("rank") is not None:
-            ranks.add(rec.get("rank"))
-        if rec.get("node") is not None:
-            nodes.add(rec.get("node"))
-        if rec.get("shard") is not None:
-            shards.add(rec.get("shard"))
-        key = (pid, device, start, end, name)
+        rank = _safe_id(rec.get("rank"))
+        if rank is not None:
+            ranks.add(rank)
+        node = rec.get("node")
+        if isinstance(node, (str, int)):
+            nodes.add(node)
+        shard = rec.get("shard")
+        if isinstance(shard, (str, int)):
+            shards.add(shard)
+        key = (pid, device, start_i, end_i, name if isinstance(name, str) else None)
         if key in seen:
             duplicate_keys += 1
         else:
             seen.add(key)
+        content_hasher.update(
+            f"{pid}|{device}|{start_i}|{end_i}|{name}\n".encode("utf-8", errors="replace")
+        )
 
     # Trailing incomplete line (no final newline) counts as truncated + malformed.
     if truncated_shard and text and not text.endswith("\n"):
@@ -196,16 +233,18 @@ def _scan_jsonl(path: Path) -> dict[str, Any]:
         "anonymous_kernels": anonymous,
         "invalid_kernels": invalid_ts,
         "workers": [{"pid": p, "device": d, "kernels": n} for (p, d), n in workers.items()],
-        "pids": sorted(pids, key=lambda x: (x is None, x)),
-        "devices": sorted(devices, key=lambda x: (x is None, x)),
-        "ranks": sorted(ranks, key=lambda x: (x is None, x)),
-        "nodes": sorted(nodes, key=lambda x: (x is None, str(x))),
-        "shards": sorted(shards, key=lambda x: (x is None, str(x))),
+        "pids": sorted(pids, key=_id_sort_key),
+        "devices": sorted(devices, key=_id_sort_key),
+        "ranks": sorted(ranks, key=_id_sort_key),
+        "nodes": sorted(nodes, key=_id_sort_key),
+        "shards": sorted(shards, key=_id_sort_key),
         "duplicate_event_keys": duplicate_keys,
         "missing_pid_kernels": sum(1 for w in workers if w[0] is None),
         "missing_device_kernels": sum(1 for w in workers if w[1] is None),
         "min_start_ns": min_start,
         "max_end_ns": max_end,
+        "content_sha256": content_hasher.hexdigest()[:16],
+        "path": str(path),
     }
 
 
@@ -222,6 +261,7 @@ def _capture_fingerprint(scan: dict[str, Any], trace: Trace | None) -> str:
         "dropped_records": scan.get("dropped_records"),
         "kernels": scan.get("kernels"),
         "truncated_shard": scan.get("truncated_shard"),
+        "content_sha256": scan.get("content_sha256"),
     }
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
@@ -263,23 +303,57 @@ def _cmp(
     return CheckResult(name, "pass", {"declared": declared, "observed": observed})
 
 
+def _ancestor_dirs(start: Path, *, max_up: int = 4) -> list[Path]:
+    out: list[Path] = []
+    cur = start if start.is_dir() else start.parent
+    for _ in range(max_up + 1):
+        out.append(cur)
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return out
+
+
 def _load_observed_manifest(artifacts_dir: Path) -> dict[str, Any]:
+    """Merge loop ``$RUN/MANIFEST`` (may be 2+ dirs up) with capture sidecars."""
+    observed: dict[str, Any] = {}
+    for root in _ancestor_dirs(artifacts_dir, max_up=4):
+        man = root / "MANIFEST"
+        if man.is_file():
+            observed = parse_run_manifest(man.read_text(encoding="utf-8"))
+            observed["_manifest_path"] = str(man)
+            break
+
     for candidate in (
-        artifacts_dir / "MANIFEST",
-        artifacts_dir.parent / "MANIFEST",
         artifacts_dir / "run_manifest.json",
+        artifacts_dir / "serving_summary.json",
+        artifacts_dir.parent / "run_manifest.json",
     ):
-        if candidate.is_file():
-            if candidate.suffix == ".json":
-                return json.loads(candidate.read_text(encoding="utf-8"))
-            return parse_run_manifest(candidate.read_text(encoding="utf-8"))
-    return {}
+        if not candidate.is_file():
+            continue
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        exports = observed.get("exports") if isinstance(observed.get("exports"), dict) else {}
+        data_exports = data.get("exports") if isinstance(data.get("exports"), dict) else {}
+        observed = {
+            **observed,
+            **{k: v for k, v in data.items() if k != "exports"},
+            "exports": {**exports, **data_exports},
+            "_sidecar_path": str(candidate),
+        }
+        break
+    return observed
 
 
 def _serving_sidecar(artifacts_dir: Path) -> dict[str, Any]:
     for candidate in (
         artifacts_dir / "serving_summary.json",
         artifacts_dir / "run_manifest.json",
+        artifacts_dir.parent / "run_manifest.json",
     ):
         if candidate.is_file():
             try:
@@ -290,21 +364,35 @@ def _serving_sidecar(artifacts_dir: Path) -> dict[str, Any]:
 
 
 def _search_roots(artifacts_dir: Path) -> list[Path]:
-    roots = [artifacts_dir]
-    if artifacts_dir.parent != artifacts_dir:
-        roots.append(artifacts_dir.parent)
-    return roots
+    return _ancestor_dirs(artifacts_dir, max_up=4)
 
 
 def _find_source_path(artifacts_dir: Path, source: str) -> Path | None:
     if source == "merged_trace":
         return _find_trace_jsonl(artifacts_dir)
-    globs = _SOURCE_GLOBS.get(source, (f"**/{source}*", f"**/*{source}*"))
-    for root in _search_roots(artifacts_dir):
-        for pattern in globs:
-            hits = sorted(root.glob(pattern))
-            # Prefer non-empty files.
-            for hit in hits:
+
+    # Exact / shallow names only — never recursive ``**/`` from shared temp
+    # ancestors (that leaks into unrelated pytest leftovers).
+    exact_names = {
+        "amdsmi": ("amdsmi.jsonl",),
+        "metrics": ("metrics.txt", "vllm_metrics.txt", "scrape_metrics.txt"),
+    }.get(source, (f"{source}.jsonl",))
+
+    for root in _ancestor_dirs(artifacts_dir, max_up=4):
+        for name in exact_names:
+            for candidate in (
+                root / name,
+                root / "telemetry" / name,
+            ):
+                if candidate.is_file() and candidate.stat().st_size > 0:
+                    return candidate
+        # Non-recursive prefix match in the run root only (e.g. amdsmi.ROLE.jsonl).
+        for hit in sorted(root.glob(f"{source}*.jsonl")):
+            if hit.is_file() and hit.stat().st_size > 0:
+                return hit
+        tel = root / "telemetry"
+        if tel.is_dir():
+            for hit in sorted(tel.glob(f"{source}*.jsonl")):
                 if hit.is_file() and hit.stat().st_size > 0:
                     return hit
     return None
@@ -458,7 +546,8 @@ def qualify_run(
                 )
             )
 
-    trace_path = source_paths.get("merged_trace") or _find_trace_jsonl(artifacts_dir)
+    all_traces = _find_trace_jsonls(artifacts_dir)
+    trace_path = source_paths.get("merged_trace") or (all_traces[-1] if all_traces else None)
     if trace_path is None:
         checks.append(
             CheckResult(
@@ -475,6 +564,60 @@ def qualify_run(
             signal_contract_version=contract.version,
         )
         return result
+
+    # When --artifacts is a run root (or otherwise contains multiple windows),
+    # integrity-scan every capture so a clean window cannot hide a bad sibling.
+    sibling_traces = [p for p in all_traces if p.resolve() != trace_path.resolve()]
+    if sibling_traces:
+        checks.append(
+            CheckResult(
+                "capture_windows",
+                "pass",
+                {
+                    "primary": str(trace_path),
+                    "windows": [str(p) for p in all_traces],
+                    "count": len(all_traces),
+                },
+            )
+        )
+        for sib in sibling_traces:
+            sib_scan = _scan_jsonl(sib)
+            label = sib.name
+            try:
+                label = str(sib.relative_to(artifacts_dir))
+            except ValueError:
+                pass
+            if sib_scan["kernels"] == 0:
+                checks.append(
+                    CheckResult(
+                        f"window_kernels:{label}",
+                        "unknown",
+                        {"path": str(sib), "kernels": 0},
+                    )
+                )
+            if sib_scan["dropped_records"] > contract.max_dropped_records:
+                checks.append(
+                    CheckResult(
+                        f"window_dropped_records:{label}",
+                        "fail",
+                        {
+                            "path": str(sib),
+                            "dropped": sib_scan["dropped_records"],
+                        },
+                    )
+                )
+            if sib_scan["malformed_lines"] or sib_scan["truncated_shard"]:
+                checks.append(
+                    CheckResult(
+                        f"window_integrity:{label}",
+                        "fail",
+                        {
+                            "path": str(sib),
+                            "malformed_lines": sib_scan["malformed_lines"],
+                            "truncated_shard": sib_scan["truncated_shard"],
+                        },
+                    )
+                )
 
     scan = _scan_jsonl(trace_path)
     checks.append(
@@ -845,7 +988,7 @@ def qualify_run(
         )
     )
 
-    # Topology inventory
+    # Topology inventory — GPUs that *produced kernels*, never header.device_count.
     topo = deployment.topology
     expected_gpus = topo.gpus
     observed_gpu_count = len([d for d in scan["devices"] if d is not None])
@@ -860,31 +1003,18 @@ def qualify_run(
             )
         )
     elif observed_gpu_count < expected_gpus:
-        if isinstance(header_devices, int) and header_devices >= expected_gpus:
-            checks.append(
-                CheckResult(
-                    "topology_gpus",
-                    "pass",
-                    {
-                        "declared_gpus": expected_gpus,
-                        "header_device_count": header_devices,
-                        "observed_device_ids": scan["devices"],
-                    },
-                )
+        checks.append(
+            CheckResult(
+                "topology_gpus",
+                "fail",
+                {
+                    "declared_gpus": expected_gpus,
+                    "observed_device_ids": scan["devices"],
+                    "header_device_count": header_devices,
+                    "note": "missing_gpu_kernel_events",
+                },
             )
-        else:
-            checks.append(
-                CheckResult(
-                    "topology_gpus",
-                    "fail",
-                    {
-                        "declared_gpus": expected_gpus,
-                        "observed_device_ids": scan["devices"],
-                        "header_device_count": header_devices,
-                        "note": "missing_device_or_rank",
-                    },
-                )
-            )
+        )
     else:
         checks.append(
             CheckResult(
@@ -1231,7 +1361,8 @@ def qualify_run(
                 )
             )
 
-    # Capture-window coverage (tool-clock domain).
+    # Capture-window coverage: compare event *span* to declared duration.
+    # Do not compare absolute device-clock timestamps to wall duration_ns.
     duration = header.get("duration_ns") or (trace.duration_ns if trace else None)
     if contract.require_capture_window:
         if not isinstance(duration, int) or duration <= 0:
@@ -1251,31 +1382,40 @@ def qualify_run(
                 )
             )
         else:
+            min_start = scan["min_start_ns"]
             max_end = scan["max_end_ns"]
-            # Events filtered to the window at merge; still reject clearly outside.
-            if isinstance(max_end, int) and max_end > duration * 2:
-                checks.append(
-                    CheckResult(
-                        "capture_window_coverage",
-                        "fail",
-                        {
-                            "duration_ns": duration,
-                            "max_end_ns": max_end,
-                            "note": "events_outside_declared_window",
-                        },
+            if isinstance(min_start, int) and isinstance(max_end, int):
+                span = max_end - min_start
+                if span > duration * 2:
+                    checks.append(
+                        CheckResult(
+                            "capture_window_coverage",
+                            "fail",
+                            {
+                                "duration_ns": duration,
+                                "event_span_ns": span,
+                                "note": "event_span_exceeds_declared_window",
+                            },
+                        )
                     )
-                )
+                else:
+                    checks.append(
+                        CheckResult(
+                            "capture_window_coverage",
+                            "pass",
+                            {
+                                "duration_ns": duration,
+                                "event_span_ns": span,
+                                "kernels": scan["kernels"],
+                            },
+                        )
+                    )
             else:
                 checks.append(
                     CheckResult(
                         "capture_window_coverage",
-                        "pass",
-                        {
-                            "duration_ns": duration,
-                            "min_start_ns": scan["min_start_ns"],
-                            "max_end_ns": max_end,
-                            "kernels": scan["kernels"],
-                        },
+                        "unknown",
+                        {"duration_ns": duration, "note": "kernel_timestamps_unusable"},
                     )
                 )
 
@@ -1322,6 +1462,8 @@ def qualify_run(
             )
         else:
             if wall_start is None or wall_end is None:
+                # State plane is checked via cadence/gaps; cross-domain alignment
+                # needs an explicit wall window and must not be invented.
                 checks.append(
                     CheckResult(
                         "clock_alignment",
@@ -1459,12 +1601,18 @@ def _extract_flag_int(
     long_name: str,
     short_key: str,
 ) -> int | None:
+    """Parse an int flag from *observed* exports only — never from declared launch_flags."""
+    _ = launch_flags  # declared flags must not pollute observed evidence
     extra = str(exports.get("GITM_EXTRA_VLLM_ARGS", "") or "")
-    blob = extra + " " + " ".join(launch_flags)
-    m = re.search(rf"--{re.escape(long_name)}[= ]+(\d+)", blob)
+    # Supervisor may also stash TP on arm.env under a short key.
+    if short_key in exports:
+        try:
+            return int(exports[short_key])
+        except (TypeError, ValueError):
+            pass
+    m = re.search(rf"--{re.escape(long_name)}[= ]+(\d+)", extra)
     if m:
         return int(m.group(1))
-    _ = short_key
     return None
 
 
@@ -1474,6 +1622,25 @@ def _aggregate(checks: list[CheckResult]) -> Verdict:
     if any(c.status == "unknown" for c in checks):
         return "not_established"
     return "qualified"
+
+
+def _contract_version_error(msg: str, deployment: DeploymentSpec | None = None) -> dict[str, Any]:
+    return {
+        "verdict": "not_established",
+        "checks": [{
+            "name": "signal_contract",
+            "status": "unknown",
+            "evidence": {"error": msg},
+        }],
+        "deployment_fingerprint": (
+            deployment_fingerprint(deployment, default_signal_contract())
+            if deployment is not None
+            else "deploy:absent"
+        ),
+        "capture_fingerprint": "capture:absent",
+        "signal_contract_version": PROVISIONAL_SIGNAL_CONTRACT_VERSION,
+        "qualify_run_revision": QUALIFY_RUN_REVISION,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1499,7 +1666,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--signal-contract-version",
         default=None,
-        help="If set to 'v0', use the built-in provisional contract.",
+        help="Require this contract version (e.g. 'v0'). Must match the loaded contract.",
     )
     args = ap.parse_args(argv)
 
@@ -1520,27 +1687,39 @@ def main(argv: list[str] | None = None) -> int:
         }, indent=2))
         return 2
 
-    if args.signal_contract_version == "v0" and args.signal_contract is None:
-        contract = default_signal_contract()
-    else:
-        try:
+    requested = args.signal_contract_version
+    try:
+        if args.signal_contract is not None:
             contract = load_signal_contract(args.signal_contract)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            print(json.dumps({
-                "verdict": "not_established",
-                "checks": [{
-                    "name": "signal_contract",
-                    "status": "unknown",
-                    "evidence": {"error": str(exc)},
-                }],
-                "deployment_fingerprint": deployment_fingerprint(
-                    deployment, default_signal_contract()
+        elif requested is None or requested == "v0":
+            contract = default_signal_contract()
+        else:
+            print(json.dumps(
+                _contract_version_error(
+                    f"unknown signal-contract-version={requested!r}; "
+                    "pass --signal-contract <file> or use v0",
+                    deployment,
                 ),
-                "capture_fingerprint": "capture:absent",
-                "signal_contract_version": PROVISIONAL_SIGNAL_CONTRACT_VERSION,
-                "qualify_run_revision": QUALIFY_RUN_REVISION,
-            }, indent=2))
+                indent=2,
+            ))
             return 2
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(json.dumps(
+            _contract_version_error(str(exc), deployment),
+            indent=2,
+        ))
+        return 2
+
+    if requested is not None and contract.version != requested:
+        print(json.dumps(
+            _contract_version_error(
+                f"requested version {requested!r} does not match "
+                f"loaded contract version {contract.version!r}",
+                deployment,
+            ),
+            indent=2,
+        ))
+        return 2
 
     result = qualify_run(args.artifacts, deployment, contract)
     print(json.dumps(result.to_dict(), indent=2))

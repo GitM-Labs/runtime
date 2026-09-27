@@ -64,8 +64,10 @@ class SignalContract(BaseModel):
 
     version: str = PROVISIONAL_SIGNAL_CONTRACT_VERSION
     capture_backend: CaptureBackend = "rocprof-inject"
+    # MI355X bring-up expects amd-smi on the run; missing state plane must not
+    # silently pass clock/cadence checks.
     required_sources: list[str] = Field(
-        default_factory=lambda: ["merged_trace"],
+        default_factory=lambda: ["merged_trace", "amdsmi"],
     )
     require_kernel_events: bool = True
     require_named_kernels: bool = True
