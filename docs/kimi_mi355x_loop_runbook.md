@@ -12,6 +12,8 @@ and where each deliverable lands.
 |---|---|---|
 | predicted graph | `scripts/kimi_loop/predict_sweep.py` (planner: `kimi-k2.5` @ MI355X, TP=8) | laptop |
 | execution | `deploy/k8s/mi355x-kimi-loop.yaml` + `scripts/kimi_loop/run_loop.sh` (GuideLLM sweeps, BurstGPT replay, GITM tracer arms) | cluster |
+| collector bring-up | checked procedure: [`docs/kimi_mi355x_collector_bringup.md`](kimi_mi355x_collector_bringup.md) | cluster |
+| run qualification | [`docs/run_qualification_path.md`](run_qualification_path.md); `python -m gitm.optimizer.qualify_run` | laptop / sidecar |
 | deviations | `gitm deviate` per captured window + `analyze_join.py` | laptop |
 | monitoring | amd-smi 1 Hz (in-pod, always on) + 1 Hz `/metrics` scrapes + deviation invariants (`gitm.optimizer.monitor`) | pod + laptop |
 | interventions | `run_loop.sh e8` with `INTERVENTION='--kv-cache-dtype fp8'` (or another lever), before/after measured | cluster |

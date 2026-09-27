@@ -1,0 +1,24 @@
+{
+  "model_repository": "moonshotai/Kimi-K2.5",
+  "checkpoint_revision": null,
+  "engine": "vllm",
+  "engine_version": null,
+  "rocm_version": null,
+  "image_digest": "sha256:e5e47f6aaab675c252c381f0dac237b31b10d87bb74d092b07fb4065efd7f5a1",
+  "launch_flags": [
+    "--enable-layerwise-nvtx-tracing"
+  ],
+  "topology": {
+    "nodes": 1,
+    "gpus": 8,
+    "processes": 8,
+    "ranks": 8,
+    "tp": 8,
+    "ep": null,
+    "dp": null
+  },
+  "workload_id": "kimi-loop",
+  "traffic_manifest_id": "smoke",
+  "capture_backend": "rocprof-inject",
+  "signal_contract_version": "v0"
+}
