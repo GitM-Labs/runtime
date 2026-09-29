@@ -14,11 +14,16 @@ The join is by op, and the two vocabularies already agree — ``applies_to_kerne
 names the same canonical ops ``classify_op`` produces, which is what the library
 header requires of every vLLM entry.
 
-**A row with no levers is a result, not an empty list to skip.** It says the
-catalog cannot address the place the time is going, and that is the most useful
-thing this module can report: on a sparse-MoE checkpoint ``moe_routed`` is half
-the predicted step and no entry names it, so the loop has nothing to try there no
-matter how it ranks.
+**A row with no op-scoped lever is a result, not an empty list to skip.** It
+says nothing in the catalog is *aimed* at the place the time is going, which is
+the most useful thing this module can report. It does not say nothing can affect
+the region: whole-step levers apply to every row and are reported separately, so
+an uncovered row still has those.
+
+``moe_routed`` was the motivating case — half the predicted step on a sparse-MoE
+checkpoint with no entry naming it. #124 scoped the MoE levers to it, so that
+particular gap is closed; the query is what remains useful, and the test that
+pinned the gap now pins its closure.
 
 Deliberately not here: a score combining the two sides. ``recoverable_ms`` is a
 duration and ``expected_delta_mean`` is a fraction of the whole step, so a product
@@ -103,18 +108,27 @@ def render_targets(found: list[Target]) -> str:
     """The table as text, most recoverable first."""
     if not found:
         return "no recoverable time found"
-    out = [f"  {'region':24s} {'phase':8s} {'bound':14s} {'recover_ms':>11s}  levers"]
+    # Widened to the content rather than cut to a fixed 24. The layer suffix is
+    # the last thing on a region name, so a fixed cut takes exactly the part that
+    # distinguishes the rows: `attn_qnorm_rope_insert@L10` and `@L11` both land
+    # on the same string, and the column stops saying which layer is over.
+    w = max(len("region"), *(len(t.row.region) for t in found))
+    out = [f"  {'region':{w}s} {'phase':8s} {'bound':14s} {'recover_ms':>11s}  levers"]
     for t in found:
         names = ", ".join(s.name for s in t.levers[:3]) if t.levers else "— none target this"
         more = f" (+{len(t.levers) - 3})" if len(t.levers) > 3 else ""
         out.append(
-            f"  {t.row.region[:24]:24s} {t.row.phase:8s} {(t.row.bound or '-')[:14]:14s} "
+            f"  {t.row.region:{w}s} {t.row.phase:8s} {(t.row.bound or '-')[:14]:14s} "
             f"{t.row.recoverable_ms:11.2f}  {names}{more}"
         )
     blind = [t for t in found if t.uncovered]
     if blind:
         ms = sum(t.row.recoverable_ms for t in blind)
         out.append("")
+        # "no lever names them", not "the catalog cannot address them": whole-step
+        # levers apply to every row, so the second claim is wider than the query
+        # supports and would read as a catalog gap that is not there.
+        whole = " (whole-step levers still apply)" if any(t.whole_step for t in blind) else ""
         out.append(f"  {len(blind)} of {len(found)} region(s) have no lever naming them — "
-                   f"{ms:.1f} ms recoverable the catalog cannot address.")
+                   f"{ms:.1f} ms recoverable with nothing aimed at it{whole}.")
     return "\n".join(out)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 from gitm.agents.targeting import levers_for, render_targets, targets
 from gitm.kernels.library import load_library
@@ -114,8 +115,14 @@ def test_a_region_no_lever_names_is_reported_not_dropped(tmp_path):
     assert found[0].row.op == "moe_routed"
     assert found[0].uncovered is True
     assert found[0].levers == ()
-    assert "none target this" in render_targets(found)
-    assert "cannot address" in render_targets(found)
+    rendered = render_targets(found)
+    assert "none target this" in rendered
+    # "nothing aimed at it", never "the catalog cannot address it": the row has
+    # no *op-scoped* lever, but the whole-step levers in `lib` apply to every
+    # region, so the wider claim is one this query does not support.
+    assert "nothing aimed at it" in rendered
+    assert "cannot address" not in rendered
+    assert "whole-step levers still apply" in rendered
 
 
 def test_the_real_catalog_now_addresses_the_dominant_moe_region(tmp_path):
@@ -165,3 +172,21 @@ def test_filters_and_top_pass_through_to_the_ranking(tmp_path):
 
 def test_nothing_recoverable_renders_as_nothing_rather_than_an_empty_table():
     assert render_targets([]) == "no recoverable time found"
+
+
+def test_layer_rows_stay_distinguishable_in_the_rendered_table(tmp_path):
+    """The layer suffix is the last thing on a region name, so a fixed-width cut
+    takes exactly the part that tells two rows apart. At 24 characters
+    `attn_qnorm_rope_insert@L10` and `@L11` render identically, and the column
+    stops answering the question it exists for — which layer is over."""
+    long_a, long_b = "attn_qnorm_rope_insert@L10", "attn_qnorm_rope_insert@L11"
+    base = targets(_one_row(tmp_path, "flash_fwd_kernel", "attn_score_value"), [], top=1)[0]
+    found = [
+        replace(base, row=replace(base.row, region=long_a)),
+        replace(base, row=replace(base.row, region=long_b)),
+    ]
+
+    rendered = render_targets(found)
+
+    assert long_a in rendered, "the L10 row lost its layer suffix"
+    assert long_b in rendered, "the L11 row lost its layer suffix"
