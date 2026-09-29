@@ -76,10 +76,20 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
     # contains "attention", so without an earlier claim it is misfiled as
     # `attn_score_value` — a constant-traffic op compared against a prediction
     # that grows with context, reporting a false deviation on every long step.
+    #
+    # "kda" repeats that lesson for Kimi Delta Attention (GLM-5.3-Flash, Kimi
+    # Linear): vLLM's split op is `vllm::kda_attention`, which the "attention"
+    # needle claimed, and its chunked kernels are `chunk_kda_scaled_dot_kkt_*`
+    # and `kda_gate_*`, which "chunk_scaled_dot" misses. The rest are fla kernels
+    # the chunked scan launches under names the GDN needles never covered —
+    # the chunk output `chunk_gla_fwd_kernel_o`, the solve_tril merge step, the
+    # gate cumsum and the in-kernel q/k l2norm — checked against vLLM 0.26's
+    # third_party/flash_linear_attention/ops.
     "linattn_recurrent": ("fused_recurrent", "gated_delta", "delta_rule", "deltarule",
                           "deltanet", "chunk_fwd", "chunk_scaled_dot", "recompute_w_u",
                           "solve_tril", "wy_fast", "linear_attn", "linear_attention",
-                          "gdn", "mamba_mixer", "short_conv"),
+                          "gdn", "mamba_mixer", "short_conv", "kda", "chunk_gla",
+                          "merge_16x16", "chunk_local_cumsum", "l2norm_fwd"),
 
     # ── sparse-MoE / compressed attention ────────────────────────────────────
     # Before the generic entries below, because their vocabularies are subsets of

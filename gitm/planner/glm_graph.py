@@ -578,9 +578,15 @@ def _emit_kda(
         spec.act_dtype,
     )
 
-    # Gated RMSNorm (o_norm) folds into the output projection's input. bf16 on
-    # disk like the rest of KDA, which is why the byte width comes from the KDA
-    # dtype and not from MLA's ``attn_out_proj``.
+    # Gated RMSNorm (o_norm): its own kernel in vLLM (``layer_norm_gated_fwd_kernel``),
+    # which classifies as ``rms_norm`` — so it gets a node, or its time lands on
+    # an rms_norm prediction that never counted it. Reads the core output and the
+    # gate, writes the normed output.
+    f_n, _b = _pointwise(rows, qkv, aw, ops=4.0)
+    add("rms_norm", f_n, 3.0 * rows * qkv * aw, spec.act_dtype)
+
+    # bf16 on disk like the rest of KDA, which is why the byte width comes from
+    # the KDA dtype and not from MLA's ``attn_out_proj``.
     f, b = _linear(rows, qkv, spec.hidden, aw, kw)
     add("attn_out_proj", f, b, kda)
 

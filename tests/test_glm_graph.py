@@ -1040,9 +1040,50 @@ def test_glm53_flash_plans_the_recipe_shape_on_gb200():
         sharding=ShardingConfig(tp=4),
     )
     ops = [n.op for n in g.nodes]
-    # 869 while the 34 KDA layers were priced as MLA.
-    assert family == "glm_moe_dsa" and len(g.nodes) == 733
+    # 869 while the 34 KDA layers were priced as MLA; 733 before each KDA layer
+    # got a node for its gated output norm.
+    assert family == "glm_moe_dsa" and len(g.nodes) == 767
     assert not g.has_fallback_peaks and not g.has_unpriced_collectives
     assert ops.count("moe_routed") == 42
     routed = next(n for n in g.nodes if n.op == "moe_routed")
     assert routed.prediction.peak_dtype == "fp8" and routed.prediction.bound == "memory"
+
+
+# Every kernel vLLM's KDA path launches (vLLM 0.26, layers/mamba/gdn/
+# kimi_gdn_linear_attn.py and third_party/flash_linear_attention/ops), with the
+# predicted op it has to pair with. Bare cuBLAS GEMMs (q/k/v/o, the gate
+# projections) carry no name to match and stay unmodeled, as everywhere else.
+_KDA_KERNELS = {
+    # decode
+    "_causal_conv1d_update_kernel": "linattn_conv",
+    "kda_gate_fwd_kernel": "linattn_recurrent",
+    "fused_recurrent_gated_delta_rule_fwd_kernel": "linattn_recurrent",
+    "layer_norm_gated_fwd_kernel": "rms_norm",
+    # chunked prefill
+    "_causal_conv1d_fwd_kernel": "linattn_conv",
+    "l2norm_fwd_kernel": "linattn_recurrent",
+    "kda_gate_cumsum_fwd_kernel": "linattn_recurrent",
+    "chunk_local_cumsum_vector_kernel": "linattn_recurrent",
+    "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter": "linattn_recurrent",
+    "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra": "linattn_recurrent",
+    "solve_tril_16x16_kernel": "linattn_recurrent",
+    "merge_16x16_to_64x64_inverse_kernel": "linattn_recurrent",
+    "recompute_w_u_fwd_kernel": "linattn_recurrent",
+    "chunk_gated_delta_rule_fwd_kernel_h_blockdim64": "linattn_recurrent",
+    "chunk_gla_fwd_kernel_o": "linattn_recurrent",
+    # the torch.compile split op, which "attention" used to claim
+    "vllm::kda_attention": "linattn_recurrent",
+}
+
+
+@pytest.mark.parametrize("kernel,op", sorted(_KDA_KERNELS.items()))
+def test_vllm_kda_kernels_pair_with_the_kda_nodes(kernel, op):
+    from gitm.optimizer.deviation import classify_op
+
+    assert classify_op(kernel) == op
+
+
+def test_every_kda_kernel_op_has_a_node_on_a_kda_layer():
+    g, _ = predict("glm-5.3-flash", batch=BatchConfig(batch=8, kv_cache_len=8192))
+    ops_on_layer_0 = {n.op for n in g.nodes if n.layer == 0}  # layer 0 is KDA
+    assert set(_KDA_KERNELS.values()) <= ops_on_layer_0
