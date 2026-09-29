@@ -20,13 +20,21 @@ what it used instead, why, and which artifacts rest on it. The log is then:
 
 Severity is defined by what it *changes*, not as a label:
 
-* ``unreliable`` — the affected numbers do not describe this run. A run
-  carrying an unreliable entry that affects the A/B is excluded from history
+* ``unreliable`` — the affected numbers do not describe this run. An A/B
+  measured under an unreliable entry is excluded from history
   (:func:`gitm.optimizer.history.load_history`), so a fabricated measurement
   cannot rank a lever on every run that follows.
 * ``approximate`` — the numbers describe this run under a stated default (a
   batch of 1, A100 peaks, runs/s standing in for tokens/s). Reported, otherwise
   unchanged.
+
+**Scope.** A degradation is either run-wide (``scope=None``: the runner failed,
+the graph is a default) or belongs to the one candidate whose A/B it happened
+during (``scope=<candidate name>``: the probe refused a restarted engine). The
+loop and autoresearch open :meth:`DegradationLog.scope` around each apply, and
+each verification record carries :meth:`DegradationLog.measured_under` for its
+candidate. So one bad A/B late in a run costs that record, not the valid A/Bs
+measured before it.
 """
 
 from __future__ import annotations
@@ -34,6 +42,7 @@ from __future__ import annotations
 import json
 import warnings
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -75,6 +84,8 @@ class Degradation:
     reason: str
     severity: str = APPROXIMATE
     affects: tuple[str, ...] = ()
+    #: ``None`` for the whole run; otherwise the candidate whose A/B it belongs to.
+    scope: str | None = None
 
     def __post_init__(self) -> None:
         if self.severity not in SEVERITIES:
@@ -88,7 +99,8 @@ class Degradation:
     def line(self) -> str:
         """One human-readable sentence, for the report and stderr."""
         on = f" (affects: {', '.join(self.affects)})" if self.affects else ""
-        return f"[{self.severity}] {self.stage}: used {self.used} — {self.reason}{on}"
+        during = f" [during {self.scope}]" if self.scope else ""
+        return f"[{self.severity}] {self.stage}{during}: used {self.used} — {self.reason}{on}"
 
 
 class DegradationLog:
@@ -96,14 +108,34 @@ class DegradationLog:
 
     ``record`` also raises a :class:`RuntimeWarning`, matching how the telemetry
     and fail-open layers surface a degraded path, so an embedded caller sees it
-    without opening a file. Recording the same fallback twice (a probe that falls
-    back on every rep) keeps one entry.
+    without opening a file. Recording the same fallback twice in one scope (a
+    probe that falls back on every rep) keeps one entry. The same fallback in
+    another candidate's scope is its own entry, since it taints that A/B too,
+    but it warns only once.
     """
 
     def __init__(self, items: Iterable[Degradation] = ()) -> None:
         self._items: list[Degradation] = []
+        self._scope: str | None = None
+        self._warned: set[tuple[str, str, str, str]] = set()
         for d in items:
             self._add(d, warn=False)
+
+    @contextmanager
+    def scope(self, candidate: str) -> Iterator[None]:
+        """Attribute what is recorded inside to ``candidate``'s A/B."""
+        outer, self._scope = self._scope, candidate
+        try:
+            yield
+        finally:
+            self._scope = outer
+
+    def measured_under(self, candidate: str) -> list[Degradation]:
+        """The A/B-affecting degradations ``candidate`` was measured under: the
+        run-wide ones and those recorded during its own A/B, never another
+        candidate's."""
+        return [d for d in self._items
+                if AFFECTS_AB in d.affects and d.scope in (None, candidate)]
 
     def record(
         self,
@@ -114,7 +146,7 @@ class DegradationLog:
         severity: str = APPROXIMATE,
         affects: Iterable[str] = (),
     ) -> Degradation:
-        d = Degradation(stage, used, reason, severity, tuple(affects))
+        d = Degradation(stage, used, reason, severity, tuple(affects), self._scope)
         self._add(d, warn=True)
         return d
 
@@ -126,7 +158,9 @@ class DegradationLog:
         if d in self._items:
             return
         self._items.append(d)
-        if warn:
+        key = (d.stage, d.used, d.reason, d.severity)
+        if warn and key not in self._warned:
+            self._warned.add(key)
             warnings.warn(f"gitm degraded: {d.line()}", RuntimeWarning, stacklevel=3)
 
     def __iter__(self) -> Iterator[Degradation]:
@@ -153,10 +187,13 @@ class DegradationLog:
 
     def summary(self) -> dict[str, Any]:
         """The compact form the run summary carries."""
+        def stages(severity: str) -> list[str]:
+            return list(dict.fromkeys(d.stage for d in self._items if d.severity == severity))
+
         return {
             "n": len(self._items),
-            "unreliable": [d.stage for d in self.unreliable],
-            "approximate": [d.stage for d in self._items if d.severity == APPROXIMATE],
+            "unreliable": stages(UNRELIABLE),
+            "approximate": stages(APPROXIMATE),
         }
 
     def write(self, run_dir: str | Path) -> Path:
@@ -171,14 +208,14 @@ class DegradationLog:
         return path
 
 
-def unreliable_ab(degradations: Iterable[dict[str, Any]]) -> list[str]:
-    """Stages of serialised degradations that make a run's A/B untrustworthy.
-
-    Read from exported JSON (``verification.json`` provenance), so it takes dicts
-    and tolerates missing keys rather than requiring :class:`Degradation`.
-    """
+def unreliable_ab(degradations: Iterable[Any]) -> list[str]:
+    """Stages that make an A/B untrustworthy, from :class:`Degradation` objects
+    or their serialised dicts (a ``verification.json`` record's
+    ``degradations``). Tolerates missing keys and junk entries."""
     out: list[str] = []
     for d in degradations:
+        if isinstance(d, Degradation):
+            d = d.to_dict()
         if not isinstance(d, dict):
             continue
         affects = d.get("affects") or ()

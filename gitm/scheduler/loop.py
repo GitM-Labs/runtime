@@ -51,6 +51,7 @@ from gitm.optimizer.degradation import (
     WORKLOAD_RUNNER,
     Degradation,
     DegradationLog,
+    unreliable_ab,
 )
 from gitm.optimizer.deviation import deviation_summary, deviation_trace, write_deviation_jsonl
 from gitm.optimizer.dr import attribute_dr
@@ -1006,6 +1007,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             "runs_read": prior_runs.runs_read,
             "filtered": prior_runs.filtered,
             "skipped": prior_runs.skipped,
+            "excluded": prior_runs.excluded,
             "levers": len(prior_runs.records),
             "gpu_sku": pctx.sku,
             "fingerprint": qual.fingerprint,
@@ -1099,7 +1101,9 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         # kwargs in place and a restart replaces the engine outright, so reading
         # them afterwards would report the candidate on both sides of the diff.
         baseline_cfg = dict(getattr(getattr(applicator, "engine", cfg.engine), "gitm_llm_kwargs", None) or {})
-        result = apply_intervention(c.spec, applicator, min_keep_delta=0.0)
+        with degradations.scope(c.spec.name):
+            result = apply_intervention(c.spec, applicator, min_keep_delta=0.0)
+        measured_under = degradations.measured_under(c.spec.name)
         ab = (
             getattr(applicator, "last_result", None)
             if result.measured_delta is not None
@@ -1114,6 +1118,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                     c.spec, ab, result,
                     baseline_config=baseline_cfg,
                     candidate_config=candidate_cfg,
+                    degradations=measured_under,
                 )
             )
         # Causal evidence: the measured A/B verdict when live, else the Granger
@@ -1145,6 +1150,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 # with its real (small) number, not a distorted one.
                 measured_delta=((ab.speedup - 1.0) if ab is not None else result.measured_delta),
                 rolled_back=result.rolled_back,
+                unreliable_ab=unreliable_ab(measured_under) if ab is not None else [],
             )
         )
         if time.time_ns() - started_ns >= int(budget_s * 1e9):
@@ -1227,6 +1233,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             history=prior_runs,
             gpu_sku=pctx.sku,
             fingerprint=qual.fingerprint,
+            degradations=degradations,
         )
     else:
         # An empty result list reads the same as "searched and found nothing";
@@ -1270,6 +1277,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 predicted_delta=r.predicted_delta,
                 measured_delta=true_delta,
                 rolled_back=r.rolled_back,
+                unreliable_ab=unreliable_ab(r.degradations) if ar_ab is not None else [],
             )
         )
         if ar_ab is not None and r.apply_result is not None:
@@ -1278,6 +1286,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                     r.spec, ar_ab, r.apply_result,
                     baseline_config=r.baseline_config or {},
                     candidate_config=r.candidate_config or {},
+                    degradations=r.degradations,
                 )
             )
     (run_dir / "autoresearch.json").write_text(

@@ -29,6 +29,7 @@ Two things are deliberate:
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -84,6 +85,10 @@ class VerificationRecord:
 
     baseline_config: dict[str, Any] = field(default_factory=dict)
     candidate_config: dict[str, Any] = field(default_factory=dict)
+    #: The A/B-affecting degradations this comparison was measured under: the
+    #: run's own and those recorded during this candidate's A/B, never another
+    #: candidate's. History judges each record by these, not by the run.
+    degradations: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -96,6 +101,7 @@ def build_record(
     *,
     baseline_config: dict[str, Any] | None = None,
     candidate_config: dict[str, Any] | None = None,
+    degradations: Iterable[Any] = (),
 ) -> VerificationRecord:
     """Assemble one record from a live A/B and its gate decision.
 
@@ -123,6 +129,7 @@ def build_record(
         via=ab.via,
         baseline_config=dict(baseline_config or {}),
         candidate_config=dict(candidate_config or {}),
+        degradations=[d if isinstance(d, dict) else d.to_dict() for d in degradations],
     )
 
 
@@ -152,12 +159,17 @@ def build_export(
 ) -> dict[str, Any]:
     """The full export document: provenance + environment + every comparison.
 
-    The run's degradations travel in ``provenance``: the history reader skips a
-    run whose A/B the run itself flagged unreliable, and a probe that timed
-    workload runs rather than tokens changes what ``metric`` says was measured.
+    The run's degradations travel in ``provenance`` for the reader. Each record
+    also carries the ones it was measured under, and that is what the history
+    reader judges it by. A probe that timed workload runs rather than tokens
+    changes what ``metric`` says was measured.
     """
     degradations = list(getattr(provenance, "degradations", None) or [])
-    runs_per_s = any(d.get("stage") == AB_UNIT for d in degradations if isinstance(d, dict))
+    # Read off the records: the unit is whatever each probe call returned.
+    runs_per_s = any(
+        isinstance(d, dict) and d.get("stage") == AB_UNIT
+        for r in records for d in r.degradations
+    )
     return {
         "schema": SCHEMA,
         "provenance": {

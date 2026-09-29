@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import random
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
@@ -60,6 +61,7 @@ from gitm.optimizer.degradation import (
     AR_PROPOSER,
     AR_TARGET,
     Degradation,
+    DegradationLog,
 )
 from gitm.optimizer.deviation import observed_op
 from gitm.optimizer.monitor import Residuals, _serialized_fraction
@@ -255,6 +257,9 @@ class AutoresearchResult:
     ab_result: EngineABResult | None = None
     baseline_config: dict | None = None
     candidate_config: dict | None = None
+    #: The A/B-affecting degradations this candidate was measured under (the
+    #: run's, and those recorded during its own apply), when a log was passed.
+    degradations: list[Degradation] = field(default_factory=list)
 
 
 @dataclass
@@ -1205,6 +1210,7 @@ def autoresearch_v0(
     history: History | None = None,
     gpu_sku: str | None = None,
     fingerprint: str | None = None,
+    degradations: DegradationLog | None = None,
 ) -> list[AutoresearchResult]:
     """Propose → gate → (apply + measure + rollback) for one bottleneck class.
 
@@ -1268,7 +1274,10 @@ def autoresearch_v0(
         if reason is None:
             eng = getattr(applicator, "engine", None)
             pre_cfg = dict(getattr(eng, "gitm_llm_kwargs", None) or {}) if eng else None
-            applied = apply_intervention(c.spec, applicator, min_keep_delta=min_keep_delta)
+            # Scoped, so a fallback the probe records during this A/B is charged
+            # to this candidate and not to the ones measured before or after it.
+            with degradations.scope(c.spec.name) if degradations is not None else nullcontext():
+                applied = apply_intervention(c.spec, applicator, min_keep_delta=min_keep_delta)
             ab = (
                 getattr(applicator, "last_result", None)
                 if applied.measured_delta is not None
@@ -1294,6 +1303,8 @@ def autoresearch_v0(
                 ab_result=ab,
                 baseline_config=pre_cfg,
                 candidate_config=post_cfg,
+                degradations=(degradations.measured_under(c.spec.name)
+                              if degradations is not None and applied is not None else []),
             )
         )
     return results
@@ -1312,6 +1323,7 @@ def autoresearch(
     history: History | None = None,
     gpu_sku: str | None = None,
     fingerprint: str | None = None,
+    degradations: DegradationLog | None = None,
 ) -> AutoresearchRun:
     """Classify the trace's bottleneck, then run the full propose→gate→apply pass.
 
@@ -1347,6 +1359,7 @@ def autoresearch(
             history=history,
             gpu_sku=gpu_sku,
             fingerprint=fingerprint,
+            degradations=degradations,
     )
     return AutoresearchRun(
         bottleneck_class=bottleneck_class,

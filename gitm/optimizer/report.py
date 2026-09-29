@@ -16,8 +16,6 @@ from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-from gitm.optimizer.degradation import unreliable_ab
-
 
 @dataclass
 class Claim:
@@ -29,6 +27,9 @@ class Claim:
     predicted_delta: float
     measured_delta: float | None
     rolled_back: bool = False
+    #: Unreliable degradations this claim's own A/B was measured under. Its delta
+    #: is still shown, but it is not a verified claim.
+    unreliable_ab: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -80,14 +81,21 @@ def write_report(
         "claims": claims,
         "provenance": provenance,
         "qualification_diagnostic": qualification_diagnostic,
-        "summary": _with_ab_caveat(summary, provenance) or _default_summary(claims, provenance),
+        "summary": _with_ab_caveat(summary, claims) or _default_summary(claims),
         "degradations": provenance.degradations,
         "now_ns": time.time_ns(),
     }
     return tpl.render(**ctx)
 
 
-def _with_ab_caveat(summary: str | None, provenance: Provenance) -> str | None:
+def _unreliable(claims: list[Claim]) -> tuple[list[Claim], list[str]]:
+    """The claims whose own A/B is unreliable, and the stages behind them."""
+    bad = [c for c in claims if c.unreliable_ab]
+    stages = list(dict.fromkeys(s for c in bad for s in c.unreliable_ab))
+    return bad, stages
+
+
+def _with_ab_caveat(summary: str | None, claims: list[Claim]) -> str | None:
     """A caller's own summary, with the unreliable-A/B caveat appended.
 
     The loop writes its own headline whenever the engine produced scheduler
@@ -96,26 +104,26 @@ def _with_ab_caveat(summary: str | None, provenance: Provenance) -> str | None:
     """
     if not summary:
         return summary
-    bad_ab = unreliable_ab(provenance.degradations)
-    if not bad_ab:
+    bad, stages = _unreliable(claims)
+    if not bad:
         return summary
-    return (f"{summary} Measured deltas below are not counted as verified: the A/B "
-            f"is unreliable ({', '.join(bad_ab)}). See Degradations below.")
+    return (f"{summary} {len(bad)} claim(s) not counted as verified: their A/B is "
+            f"unreliable ({', '.join(stages)}). See Degradations below.")
 
 
-def _default_summary(claims: list[Claim], provenance: Provenance | None = None) -> str:
-    verified = [c for c in claims if c.measured_delta is not None and not c.rolled_back]
-    bad_ab = unreliable_ab(provenance.degradations) if provenance is not None else []
-    if verified and bad_ab:
-        # The deltas are still shown per claim, but a measurement the run itself
-        # flagged as unreliable is not a verified claim, and the headline must
-        # not add it up as one.
-        return (f"{len(verified)} claim(s) measured, none counted as verified: the A/B "
-                f"is unreliable ({', '.join(bad_ab)}). See Degradations below.")
+def _default_summary(claims: list[Claim]) -> str:
+    # A claim whose own A/B was flagged unreliable keeps its row, but the
+    # headline does not add it up as verified. Judged per claim: one bad A/B does
+    # not discount the others.
+    measured = [c for c in claims if c.measured_delta is not None and not c.rolled_back]
+    verified = [c for c in measured if not c.unreliable_ab]
+    bad, stages = _unreliable(measured)
+    note = (f" {len(bad)} more not counted: their A/B is unreliable ({', '.join(stages)})."
+            if bad else "")
     if not verified:
-        return "No claims verified within budget. See diagnostic below."
+        return "No claims verified within budget. See diagnostic below." + note
     total = sum(c.measured_delta or 0.0 for c in verified)
-    return f"{len(verified)} verified claims, aggregate measured delta {total:+.1%}."
+    return f"{len(verified)} verified claims, aggregate measured delta {total:+.1%}." + note
 
 
 def build_provenance(
