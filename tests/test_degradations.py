@@ -172,9 +172,9 @@ def test_probe_without_a_token_count_says_runs_per_second():
         probe(engine)
     assert [d.stage for d in log] == [AB_UNIT]  # once, not once per rep
     ab = SimpleNamespace(speedup=1.1, via="hot-swap", baseline_tps=2.0, candidate_tps=2.2)
-    text = _ab_evidence(ab, rolled_back=False, degradations=log)
+    text = _ab_evidence(ab, rolled_back=False, measured_under=list(log))
     assert "runs/s" in text and "tok/s" not in text and "workload throughput" in text
-    assert "tok/s" in _ab_evidence(ab, rolled_back=False, degradations=DegradationLog())
+    assert "tok/s" in _ab_evidence(ab, rolled_back=False, measured_under=[])
 
 
 # ── the predicted graph's basis ──────────────────────────────────────────────

@@ -13,6 +13,7 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -149,6 +150,10 @@ def _engine_throughput_fn(
       timing it after a restart measures the old engine and credits the new one.
     * No token count in the runner's output: the probe still works, as workload
       runs per second, and the unit is recorded so no report calls it tok/s.
+    * The unit is fixed by the first call and held for the run. A speedup is a
+      ratio of two probe calls, so a runner that reports ``generated_tokens`` on
+      one call and nothing (or ``decode_steps``) on the next would divide one
+      unit by another. That call raises instead, and the A/B ends as an error.
     """
     explicit = getattr(engine, "gitm_throughput_fn", None)
     if callable(explicit):
@@ -163,6 +168,10 @@ def _engine_throughput_fn(
 
         return _no_probe
 
+    # The first call's unit, held for every call after it: a key of the runner's
+    # output, or "runs" when it reported none.
+    locked: list[str] = []
+
     def _tps(_engine: Any) -> float:
         if _engine is not engine:
             why = ("the default probe drives the engine the runner was built with, "
@@ -175,14 +184,24 @@ def _engine_throughput_fn(
         dt = max(time.perf_counter() - t0, 1e-9)
         # First key that is actually present wins — `or` would treat a legitimate
         # 0 (a window that produced no tokens) as missing and fabricate a count.
+        unit, count = "runs", 1.0
         if isinstance(out, dict):
             for key in ("generated_tokens", "decode_steps", "events"):
                 if out.get(key) is not None:
-                    return float(out[key]) / dt
-        _note_ab(degradations, AB_UNIT, "workload runs per second",
-                 "the runner reported none of generated_tokens / decode_steps / events",
-                 APPROXIMATE)
-        return 1.0 / dt
+                    unit, count = key, float(out[key])
+                    break
+        if not locked:
+            locked.append(unit)
+        elif unit != locked[0]:
+            why = (f"the runner reported {unit!r} after reporting {locked[0]!r}; a speedup "
+                   "across the two would divide one unit by another")
+            _note_ab(degradations, AB_PROBE, "no measurement in a mixed unit", why, UNRELIABLE)
+            raise RuntimeError(why)
+        if unit == "runs":
+            _note_ab(degradations, AB_UNIT, "workload runs per second",
+                     "the runner reported none of generated_tokens / decode_steps / events",
+                     APPROXIMATE)
+        return count / dt
 
     return _tps
 
@@ -552,9 +571,14 @@ def _ar_target_residual(ar_run: AutoresearchRun, fallback: float = 0.0) -> float
     return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else fallback
 
 
-def _ab_evidence(ab: Any, rolled_back: bool, degradations: DegradationLog) -> str:
-    """The claim sentence for a live A/B, in the unit the probe actually measured."""
-    runs = degradations.has(AB_UNIT)
+def _ab_evidence(ab: Any, rolled_back: bool, measured_under: Iterable[Any]) -> str:
+    """The claim sentence for a live A/B, in the unit the probe actually measured.
+
+    ``measured_under`` is this candidate's own list
+    (:meth:`DegradationLog.measured_under`), never the run's: a runs/s fallback
+    in a later A/B says nothing about the unit of this one.
+    """
+    runs = any(getattr(d, "stage", None) == AB_UNIT for d in measured_under)
     what, unit = ("workload throughput", "runs/s") if runs else ("decode throughput", "tok/s")
     outcome = "rolled back" if rolled_back else "kept"
     return (
@@ -1131,7 +1155,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         # from the authoritative ApplyResult (the real gate decision), not from
         # EngineABResult.kept (a measure-time delta>=0 indicator).
         if ab is not None:
-            causal_evidence = _ab_evidence(ab, result.rolled_back, degradations)
+            causal_evidence = _ab_evidence(ab, result.rolled_back, measured_under)
         else:
             causal_evidence = ", ".join(
                 f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
@@ -1262,7 +1286,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             rolled_back.append(r.spec.name)
         ar_ab = r.ab_result
         if ar_ab is not None:
-            evidence = _ab_evidence(ar_ab, r.rolled_back, degradations)
+            evidence = _ab_evidence(ar_ab, r.rolled_back, r.degradations)
         else:
             evidence = ar_granger_evidence
         if r.measured_delta is None and r.apply_error:

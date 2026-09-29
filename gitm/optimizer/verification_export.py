@@ -89,6 +89,9 @@ class VerificationRecord:
     #: run's own and those recorded during this candidate's A/B, never another
     #: candidate's. History judges each record by these, not by the run.
     degradations: list[dict[str, Any]] = field(default_factory=list)
+    #: What ``baseline_tps`` / ``candidate_tps`` count, from this record's own
+    #: degradations: another record's fallback says nothing about this one.
+    unit: str = "tokens/sec"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -109,6 +112,8 @@ def build_record(
     kwargs are mutated in place by a hot-swap and replaced entirely by a
     restart, so reading them afterwards yields the candidate on both sides.
     """
+    degradations = [d if isinstance(d, dict) else d.to_dict() for d in degradations]
+    runs = any(d.get("stage") == AB_UNIT for d in degradations)
     return VerificationRecord(
         intervention_name=spec.name,
         summary=spec.summary,
@@ -129,7 +134,8 @@ def build_record(
         via=ab.via,
         baseline_config=dict(baseline_config or {}),
         candidate_config=dict(candidate_config or {}),
-        degradations=[d if isinstance(d, dict) else d.to_dict() for d in degradations],
+        degradations=degradations,
+        unit="runs/sec" if runs else "tokens/sec",
     )
 
 
@@ -165,11 +171,8 @@ def build_export(
     changes what ``metric`` says was measured.
     """
     degradations = list(getattr(provenance, "degradations", None) or [])
-    # Read off the records: the unit is whatever each probe call returned.
-    runs_per_s = any(
-        isinstance(d, dict) and d.get("stage") == AB_UNIT
-        for r in records for d in r.degradations
-    )
+    # Each record states its own unit; the protocol line only summarises them.
+    units = {r.unit for r in records}
     return {
         "schema": SCHEMA,
         "provenance": {
@@ -184,7 +187,9 @@ def build_export(
         "protocol": {
             "metric": (
                 "workload throughput (runs/sec; the runner reported no token count)"
-                if runs_per_s else "decode throughput (tokens/sec)"
+                if units == {"runs/sec"}
+                else "throughput; unit per record, see results[].unit" if len(units) > 1
+                else "decode throughput (tokens/sec)"
             ),
             "reps": "each side benchmarked `reps` times; std is the sample stdev",
             "agreement_band": (
