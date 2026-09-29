@@ -33,7 +33,10 @@ from gitm.planner.glm_graph import (
     GlmMoeDsaModelSpec,
     core_read_entries,
     is_glm_moe_dsa_config,
+    kda_weight_bytes_per_layer,
+    kv_bytes_per_token,
     kv_entry_bytes,
+    kv_fixed_bytes_per_sequence,
     model_weight_bytes,
     predict_glm_graph,
     spec_from_hf_config,
@@ -935,13 +938,12 @@ def test_plan_cli_forwards_spec_decode_and_launch_flags(capsys):
     assert eager > plain
 
 
-# ── GLM-5.3-Flash: KDA + MLA, priced as all-MLA ──────────────────────────────
+# ── GLM-5.3-Flash: KDA + MLA ─────────────────────────────────────────────────
 #
 # zai-org/GLM-5.3-Flash interleaves 34 KDA linear-attention layers with 11 MLA
-# layers. No family holds both, so the entry takes glm_moe_dsa and prices every
-# layer as MLA. These pin what the entry does get right — the 11-layer indexer
-# schedule read from the weight map (the config says 45), the dense prefix, the
-# fp8 split — and pin the known footprint gap so nobody reads it as a fit.
+# layers. glm_moe_dsa prices the KDA layers through ``layer_types``. These pin
+# the 11-layer indexer schedule read from the weight map (the config says 45),
+# the dense prefix, the fp8 split, and the KDA terms against the shard headers.
 
 
 def _gb200():
@@ -963,15 +965,57 @@ def test_glm53_flash_catalogue_entry_loads_and_predicts():
 
 
 def test_glm53_flash_weight_bytes_against_published_checkpoint():
-    """328.33 GB published. The entry lands at -2.06%, and the gap is known.
-
-    KDA priced as MLA (-5.37 GB) and the unmodelled vision tower (-1.13 GB) are
-    most of it; the design note itemises the rest to the byte. Pinned loosely
-    enough to survive a planner refinement, tightly enough that a dtype
+    """328.33 GB published. The entry lands at -0.42%; most of what is left is
+    the vision tower (1.13 GB), which a text decode step never loads. Pinned
+    loosely enough to survive a planner refinement, tightly enough that a dtype
     regression (bf16 experts would double the total) fails.
     """
     published = 328_326_771_576  # model.safetensors.index.json total_size
-    assert model_weight_bytes(load_spec("glm-5.3-flash")) / published == pytest.approx(1.0, abs=0.03)
+    assert model_weight_bytes(load_spec("glm-5.3-flash")) / published == pytest.approx(1.0, abs=0.01)
+
+
+def test_glm53_flash_kda_weights_match_the_headers():
+    """Every self_attn.* tensor on the 34 KDA layers sums to 9,366,356,992 B in
+    the shard headers. The term leaves out A_log, dt_bias and o_norm (1.1 MB)."""
+    spec = load_spec("glm-5.3-flash")
+    assert spec.n_linear_attention_layers == 34 and spec.n_mla_layers == 11
+    assert 34 * kda_weight_bytes_per_layer(spec) == pytest.approx(9_366_356_992, rel=2e-4)
+
+
+def test_glm53_flash_kv_is_mla_layers_only_plus_a_fixed_kda_state():
+    """KDA layers cache no KV. The per-token rate is the 11 MLA latents plus
+    their index keys; the KDA state (64 x 128 x 128 fp32, plus the conv tail) is
+    paid once per sequence."""
+    spec = load_spec("glm-5.3-flash")
+    kw = 1.000244140625  # fp8 with 128x128 fp32 block scales
+    assert kv_bytes_per_token(spec) == pytest.approx(11 * kv_entry_bytes(spec) + 11 * 128 * kw)
+    recurrent = 34 * 64 * 128 * 128 * 4
+    conv = 34 * 3 * 8192 * 3 * 2
+    assert kv_fixed_bytes_per_sequence(spec) == pytest.approx(recurrent + conv)
+
+
+def test_glm53_flash_kda_layers_emit_linear_attention_not_mla():
+    g, _ = predict("glm-5.3-flash", batch=BatchConfig(batch=32, kv_cache_len=8192))
+    kda = {i for i, t in enumerate(load_spec("glm-5.3-flash").layer_types) if t == "linear_attention"}
+    by_layer = lambda op: {n.layer for n in g.nodes if n.op == op}  # noqa: E731
+    for op in ("linattn_in_proj", "linattn_conv", "linattn_recurrent"):
+        assert by_layer(op) == kda
+    # MLA ops on the 11 MLA layers, never on a KDA layer.
+    assert by_layer("attn_kv_a") & set(range(45)) == set(range(45)) - kda
+    assert not by_layer("attn_score_value") & kda
+
+
+def test_glm_hf_config_reads_the_kda_schedule():
+    cfg = dict(GLM_CONFIG)
+    n = cfg["num_hidden_layers"]
+    cfg["layer_types"] = ["linear_attention" if i % 4 != 3 else "deepseek_sparse_attention" for i in range(n)]
+    cfg["linear_attn_config"] = {"num_heads": 64, "head_dim": 128, "short_conv_kernel_size": 4}
+    spec = spec_from_hf_config(cfg)
+    assert spec.n_linear_attention_layers == sum(1 for i in range(n) if i % 4 != 3)
+    assert (spec.linear_num_heads, spec.linear_head_dim) == (64, 128)
+    # Without a KDA shape the schedule is not read, so GLM-5.2 stays all-MLA.
+    del cfg["linear_attn_config"]
+    assert spec_from_hf_config(cfg).n_linear_attention_layers == 0
 
 
 def test_glm53_flash_indexer_follows_the_weight_map_not_the_config():
@@ -996,7 +1040,8 @@ def test_glm53_flash_plans_the_recipe_shape_on_gb200():
         sharding=ShardingConfig(tp=4),
     )
     ops = [n.op for n in g.nodes]
-    assert family == "glm_moe_dsa" and len(g.nodes) == 869
+    # 869 while the 34 KDA layers were priced as MLA.
+    assert family == "glm_moe_dsa" and len(g.nodes) == 733
     assert not g.has_fallback_peaks and not g.has_unpriced_collectives
     assert ops.count("moe_routed") == 42
     routed = next(n for n in g.nodes if n.op == "moe_routed")

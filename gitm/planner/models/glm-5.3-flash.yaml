@@ -6,13 +6,11 @@
 # models/glm5_next at 7cd73d9df0c14b151c684b708a9f27d8d0349dfe (the model repo
 # ships no modeling code) — no traces.
 #
-# Family note: NO family fits. 34 of 45 layers are KDA linear attention — a
-# fixed recurrent state and no KV cache — and 11 are MLA with an indexer.
-# `hybrid` has the linear layers but GQA, not MLA; `glm_moe_dsa` has MLA, the
-# indexer, per-op precision and MTP but no linear layers. This entry takes
-# `glm_moe_dsa`, because the precision split and the 11 MLA layers are the
-# larger terms, and prices every layer as MLA. The known cost of that choice is
-# under unmodelled; see docs/glm-5.3-flash/DESIGN-NOTE.md for the full ledger.
+# Family note: 34 of 45 layers are KDA linear attention — a fixed recurrent
+# state and no KV cache — and 11 are MLA with an indexer. `glm_moe_dsa` carries
+# MLA, the indexer, per-op precision and MTP, and prices the KDA layers through
+# its `layer_types` schedule. See docs/glm-5.3-flash/DESIGN-NOTE.md for the
+# full ledger.
 
 name: zai-org/GLM-5.3-Flash
 family: glm_moe_dsa
@@ -30,6 +28,30 @@ spec:
   hidden: 4096
   n_layers: 45
   vocab: 154880
+
+  # KDA linear attention on the other 34 (config.json layer_types and
+  # linear_attn_config.kda_layers agree; self_attn.A_log on exactly these in the
+  # weight map). Per layer, bf16: q/k/v_proj [8192, 4096], o_proj [4096, 8192],
+  # f_a/g_a [128, 4096], f_b/g_b [8192, 128], b_proj [64, 4096], three
+  # [8192, 1, 4] convs. State per sequence: 64 x 128 x 128 fp32.
+  layer_types: [
+    linear_attention, linear_attention, linear_attention, deepseek_sparse_attention,
+    linear_attention, linear_attention, linear_attention, deepseek_sparse_attention,
+    linear_attention, linear_attention, linear_attention, deepseek_sparse_attention,
+    linear_attention, linear_attention, linear_attention, deepseek_sparse_attention,
+    linear_attention, linear_attention, linear_attention, deepseek_sparse_attention,
+    linear_attention, linear_attention, linear_attention, deepseek_sparse_attention,
+    linear_attention, linear_attention, linear_attention, deepseek_sparse_attention,
+    linear_attention, linear_attention, linear_attention, deepseek_sparse_attention,
+    linear_attention, linear_attention, linear_attention, deepseek_sparse_attention,
+    linear_attention, linear_attention, linear_attention, deepseek_sparse_attention,
+    linear_attention, linear_attention, linear_attention, deepseek_sparse_attention,
+    linear_attention,
+  ]
+  linear_num_heads: 64
+  linear_head_dim: 128
+  linear_conv_kernel_dim: 4
+  linear_state_dtype: fp32
 
   # MLA attention, on the 11 MLA layers only. qk_rope_head_dim is 0 and
   # kv_a_proj_with_mqa is [512, 4096] in the header — no decoupled RoPE key, so
@@ -99,6 +121,7 @@ spec:
     - [lm_head, bf16]               # untied: tie_word_embeddings false, 1.27 GB lm_head ships
     - [mtp_eh_proj, bf16]
     - [moe_router, fp32]            # moe_router_dtype float32; stored bf16, cast at run time
+    - [linattn_in_proj, bf16]       # every KDA projection and conv is BF16 in the header
 
 provenance:
   verified:
@@ -125,12 +148,23 @@ provenance:
         A_log, dt_bias, e_score_correction_bias, hc_*_base, hc_*_scale.
     - claim: model_weight_bytes on this entry, and what the gap is made of
       detail: >
-        321,562,118,171 B (-2.06% against total_size). The -6,764,653,405 B
-        breaks down exactly: KDA priced as MLA (-5.372 GB), the vision tower
-        (-1.127 GB), kv_b_proj and mHC/norm/MTP terms (-0.366 GB), the router
-        at fp32 over bf16 on disk (+0.101 GB), and +110,619 B from a planner
-        defect — glm_graph.py prices the dense FFN at ww twice (lines 366 and
-        399). Design note section 3.
+        326,933,391,387 B (-0.42% against total_size). The KDA term is
+        9,365,225,472 B against 9,366,356,992 B of self_attn.* on the 34 KDA
+        layers in the headers (A_log, dt_bias and o_norm are left out). The
+        remaining -1.39 GB is the vision tower (-1.127 GB), kv_b_proj and
+        mHC/norm/MTP terms (-0.366 GB), the router at fp32 over bf16 on disk
+        (+0.101 GB), and +110,619 B from a planner defect — glm_graph.py prices
+        the dense FFN at ww twice. Before KDA was modelled this entry read
+        321,562,118,171 B (-2.06%), the extra -5.372 GB being KDA priced as
+        MLA. Design note section 3.
+    - claim: KV per token is the 11 MLA layers; KDA state is fixed per sequence
+      detail: >
+        kv_bytes_per_token 7,041.7 B (11 latents at 512 fp8 plus 11 index keys),
+        against 24,454.0 B while every layer was priced as MLA (3.47x).
+        kv_fixed_bytes_per_sequence 147.6 MB: 34 x 64 x 128 x 128 fp32
+        recurrent state plus a 3-step bf16 conv tail on 3 x 8192 channels. The
+        two readings cost the same per sequence near 8.5K tokens of context; at
+        1M the sequence costs 7.53 GB where the all-MLA reading said 25.64 GB.
 
   estimated:
     - field: kv_dtype
@@ -174,9 +208,13 @@ provenance:
         checkpoints or recompute. Engine behaviour UNVERIFIED.
 
   unmodelled:
-    - KDA linear attention on 34 layers, priced here as MLA with a shared index.
-      The latent KV rate comes out 45/11 = 4.09x too high, and the fixed KDA
-      state (34 x 64 x 128 x 128 fp32 = 142.6 MB per sequence) is absent.
+    - KDA kernel identity. The KDA nodes reuse the gated-DeltaNet op names
+      (linattn_*); deviation's needles for them are the GDN kernel names and
+      are unverified against vLLM's KDA kernels, and q/k/v run as plain GEMMs
+      rather than a fused in_proj_qkvz.
+    - KDA state under MTP verify. The recurrent node touches the state once per
+      sequence per step, as a decode does; per-position checkpoints for
+      rejected drafts are not priced.
     - IndexPool. The family scans S raw index keys; the model scores S/4 pooled
       keys and expands 512 pools back to 2048 tokens plus a tail of up to 3.
     - mHC. Four 4096-wide residual streams, two [24, 16384] projections and 20

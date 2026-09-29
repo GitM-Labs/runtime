@@ -57,6 +57,7 @@ Known limits, stated rather than hidden:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -75,6 +76,9 @@ FULL_INDEXER = "full"
 SHARED_INDEXER = "shared"
 DENSE_MLP = "dense"
 SPARSE_MLP = "sparse"
+LINEAR_ATTENTION = "linear_attention"
+#: Chunk length of the chunked KDA scan at prefill (fla ``chunk_kda``, 64).
+KDA_CHUNK = 64
 
 
 @dataclass(frozen=True)
@@ -143,6 +147,21 @@ class GlmMoeDsaModelSpec:
     mlp_layer_types: tuple[str, ...] = ()
     #: Numerics only — no effect on the FLOP/byte roofline.
     routed_scaling_factor: float = 1.0
+
+    # ── KDA linear attention (GLM-5.3-Flash) ─────────────────────────────────
+    #: Per-layer attention kind, straight from the checkpoint. A
+    #: ``linear_attention`` layer runs Kimi Delta Attention in place of MLA: its
+    #: own bf16 q/k/v/o projections, low-rank forget and output gates, a short
+    #: causal convolution and a fixed ``[head_dim, head_dim]`` recurrent state per
+    #: head — no KV cache, no indexer. Any other entry is MLA. Empty == every
+    #: layer is MLA, as on GLM-5.2.
+    layer_types: tuple[str, ...] = ()
+    linear_num_heads: int = 0
+    linear_head_dim: int = 0
+    linear_conv_kernel_dim: int = 4
+    #: The recurrent state is kept fp32 whatever the weights are
+    #: (``update_recurrent_state(state.to(torch.float32))``).
+    linear_state_dtype: str = "fp32"
 
     # ── multi-token prediction ───────────────────────────────────────────────
     num_nextn_predict_layers: int = 0
@@ -223,6 +242,36 @@ class GlmMoeDsaModelSpec:
     @property
     def n_sparse_mlp_layers(self) -> int:
         return sum(1 for i in range(self.n_layers) if self.is_sparse_mlp(i))
+
+    def is_linear_attention(self, layer: int) -> bool:
+        """Whether ``layer`` runs KDA rather than MLA. MTP layers are MLA."""
+        return layer < len(self.layer_types) and self.layer_types[layer] == LINEAR_ATTENTION
+
+    @property
+    def n_linear_attention_layers(self) -> int:
+        return sum(1 for i in range(self.n_layers) if self.is_linear_attention(i))
+
+    @property
+    def n_mla_layers(self) -> int:
+        return self.n_layers - self.n_linear_attention_layers
+
+    @property
+    def linear_qkv_dim(self) -> int:
+        return self.linear_num_heads * self.linear_head_dim
+
+    @property
+    def linear_state_bytes_per_layer(self) -> float:
+        """Recurrent plus convolution state, per sequence, per KDA layer.
+
+        ``num_heads x head_dim x head_dim`` at :attr:`linear_state_dtype`, plus
+        ``kernel - 1`` previous inputs for each of the ``3 x qkv_dim`` conv
+        channels at the activation dtype. Fixed however long the context grows.
+        """
+        recurrent = self.linear_num_heads * self.linear_head_dim**2
+        conv = 3 * self.linear_qkv_dim * max(0, self.linear_conv_kernel_dim - 1)
+        return recurrent * weight_bytes(self.linear_state_dtype) + conv * weight_bytes(
+            self.act_dtype
+        )
 
     @property
     def top_k(self) -> int:
@@ -358,7 +407,8 @@ def model_weight_bytes(
     n_full_idx = spec.n_full_indexer_layers + (
         0 if spec.index_share_for_mtp_iteration else spec.num_nextn_predict_layers
     )
-    n_attn = spec.n_layers + spec.num_nextn_predict_layers
+    # MLA weights on MLA layers only; a KDA layer carries its own (below).
+    n_attn = spec.n_mla_layers + spec.num_nextn_predict_layers
 
     experts = n_sparse * spec.n_routed_experts * 3 * h * inter * ew / es
     shared_exp = n_sparse * spec.n_shared_experts * 3 * h * inter * sw / tp
@@ -397,20 +447,51 @@ def model_weight_bytes(
         + n_full_idx * indexer_per_full * iw
         + embed
         + (n_attn * attn_per_layer + dense_ffn) * ww
+        + spec.n_linear_attention_layers * kda_weight_bytes_per_layer(spec, sh)
     )
+
+
+def kda_weight_bytes_per_layer(
+    spec: GlmMoeDsaModelSpec, sharding: ShardingConfig | None = None
+) -> float:
+    """Resident bytes of one KDA layer's attention on one rank.
+
+    q/k/v (``hidden -> qkv_dim``) and o (``qkv_dim -> hidden``) shard on heads;
+    so do ``b_proj`` (one beta per head), the up-halves of the low-rank forget and
+    output gates, and the depthwise conv over the three q/k/v streams. The
+    gates' down-halves (``hidden -> head_dim``) are replicated. Norms, ``A_log``
+    and ``dt_bias`` are left out, as they are for MLA.
+    """
+    tp = max(1, (sharding or ShardingConfig()).tp)
+    h, hd, qkv = spec.hidden, spec.linear_head_dim, spec.linear_qkv_dim
+    elems = (
+        4 * h * qkv / tp  # q, k, v, o
+        + h * spec.linear_num_heads / tp  # b_proj
+        + 2 * h * hd  # f_a, g_a, replicated
+        + 2 * hd * qkv / tp  # f_b, g_b
+        + 3 * qkv * spec.linear_conv_kernel_dim / tp  # q/k/v conv1d
+    )
+    return elems * weight_bytes(spec.dtype_for("linattn_in_proj", spec.weight_dtype))
 
 
 def kv_bytes_per_token(spec: GlmMoeDsaModelSpec) -> float:
     """KV bytes each additional token of context costs, across the whole model.
 
-    One MLA latent (plus the indexer key on ``full`` layers) per token per layer.
-    Flat across layers — there is no compression schedule to sum over — but the
-    indexer key is only cached where an indexer runs.
+    One MLA latent (plus the indexer key on ``full`` layers) per token per MLA
+    layer. Flat across layers — there is no compression schedule to sum over — but
+    the indexer key is only cached where an indexer runs. KDA layers cache no KV;
+    their state is fixed per sequence (:func:`kv_fixed_bytes_per_sequence`).
     """
     kw = weight_bytes(spec.kv_dtype)
-    latent = spec.n_layers * kv_entry_bytes(spec)
+    latent = spec.n_mla_layers * kv_entry_bytes(spec)
     index_keys = spec.n_full_indexer_layers * spec.index_head_dim * kw
     return latent + index_keys
+
+
+def kv_fixed_bytes_per_sequence(spec: GlmMoeDsaModelSpec) -> float:
+    """State a sequence costs regardless of context length: the KDA layers'
+    recurrent and conv state. Zero on an all-MLA checkpoint."""
+    return spec.n_linear_attention_layers * spec.linear_state_bytes_per_layer
 
 
 def _linear(rows: float, k: int, n: int, act_b: float, w_b: float) -> tuple[float, float]:
@@ -438,6 +519,70 @@ def _pointwise(rows: float, elems: float, act_b: float, *, ops: float = 1.0) -> 
     """
     n = rows * elems
     return ops * n, 2.0 * n * act_b
+
+
+def _emit_kda(
+    add, spec: GlmMoeDsaModelSpec, *, batch: BatchConfig, rows: float, tp: int, aw: float,
+) -> None:
+    """Kimi Delta Attention in place of MLA on a ``linear_attention`` layer.
+
+    The same four kernels, under the same op names, as the gated-DeltaNet layers
+    in :mod:`gitm.planner.hybrid_graph` — KDA is that recurrence with a
+    per-channel rather than per-head forget gate, and ``classify_op`` already
+    pairs these names. What it does *not* have is anything MLA does: no latent,
+    no cache read that grows with context, no indexer.
+    """
+    heads = max(1, spec.linear_num_heads // tp)
+    hd = spec.linear_head_dim
+    qkv = heads * hd
+    kda = spec.dtype_for("linattn_in_proj", spec.weight_dtype)
+    kw = weight_bytes(kda)
+    sw = weight_bytes(spec.linear_state_dtype)
+
+    # q, k, v and beta, plus both low-rank gates: forget (f_a -> f_b) and output
+    # (g_a -> g_b). The gates' down-halves are replicated; everything else shards
+    # on heads.
+    f_qkvb, b_qkvb = _linear(rows, spec.hidden, 3 * qkv + heads, aw, kw)
+    f_down, b_down = _linear(rows, spec.hidden, 2 * hd, aw, kw)
+    f_up, b_up = _linear(rows, hd, 2 * qkv, aw, kw)
+    add("linattn_in_proj", f_qkvb + f_down + f_up, b_qkvb + b_down + b_up, kda)
+
+    # Short causal depthwise conv over the q/k/v streams; ``kernel - 1`` previous
+    # inputs per channel are read and written back every step.
+    conv_ch = 3 * qkv
+    conv_state = conv_ch * max(0, spec.linear_conv_kernel_dim - 1)
+    add(
+        "linattn_conv",
+        2.0 * rows * conv_ch * spec.linear_conv_kernel_dim,
+        2.0 * batch.batch * conv_state * aw + 2.0 * rows * conv_ch * aw,
+        spec.act_dtype,
+    )
+
+    # The delta-rule state update. Decode reads and writes the whole fp32
+    # ``[hd, hd]`` state per head per sequence, once per step, whatever the
+    # context; prefill runs the chunked scan and touches it once per chunk.
+    state_elems = heads * hd * hd
+    positions = float(batch.positions_per_step)
+    flops = 4.0 * positions * state_elems
+    touches = float(batch.batch)
+    if batch.prefill_tokens > 0:
+        c = float(KDA_CHUNK)
+        flops += heads * (
+            2.0 * batch.prefill_tokens * c * (2 * hd) + 4.0 * batch.prefill_tokens * hd * hd
+        )
+        touches += batch.prefill_requests * math.ceil(batch.prefill_tokens / c)
+    add(
+        "linattn_recurrent",
+        flops,
+        2.0 * touches * state_elems * sw + rows * 3 * qkv * aw,
+        spec.act_dtype,
+    )
+
+    # Gated RMSNorm (o_norm) folds into the output projection's input. bf16 on
+    # disk like the rest of KDA, which is why the byte width comes from the KDA
+    # dtype and not from MLA's ``attn_out_proj``.
+    f, b = _linear(rows, qkv, spec.hidden, aw, kw)
+    add("attn_out_proj", f, b, kda)
 
 
 def _emit_layer(
@@ -541,122 +686,125 @@ def _emit_layer(
 
     # ── MLA attention: low-rank query, compressed KV latent ──────────────────
     add_rms_norm(with_residual=layer > 0)
-    add_act_quant("act_quant", h, "attn_q_a")
+    if spec.is_linear_attention(layer):
+        _emit_kda(add, spec, batch=batch, rows=rows, tp=tp, aw=aw)
+    else:
+        add_act_quant("act_quant", h, "attn_q_a")
 
-    # q_a and kv_a are replicated across TP ranks: they produce the shared latent,
-    # which has nothing to split when there is one KV latent. Every rank pays them
-    # in full, so TP's speedup on attention is strictly less than ``tp``.
-    f, b = _linear(rows, h, spec.q_lora_rank, aw, w_bytes("attn_q_a", wd))
-    add("attn_q_a", f, b, wd)
+        # q_a and kv_a are replicated across TP ranks: they produce the shared latent,
+        # which has nothing to split when there is one KV latent. Every rank pays them
+        # in full, so TP's speedup on attention is strictly less than ``tp``.
+        f, b = _linear(rows, h, spec.q_lora_rank, aw, w_bytes("attn_q_a", wd))
+        add("attn_q_a", f, b, wd)
 
-    f, b = _linear(
-        rows, spec.q_lora_rank, spec.n_heads * spec.q_head_dim // tp, aw,
-        w_bytes("attn_q_b", wd),
-    )
-    add("attn_q_b", f, b, wd)
-
-    # The compressed latent plus the decoupled RoPE key, and the cache write for
-    # the positions just computed. One projection (no CSA/HCA overlap here).
-    f, b = _linear(rows, h, spec.kv_entry_dim, aw, w_bytes("attn_kv_a", wd))
-    add("attn_kv_a", f, b + rows * kv_entry_bytes(spec), wd)
-
-    # Reconstruct per-head K_nope and V from the cached latent (W^UK, W^UV),
-    # modelled *unabsorbed*: its own GEMM, and attn_out_proj stays narrow. An
-    # engine that absorbs MLA drops this node and doubles attn_out_proj's input
-    # width instead — a serving variant, flagged in the catalogue provenance.
-    f, b = _linear(
-        rows, spec.kv_lora_rank,
-        spec.n_heads * (spec.qk_nope_head_dim + spec.v_head_dim) // tp, aw,
-        w_bytes("attn_kv_b", wd),
-    )
-    add("attn_kv_b", f, b, wd)
-
-    # ── indexer: only ``full`` layers run one ────────────────────────────────
-    # ``shared`` layers reuse the group's selection and carry no indexer weights,
-    # so they emit no indexer node. Emitting one would put a kernel in the graph
-    # that never ran and inflate the indexer's share ~4x.
-    runs_indexer = (
-        spec.is_full_indexer(layer) if force_full_indexer is None else force_full_indexer
-    )
-    scan_pairs = index_scan_pairs(batch)
-    if runs_indexer and scan_pairs > 0:
-        # The indexer query comes off the same latent as the attention query, so
-        # only the up-projection is charged (``wq_b``), plus the per-token key
-        # (``wk`` — one key per token, MQA-style, not one per index head) and the
-        # per-head gate (``weights_proj``). Not divided by ``tp``: vLLM builds the
-        # indexer as ReplicatedLinear, so every rank runs the whole thing. bf16 on
-        # the FP8 checkpoint — the indexer is named in ``modules_to_not_convert``.
-        idx_w = w_bytes("attn_index_proj", wd)
-        f_q, b_q = _linear(
-            rows, spec.q_lora_rank, spec.index_n_heads * spec.index_head_dim, aw, idx_w
+        f, b = _linear(
+            rows, spec.q_lora_rank, spec.n_heads * spec.q_head_dim // tp, aw,
+            w_bytes("attn_q_b", wd),
         )
-        f_k, b_k = _linear(rows, h, spec.index_head_dim, aw, idx_w)
-        f_g, b_g = _linear(rows, h, spec.index_n_heads, aw, idx_w)
+        add("attn_q_b", f, b, wd)
+
+        # The compressed latent plus the decoupled RoPE key, and the cache write for
+        # the positions just computed. One projection (no CSA/HCA overlap here).
+        f, b = _linear(rows, h, spec.kv_entry_dim, aw, w_bytes("attn_kv_a", wd))
+        add("attn_kv_a", f, b + rows * kv_entry_bytes(spec), wd)
+
+        # Reconstruct per-head K_nope and V from the cached latent (W^UK, W^UV),
+        # modelled *unabsorbed*: its own GEMM, and attn_out_proj stays narrow. An
+        # engine that absorbs MLA drops this node and doubles attn_out_proj's input
+        # width instead — a serving variant, flagged in the catalogue provenance.
+        f, b = _linear(
+            rows, spec.kv_lora_rank,
+            spec.n_heads * (spec.qk_nope_head_dim + spec.v_head_dim) // tp, aw,
+            w_bytes("attn_kv_b", wd),
+        )
+        add("attn_kv_b", f, b, wd)
+
+        # ── indexer: only ``full`` layers run one ────────────────────────────────
+        # ``shared`` layers reuse the group's selection and carry no indexer weights,
+        # so they emit no indexer node. Emitting one would put a kernel in the graph
+        # that never ran and inflate the indexer's share ~4x.
+        runs_indexer = (
+            spec.is_full_indexer(layer) if force_full_indexer is None else force_full_indexer
+        )
+        scan_pairs = index_scan_pairs(batch)
+        if runs_indexer and scan_pairs > 0:
+            # The indexer query comes off the same latent as the attention query, so
+            # only the up-projection is charged (``wq_b``), plus the per-token key
+            # (``wk`` — one key per token, MQA-style, not one per index head) and the
+            # per-head gate (``weights_proj``). Not divided by ``tp``: vLLM builds the
+            # indexer as ReplicatedLinear, so every rank runs the whole thing. bf16 on
+            # the FP8 checkpoint — the indexer is named in ``modules_to_not_convert``.
+            idx_w = w_bytes("attn_index_proj", wd)
+            f_q, b_q = _linear(
+                rows, spec.q_lora_rank, spec.index_n_heads * spec.index_head_dim, aw, idx_w
+            )
+            f_k, b_k = _linear(rows, h, spec.index_head_dim, aw, idx_w)
+            f_g, b_g = _linear(rows, h, spec.index_n_heads, aw, idx_w)
+            add(
+                "attn_index_proj",
+                f_q + f_k + f_g,
+                b_q + b_k + b_g + rows * spec.index_head_dim * weight_bytes(spec.kv_dtype),
+                wd,
+            )
+
+            # Two dtypes, two questions: the *bytes* follow how the keys are stored
+            # (``kv_dtype``), the *FLOPs* follow what the indexer computes in — and the
+            # indexer is one of the modules the quantiser skipped. Invisible at decode
+            # (memory-bound at every context); doubles the prefill row.
+            add(
+                "attn_index_score",
+                # Every one of the 32 index heads scores each candidate against the
+                # single shared 128-d key ``wk`` produces per token — MQA-style, which
+                # is why the key term below is not multiplied by the head count and
+                # this one is. Dropping ``index_n_heads`` here understates the scan 32x
+                # and would leave it looking free at every context.
+                2.0 * scan_pairs * spec.index_n_heads * spec.index_head_dim,
+                # Index keys live in the cache: read once per sequence (or per
+                # prefilling request), not per position, and replicated across ranks
+                # alongside the KV latent.
+                index_scan_entries(batch) * spec.index_head_dim
+                * weight_bytes(spec.kv_dtype),
+                spec.dtype_for("attn_index_proj", wd),
+            )
+
+        # ── attention core over the selected positions ──────────────────────────
+        # FLOPs follow the *selected* pairs (top-k bounded); bytes follow what the
+        # kernel must stream, which at prefill is the whole cache and at decode is one
+        # top-k window per sequence. The two do not move together on this
+        # architecture, which is why they are separate helpers.
+        heads = max(1, spec.n_heads // tp)
+        pairs = core_qk_pairs(spec, batch)
+        qk = 2.0 * pairs * heads * spec.q_head_dim
+        pv = 2.0 * pairs * heads * spec.v_head_dim
         add(
-            "attn_index_proj",
-            f_q + f_k + f_g,
-            b_q + b_k + b_g + rows * spec.index_head_dim * weight_bytes(spec.kv_dtype),
+            "attn_score_value",
+            qk + pv,
+            # One latent, shared by every query head, so *not* multiplied by n_heads.
+            # Deliberately not divided by ``tp`` either: a single shared latent cannot
+            # be split, so the cache is replicated and every rank reads all of it —
+            # tensor parallelism buys no KV bandwidth on this architecture.
+            core_read_entries(spec, batch) * kv_entry_bytes(spec),
             wd,
         )
 
-        # Two dtypes, two questions: the *bytes* follow how the keys are stored
-        # (``kv_dtype``), the *FLOPs* follow what the indexer computes in — and the
-        # indexer is one of the modules the quantiser skipped. Invisible at decode
-        # (memory-bound at every context); doubles the prefill row.
+        # RMSNorm on every query head and the single KV latent, plus partial RoPE on
+        # the last ``qk_rope_head_dim`` dims and the cache insert — one fused kernel.
+        normed = rows * (heads * spec.q_head_dim + spec.kv_entry_dim)
+        roped = rows * (heads + 1) * spec.qk_rope_head_dim
         add(
-            "attn_index_score",
-            # Every one of the 32 index heads scores each candidate against the
-            # single shared 128-d key ``wk`` produces per token — MQA-style, which
-            # is why the key term below is not multiplied by the head count and
-            # this one is. Dropping ``index_n_heads`` here understates the scan 32x
-            # and would leave it looking free at every context.
-            2.0 * scan_pairs * spec.index_n_heads * spec.index_head_dim,
-            # Index keys live in the cache: read once per sequence (or per
-            # prefilling request), not per position, and replicated across ranks
-            # alongside the KV latent.
-            index_scan_entries(batch) * spec.index_head_dim
-            * weight_bytes(spec.kv_dtype),
-            spec.dtype_for("attn_index_proj", wd),
+            "attn_qnorm_rope_insert",
+            3.0 * normed + 6.0 * roped,
+            2.0 * normed * aw + 2.0 * roped * aw,
+            spec.act_dtype,
         )
 
-    # ── attention core over the selected positions ──────────────────────────
-    # FLOPs follow the *selected* pairs (top-k bounded); bytes follow what the
-    # kernel must stream, which at prefill is the whole cache and at decode is one
-    # top-k window per sequence. The two do not move together on this
-    # architecture, which is why they are separate helpers.
-    heads = max(1, spec.n_heads // tp)
-    pairs = core_qk_pairs(spec, batch)
-    qk = 2.0 * pairs * heads * spec.q_head_dim
-    pv = 2.0 * pairs * heads * spec.v_head_dim
-    add(
-        "attn_score_value",
-        qk + pv,
-        # One latent, shared by every query head, so *not* multiplied by n_heads.
-        # Deliberately not divided by ``tp`` either: a single shared latent cannot
-        # be split, so the cache is replicated and every rank reads all of it —
-        # tensor parallelism buys no KV bandwidth on this architecture.
-        core_read_entries(spec, batch) * kv_entry_bytes(spec),
-        wd,
-    )
-
-    # RMSNorm on every query head and the single KV latent, plus partial RoPE on
-    # the last ``qk_rope_head_dim`` dims and the cache insert — one fused kernel.
-    normed = rows * (heads * spec.q_head_dim + spec.kv_entry_dim)
-    roped = rows * (heads + 1) * spec.qk_rope_head_dim
-    add(
-        "attn_qnorm_rope_insert",
-        3.0 * normed + 6.0 * roped,
-        2.0 * normed * aw + 2.0 * roped * aw,
-        spec.act_dtype,
-    )
-
-    # Per-head value space back to hidden. No o_lora/o_groups here (unlike V4).
-    # On the FP8 checkpoint this one *is* quantised — the opposite of the
-    # fp8-backbone checkpoints that keep o_proj wide.
-    f, b = _linear(
-        rows, spec.n_heads * spec.v_head_dim // tp, h, aw, w_bytes("attn_out_proj", wd)
-    )
-    add("attn_out_proj", f, b, wd)
+        # Per-head value space back to hidden. No o_lora/o_groups here (unlike V4).
+        # On the FP8 checkpoint this one *is* quantised — the opposite of the
+        # fp8-backbone checkpoints that keep o_proj wide.
+        f, b = _linear(
+            rows, spec.n_heads * spec.v_head_dim // tp, h, aw, w_bytes("attn_out_proj", wd)
+        )
+        add("attn_out_proj", f, b, wd)
 
     _emit_collective(g, spec, hw, layer, "tp_all_reduce_attn", rows, sh, prefix)
     add_rms_norm(with_residual=True)
@@ -1137,6 +1285,8 @@ def spec_from_hf_config(
     weight_dtype = str(q.get("quant_method", dtype)).lower() if q else dtype
     expert_dtype = str(cfg.get("expert_dtype", weight_dtype)).lower()
     overrides = _op_dtype_overrides(cfg, q, weight_dtype, dtype)
+    # KDA shape (GLM-5.3-Flash). Absent on an all-MLA checkpoint.
+    lin = cfg.get("linear_attn_config") or {}
 
     return GlmMoeDsaModelSpec(
         name=name or str(cfg.get("_name_or_path") or cfg.get("model_type") or "glm-moe-dsa"),
@@ -1161,6 +1311,12 @@ def spec_from_hf_config(
         intermediate_size=_int("intermediate_size", 12288),
         first_k_dense_replace=_int("first_k_dense_replace", 0),
         mlp_layer_types=_types("mlp_layer_types"),
+        # Read only alongside a KDA shape, so a config that happens to carry some
+        # other ``layer_types`` schedule is not held to this one's length rule.
+        layer_types=_types("layer_types") if lin else (),
+        linear_num_heads=int(lin.get("num_heads", 0) or 0),
+        linear_head_dim=int(lin.get("head_dim", 0) or 0),
+        linear_conv_kernel_dim=int(lin.get("short_conv_kernel_size", 4) or 4),
         routed_scaling_factor=float(cfg.get("routed_scaling_factor", 1.0) or 1.0),
         num_nextn_predict_layers=_int("num_nextn_predict_layers", 0),
         index_share_for_mtp_iteration=bool(cfg.get("index_share_for_mtp_iteration", True)),
