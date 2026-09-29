@@ -38,6 +38,7 @@ from scipy import optimize, stats
 
 from gitm.optimizer.deviation import classify_op
 from gitm.optimizer.mechanism_fixtures import fit_affine
+from gitm.serve.metrics import parse_prometheus
 
 # ── pre-registered constants (docs/experiments/p1_fp8_kv_separation.md §4) ──
 
@@ -92,7 +93,8 @@ OUTCOMES = ("multiplicative", "additive", "mixed", "no_effect", "inconclusive")
 #: What would resolve each kind of abstention (docs §4).
 REMEDY = {
     "run": "fix the failed run-level check (see reasons) and rerun the affected phase",
-    "points": "rerun the missing operating points; the line needs ≥ 3",
+    "points": "rerun the missing operating points; the line needs ≥ 3 (a point whose "
+              "modal grid differs across phases or reps is excluded: see grid_mismatch)",
     "reps": "rerun the dropped windows so every point has ≥ 2 reps in both arms",
     "cv": "add reps or lengthen the capture window at the noisy points",
     "drift": "rerun on a quiet node, baseline–candidate–baseline again",
@@ -419,17 +421,51 @@ def _finish(d: Decision) -> Decision:
 # ── reading a run directory (layout written by scripts/kimi_loop/p1_separation.sh) ──
 
 _POINT = re.compile(r"^L(\d+)_r(\d+)$")
+#: Both spellings vLLM has shipped (see :mod:`gitm.serve.metrics`).
+_RUNNING = ("vllm:num_requests_running", "vllm_num_requests_running")
+_PREEMPTIONS = ("vllm:num_preemptions_total", "vllm_num_preemptions_total",
+                "vllm:num_preemptions", "vllm_num_preemptions")
 
 
-def _prom_series(path: Path, metric: str) -> list[float]:
+def _read_json(path: Path):
+    """A JSON file, or None if an interrupted run left it missing or half-written."""
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _prom_series(path: Path, names: Sequence[str]) -> list[float]:
+    """One value per scrape (``### ts_ns=`` blocks), summed over label sets.
+
+    A scrape without the metric contributes nothing, so fewer values than
+    scrapes means the metric was missing some of the time.
+    """
     vals = []
-    for line in path.read_text().splitlines():
-        if line.startswith(f"vllm:{metric}"):
-            try:
-                vals.append(float(line.rsplit(" ", 1)[1]))
-            except (IndexError, ValueError):
-                pass
+    for block in re.split(r"^### ts_ns=.*$", path.read_text(), flags=re.M):
+        snap = parse_prometheus(block)
+        v = next((snap[n] for n in names if n in snap), None)
+        if v is not None:
+            vals.append(v)
     return vals
+
+
+def _preemption_problem(prom: Path) -> str | None:
+    """Why the zero-preemptions gate cannot pass, or None if it does.
+
+    Unverifiable counts as failing: a point that may have been preempted must not
+    reach the verdict.
+    """
+    if not prom.exists():
+        return "no metrics.prom; preemptions unverifiable"
+    pre = _prom_series(prom, _PREEMPTIONS)
+    if len(pre) < 2:
+        return f"preemption counter in {len(pre)} scrape(s); unverifiable"
+    if any(b < a for a, b in zip(pre, pre[1:], strict=False)):
+        return "preemption counter went backwards (server restart)"
+    if pre[-1] > pre[0]:
+        return f"{pre[-1] - pre[0]:.0f} preemptions"
+    return None
 
 
 def _window_running(d: Path) -> list[float]:
@@ -444,7 +480,7 @@ def _window_running(d: Path) -> list[float]:
         if vals:
             return vals
     prom = d / "metrics.prom"
-    return _prom_series(prom, "num_requests_running") if prom.exists() else []
+    return _prom_series(prom, _RUNNING) if prom.exists() else []
 
 
 @dataclass
@@ -474,7 +510,12 @@ def _phase(run: Path, arm: str, phase: str, concurrency: int,
         if not traces:
             dropped.append(f"{where}: no trace")
             continue
-        w = window_stat(read_kernels(traces[-1]))
+        try:
+            w = window_stat(read_kernels(traces[-1]))
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            # A capture cut off mid-write: drop the window, keep the run.
+            dropped.append(f"{where}: unreadable trace ({type(e).__name__}: {e})")
+            continue
         if w.launch_s is None or w.launches < MIN_LAUNCHES:
             dropped.append(f"{where}: {w.launches} anchor launches < {MIN_LAUNCHES}")
             continue
@@ -482,6 +523,8 @@ def _phase(run: Path, arm: str, phase: str, concurrency: int,
         g = d / "guidellm.json"
         if not g.exists():
             problems.append("no guidellm.json")
+        elif _read_json(g) is None:
+            problems.append("guidellm.json unreadable")
         else:
             p50, p95 = _itl_ms(g), _itl_ms(g, "p95")
             if not (p50 and p95):
@@ -494,12 +537,8 @@ def _phase(run: Path, arm: str, phase: str, concurrency: int,
         elif statistics.median(running) < MIN_RUNNING_FRACTION * concurrency:
             problems.append(f"median running {statistics.median(running):.0f} < "
                             f"{MIN_RUNNING_FRACTION:.0%} of c={concurrency}")
-        prom = d / "metrics.prom"
-        if prom.exists():
-            pre = _prom_series(prom, "num_preemptions_total") or _prom_series(
-                prom, "num_preemptions")
-            if len(pre) >= 2 and pre[-1] > pre[0]:
-                problems.append(f"{pre[-1] - pre[0]:.0f} preemptions")
+        if (pre := _preemption_problem(d / "metrics.prom")) is not None:
+            problems.append(pre)
         if problems:
             dropped.append(f"{where}: " + "; ".join(problems))
             continue
@@ -539,9 +578,12 @@ def analyze(run: Path, *, n_layers: int, concurrency: int) -> dict:
     dropped: list[str] = []
     for phase in ("base1", "cand", "base2"):
         f = run / "p1" / "traced" / phase / "sanity.json"
+        verdict = _read_json(f)
         if not f.exists():
             failures.append(f"{phase}: no correctness check (sanity.json)")
-        elif json.loads(f.read_text())["failures"]:
+        elif not isinstance(verdict, dict) or "failures" not in verdict:
+            failures.append(f"{phase}: sanity.json unreadable")
+        elif verdict["failures"]:
             failures.append(f"{phase}: correctness check failed")
         failed = run / "p1" / "traced" / phase / "FAILED"
         if failed.exists():
@@ -560,10 +602,19 @@ def analyze(run: Path, *, n_layers: int, concurrency: int) -> dict:
     if base.anchors | rep.anchors and len(base.anchors | rep.anchors) > 1:
         failures.append("baseline anchor changed between base1 and base2")
 
-    warnings = [f"{p}: modal grid differs between arms ({sorted(base.grids[p])} vs "
-                f"{sorted(cand.grids[p])}); check the decode batch matched"
-                for p in sorted(set(base.grids) & set(cand.grids))
-                if base.grids[p] != cand.grids[p]]
+    # On a serving run the anchor's grid tracks the decode batch, so a point is
+    # the same work in every phase only if all its reps ran at one modal grid.
+    # Running requests cannot stand in for this: a running request may be
+    # prefilling. A mismatched point is excluded from the fit, not warned about.
+    grid_mismatch = {}
+    for p in sorted(set(base.grids) | set(cand.grids) | set(rep.grids)):
+        seen = {name: sorted(ph.grids[p]) for name, ph in
+                (("base1", base), ("cand", cand), ("base2", rep)) if ph.grids.get(p)}
+        if len({tuple(g) for g in seen.values()}) > 1 or any(len(g) > 1 for g in seen.values()):
+            grid_mismatch[p] = seen
+            for ph in (base, cand, rep):
+                ph.launch.pop(p, None)
+                ph.control.pop(p, None)
 
     cpts = sorted(p for p in set(base.control) & set(cand.control)
                   if len(base.control[p]) >= 2 and len(cand.control[p]) >= 2)
@@ -575,11 +626,14 @@ def analyze(run: Path, *, n_layers: int, concurrency: int) -> dict:
     dec = decide(base.launch, cand.launch, base_repeat=rep.launch or None,
                  control_ratio=ctl or None, control_se=ctl_se, gate_failures=failures,
                  kernels_per_launch=(base.kernels_per_launch, cand.kernels_per_launch))
+    if grid_mismatch:
+        dec.reasons.append(f"excluded {', '.join(grid_mismatch)}: modal grid differs across "
+                           "phases or reps, so the decode batch is not matched")
 
     return {
         "decision": asdict(dec),
         "dropped_windows": dropped,
-        "warnings": warnings,
+        "grid_mismatch": grid_mismatch,
         "anchors": {"base": sorted(base.anchors), "cand": sorted(cand.anchors)},
         "targets": {"base": sorted(set().union(*base.names.values())) if base.names else [],
                     "cand": sorted(set().union(*cand.names.values())) if cand.names else []},
@@ -602,7 +656,7 @@ def _corroborate(run: Path, dec: Decision, base: Sweep, n_layers: int) -> dict |
     for phase in ("base1", "cand"):
         for d in sorted((run / "p1" / "off" / phase).glob("L*_r*")):
             g, m = d / "guidellm.json", _POINT.match(d.name)
-            if m and g.exists() and (itl := _itl_ms(g)) is not None:
+            if m and _read_json(g) is not None and (itl := _itl_ms(g)) is not None:
                 off[phase][f"L{m.group(1)}"].append(itl)
     if dec.k is None:
         return None

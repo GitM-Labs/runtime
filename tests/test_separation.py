@@ -231,8 +231,8 @@ def test_analyze_drops_bad_windows_and_gates_the_run(tmp_path, monkeypatch):
     cand = tmp_path / "p1" / "traced" / "cand"
     (cand / "L8192_r2" / "guidellm.json").write_text(_itl(30.0, 120.0))  # latency gate
     (cand / "L2048_r1" / "metrics.prom").write_text(
-        "vllm:num_requests_running 9\nvllm:num_preemptions_total 0\n"
-        "vllm:num_requests_running 9\nvllm:num_preemptions_total 3\n")  # load gates
+        "### ts_ns=0\nvllm:num_requests_running 9\nvllm:num_preemptions_total 0\n"
+        "### ts_ns=1\nvllm:num_requests_running 9\nvllm:num_preemptions_total 3\n")  # load
     (cand / "L4096_r3" / "guidellm.json").unlink()  # a failed load generator
     report = sep.analyze(tmp_path, n_layers=61, concurrency=16)
     dropped = " | ".join(report["dropped_windows"])
@@ -247,6 +247,96 @@ def test_analyze_drops_bad_windows_and_gates_the_run(tmp_path, monkeypatch):
     assert dec["outcome"] == "inconclusive"
     assert any("correctness" in r for r in dec["reasons"])
     assert dec["remedies"]
+
+
+def test_unverifiable_preemptions_drop_the_window(tmp_path, monkeypatch):
+    # Zero preemptions is a gate, so a point where the count cannot be read must
+    # not reach the verdict: no scrape file, a counter under a name the scraper
+    # did not keep, or a single sample.
+    _write_run(tmp_path, monkeypatch)
+    cand = tmp_path / "p1" / "traced" / "cand"
+    (cand / "L2048_r1" / "metrics.prom").unlink()
+    (cand / "L4096_r1" / "metrics.prom").write_text(
+        "### ts_ns=0\nvllm:num_requests_running 16\n### ts_ns=1\nvllm:num_requests_running 16\n")
+    (cand / "L8192_r1" / "metrics.prom").write_text(
+        "### ts_ns=0\nvllm:num_requests_running 16\nvllm:num_preemptions_total 0\n")
+    dropped = sep.analyze(tmp_path, n_layers=61, concurrency=16)["dropped_windows"]
+    joined = " | ".join(dropped)
+    assert "cand/L2048_r1: " in joined and "no metrics.prom" in joined
+    assert "cand/L4096_r1: " in joined and "counter in 0 scrape(s)" in joined
+    assert "cand/L8192_r1: " in joined and "counter in 1 scrape(s)" in joined
+
+
+def test_preemptions_read_under_either_spelling_and_every_label_set(tmp_path):
+    # vLLM has shipped vllm_ as well as vllm: names, and labels its counters per
+    # engine; a preemption on any engine counts.
+    prom = tmp_path / "metrics.prom"
+    prom.write_text(
+        "### ts_ns=0\n"
+        'vllm_num_preemptions_total{engine="0"} 0\nvllm_num_preemptions_total{engine="1"} 5\n'
+        "### ts_ns=1\n"
+        'vllm_num_preemptions_total{engine="0"} 2\nvllm_num_preemptions_total{engine="1"} 5\n')
+    assert sep._preemption_problem(prom) == "2 preemptions"
+    prom.write_text(prom.read_text().replace('"0"} 2', '"0"} 0'))
+    assert sep._preemption_problem(prom) is None
+
+
+def _set_grid(window_dir, grid):
+    trace = window_dir / "cap" / "trace.jsonl"
+    lines = trace.read_text().splitlines()
+    out = [lines[0]]
+    for line in lines[1:]:
+        e = json.loads(line)
+        e["grid_x"] = grid
+        out.append(json.dumps(e))
+    trace.write_text("\n".join(out) + "\n")
+
+
+def test_grid_mismatch_excludes_the_point(tmp_path, monkeypatch):
+    # The candidate ran a different decode batch at one point: that point is
+    # different work, so it leaves the fit rather than carrying a warning.
+    _write_run(tmp_path, monkeypatch)
+    for r in (1, 2, 3):
+        _set_grid(tmp_path / "p1" / "traced" / "cand" / f"L2048_r{r}", 999)
+    report = sep.analyze(tmp_path, n_layers=61, concurrency=16)
+    assert "L2048" in report["grid_mismatch"]
+    assert "L2048" not in report["decision"]["points"]
+    assert any("L2048" in r and "grid" in r for r in report["decision"]["reasons"])
+    assert report["decision"]["outcome"] == "multiplicative", report["decision"]["reasons"]
+
+    # One rep at another grid inside a single arm is also unmatched work.
+    _set_grid(tmp_path / "p1" / "traced" / "base1" / "L8192_r2", 999)
+    assert "L8192" in sep.analyze(tmp_path, n_layers=61, concurrency=16)["grid_mismatch"]
+
+
+def test_grid_mismatch_everywhere_is_inconclusive(tmp_path, monkeypatch):
+    _write_run(tmp_path, monkeypatch)
+    for d in (tmp_path / "p1" / "traced" / "cand").glob("L*_r*"):
+        _set_grid(d, 999)
+    dec = sep.analyze(tmp_path, n_layers=61, concurrency=16)["decision"]
+    assert dec["outcome"] == "inconclusive"
+    assert dec["remedies"]
+
+
+def test_interrupted_files_drop_the_window_not_the_analysis(tmp_path, monkeypatch):
+    _write_run(tmp_path, monkeypatch)
+    cand = tmp_path / "p1" / "traced" / "cand"
+    trace = cand / "L2048_r1" / "cap" / "trace.jsonl"
+    trace.write_text(trace.read_text()[:-40])  # cut off mid-record
+    (cand / "L4096_r2" / "guidellm.json").write_text('{"benchmarks": [')
+    (tmp_path / "p1" / "off" / "base1" / "L2048_r1").mkdir(parents=True)
+    (tmp_path / "p1" / "off" / "base1" / "L2048_r1" / "guidellm.json").write_text("{")
+    report = sep.analyze(tmp_path, n_layers=61, concurrency=16)
+    joined = " | ".join(report["dropped_windows"])
+    assert "cand/L2048_r1: unreadable trace" in joined
+    assert "cand/L4096_r2: guidellm.json unreadable" in joined
+    assert report["decision"]["outcome"] == "multiplicative", report["decision"]["reasons"]
+
+    # A half-written correctness verdict is a failed check, not a crash.
+    (cand / "sanity.json").write_text('{"failures": [')
+    dec = sep.analyze(tmp_path, n_layers=61, concurrency=16)["decision"]
+    assert dec["outcome"] == "inconclusive"
+    assert any("sanity.json unreadable" in r for r in dec["reasons"])
 
 
 def test_anchor_is_the_longest_kernel_even_when_counts_tie():

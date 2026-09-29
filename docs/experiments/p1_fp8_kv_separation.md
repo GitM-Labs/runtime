@@ -111,17 +111,18 @@ Traces are 30 s windows, 45 per run. Pull them selectively (see §5).
 
 ## 3. Gates
 
-Two kinds of gate. A **window** gate drops that one window, and the rest of the
+Three kinds of gate. A **window** gate drops that one window, and the rest of the
 run continues; the verdict still needs the reps and points gates below. A
-**run** gate makes the outcome **inconclusive**. Every failure is recorded with
+**point** gate drops that operating point from every phase. A **run** gate makes the outcome **inconclusive**. Every failure is recorded with
 what would resolve it. No gate is waived after the fact.
 
 | gate | kind | rule | why |
 |---|---|---|---|
 | correctness | run | after every arm switch, 32 fixed greedy prompts each return ≥ 16 tokens, not collapsed onto ≤ 2 distinct tokens (`separation sanity`) | fp8 KV must not have broken the model; the runner also stops the phase |
-| capture | window | a trace exists, with ≥ 1000 anchor launches at the modal grid | enough launches for a stable median |
-| load | window | median running requests ≥ 0.9 × 16 **inside the capture window** (`cap/metrics_samples.jsonl`); zero preemptions over the point | same decode batch in both arms |
+| capture | window | a readable trace exists (a capture cut off mid-write is dropped, not fatal), with ≥ 1000 anchor launches at the modal grid | enough launches for a stable median |
+| load | window | median running requests ≥ 0.9 × 16 **inside the capture window** (`cap/metrics_samples.jsonl`); zero preemptions over the point, read from ≥ 2 scrapes of the counter (`vllm:` or `vllm_` spelling, summed over label sets); a count that cannot be read fails the gate | same decode batch in both arms |
 | latency | window | `guidellm.json` present with a readable ITL; ITL p95 / p50 ≤ 3 | a stalling server is not a steady operating point. GuideLLM reports ITL per request, so this catches gross stalls only |
+| grid | point | the anchor's modal grid is the same in every rep of `base1`, `cand` and `base2`; otherwise the point is excluded from the fit | the grid tracks the decode batch; running requests do not, since a running request may be prefilling |
 | points, reps | run | ≥ 3 operating points, each with ≥ 2 surviving reps in both arms | a line needs two points; testing it needs three; noise needs reps |
 | repeatability | run | rep-to-rep CV ≤ 5% at every point, per arm | noise small enough for the margins |
 | anchor | run | the same anchor kernel in every window of an arm, and in `base1` and `base2` | a per-window anchor flip would change what "one launch" means |
@@ -130,9 +131,10 @@ what would resolve it. No gate is waived after the fact.
 | control | run | `rms_norm` per-launch time, candidate ÷ baseline, same rule as drift, with standard errors from the control's own rep-to-rep noise | KV dtype must not move an op that does not read KV |
 | fit | run | fails only if the curvature exceeds 0.05 **and** the lack-of-fit F test gives p < 0.01 | one `(k, m)` describes all points (A5); a bend that noise explains is not a failure |
 
-Reported but not gating: the modal grid per point and arm (a mismatch is a
-warning to check the batch), and the per-kernel time difference between arms
-(`kernel_diff`, below).
+Reported but not gating: the per-kernel time difference between arms
+(`kernel_diff`, below). If fp8 changes the kernel's launch configuration
+itself (a different split count, say), every point fails the grid gate and the
+run is inconclusive: the grid can then no longer show that the batch matched.
 
 ## 4. Decision rule (pre-registered)
 
@@ -295,7 +297,7 @@ first windows show noise above 1%, add reps before trusting a "no effect".
 |---|---|---|
 | tracer inflates device-side durations by `ε` per kernel | under a pure `k`, the intercept becomes `(n_c − k·n_b)·ε` | `μ ≥ 2 × tracer leak`, reported with every `m`; off-arm slope is tracer-free. `ε_max = 0.25 µs` is an assumption: timestamps are device-side, and the tracer's per-dispatch work is on the host |
 | noise with an absolute floor (timer resolution, jitter) | short points over-trusted if noise were assumed proportional | two-part noise model; §6 gives its calibration |
-| decode batch differs between arms (fp8 frees KV, changing scheduling) | changes work per launch | in-window load gate; modal-grid filter; grid mismatch warning |
+| decode batch differs between arms (fp8 frees KV, changing scheduling) | changes work per launch | in-window load gate; modal-grid filter; grid gate across phases |
 | a separate candidate-only kernel (dequantize, cast) | an additive cost outside the op | `kernel_diff` reports it; the verdict states it covers the attention core |
 | kv spread within a point (kv grows by 256 during decode) | per-point time is a mean over kv | exact if cost is linear in kv (it is, for memory-bound MLA); fit gate catches otherwise |
 | the candidate runs a different kernel variant | `k`, `m` then describe variant vs variant, not one kernel's mechanism | anchors and target names reported per arm |
