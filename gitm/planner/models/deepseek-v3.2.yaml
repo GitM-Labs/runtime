@@ -19,10 +19,13 @@ checkpoint:
 description: >
   61 layers, hidden 7168, ~671B total params. MLA attention (kv_lora_rank 512,
   one latent shared across 128 query heads) with a DeepSeek Sparse Attention
-  lightning indexer selecting top-2048. Unlike GLM-5.2 there is NO IndexShare:
-  every layer computes its own index (all 61 layers carry indexer.* tensors), so
-  index_topk_freq is 1. First 3 layers dense, remaining 58 MoE (256 experts,
-  top-8, one shared). One MTP draft layer carries its own indexer weights. FP8
+  lightning indexer selecting top-2048. Every layer carries its own indexer
+  weights (VERIFIED: all 61 layers, plus the MTP layer, hold self_attn.indexer.*
+  tensors, unlike GLM-5.2's shared layers). That each layer also recomputes its
+  own selection at run time (no IndexShare, index_topk_freq 1) is a planner
+  ASSUMPTION pending engine evidence, not established by the checkpoint. First 3
+  layers dense, remaining 58 MoE (256 experts, top-8, one shared). One MTP draft
+  layer carries its own indexer weights. FP8
   e4m3 weights, 128x128 block scales; embeddings, lm_head, router weights and
   indexer.weights_proj are stored bf16. Execution details need an engine pin.
 
@@ -43,10 +46,13 @@ spec:
   qk_rope_head_dim: 64
   v_head_dim: 128
 
-  # DeepSeek Sparse Attention indexer. NO IndexShare on V3.2: index_topk_freq 1
-  # means every layer is a 'full' indexer layer. This is proven from the weight
-  # map — all 61 layers (and the MTP layer) carry self_attn.indexer.* tensors,
-  # whereas GLM-5.2's 'shared' layers carry none. index_n_heads is 64 (GLM: 32).
+  # DeepSeek Sparse Attention indexer.
+  # VERIFIED (weight map): every layer, and the MTP layer, carries its own
+  # self_attn.indexer.* tensors, whereas GLM-5.2's 'shared' layers carry none.
+  # ASSUMPTION (pending engine evidence): index_topk_freq 1 models each layer as
+  # recomputing its own top-2048 selection (no IndexShare). The stored weights do
+  # not prove the runtime recomputes selection per layer rather than reusing it;
+  # an engine pin/trace is needed to confirm. index_n_heads is 64 (GLM: 32).
   index_n_heads: 64
   index_head_dim: 128
   index_topk: 2048
@@ -101,13 +107,15 @@ spec:
 
 provenance:
   verified:
-    - claim: every layer carries its own indexer weights
+    - claim: every layer carries its own indexer weights (weights, not execution)
       detail: >
         model.safetensors.index.json carries self_attn.indexer.* tensors on all
         61 layers (0-60) and on the MTP layer (61). GLM-5.2, by contrast, carries
         them on only 21 of 78 layers. A layer that reused a neighbour's selection
-        would not need indexer weights; every V3.2 layer has them. This proves
-        the stored inventory, not that the serving engine recomputes selection.
+        would not need indexer weights; every V3.2 layer has them. This verifies
+        the stored weight inventory ONLY. It does not establish that the serving
+        engine recomputes a fresh selection at each layer — that per-layer
+        selection execution is a planner assumption (see estimated, below).
     - claim: dense/sparse MLP split matches the tensor map
       detail: >
         Layers 0-2 carry mlp.{gate,up,down}_proj (dense FFN) and no experts;
@@ -136,6 +144,14 @@ provenance:
         per-rank footprint remains an estimate until placement is verified.
 
   estimated:
+    - field: per-layer index selection execution
+      value: planner assumption (index_topk_freq 1, no IndexShare)
+      detail: >
+        The weight map verifies every layer carries its own indexer weights, but
+        it does not establish that the serving engine recomputes a fresh top-2048
+        selection at each layer. index_topk_freq 1 models per-layer selection; an
+        engine that shared or reused selections across layers would lower the
+        indexer scan cost. Pending engine source / a qualified trace.
     - field: kv_dtype
       value: bf16 exploratory scenario; deployment UNVERIFIED
       detail: >
