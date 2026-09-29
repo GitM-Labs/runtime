@@ -21,6 +21,7 @@ dependencies = [
     "pyyaml>=6.0",
     "numpy>=1.26",
     "statsmodels>=0.14",
+    "scipy>=1.11",  # t quantiles for experiment verdict intervals (gitm/experiment)
 ]
 
 [project.optional-dependencies]
