@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import subprocess
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+from gitm.optimizer.degradation import unreliable_ab
 
 
 @dataclass
@@ -40,6 +43,9 @@ class Provenance:
     trace_path: str | None = None
     rejected_candidates: list[str] = field(default_factory=list)
     rolled_back: list[str] = field(default_factory=list)
+    #: Every fallback the run took (:mod:`gitm.optimizer.degradation`), as dicts
+    #: so the verification export and the history reader see the same record.
+    degradations: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _git_sha() -> str:
@@ -74,14 +80,22 @@ def write_report(
         "claims": claims,
         "provenance": provenance,
         "qualification_diagnostic": qualification_diagnostic,
-        "summary": summary or _default_summary(claims),
+        "summary": summary or _default_summary(claims, provenance),
+        "degradations": provenance.degradations,
         "now_ns": time.time_ns(),
     }
     return tpl.render(**ctx)
 
 
-def _default_summary(claims: list[Claim]) -> str:
+def _default_summary(claims: list[Claim], provenance: Provenance | None = None) -> str:
     verified = [c for c in claims if c.measured_delta is not None and not c.rolled_back]
+    bad_ab = unreliable_ab(provenance.degradations) if provenance is not None else []
+    if verified and bad_ab:
+        # The deltas are still shown per claim, but a measurement the run itself
+        # flagged as unreliable is not a verified claim, and the headline must
+        # not add it up as one.
+        return (f"{len(verified)} claim(s) measured, none counted as verified: the A/B "
+                f"is unreliable ({', '.join(bad_ab)}). See Degradations below.")
     if not verified:
         return "No claims verified within budget. See diagnostic below."
     total = sum(c.measured_delta or 0.0 for c in verified)
@@ -94,10 +108,16 @@ def build_provenance(
     run_id: str,
     started_at_ns: int,
     trace_path: str | None = None,
+    degradations: Iterable[Any] | None = None,
 ) -> Provenance:
+    """``degradations`` takes a :class:`~gitm.optimizer.degradation.DegradationLog`
+    (or any iterable of ``Degradation`` / dicts) and is stored as dicts."""
     from gitm import __version__
 
     return Provenance(
+        degradations=[
+            d if isinstance(d, dict) else d.to_dict() for d in (degradations or ())
+        ],
         workload_id=workload_id,
         fingerprint=fingerprint,
         run_id=run_id,

@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from gitm.optimizer.degradation import unreliable_ab
+
 __all__ = [
     "LeverRecord",
     "runs_with_results",
@@ -218,6 +220,14 @@ def load_history(
             skipped[d.name] = "malformed intervention name"
             continue
         prov = doc.get("provenance") if isinstance(doc.get("provenance"), dict) else {}
+        # A run that flagged its own A/B as unreliable (a probe timing a runner
+        # that does nothing, a restarted engine measured through the old one)
+        # wrote numbers that are not measurements. Reading them would rank the
+        # lever as "measured" on every run that follows.
+        bad_ab = unreliable_ab(prov.get("degradations") or [])
+        if bad_ab:
+            skipped[d.name] = f"unreliable A/B: {', '.join(bad_ab)}"
+            continue
         sku = (env or {}).get("gpu_sku")
         fp = prov.get("fingerprint")
         # Both are keys and neither has a fallback: a record filed under the wrong

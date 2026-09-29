@@ -74,7 +74,15 @@ def apply_intervention(
     blocks the apply). Pass one only where the applicator mutates a real target;
     a dry-run leaves it ``None`` so the trail stays free of no-op entries.
     """
-    snapshot = applicator.snapshot()
+    # Step 1: snapshot. On a live engine this benchmarks the baseline, so it can
+    # fail the same ways a measurement can — and when it does, nothing has been
+    # applied yet. Returned as an error, not raised: one candidate whose baseline
+    # could not be taken must not end a run that has other candidates to try.
+    try:
+        snapshot = applicator.snapshot()
+    except Exception as exc:
+        return ApplyResult(False, rolled_back=False, measured_delta=None,
+                           error=f"snapshot failed, nothing applied: {exc}")
 
     # Step 2: apply. A bad value (validation error) rolls straight back.
     try:

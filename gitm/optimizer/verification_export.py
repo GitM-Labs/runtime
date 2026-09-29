@@ -33,6 +33,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from gitm.optimizer.degradation import AB_UNIT
+
 if TYPE_CHECKING:
     from gitm.kernels.spec import InterventionSpec
     from gitm.optimizer.apply import ApplyResult, EngineABResult
@@ -148,7 +150,14 @@ def build_export(
     *,
     gpu_sku: str | None = None,
 ) -> dict[str, Any]:
-    """The full export document: provenance + environment + every comparison."""
+    """The full export document: provenance + environment + every comparison.
+
+    The run's degradations travel in ``provenance``: the history reader skips a
+    run whose A/B the run itself flagged unreliable, and a probe that timed
+    workload runs rather than tokens changes what ``metric`` says was measured.
+    """
+    degradations = list(getattr(provenance, "degradations", None) or [])
+    runs_per_s = any(d.get("stage") == AB_UNIT for d in degradations if isinstance(d, dict))
     return {
         "schema": SCHEMA,
         "provenance": {
@@ -157,10 +166,14 @@ def build_export(
             "run_id": provenance.run_id,
             "git_sha": provenance.git_sha,
             "gitm_version": provenance.gitm_version,
+            "degradations": degradations,
         },
         "environment": _environment(gpu_sku),
         "protocol": {
-            "metric": "decode throughput (tokens/sec)",
+            "metric": (
+                "workload throughput (runs/sec; the runner reported no token count)"
+                if runs_per_s else "decode throughput (tokens/sec)"
+            ),
             "reps": "each side benchmarked `reps` times; std is the sample stdev",
             "agreement_band": (
                 "relative band around our numbers within which a re-measurement "

@@ -14,6 +14,19 @@
 > **Qualification gate diagnostic.** {{ qualification_diagnostic }}
 {%- endif %}
 
+{%- if degradations %}
+
+## Degradations
+
+Where this run fell back instead of measuring. `unreliable` numbers do not
+describe this run and are excluded from history; `approximate` ones describe it
+under the stated default.
+
+{% for d in degradations -%}
+- **{{ d.severity }}** `{{ d.stage }}`: used {{ d.used }} — {{ d.reason }}{% if d.affects %} _(affects: {{ d.affects | join(', ') }})_{% endif %}
+{% endfor %}
+{%- endif %}
+
 ## Claims
 
 Every claim below carries the full provenance chain. Incomplete chain = no

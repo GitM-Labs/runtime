@@ -401,6 +401,25 @@ def _run_capture(args, serve_argv: list[str] | None) -> int:
     return rc
 
 
+def _warn_degraded(summary: dict, run_dir: str | None) -> None:
+    """One stderr line when the run fell back anywhere.
+
+    With ``--report`` the summary JSON is never printed, so without this a run
+    whose residuals were scored against a default graph finishes looking like
+    any other.
+    """
+    deg = summary.get("degradations") or {}
+    if not deg.get("n"):
+        return
+    parts = []
+    if deg.get("unreliable"):
+        parts.append("unreliable: " + ", ".join(deg["unreliable"]))
+    if deg.get("approximate"):
+        parts.append("approximate: " + ", ".join(deg["approximate"]))
+    where = f"; see {run_dir}/degradations.json" if run_dir else ""
+    print(f"gitm: run degraded ({'; '.join(parts)}){where}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
 
@@ -446,6 +465,7 @@ def main(argv: list[str] | None = None) -> int:
             args.report.write_text(result.get("report_md", ""))
         else:
             print(json.dumps(summary, indent=2))
+        _warn_degraded(summary, result.get("run_dir"))
         # Non-zero so automation notices a run that measured nothing (no GPU /
         # CUPTI shim, or the workload never ran) instead of seeing a fake pass.
         return 3 if summary.get("status") == "no_data" else 0
