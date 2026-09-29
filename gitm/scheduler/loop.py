@@ -113,6 +113,15 @@ def _parse_budget_s(budget: str) -> float:
     value, unit = float(m.group(1)), m.group(2)
     return value * {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}[unit]
 
+def _note_ab(
+    degradations: DegradationLog | None, stage: str, used: str, reason: str, severity: str
+) -> None:
+    """Record a throughput-probe fallback, when the caller passed a log."""
+    if degradations is not None:
+        degradations.record(stage, used=used, reason=reason, severity=severity,
+                            affects=(AFFECTS_AB, AFFECTS_CLAIMS))
+
+
 def _engine_throughput_fn(
     engine: Any, runner: Any, degradations: DegradationLog | None = None
 ) -> Any:
@@ -145,14 +154,9 @@ def _engine_throughput_fn(
     if callable(explicit):
         return explicit
 
-    def _note(stage: str, used: str, reason: str, severity: str) -> None:
-        if degradations is not None:
-            degradations.record(stage, used=used, reason=reason, severity=severity,
-                                affects=(AFFECTS_AB, AFFECTS_CLAIMS))
-
     if runner is None:
         why = "no workload runner and no engine.gitm_throughput_fn: nothing to time"
-        _note(AB_PROBE, "no throughput probe", why, UNRELIABLE)
+        _note_ab(degradations, AB_PROBE, "no throughput probe", why, UNRELIABLE)
 
         def _no_probe(_engine: Any) -> float:
             raise RuntimeError(why)
@@ -163,7 +167,8 @@ def _engine_throughput_fn(
         if _engine is not engine:
             why = ("the default probe drives the engine the runner was built with, "
                    "not the restarted one; supply engine.gitm_throughput_fn")
-            _note(AB_PROBE, "no measurement of the restarted engine", why, UNRELIABLE)
+            _note_ab(degradations, AB_PROBE, "no measurement of the restarted engine", why,
+                     UNRELIABLE)
             raise RuntimeError(why)
         t0 = time.perf_counter()
         out = runner()
@@ -174,9 +179,9 @@ def _engine_throughput_fn(
             for key in ("generated_tokens", "decode_steps", "events"):
                 if out.get(key) is not None:
                     return float(out[key]) / dt
-        _note(AB_UNIT, "workload runs per second",
-              "the runner reported none of generated_tokens / decode_steps / events",
-              APPROXIMATE)
+        _note_ab(degradations, AB_UNIT, "workload runs per second",
+                 "the runner reported none of generated_tokens / decode_steps / events",
+                 APPROXIMATE)
         return 1.0 / dt
 
     return _tps
