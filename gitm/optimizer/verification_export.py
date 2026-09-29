@@ -34,7 +34,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from gitm.optimizer.degradation import AB_UNIT
+from gitm.optimizer.degradation import AB_UNITS, ab_unit
 
 if TYPE_CHECKING:
     from gitm.kernels.spec import InterventionSpec
@@ -113,7 +113,6 @@ def build_record(
     restart, so reading them afterwards yields the candidate on both sides.
     """
     degradations = [d if isinstance(d, dict) else d.to_dict() for d in degradations]
-    runs = any(d.get("stage") == AB_UNIT for d in degradations)
     return VerificationRecord(
         intervention_name=spec.name,
         summary=spec.summary,
@@ -135,7 +134,7 @@ def build_record(
         baseline_config=dict(baseline_config or {}),
         candidate_config=dict(candidate_config or {}),
         degradations=degradations,
-        unit="runs/sec" if runs else "tokens/sec",
+        unit=AB_UNITS[ab_unit(degradations)][2],
     )
 
 
@@ -185,12 +184,7 @@ def build_export(
         },
         "environment": _environment(gpu_sku),
         "protocol": {
-            "metric": (
-                "workload throughput (runs/sec; the runner reported no token count)"
-                if units == {"runs/sec"}
-                else "throughput; unit per record, see results[].unit" if len(units) > 1
-                else "decode throughput (tokens/sec)"
-            ),
+            "metric": _metric(units),
             "reps": "each side benchmarked `reps` times; std is the sample stdev",
             "agreement_band": (
                 "relative band around our numbers within which a re-measurement "
@@ -201,6 +195,15 @@ def build_export(
         },
         "results": [r.to_dict() for r in records],
     }
+
+
+def _metric(units: set[str]) -> str:
+    """The protocol's one-line metric, summarising each record's own ``unit``."""
+    if units <= {"tokens/sec"}:
+        return "decode throughput (tokens/sec)"
+    if len(units) == 1:
+        return f"throughput ({next(iter(units))}; the runner reported no token count)"
+    return "throughput; unit per record, see results[].unit"
 
 
 def write_verification(

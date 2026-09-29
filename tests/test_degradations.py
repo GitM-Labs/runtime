@@ -177,6 +177,51 @@ def test_probe_without_a_token_count_says_runs_per_second():
     assert "tok/s" in _ab_evidence(ab, rolled_back=False, measured_under=[])
 
 
+def test_decode_steps_are_labelled_as_steps_not_tokens():
+    from gitm.optimizer.verification_export import build_record
+    from gitm.scheduler.loop import _ab_evidence, _engine_throughput_fn
+
+    engine = SimpleNamespace()
+    log = DegradationLog()
+    probe = _engine_throughput_fn(engine, lambda: {"decode_steps": 40}, log)
+    with _quiet():
+        probe(engine)
+    ab = SimpleNamespace(speedup=1.1, via="hot-swap", baseline_tps=2.0, candidate_tps=2.2,
+                         baseline_std=0.0, candidate_std=0.0, reps=1, rel_std=0.0,
+                         significant=True)
+    text = _ab_evidence(ab, rolled_back=False, measured_under=list(log))
+    assert "steps/s" in text and "tok/s" not in text
+    spec = SimpleNamespace(name="l", summary="s", knob="k", value=1, source="t")
+    rec = build_record(spec, ab, SimpleNamespace(rolled_back=False), degradations=list(log))
+    assert rec.unit == "decode_steps/sec"
+
+
+def test_unit_lock_is_per_ab_not_per_run():
+    """One candidate's A/B in steps, the next in tokens: both are consistent and
+    both are measured. Mixing within one A/B is still refused."""
+    from gitm.scheduler.loop import _engine_throughput_fn
+
+    engine = SimpleNamespace()
+    outs = iter([{"decode_steps": 4}, {"decode_steps": 4},
+                 {"generated_tokens": 9}, {"generated_tokens": 9},
+                 {"generated_tokens": 9}, {}])
+    log = DegradationLog()
+    probe = _engine_throughput_fn(engine, lambda: next(outs), log)
+    with _quiet():
+        with log.scope("first"):
+            probe(engine)
+            probe(engine)
+        with log.scope("second"):
+            probe(engine)
+            probe(engine)  # a different unit from "first", and that's fine
+        with log.scope("third"), pytest.raises(RuntimeError, match="same A/B"):
+            probe(engine)
+            probe(engine)  # tokens, then nothing, inside one A/B
+    assert unreliable_ab(log.measured_under("third")) == [AB_PROBE]
+    assert not unreliable_ab(log.measured_under("first"))
+    assert not unreliable_ab(log.measured_under("second"))
+
+
 # ── the predicted graph's basis ──────────────────────────────────────────────
 
 
@@ -394,7 +439,7 @@ def test_verification_records_carry_their_own_degradations_and_unit():
     spec = NS(name="lever", summary="s", knob="k", value=1, source="t")
     ab = NS(baseline_tps=1.0, candidate_tps=1.1, speedup=1.1, baseline_std=0.0,
             candidate_std=0.0, reps=1, rel_std=0.0, significant=True, via="hot-swap")
-    unit = Degradation(AB_UNIT, used="runs/s", reason="r", affects=(AFFECTS_AB,))
+    unit = Degradation(AB_UNIT, used="runs/sec", reason="r", affects=(AFFECTS_AB,))
     rec = build_record(spec, ab, NS(rolled_back=False), degradations=[unit])
     assert rec.degradations[0]["stage"] == AB_UNIT
     doc = build_export([rec], _provenance(DegradationLog()))

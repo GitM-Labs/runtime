@@ -40,6 +40,7 @@ from gitm.optimizer.collective_signal import collective_causes, worst_device_com
 from gitm.optimizer.degradation import (
     AB_PROBE,
     AB_UNIT,
+    AB_UNITS,
     AFFECTS_AB,
     AFFECTS_CLAIMS,
     AFFECTS_RESIDUALS,
@@ -48,10 +49,12 @@ from gitm.optimizer.degradation import (
     GRAPH_BATCH,
     GRAPH_HARDWARE,
     GRAPH_MODEL,
+    TOKENS,
     UNRELIABLE,
     WORKLOAD_RUNNER,
     Degradation,
     DegradationLog,
+    ab_unit,
     unreliable_ab,
 )
 from gitm.optimizer.deviation import deviation_summary, deviation_trace, write_deviation_jsonl
@@ -150,10 +153,15 @@ def _engine_throughput_fn(
       timing it after a restart measures the old engine and credits the new one.
     * No token count in the runner's output: the probe still works, as workload
       runs per second, and the unit is recorded so no report calls it tok/s.
-    * The unit is fixed by the first call and held for the run. A speedup is a
-      ratio of two probe calls, so a runner that reports ``generated_tokens`` on
-      one call and nothing (or ``decode_steps``) on the next would divide one
-      unit by another. That call raises instead, and the A/B ends as an error.
+    * The unit is fixed by an A/B's first call and held for that A/B. A speedup
+      is a ratio of two probe calls, so a runner that reports ``generated_tokens``
+      on one call and nothing (or ``decode_steps``) on the next would divide one
+      unit by another; that call raises and the A/B ends as an error. The lock is
+      keyed by :attr:`DegradationLog.current_scope`, so the next candidate starts
+      fresh and a consistent A/B in another unit is still measured.
+    * Any count other than ``generated_tokens`` is recorded as an
+      :data:`AB_UNIT` degradation naming its unit, so nothing reports steps or
+      events as tok/s.
     """
     explicit = getattr(engine, "gitm_throughput_fn", None)
     if callable(explicit):
@@ -168,9 +176,9 @@ def _engine_throughput_fn(
 
         return _no_probe
 
-    # The first call's unit, held for every call after it: a key of the runner's
-    # output, or "runs" when it reported none.
-    locked: list[str] = []
+    # Per A/B: the unit of its first call, held for the rest of it. Keyed by the
+    # candidate being measured; one key for everything when there is no log.
+    locked: dict[str | None, str] = {}
 
     def _tps(_engine: Any) -> float:
         if _engine is not engine:
@@ -190,17 +198,17 @@ def _engine_throughput_fn(
                 if out.get(key) is not None:
                     unit, count = key, float(out[key])
                     break
-        if not locked:
-            locked.append(unit)
-        elif unit != locked[0]:
-            why = (f"the runner reported {unit!r} after reporting {locked[0]!r}; a speedup "
-                   "across the two would divide one unit by another")
+        ab = degradations.current_scope if degradations is not None else None
+        first = locked.setdefault(ab, unit)
+        if unit != first:
+            why = (f"the runner reported {unit!r} after reporting {first!r} in the same A/B; "
+                   "a speedup across the two would divide one unit by another")
             _note_ab(degradations, AB_PROBE, "no measurement in a mixed unit", why, UNRELIABLE)
             raise RuntimeError(why)
-        if unit == "runs":
-            _note_ab(degradations, AB_UNIT, "workload runs per second",
-                     "the runner reported none of generated_tokens / decode_steps / events",
-                     APPROXIMATE)
+        if unit != TOKENS:
+            counted = "" if unit == "runs" else f"; counted {unit} instead"
+            _note_ab(degradations, AB_UNIT, AB_UNITS[unit][2],
+                     "the runner reported no generated_tokens" + counted, APPROXIMATE)
         return count / dt
 
     return _tps
@@ -522,10 +530,13 @@ def _execution_graph_basis(engine: Any, hw: Any, batch: Any):
 
             return predict_hybrid_graph(family_spec(cfg, name=name), hw, batch,
                                         ShardingConfig()), family, None
-    spec, why = _model_spec_from_hf_explained(hf)
     if hf is None:
-        why = ("no engine attached" if engine is None
-               else "the engine exposes no HF config at any known path")
+        # More specific than the helper's "no HF config": which of the two it is
+        # decides the fix (attach an engine vs. teach the reader a config path).
+        spec, why = None, ("no engine attached" if engine is None
+                           else "the engine exposes no HF config at any known path")
+    else:
+        spec, why = _model_spec_from_hf_explained(hf)
     return predict_graph(model=spec, hw=hw, batch=batch), "dense", why
 
 
@@ -578,8 +589,7 @@ def _ab_evidence(ab: Any, rolled_back: bool, measured_under: Iterable[Any]) -> s
     (:meth:`DegradationLog.measured_under`), never the run's: a runs/s fallback
     in a later A/B says nothing about the unit of this one.
     """
-    runs = any(getattr(d, "stage", None) == AB_UNIT for d in measured_under)
-    what, unit = ("workload throughput", "runs/s") if runs else ("decode throughput", "tok/s")
+    what, unit, _export = AB_UNITS[ab_unit(measured_under)]
     outcome = "rolled back" if rolled_back else "kept"
     return (
         f"live A/B: {outcome} ({ab.speedup - 1.0:+.1%} {what}, via {ab.via}); "

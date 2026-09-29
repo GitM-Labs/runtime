@@ -74,6 +74,18 @@ AFFECTS_CLAIMS = "claims"
 #: Where the degradations of a run are written.
 FILE_NAME = "degradations.json"
 
+#: What an A/B probe can count, keyed by the runner-output field it read (or
+#: ``"runs"`` when it read none): ``(what, short unit, export unit)``. Only
+#: ``generated_tokens`` is decode throughput in tokens; every other key records
+#: an :data:`AB_UNIT` degradation whose ``used`` is its export unit.
+AB_UNITS: dict[str, tuple[str, str, str]] = {
+    "generated_tokens": ("decode throughput", "tok/s", "tokens/sec"),
+    "decode_steps": ("decode-step throughput", "steps/s", "decode_steps/sec"),
+    "events": ("event throughput", "events/s", "events/sec"),
+    "runs": ("workload throughput", "runs/s", "runs/sec"),
+}
+TOKENS = "generated_tokens"
+
 
 @dataclass(frozen=True)
 class Degradation:
@@ -120,6 +132,11 @@ class DegradationLog:
         self._warned: set[tuple[str, str, str, str]] = set()
         for d in items:
             self._add(d, warn=False)
+
+    @property
+    def current_scope(self) -> str | None:
+        """The candidate whose A/B is being measured right now, if any."""
+        return self._scope
 
     @contextmanager
     def scope(self, candidate: str) -> Iterator[None]:
@@ -206,6 +223,19 @@ class DegradationLog:
             "items": self.to_dicts(),
         }, indent=2))
         return path
+
+
+def ab_unit(degradations: Iterable[Any]) -> str:
+    """The :data:`AB_UNITS` key an A/B was measured in, from its own
+    degradations (objects or dicts). Tokens unless an :data:`AB_UNIT` entry
+    says otherwise."""
+    by_export = {v[2]: k for k, v in AB_UNITS.items()}
+    for d in degradations:
+        stage = d.get("stage") if isinstance(d, dict) else getattr(d, "stage", None)
+        used = d.get("used") if isinstance(d, dict) else getattr(d, "used", None)
+        if stage == AB_UNIT and used in by_export:
+            return by_export[used]
+    return TOKENS
 
 
 def unreliable_ab(degradations: Iterable[Any]) -> list[str]:
