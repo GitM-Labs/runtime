@@ -460,6 +460,27 @@ def _ar_target_residual(ar_run: AutoresearchRun, fallback: float = 0.0) -> float
     return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else fallback
 
 
+def _unmet_prerequisite_now(spec: Any, applicator: Any, fallback_engine: Any) -> str | None:
+    """Why ``spec`` can't run on the engine live *now*, or ``None``.
+
+    The engine is the applicator's current one: a Phase-4 restart that was kept
+    has replaced ``cfg.engine``, and a prerequisite it turned on (or off) is
+    visible only on the engine the applicator holds. A joint candidate that sets
+    its own prerequisite is not vetoed for lacking it.
+    """
+    values = spec.knob_values
+    engine_now = getattr(applicator, "engine", None) or fallback_engine
+    for k in values:
+        reason = unmet_prerequisite(engine_now, k)
+        if reason is None:
+            continue
+        prereq = next((p for needle, p in KNOB_PREREQUISITES if needle in k.lower()), None)
+        if prereq in values:
+            continue
+        return reason
+    return None
+
+
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     """Execute the 24-hour loop and return ``{summary, report_md, ...}``."""
     workload = cfg.workload or (getattr(cfg.engine, "workload_id", None) or "vllm-decode")
@@ -943,23 +964,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 and _has_structural_knob(spec)
             ):
                 return "structural knob: needs engine restart, no restart_fn"
-            values = spec.knob_values
-            # The engine running *now*: a Phase-4 restart that was kept has
-            # replaced cfg.engine, and a prerequisite it turned on (or off) is
-            # visible only on the engine the applicator holds.
-            engine_now = getattr(applicator, "engine", None) or cfg.engine
-            for k in values:
-                reason = unmet_prerequisite(engine_now, k)
-                if reason is None:
-                    continue
-                prereq = next(
-                    (p for needle, p in KNOB_PREREQUISITES if needle in k.lower()),
-                    None,
-                )
-                if prereq in values:
-                    continue
-                return reason
-            return None
+            return _unmet_prerequisite_now(spec, applicator, cfg.engine)
 
         ar_run = autoresearch(
             trace,

@@ -357,3 +357,32 @@ def test_a_known_layer_with_one_node_still_gets_a_point_residual():
                   vendor="nvidia", captured_at_ns=0, duration_ns=10**6, events=ev)
     [kr] = residuals(trace, g).per_kernel
     assert kr.r_kt == pytest.approx(1.0, rel=1e-3) and not kr.interval_based
+
+
+# ── Phase 4b prerequisite checks read the engine running now ────────────────
+
+
+def test_prerequisite_is_checked_on_the_engine_a_kept_restart_installed():
+    """Phase 4 kept a restart that enabled expert parallelism. EPLB depends on it,
+    and must be judged against that engine, not the original ``cfg.engine``."""
+    from gitm.scheduler.loop import _unmet_prerequisite_now
+
+    original = SimpleNamespace(enable_expert_parallel=False)
+    restarted = SimpleNamespace(enable_expert_parallel=True)
+    eplb = _spec("eplb", ["moe_routed"]).model_copy(update={"knob": "enable_eplb"})
+
+    applicator = SimpleNamespace(engine=restarted)
+    assert _unmet_prerequisite_now(eplb, applicator, original) is None
+    # With no engine on the applicator it falls back to the original — and vetoes.
+    reason = _unmet_prerequisite_now(eplb, SimpleNamespace(), original)
+    assert reason is not None and "enable_expert_parallel" in reason
+
+
+def test_a_joint_candidate_that_sets_its_own_prerequisite_is_not_vetoed():
+    from gitm.scheduler.loop import _unmet_prerequisite_now
+
+    joint = _spec("joint", ["moe_routed"]).model_copy(update={
+        "knob": "enable_expert_parallel=True,enable_eplb=True", "value": None,
+        "knobs": {"enable_expert_parallel": True, "enable_eplb": True}})
+    off = SimpleNamespace(enable_expert_parallel=False)
+    assert _unmet_prerequisite_now(joint, SimpleNamespace(engine=off), off) is None
