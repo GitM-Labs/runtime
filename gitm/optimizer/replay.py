@@ -35,12 +35,20 @@ def predict_delta(
     discounts it by the lever's scope. :func:`gitm.agents.policy.select_interventions`
     uses a measured delta directly for that reason.
     """
-    total_ns = max(trace.duration_ns, 1)
-    applicable_ns = 0
-    for k in trace.kernels():
-        if _applies(spec, k.name, k.range_op):
-            applicable_ns += k.end_ns - k.start_ns
-    coverage = applicable_ns / total_ns
+    # Device time, not wall time. Summed kernel durations over the wall window is
+    # not a fraction: two GPUs busy for the same second sum to two seconds of work
+    # in one second of wall clock, and coverage came out at 2.0 — a lever worth
+    # 10% predicted 20% on an eight-GPU box. Idle gaps bent it the other way. Both
+    # denominators are already distinguished in the deviation table, where
+    # share_of_device divides by observed device time for exactly this reason.
+    kernels = list(trace.kernels())
+    device_ns = sum(max(0, k.end_ns - k.start_ns) for k in kernels)
+    if device_ns <= 0:
+        return 0.0
+    applicable_ns = sum(
+        max(0, k.end_ns - k.start_ns) for k in kernels if _applies(spec, k.name, k.range_op)
+    )
+    coverage = applicable_ns / device_ns
     mean = spec.expected_delta_mean if delta_mean is None else delta_mean
     return coverage * mean
 
@@ -48,15 +56,24 @@ def predict_delta(
 def _applies(spec: InterventionSpec, kernel_name: str, range_op: str | None = None) -> bool:
     """Does ``kernel_name`` fall within ``spec``'s declared scope?
 
-    Prefers op-identity via :func:`gitm.optimizer.deviation.observed_op` — the
-    NVTX range identity when the capture has one, else the name guess — which is
-    exactly what ``residuals()`` pairs on. Ranking by the name alone meant a bare
-    cuBLAS GEMM that its NVTX range identified as ``mlp_gate_up`` counted toward
-    that op's residual but toward no lever's coverage. Falls back to substring
-    matching for tags it doesn't cover (other workloads' own vocabularies, e.g.
-    HFT's ``cudf_groupby_scan``). An empty ``applies_to_kernels`` means 0
-    coverage, not 100% — a blank scope no longer wins ranking by default.
+    A ``whole_step`` lever covers every kernel in the step, including those the
+    predicted graph does not model. Batch shape, admission order and graph
+    capture do not care which ops a checkpoint happens to have, and enumerating
+    one architecture's op names is what made those levers score zero coverage on
+    every other architecture.
+
+    Otherwise, prefers op-identity via :func:`gitm.optimizer.deviation.observed_op`
+    — the NVTX range identity when the capture has one, else the name guess —
+    which is exactly what ``residuals()`` pairs on. Ranking by the name alone
+    meant a bare cuBLAS GEMM that its NVTX range identified as ``mlp_gate_up``
+    counted toward that op's residual but toward no lever's coverage. Falls back
+    to substring matching for tags it doesn't cover (other workloads' own
+    vocabularies, e.g. HFT's ``cudf_groupby_scan``). An empty
+    ``applies_to_kernels`` still means 0 coverage, not 100% — a blank scope does
+    not win ranking by default.
     """
+    if spec.whole_step:
+        return True
     if not spec.applies_to_kernels:
         return False
     op = observed_op(kernel_name, range_op)

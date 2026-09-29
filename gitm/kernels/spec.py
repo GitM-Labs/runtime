@@ -60,6 +60,13 @@ class InterventionSpec(BaseModel):
     # (default) means single-knob — use knob/value instead. See knob_values.
     knobs: dict[str, Any] = Field(default_factory=dict)
     applies_to_kernels: list[str] = Field(default_factory=list)  # substring match
+    #: The lever acts on the whole decode step rather than on named ops — batch
+    #: shape, admission order, graph capture, sharding degree. Kept apart from
+    #: ``applies_to_kernels`` because "every op" is a property of the lever, not a
+    #: list that happens to name the ops one architecture has: enumerating a dense
+    #: model's ops made these levers invisible on a sparse-MoE one, where the same
+    #: knob applies just as much and none of those op names occur.
+    whole_step: bool = False
     expected_delta_mean: float  # signed, e.g. +0.08 = 8% improvement
     expected_delta_lo: float
     expected_delta_hi: float
