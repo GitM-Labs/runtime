@@ -49,12 +49,12 @@ filled in from one real run.
 |---|---|---|---|---|
 | G1 | **Experiment contract**: a machine-readable claim, intervention, expected effect and interval, metric, gates, budget, reps, order, stopping rule | `InterventionSpec` (`gitm/kernels/spec.py`) covers only the knob and prior; the contract wraps it | YAML → validated `Experiment` | Isaiah; Tarun and Abhiram must sign off |
 | G2 | **Served-engine applicator**: apply/restore through `arm.sh` against `vllm serve`, behind `apply_intervention` | the `Applicator` protocol (`optimizer/apply.py`); `arm.sh I` is the apply step | spec → server on candidate / restored to baseline | Isaiah; needs `kubectl` access to `us-mi355x-gitmachine` |
-| G3 | **Replay as the measurement load**: fire the contract's workload through `ReplayPlan.bench_serve_argv` | `gitm/traffic/replay.py`; the `burst` phase already calls it | trace id + operating point → bench-serve result JSON joined to `ReplayPlan` | Isaiah; the spec's "result JSON does not carry trace identity" join is still open |
+| G3 | **Replay as the measurement load**: fire the contract's workload through `run_replay` and use the joined result as the sample | `gitm/traffic/runner.py`: `run_replay` already calls `join_result`, which attaches trace identity and regime and reconciles the result; the `burst` phase uses it | trace id + operating point → joined bench-serve record per rep | Isaiah |
 | G4 | **Repeated, interleaved measurement**: N reps, ABAB or randomized order, warmup discarded | `LiveEngineApplicator._bench_stats` (reps exist; order and warmup do not) | protocol → raw per-rep samples | Isaiah |
-| G5 | **Estimator and interval**: effect with a CI and a paired or unpaired method, instead of `delta − (σ_b+σ_c)/μ_b` | `LiveEngineApplicator.measure`: the "noise band" is not an interval and is subtracted from the reported delta | samples → effect, CI | Isaiah |
+| G5 | **Estimator and interval**: effect with a CI and a paired or unpaired method, instead of `delta − (σ_b+σ_c)/μ_b` | `LiveEngineApplicator.measure`: the "noise band" is not an interval; it is subtracted before the keep/rollback gate, while reports show the raw delta with no interval | samples → effect, CI | Isaiah |
 | G6 | **Noise floor per operating point**, and MDE lookup | new; keyed like `history.record_for` (`gpu_sku`, fingerprint) | (hw, model, workload, metric, protocol) → MDE or `not_established` | Isaiah; **blocked on MI355X time** |
 | G7 | **Correctness gate**: candidate outputs checked against baseline or eval | none exists | outputs → pass / fail | Isaiah + Tarun (the fp8 / precision tolerance is his call) |
-| G8 | **Latency gate**: TTFT / ITL p50 and p95 against contract limits | GuideLLM and bench-serve already emit these; nothing gates on them | metrics → pass / fail | Isaiah |
+| G8 | **Latency gate**: TTFT / ITL against contract limits | the joined bench-serve record keeps mean, median and p99 TTFT / TPOT / ITL (`results.py` `KEPT_METRICS`) but not p95; nothing gates on them | metrics → pass / fail | Isaiah; gate on p99, or capture p95 (bench-serve `--metric-percentiles`) and add it to `KEPT_METRICS` |
 | G9 | **Verdict record**: five terminal states, effect, CI, gates, cost, rollback, full provenance | `verification_export.py` / `ApplyResult` | run → `verdict.json` | Isaiah |
 | G10 | **Provenance**: model/checkpoint revision, gitm sha, engine args, image digest, topology | `run_loop.sh manifest()` records arm, ROCm, vLLM and env only | run → provenance block | Isaiah |
 | G11 | **Known-effect controls**: a no-op A/A and a controlled slowdown that block verdicts on failure | none | control batch → valid / `invalid` | Isaiah |
@@ -63,9 +63,12 @@ filled in from one real run.
 
 ## Smaller issues found on the way
 
-- `LiveEngineApplicator.measure` returns `delta − noise_band` as `measured_delta`.
-  Downstream reports therefore show a number that is neither the observed
-  effect nor a bound (`apply.py:486-496`).
+- `LiveEngineApplicator.measure` returns `delta − noise_band` (`apply.py:496`),
+  and `apply_intervention` gates keep/rollback on that value. It is neither the
+  observed effect nor a bound. The scheduler's claim and `verification.json`
+  report the observed delta (`speedup − 1`) instead (`loop.py:992`,
+  `verification_export.py:113`), so the adjusted value survives only in
+  `ApplyResult` and the per-candidate metadata. The reports carry no interval.
 - `e8` leaves the server on the intervention arm, so the next phase silently
   runs on the candidate config.
 - At `reps=1` the "noise band" is 0 and every positive delta counts as
