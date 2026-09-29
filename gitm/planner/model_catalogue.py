@@ -136,7 +136,16 @@ def load_spec(name_or_path: str | Path):
     # Per-layer schedule lists that must reach the frozen dataclass as tuples. A
     # list would make the spec unhashable; a dropped tuple-coercion here is how a
     # schedule silently arrives as the wrong type.
-    for key in ("compress_ratios", "dspark_layer_ids", "indexer_types", "mlp_layer_types"):
+    for key in (
+        "compress_ratios",
+        "dspark_layer_ids",
+        "indexer_types",
+        "mlp_layer_types",
+        "kv_source_layer_ids",
+        "index_source_layer_ids",
+        "engram_layer_ids",
+        "engram_num_embeddings",
+    ):
         if key in raw and isinstance(raw[key], list):
             raw[key] = tuple(raw[key])
     # Per-layer schedules must cover the model exactly. ``spec_from_hf_config``

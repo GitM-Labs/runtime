@@ -141,13 +141,54 @@ def index_candidates(spec: SparseMoEModelSpec, layer: int, kv_len: int) -> int:
     decides whether a million-token deployment is viable, and now the *only* term
     in the attention path that still grows with context.
     """
-    if kv_len <= 0 or spec.attention_kind(layer) != "csa":
+    if kv_len <= 0 or not spec.runs_indexer(layer):
+        # A layer after its index source reuses the published top-k and scores
+        # nothing itself (DeepSeek-V4.1 ``index_source_layer_ids``).
         return 0
     return math.ceil(kv_len / max(1, spec.compress_ratio(layer)))
 
 
+#: Bytes per engram table element: fp8 e4m3 with one e8m0 scale per 32 along the
+#: row (``ParallelEngramEmbedding``, ``[rows, 256]`` + ``[rows, 8]`` in the
+#: header). Priced here rather than at ``weight_bytes("fp8")``, whose 128x128
+#: fp32 block scales run 3% light on 203 GB of table.
+_ENGRAM_TABLE_BYTES = 1.0 + 1.0 / 32
+
+
+def engram_weight_bytes(
+    spec: SparseMoEModelSpec,
+    sharding: ShardingConfig | None = None,
+    *,
+    tables: bool = True,
+) -> float:
+    """Resident engram bytes on one rank: the n-gram tables and their ``wkv``.
+
+    Its own term because it is the one block of weights a deployment may keep off
+    the GPU entirely (vLLM's ``--engram-config '{"cpu_offload":true}'``), and at
+    203 GB on DeepSeek-V4.1-Flash it decides the fit either way. ``tables=False``
+    is the offloaded layout: the projection stays, the tables do not.
+
+    The tables are sharded over their rows, ``ceil(rows / tp)`` per rank; ``wkv``
+    is a plain replicated ``Linear`` from the ``(max_ngram - 1) * n_heads`` rows a
+    token looks up to one key per residual stream plus a shared value.
+    """
+    if not spec.engram_layer_ids:
+        return 0.0
+    tp = max(1, (sharding or ShardingConfig()).tp)
+    rows_in = (spec.engram_max_ngram_size - 1) * spec.engram_n_heads * spec.engram_head_dim
+    wkv = rows_in * spec.hidden * (spec.hc_width + 1) * weight_bytes(spec.weight_dtype)
+    table = sum(
+        math.ceil(rows / tp) * spec.engram_head_dim * _ENGRAM_TABLE_BYTES
+        for rows in spec.engram_num_embeddings
+    )
+    return len(spec.engram_layer_ids) * wkv + (table if tables else 0.0)
+
+
 def model_weight_bytes(
-    spec: SparseMoEModelSpec, sharding: ShardingConfig | None = None
+    spec: SparseMoEModelSpec,
+    sharding: ShardingConfig | None = None,
+    *,
+    engram_offload: bool = False,
 ) -> float:
     """Resident weight bytes on one rank.
 
@@ -166,6 +207,12 @@ def model_weight_bytes(
     is not public, so the term below is carried for internal consistency with the
     graph's ``dspark`` node and is *known to be orders of magnitude low*. Treat a
     footprint prediction for that checkpoint as a lower bound, not an estimate.
+
+    ``DeepSeek-V4.1-Flash`` adds three terms, each zero on a checkpoint that does
+    not declare it: the engram tables (:func:`engram_weight_bytes`; pass
+    ``engram_offload=True`` for a deployment that keeps them in host memory),
+    draft blocks with their own expert count, and indexers on the index sources
+    only.
     """
     sh = sharding or ShardingConfig()
     tp = max(1, sh.tp)
@@ -173,9 +220,12 @@ def model_weight_bytes(
     ew = weight_bytes(spec.expert_dtype)
     ww = weight_bytes(spec.weight_dtype)
     h, inter = spec.hidden, spec.moe_intermediate_size
-    layers = spec.n_layers + spec.num_nextn_predict_layers
+    mtp = spec.num_nextn_predict_layers
+    layers = spec.n_layers + mtp
+    draft_experts = spec.routed_experts(spec.n_layers)[0]
 
-    experts = layers * spec.n_routed_experts * 3 * h * inter * ew / es
+    expert_slots = spec.n_layers * spec.n_routed_experts + mtp * draft_experts
+    experts = expert_slots * 3 * h * inter * ew / es
     shared = layers * spec.n_shared_experts * 3 * h * inter * ew / tp
     attn_per_layer = (
         h * spec.q_lora_rank  # q_a, replicated
@@ -188,7 +238,22 @@ def model_weight_bytes(
     )
     embed = 2 * spec.vocab * h / tp  # input embedding + untied lm_head
     dspark = len(spec.dspark_layer_ids) * 2 * h * spec.dspark_markov_rank / tp
-    return experts + shared + (layers * attn_per_layer + embed + dspark) * ww
+    # attn_per_layer charges every layer an indexer and a backbone-sized router.
+    # Take back what a layer does not hold: no indexer off the index sources, and
+    # the draft blocks' smaller router.
+    not_held = 0.0
+    if spec.index_source_layer_ids:
+        not_held += (layers - len(spec.index_source_layer_ids)) * (
+            h * spec.index_n_heads * spec.index_head_dim / tp
+        )
+    if draft_experts != spec.n_routed_experts:
+        not_held += mtp * h * (spec.n_routed_experts - draft_experts)
+    return (
+        experts
+        + shared
+        + (layers * attn_per_layer + embed + dspark - not_held) * ww
+        + engram_weight_bytes(spec, sh, tables=not engram_offload)
+    )
 
 
 def kv_bytes_per_token(spec: SparseMoEModelSpec) -> float:
@@ -204,6 +269,11 @@ def kv_bytes_per_token(spec: SparseMoEModelSpec) -> float:
     so they belong in :func:`kv_fixed_bytes_per_sequence`, not in a per-token
     rate. Counting them here would make footprint appear to grow ~4x faster than
     it does and would cap concurrency far below what the hardware allows.
+
+    **Only KV sources store a cache.** Under cross-layer sharing
+    (``kv_source_layer_ids``) the other compressed layers read their source's
+    latent and index keys and own neither. Charging them one is 11.6x on
+    DeepSeek-V4.1-Flash, where 4 of 38 compressed layers are sources.
     """
     kw = weight_bytes(spec.kv_dtype)
     total = 0.0
@@ -211,6 +281,8 @@ def kv_bytes_per_token(spec: SparseMoEModelSpec) -> float:
         r = spec.compress_ratio(layer)
         if r == 0:
             continue  # bounded buffer, not per-token growth
+        if not spec.owns_kv(layer):
+            continue  # reads its source's cache
         # The latent, plus the indexer's key for the same (compressed) position.
         total += (kv_entry_bytes(spec) + spec.index_head_dim * kw) / max(1, r)
     return total
@@ -316,11 +388,13 @@ def _emit_layer(
     # computes one of each; a window layer caches raw entries and compresses
     # nothing. Modelling one projection everywhere understates CSA 4x on this op.
     kind = spec.attention_kind(layer)
-    n_kv_proj = {"csa": 4, "hca": 2}.get(kind, 1)
+    # A layer that reads a KV source's cache has no compressor of its own: it
+    # projects only its window entry.
+    n_kv_proj = {"csa": 4, "hca": 2}.get(kind, 1) if spec.owns_kv(layer) else 1
     f, b = _linear(positions, h, spec.kv_latent_dim * n_kv_proj, aw, ww)
     add("attn_kv_a", f, b + positions * kv_entry_bytes(spec), wd)
 
-    if kind != "swa":
+    if kind != "swa" and spec.owns_kv(layer):
         # The compressor itself: a row-softmax over the window's weights and the
         # weighted sum that collapses it to one entry. One compressed entry per
         # ``r`` tokens, so at decode this fires on a 1/r duty cycle.
@@ -453,8 +527,9 @@ def _emit_layer(
     # Routing is replicated: every rank scores every expert so it knows what to
     # keep and what to ship. Hash-routed layers pick experts from the token id
     # alone (paper §2.1), so they run no router GEMM at all.
+    n_routed, top_k = spec.routed_experts(layer)
     if layer >= spec.num_hash_layers:
-        f, b = _linear(positions, h, spec.n_routed_experts, aw, ww)
+        f, b = _linear(positions, h, n_routed, aw, ww)
         add("moe_router", f, b, wd)
 
     inter = spec.moe_intermediate_size
@@ -476,19 +551,19 @@ def _emit_layer(
     # drafted position routes independently, so drafts widen the expert set the
     # step must fetch.
     distinct = distinct_experts(
-        int(positions), spec.n_routed_experts, spec.num_experts_per_tok
+        int(positions), n_routed, top_k
     )
     # Under EP a step waits for the rank that drew the most selected experts, so
     # the imbalance factor multiplies the *slowest* rank's share, not the mean.
     skew = sh.ep_imbalance if sh.ep > 1 else 1.0
     add(
         "moe_routed",
-        per_position_flops * positions * spec.num_experts_per_tok * skew / es,
+        per_position_flops * positions * top_k * skew / es,
         # The union term: arithmetic scales with positions, weight traffic with
         # how many distinct experts the batch woke up — then divided across the
         # ranks that hold them.
         per_expert_weights * distinct * ew * skew / es
-        + aw * (positions * h * 2 + positions * inter * 2 * spec.num_experts_per_tok / es),
+        + aw * (positions * h * 2 + positions * inter * 2 * top_k / es),
         ed,
     )
 
@@ -527,7 +602,7 @@ def _emit_layer(
             off_rank = (sh.ep - 1) / sh.ep
             add_link(
                 "moe_all_to_all",
-                2.0 * positions * spec.num_experts_per_tok * h * aw * off_rank,
+                2.0 * positions * top_k * h * aw * off_rank,
             )
         if tp > 1:
             # Two all-reduces per layer (post-attention, post-MoE). Ring cost is
@@ -675,6 +750,19 @@ def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None) -> Spar
         num_hash_layers=int(cfg.get("num_hash_layers", 0) or 0),
         dspark_layer_ids=tuple(int(i) for i in (cfg.get("dspark_target_layer_ids") or ())),
         dspark_markov_rank=int(cfg.get("dspark_markov_rank", 0)),
+        dspark_n_routed_experts=int(cfg.get("dspark_n_routed_experts", 0) or 0),
+        dspark_num_experts_per_tok=int(cfg.get("dspark_num_experts_per_tok", 0) or 0),
+        kv_source_layer_ids=tuple(int(i) for i in (cfg.get("kv_source_layer_ids") or ())),
+        index_source_layer_ids=tuple(
+            int(i) for i in (cfg.get("index_source_layer_ids") or ())
+        ),
+        engram_layer_ids=tuple(int(i) for i in (cfg.get("engram_layer_ids") or ())),
+        engram_num_embeddings=tuple(
+            int(n) for n in (cfg.get("engram_num_embeddings") or ())
+        ),
+        engram_head_dim=int(cfg.get("engram_head_dim", 0) or 0),
+        engram_n_heads=int(cfg.get("engram_n_heads", 0) or 0),
+        engram_max_ngram_size=int(cfg.get("engram_max_ngram_size", 0) or 0),
         weight_dtype=weight_dtype,
         expert_dtype=str(cfg.get("expert_dtype", weight_dtype)).lower(),
         # vLLM serves this checkpoint with an fp8 KV cache; the config does not

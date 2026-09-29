@@ -6,11 +6,11 @@
 # 00048 at that revision — no traces.
 #
 # Family note: `sparse_moe` is the DeepSeek-V4 graph and carries the backbone
-# field for field. It cannot express what is new in V4.1: the engram tables
-# (203.07 GB, 39.8% of the checkpoint), cross-layer KV sharing (4 source layers
-# own a cache, the rest read it), candidate pre-filtering, the DSpark draft
-# blocks' own expert count, or the ViT. This is the closest honest fit and its
-# predictions are wrong in known directions, listed under unmodelled. See
+# field for field. It also carries the V4.1 terms that the checkpoint declares:
+# the engram tables (203.07 GB, 39.8% of the checkpoint), cross-layer KV and
+# indexer sharing (4 KV sources, 8 index sources), and the DSpark draft blocks'
+# own expert count. It still cannot express candidate pre-filtering or the ViT;
+# those and the other remaining gaps are listed under unmodelled. See
 # docs/deepseek-v4.1-flash/DESIGN-NOTE.md for the ledger.
 
 name: deepseek-ai/DeepSeek-V4.1-Flash
@@ -67,8 +67,30 @@ spec:
     0, 0, 0,
   ]
 
-  # Multi-token prediction: three DSpark draft blocks.
+  # Cross-layer sharing (config.json kv_source_layer_ids / index_source_layer_ids,
+  # model.py Attention and Indexer). Only the KV sources carry a compressor and
+  # an index-key projection (wk) and own the compressed cache and index keys;
+  # every other compressed layer reads its source's. The index sources carry an
+  # indexer (wq_b, weights_proj); 24-36 score against layer 20's keys, and the
+  # rest reuse the top-k their source published. The header agrees: compressor
+  # and indexer.wk on 2/8/14/20 only, indexer.wq_b on the eight.
+  kv_source_layer_ids: [2, 8, 14, 20]
+  index_source_layer_ids: [2, 8, 14, 20, 24, 28, 32, 36]
+
+  # Engram n-gram tables on layers 1 and 14: engram.embed is [rows, 256] fp8 +
+  # [rows, 8] e8m0, engram.wkv [25600, 6144] = ((4 - 1) x 8 x 256) -> 5120 x (4 + 1).
+  engram_layer_ids: [1, 14]
+  engram_num_embeddings: [384006168, 384016682]
+  engram_head_dim: 256
+  engram_n_heads: 8
+  engram_max_ngram_size: 4
+
+  # Multi-token prediction: three DSpark draft blocks, 128 experts top-3 each
+  # (config.json dspark_n_routed_experts / dspark_num_experts_per_tok; the
+  # header's mtp.{0,1,2}.ffn.experts run 0-127).
   num_nextn_predict_layers: 3
+  dspark_n_routed_experts: 128
+  dspark_num_experts_per_tok: 3
 
   # mHC, as on V4 Pro: 4 residual streams, 20 Sinkhorn iterations, two mixing
   # blocks per layer.
@@ -117,12 +139,26 @@ provenance:
         510,286,023,000 B, the index total_size. Tensor counts close too:
         93,415 layers.*, 2,401 mtp.*, 259 vision.*, 4 aligner.*, 6 top-level,
         96,085 in all. Ledger in the design note, section 2.
-    - claim: model_weight_bytes on this entry, and why it is far off
+    - claim: model_weight_bytes on this entry, term by term
       detail: >
-        316,399,407,824 B against 510,286,023,000 B (-38.0%). Most of the gap
-        is the engram tables (203.07 GB), which the family has no term for. Do
-        not read the remainder as validation; its itemised errors are in
-        unmodelled.
+        504,295,082,784 B against 510,286,023,000 B (-1.17%). The engram term
+        is 203,072,682,000 B against 203,073,076,240 B of layers.*.engram.*
+        in the headers (the rest is q_weight/k_weight). Everything else is
+        301.22 GB against 307.21 GB (-1.95%, comparable to V4-Flash's -2.4%):
+        the ViT (0.97 GB), bf16 embedding/lm_head/router priced at fp8, the
+        DSpark main_proj and Markov head, and mHC fns. Before the engram, KV
+        sharing and DSpark terms this entry read 316.40 GB (-38.0%); that
+        number was 9.2 GB *over* once the engram was set aside, mostly the
+        14.44 GB of 384-expert draft blocks. With engram CPU offload
+        (engram_offload=True) the resident total is 301.54 GB.
+    - claim: kv_bytes_per_token counts the four KV sources only
+      detail: >
+        1,920.4 B per token: (latent entry + index key) on layers 2, 8, 14
+        (ratio 2) and 20 (ratio 1), priced at the planner's fp8 KV entry.
+        Charging every compressed layer, as the family did before, gave
+        22,276.5 B, 11.6x more. (The 13.9x once quoted here compared that
+        against 1,600 B, which priced the entry without the planner's bf16
+        RoPE width; it was not like for like.)
 
   estimated:
     - field: kv_dtype
@@ -148,15 +184,18 @@ provenance:
         between 41.6 GB and 257.0 GB.
 
   unmodelled:
-    - Engram tables and their projections, 203.07 GB (39.8% of bytes). This is
-      most of the -38.0% in model_weight_bytes.
-    - Cross-layer KV and indexer sharing. kv_bytes_per_token charges every
-      ratio-1 and ratio-2 layer its own cache and index keys, 22,276.5 B per
-      token, against 1,600 B for the four real sources at fp8 (13.9x).
+    - The engram lookup and wkv GEMM as decode-step nodes. The weights are
+      counted; the per-step read of wkv (2 x 157 MB at fp8) is not in the graph.
     - Two-level candidate selection (source layer 20, 2048 blocks of 8) that
-      layers 24, 28, 32 and 36 score inside.
-    - DSpark blocks have 128 experts top-3, a main_proj and a Markov head. The
-      planner gives them the backbone's 384 experts, 14.44 GB too much.
+      layers 24, 28, 32 and 36 score inside. They are priced as full scans of
+      layer 20's keys, which is what the reference einsum does before masking.
+    - The DSpark main_proj and Markov head, and the draft pass over
+      dspark_block_size (5) positions. The draft blocks' own 128-expert top-3
+      routing is modelled.
+    - Compressed KV and index keys at fp4 in the reference code (0.5625 and
+      0.53125 B per element); priced at the recipe's fp8 here.
+    - Whether the draft blocks run on a step with no speculative tokens. The
+      family charges them every step, as it does on V4.
     - The 32-layer ViT and aligner (0.97 GB) and the vision routing bias bias_vl.
       A text decode step never enters the ViT.
     - Shared expert, router, embedding and lm_head dtypes (fp8, bf16, bf16,

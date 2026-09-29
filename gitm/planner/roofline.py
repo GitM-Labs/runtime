@@ -400,6 +400,27 @@ class SparseMoEModelSpec:
     # Low-rank state update on a subset of layers (DeepSeek "DSpark").
     dspark_layer_ids: tuple[int, ...] = ()
     dspark_markov_rank: int = 256
+    # The draft blocks' own routing (DeepSeek-V4.1 builds them with 128 experts,
+    # top-3). 0 == the backbone's ``n_routed_experts`` / ``num_experts_per_tok``.
+    dspark_n_routed_experts: int = 0
+    dspark_num_experts_per_tok: int = 0
+
+    # Cross-layer sharing (DeepSeek-V4.1 ``kv_source_layer_ids`` /
+    # ``index_source_layer_ids``). A KV source compresses its own latent and owns
+    # the compressed cache and index keys; every other compressed layer reads its
+    # source's. An index source runs its own indexer; the layers after it reuse
+    # the top-k it published. Empty == every compressed layer does both, as on V4.
+    kv_source_layer_ids: tuple[int, ...] = ()
+    index_source_layer_ids: tuple[int, ...] = ()
+
+    # Engram n-gram hash tables (DeepSeek-V4.1): one table of
+    # ``engram_num_embeddings[i]`` rows x ``engram_head_dim`` on each layer in
+    # ``engram_layer_ids``, plus a ``wkv`` projection from the looked-up rows.
+    engram_layer_ids: tuple[int, ...] = ()
+    engram_num_embeddings: tuple[int, ...] = ()
+    engram_head_dim: int = 0
+    engram_n_heads: int = 0
+    engram_max_ngram_size: int = 0
 
     # Precision, per tensor class
     weight_dtype: str = "fp8"  # attention + router + lm_head linears
@@ -414,6 +435,30 @@ class SparseMoEModelSpec:
         if layer < len(self.compress_ratios):
             return self.compress_ratios[layer]
         return self.compress_ratios[-1]
+
+    def owns_kv(self, layer: int) -> bool:
+        """Whether ``layer`` compresses and stores its own compressed KV and index
+        keys, rather than reading a source layer's."""
+        if self.compress_ratio(layer) == 0:
+            return False
+        return not self.kv_source_layer_ids or layer in self.kv_source_layer_ids
+
+    def runs_indexer(self, layer: int) -> bool:
+        """Whether ``layer`` scores candidates itself, rather than reusing the
+        top-k its index source published. Only CSA layers select at all."""
+        if self.attention_kind(layer) != "csa":
+            return False
+        return not self.index_source_layer_ids or layer in self.index_source_layer_ids
+
+    def routed_experts(self, layer: int) -> tuple[int, int]:
+        """``(n_routed_experts, num_experts_per_tok)`` for ``layer``. The DSpark
+        draft blocks (``layer >= n_layers``) may route differently."""
+        if layer >= self.n_layers and self.dspark_n_routed_experts:
+            return (
+                self.dspark_n_routed_experts,
+                self.dspark_num_experts_per_tok or self.num_experts_per_tok,
+            )
+        return self.n_routed_experts, self.num_experts_per_tok
 
     @property
     def compression_levels(self) -> tuple[int, ...]:

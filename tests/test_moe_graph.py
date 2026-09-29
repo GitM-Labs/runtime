@@ -38,6 +38,7 @@ from gitm.planner.hybrid_graph import spec_from_hf_config as hybrid_spec_from_hf
 from gitm.planner.model_catalogue import available, load_entry, load_spec, predict
 from gitm.planner.moe_graph import (
     effective_kv_tokens,
+    engram_weight_bytes,
     index_candidates,
     kv_bytes_per_token,
     kv_entry_bytes,
@@ -1990,14 +1991,14 @@ def test_mimo_step_time_is_strongly_sublinear_in_batch(mimo):
     assert t32.total_pred_s / t1.total_pred_s < 32 / 2
 
 
-# ── DeepSeek-V4.1-Flash: the V4 graph, without engram or KV sharing ───────────
+# ── DeepSeek-V4.1-Flash: the V4 graph plus engram, KV sharing, DSpark experts ──
 #
 # deepseek-ai/DeepSeek-V4.1-Flash keeps V4's compressed sparse attention and fp4
 # experts, and adds two engram n-gram tables (203.07 GB, 39.8% of the
-# checkpoint) and cross-layer KV sharing (four source layers own a cache).
-# sparse_moe has no term for either. These pin the backbone the entry does
-# carry, and pin both known gaps so that a later "fix" which fits a number to
-# this checkpoint fails loudly instead of passing as a validation.
+# checkpoint), cross-layer KV and indexer sharing (four KV sources, eight index
+# sources), and draft blocks with 128 experts top-3. Each term is pinned to its
+# own line of the shard-header ledger rather than the total to the checkpoint,
+# so a later change that fits the total by moving bytes between terms fails.
 
 
 def test_v41_flash_catalogue_entry_loads_and_predicts():
@@ -2012,28 +2013,87 @@ def test_v41_flash_catalogue_entry_loads_and_predicts():
     assert (spec.n_routed_experts, spec.num_experts_per_tok) == (384, 6)
 
 
-def test_v41_flash_footprint_gap_is_the_engram_tables():
-    """510.29 GB published; the entry predicts 316.40 GB (-38%).
+def test_v41_flash_engram_term_matches_the_headers():
+    """Every layers.*.engram.* tensor in the headers sums to 203,073,076,240 B.
+    The term prices the tables at fp8 plus one e8m0 scale per 32, and ``wkv`` at
+    the backbone's fp8; what it leaves out is the two q/k weight vectors."""
+    spec = load_spec("deepseek-v4.1-flash")
+    assert engram_weight_bytes(spec) == pytest.approx(203_073_076_240, rel=1e-5)
+    # Sharded over rows, so TP divides the tables and not the projection.
+    tables = engram_weight_bytes(spec) - engram_weight_bytes(spec, tables=False)
+    tp4 = engram_weight_bytes(spec, ShardingConfig(tp=4))
+    assert tp4 - engram_weight_bytes(spec, tables=False) == pytest.approx(tables / 4, rel=1e-6)
 
-    The shortfall is the engram tables the family cannot express: 203.07 GB,
-    read from the shard headers. Pinning the gap to that term, not the total to
-    the checkpoint, is what keeps this from reading as a fit.
-    """
-    published = 510_286_023_000  # model.safetensors.index.json total_size
-    engram = 203_073_076_240  # every layers.*.engram.* tensor, from the headers
-    shortfall = published - model_weight_bytes(load_spec("deepseek-v4.1-flash"))
-    assert shortfall == pytest.approx(engram, rel=0.06)
+
+def test_v41_flash_footprint_closes_term_by_term():
+    """510.29 GB published. The engram term is pinned above; the rest must land
+    on the 307.21 GB of non-engram tensors within V4-Flash's own -2.4%, and
+    offloading the engram must remove exactly its tables."""
+    spec = load_spec("deepseek-v4.1-flash")
+    engram = engram_weight_bytes(spec)
+    rest = model_weight_bytes(spec) - engram
+    assert rest / (510_286_023_000 - 203_073_076_240) == pytest.approx(1.0, abs=0.025)
+    offloaded = model_weight_bytes(spec, engram_offload=True)
+    assert model_weight_bytes(spec) - offloaded == pytest.approx(
+        engram - engram_weight_bytes(spec, tables=False)
+    )
 
 
-def test_v41_flash_kv_rate_overcounts_the_shared_cache():
-    """Only layers 2, 8, 14 and 20 own a compressed cache; the rest read it.
+def test_v41_flash_draft_blocks_route_over_their_own_experts():
+    """mtp.{0,1,2}.ffn.experts run 0-127 in the headers; the backbone's 0-383.
+    Routed expert bytes are 288.78 GB backbone + 7.22 GB draft."""
+    spec = load_spec("deepseek-v4.1-flash")
+    assert spec.routed_experts(0) == (384, 6)
+    assert spec.routed_experts(40) == (128, 3)
+    per_expert = 3 * spec.hidden * spec.moe_intermediate_size * weight_bytes("fp4")
+    backbone, draft = 40 * 384 * per_expert, 3 * 128 * per_expert
+    assert backbone == pytest.approx(288.7778e9, rel=1e-4)
+    assert draft == pytest.approx(7.2194e9, rel=1e-4)
 
-    kv_bytes_per_token charges every compressed layer its own, 22,276.5 B per
-    token against 1,600 B for the four real sources at fp8. Pinned as an upper
-    bound, so the day cross-layer sharing is modelled this test is the one that
-    has to change.
-    """
-    assert kv_bytes_per_token(load_spec("deepseek-v4.1-flash")) > 10 * 1_600
+
+def test_v41_flash_kv_rate_counts_the_sources_only():
+    """Only layers 2, 8, 14 and 20 own a compressed cache and index keys; the
+    other 34 compressed layers read their source's. So the rate is exactly the
+    sources' entries: three at ratio 2 and one at ratio 1."""
+    spec = load_spec("deepseek-v4.1-flash")
+    entry = kv_entry_bytes(spec) + spec.index_head_dim * weight_bytes(spec.kv_dtype)
+    assert kv_bytes_per_token(spec) == pytest.approx(entry * (3 / 2 + 1))
+    unshared = replace(spec, kv_source_layer_ids=())
+    assert kv_bytes_per_token(unshared) / kv_bytes_per_token(spec) == pytest.approx(11.6, abs=0.05)
+
+
+def test_v41_flash_graph_runs_indexers_and_compressors_where_the_weights_are():
+    """indexer.wq_b is on the eight index sources, compressor and indexer.wk on
+    the four KV sources, and nowhere else in the headers."""
+    g = predict_moe_graph(
+        load_spec("deepseek-v4.1-flash"), HardwareSpec(),
+        BatchConfig(batch=8, kv_cache_len=65536), ShardingConfig(tp=4),
+    )
+    layers = lambda op: sorted({n.layer for n in g.nodes if n.op == op})  # noqa: E731
+    assert layers("attn_index_score") == [2, 8, 14, 20, 24, 28, 32, 36]
+    assert layers("attn_index_proj") == [2, 8, 14, 20, 24, 28, 32, 36]
+    assert layers("attn_kv_compress") == [2, 8, 14, 20]
+
+
+def test_hf_config_reads_the_v41_sharing_and_engram_keys():
+    cfg = {
+        "n_routed_experts": 384, "num_experts_per_tok": 6, "index_topk": 512,
+        "num_hidden_layers": 40, "compress_ratios": [0, 0] + [2] * 18 + [1] * 20 + [0] * 3,
+        "kv_source_layer_ids": [2, 8, 14, 20],
+        "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
+        "engram_layer_ids": [1, 14], "engram_num_embeddings": [10, 20],
+        "engram_head_dim": 256, "engram_n_heads": 8, "engram_max_ngram_size": 4,
+        "dspark_n_routed_experts": 128, "dspark_num_experts_per_tok": 3,
+    }
+    spec = spec_from_hf_config(cfg)
+    assert spec.kv_source_layer_ids == (2, 8, 14, 20)
+    assert spec.index_source_layer_ids[-1] == 36
+    assert spec.engram_num_embeddings == (10, 20)
+    assert (spec.dspark_n_routed_experts, spec.dspark_num_experts_per_tok) == (128, 3)
+    # And a V4 config, which declares none of them, gets the unshared defaults.
+    v4 = spec_from_hf_config({k: cfg[k] for k in ("n_routed_experts", "num_experts_per_tok")})
+    assert v4.owns_kv(5) == (v4.compress_ratio(5) > 0)
+    assert engram_weight_bytes(v4) == 0.0
 
 
 def test_v41_flash_plans_the_recipe_shape_on_b200():
@@ -2045,7 +2105,8 @@ def test_v41_flash_plans_the_recipe_shape_on_b200():
         batch=BatchConfig(batch=32, kv_cache_len=8192),
         sharding=ShardingConfig(tp=2),
     )
-    assert family == "sparse_moe" and len(g.nodes) == 631
+    # 631 before indexers and compressors were limited to their source layers.
+    assert family == "sparse_moe" and len(g.nodes) == 537
     assert not g.has_fallback_peaks and not g.has_unpriced_collectives
     routed = next(n for n in g.nodes if n.op == "moe_routed")
     assert routed.prediction.peak_dtype == "fp4" and routed.prediction.bound == "memory"
