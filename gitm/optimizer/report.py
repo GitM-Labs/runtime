@@ -80,11 +80,27 @@ def write_report(
         "claims": claims,
         "provenance": provenance,
         "qualification_diagnostic": qualification_diagnostic,
-        "summary": summary or _default_summary(claims, provenance),
+        "summary": _with_ab_caveat(summary, provenance) or _default_summary(claims, provenance),
         "degradations": provenance.degradations,
         "now_ns": time.time_ns(),
     }
     return tpl.render(**ctx)
+
+
+def _with_ab_caveat(summary: str | None, provenance: Provenance) -> str | None:
+    """A caller's own summary, with the unreliable-A/B caveat appended.
+
+    The loop writes its own headline whenever the engine produced scheduler
+    samples — which is every live run, and so exactly the runs where an A/B can
+    be unreliable. The caveat cannot depend on the default headline being used.
+    """
+    if not summary:
+        return summary
+    bad_ab = unreliable_ab(provenance.degradations)
+    if not bad_ab:
+        return summary
+    return (f"{summary} Measured deltas below are not counted as verified: the A/B "
+            f"is unreliable ({', '.join(bad_ab)}). See Degradations below.")
 
 
 def _default_summary(claims: list[Claim], provenance: Provenance | None = None) -> str:

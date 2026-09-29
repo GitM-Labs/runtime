@@ -132,6 +132,35 @@ def test_default_probe_refuses_a_restarted_engine():
     assert [d.stage for d in log.unreliable] == [AB_PROBE]
 
 
+def test_restart_ab_under_the_default_probe_is_an_error_not_a_result():
+    """Through the real applicator's restart path: the new engine cannot be timed
+    by a runner bound to the old one, so the candidate is restored with an error
+    and nothing is measured."""
+    from gitm.kernels.spec import InterventionSpec
+    from gitm.optimizer.apply import LiveEngineApplicator, apply_intervention
+    from gitm.scheduler.loop import _engine_throughput_fn
+
+    original = SimpleNamespace(gitm_llm_kwargs={})
+    rebuilt = SimpleNamespace(gitm_llm_kwargs={})
+    log = DegradationLog()
+    spec = InterventionSpec.model_validate(dict(
+        name="restart_test", summary="s", knob="max_num_seqs", value=64,
+        expected_delta_mean=0.05, expected_delta_lo=0.0, expected_delta_hi=0.1,
+        source="test",
+    ))
+    with _quiet():
+        applicator = LiveEngineApplicator(
+            original,
+            throughput_fn=_engine_throughput_fn(original, lambda: {"generated_tokens": 50}, log),
+            restart_fn=lambda _old, _values: rebuilt,
+            force_restart=True,
+        )
+        result = apply_intervention(spec, applicator, min_keep_delta=0.0)
+    assert result.measured_delta is None
+    assert result.error and "restarted" in result.error
+    assert [d.stage for d in log.unreliable] == [AB_PROBE]
+
+
 def test_probe_without_a_token_count_says_runs_per_second():
     from gitm.scheduler.loop import _ab_evidence, _engine_throughput_fn
 
@@ -256,6 +285,19 @@ def test_report_lists_degradations_and_does_not_count_an_unreliable_ab():
     md = write_report([claim], _provenance(log))
     assert "## Degradations" in md and AB_PROBE in md
     assert "none counted as verified" in md
+
+
+def test_a_callers_own_summary_still_carries_the_ab_caveat():
+    """The loop passes its own headline on every live run with scheduler samples."""
+    from gitm.optimizer.report import write_report
+
+    log = DegradationLog([Degradation(AB_PROBE, used="u", reason="r", severity=UNRELIABLE,
+                                      affects=(AFFECTS_AB,))])
+    md = write_report([], _provenance(log), summary="vLLM decode on H100: 3 candidates.")
+    assert "vLLM decode on H100: 3 candidates." in md
+    assert "not counted as verified" in md and AB_PROBE in md
+    clean = write_report([], _provenance(DegradationLog()), summary="plain headline.")
+    assert "not counted as verified" not in clean
 
 
 def test_a_clean_report_has_no_degradations_section():
