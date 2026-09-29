@@ -485,14 +485,29 @@ def _window_running(d: Path) -> list[float]:
 
 @dataclass
 class _Phase:
+    """Every field is keyed by point, so an excluded point leaves no trace."""
+
     launch: dict[str, list[float]] = field(default_factory=lambda: defaultdict(list))
     control: dict[str, list[float]] = field(default_factory=lambda: defaultdict(list))
     names: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
-    anchors: set[str] = field(default_factory=set)
+    point_anchors: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     grids: dict[str, set[tuple]] = field(default_factory=lambda: defaultdict(set))
     per_launch: dict[str, list[dict[str, float]]] = field(
         default_factory=lambda: defaultdict(list))
-    kernels_per_launch: float = 1.0
+    point_kpl: dict[str, list[float]] = field(default_factory=lambda: defaultdict(list))
+
+    def drop(self, p: str) -> None:
+        for d in (self.launch, self.control, self.names, self.point_anchors,
+                  self.grids, self.per_launch, self.point_kpl):
+            d.pop(p, None)
+
+    @property
+    def anchors(self) -> set[str]:
+        return set().union(*self.point_anchors.values())
+
+    @property
+    def kernels_per_launch(self) -> float:
+        return max((n for ns in self.point_kpl.values() for n in ns), default=1.0)
 
 
 def _phase(run: Path, arm: str, phase: str, concurrency: int,
@@ -546,10 +561,10 @@ def _phase(run: Path, arm: str, phase: str, concurrency: int,
         if w.control_s is not None:
             out.control[label].append(w.control_s)
         out.names[label].update(w.targets)
-        out.anchors.add(w.anchor)  # type: ignore[arg-type]
+        out.point_anchors[label].add(w.anchor)  # type: ignore[arg-type]
         out.grids[label].add(w.grid)
         out.per_launch[label].append(w.per_launch_s)
-        out.kernels_per_launch = max(out.kernels_per_launch, w.kernels_per_launch)
+        out.point_kpl[label].append(w.kernels_per_launch)
     return out
 
 
@@ -592,6 +607,21 @@ def analyze(run: Path, *, n_layers: int, concurrency: int) -> dict:
     cand = _phase(run, "traced", "cand", concurrency, dropped)
     rep = _phase(run, "traced", "base2", concurrency, dropped)
 
+    # On a serving run the anchor's grid tracks the decode batch, so a point is
+    # the same work in every phase only if all its reps ran at one modal grid.
+    # Running requests cannot stand in for this: a running request may be
+    # prefilling. A mismatched point is excluded before any other check reads it:
+    # the fit, the kernel-set and anchor gates, the tracer leak and kernel_diff.
+    grid_mismatch = {}
+    for p in sorted(set(base.grids) | set(cand.grids) | set(rep.grids)):
+        seen = {name: sorted(ph.grids[p]) for name, ph in
+                (("base1", base), ("cand", cand), ("base2", rep)) if ph.grids.get(p)}
+        if len({tuple(g) for g in seen.values()}) > 1 or any(len(g) > 1 for g in seen.values()):
+            grid_mismatch[p] = seen
+    for p in grid_mismatch:
+        for ph in (base, cand, rep):
+            ph.drop(p)
+
     for arm, ph in (("base", base), ("cand", cand)):
         if len({frozenset(v) for v in ph.names.values()}) > 1:
             failures.append(f"{arm}: target kernel set differs across points "
@@ -601,20 +631,6 @@ def analyze(run: Path, *, n_layers: int, concurrency: int) -> dict:
                             f"({', '.join(sorted(ph.anchors))})")
     if base.anchors | rep.anchors and len(base.anchors | rep.anchors) > 1:
         failures.append("baseline anchor changed between base1 and base2")
-
-    # On a serving run the anchor's grid tracks the decode batch, so a point is
-    # the same work in every phase only if all its reps ran at one modal grid.
-    # Running requests cannot stand in for this: a running request may be
-    # prefilling. A mismatched point is excluded from the fit, not warned about.
-    grid_mismatch = {}
-    for p in sorted(set(base.grids) | set(cand.grids) | set(rep.grids)):
-        seen = {name: sorted(ph.grids[p]) for name, ph in
-                (("base1", base), ("cand", cand), ("base2", rep)) if ph.grids.get(p)}
-        if len({tuple(g) for g in seen.values()}) > 1 or any(len(g) > 1 for g in seen.values()):
-            grid_mismatch[p] = seen
-            for ph in (base, cand, rep):
-                ph.launch.pop(p, None)
-                ph.control.pop(p, None)
 
     cpts = sorted(p for p in set(base.control) & set(cand.control)
                   if len(base.control[p]) >= 2 and len(cand.control[p]) >= 2)

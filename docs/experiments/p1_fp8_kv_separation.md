@@ -113,7 +113,7 @@ Traces are 30 s windows, 45 per run. Pull them selectively (see §5).
 
 Three kinds of gate. A **window** gate drops that one window, and the rest of the
 run continues; the verdict still needs the reps and points gates below. A
-**point** gate drops that operating point from every phase. A **run** gate makes the outcome **inconclusive**. Every failure is recorded with
+**point** gate drops that operating point from every phase and every later check. A **run** gate makes the outcome **inconclusive**. Every failure is recorded with
 what would resolve it. No gate is waived after the fact.
 
 | gate | kind | rule | why |

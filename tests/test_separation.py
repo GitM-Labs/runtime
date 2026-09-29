@@ -309,6 +309,24 @@ def test_grid_mismatch_excludes_the_point(tmp_path, monkeypatch):
     assert "L8192" in sep.analyze(tmp_path, n_layers=61, concurrency=16)["grid_mismatch"]
 
 
+def test_excluded_point_reaches_no_other_check(tmp_path, monkeypatch):
+    # At one point the candidate ran another batch *and* another kernel variant.
+    # Excluding the point must also keep it out of the kernel-set and anchor
+    # gates and kernel_diff, or it voids a run the other four points can decide.
+    _write_run(tmp_path, monkeypatch)
+    for r in (1, 2, 3):
+        d = tmp_path / "p1" / "traced" / "cand" / f"L2048_r{r}"
+        _set_grid(d, 999)
+        trace = d / "cap" / "trace.jsonl"
+        trace.write_text(trace.read_text().replace(f"fixture_{ATTN}_kernel",
+                                                   f"fixture_{ATTN}_split_kernel"))
+    report = sep.analyze(tmp_path, n_layers=61, concurrency=16)
+    assert "L2048" in report["grid_mismatch"]
+    assert report["decision"]["outcome"] == "multiplicative", report["decision"]["reasons"]
+    assert report["anchors"]["cand"] == [f"fixture_{ATTN}_kernel"]
+    assert "L2048" not in report["kernel_diff"]
+
+
 def test_grid_mismatch_everywhere_is_inconclusive(tmp_path, monkeypatch):
     _write_run(tmp_path, monkeypatch)
     for d in (tmp_path / "p1" / "traced" / "cand").glob("L*_r*"):
