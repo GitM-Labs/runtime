@@ -8,13 +8,15 @@ then evidence quality, then magnitude, then a deterministic tie-break.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from gitm.kernels.spec import InterventionSpec
 from gitm.optimizer.history import History, record_for
 from gitm.optimizer.preconditions import GateContext, applicable
 from gitm.optimizer.replay import predict_delta
+from gitm.optimizer.vllm_knobs import noop_reason
 from gitm.tracer.schema import Trace
 
 
@@ -34,6 +36,10 @@ class RankedCandidate:
     #: while that holds. The demotion lifts by itself once the record stops
     #: disagreeing: it describes the evidence, not the lever.
     demoted: bool = False
+    #: Set when every knob the lever sets already holds its target on the
+    #: engine, per the ``current_values`` this ranking was given. Not a
+    #: rejection: the lever is fine, it just has nothing left to change.
+    baseline_noop: str | None = None
 
 
 @dataclass
@@ -59,6 +65,7 @@ def select_interventions(
     history: History | None = None,
     gpu_sku: str | None = None,
     fingerprint: str | None = None,
+    current_values: Mapping[str, Any] | None = None,
 ) -> list[RankedCandidate]:
     """Rank the library for this trace, rejected candidates last.
 
@@ -69,6 +76,13 @@ def select_interventions(
     about an MI355X, and scoring one from the other is the mistake the record's
     GPU key exists to prevent. No SKU therefore means no substitution, not a
     guess at which box the record came from.
+
+    ``current_values`` (knob -> the engine's value right now) is passed in for
+    the same reason. A lever whose every knob already holds its target is marked
+    ``baseline_noop``, never takes one of the ``top_n`` slots, and is returned
+    after them so the caller can record it. The answer is only as fresh as the
+    values: a caller that re-ranks after a kept intervention must pass values
+    read after it, or a lever that became a no-op mid-run will still be queued.
     """
     use_history = policy.use_history and history is not None and gpu_sku is not None
     candidates: list[RankedCandidate] = []
@@ -92,13 +106,18 @@ def select_interventions(
         # tried and how it fared, but carries no number to rank on. The prior
         # stands in that case and only the demotion applies.
         measured = record.mean_delta if record is not None else None
+        noop = (
+            noop_reason(spec, current_values)
+            if current_values is not None and reason is None
+            else None
+        )
         # A measured delta is the A/B's end-to-end ``speedup - 1``: the answer to
         # the question predict_delta *estimates*, already net of how much of the
         # step the lever touches. Scaling it by coverage again discounted a proven
         # result by the lever's scope — a +10% win on a lever scoped to 20% of the
         # trace ranked as +2%, below an untested 5% prior with full coverage, and a
         # measured win on a lever with an empty scope ranked as exactly zero.
-        if reason is not None:
+        if reason is not None or noop is not None:
             delta = 0.0
         elif measured is not None:
             delta = measured
@@ -110,6 +129,7 @@ def select_interventions(
             rejected_reason=reason,
             delta_source="measured" if measured is not None else "prior",
             demoted=bool(record is not None and record.conflicted),
+            baseline_noop=noop,
         ))
 
     # Four terms, in this order and for these reasons:
@@ -133,4 +153,6 @@ def select_interventions(
             c.spec.name,
         )
     )
-    return candidates[:top_n]
+    ranked = [c for c in candidates if c.baseline_noop is None]
+    noops = [c for c in candidates if c.baseline_noop is not None]
+    return ranked[:top_n] + noops

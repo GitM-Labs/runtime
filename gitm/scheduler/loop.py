@@ -72,6 +72,7 @@ from gitm.optimizer.verification_export import (
 )
 from gitm.optimizer.vllm_knobs import (
     KNOB_PREREQUISITES,
+    current_knob_values,
     expand_relative_candidates,
     knob_kind,
     unmet_prerequisite,
@@ -1068,7 +1069,12 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         }, indent=2))
     ranked = select_interventions(trace, library, policy, top_n=cfg.top_n_interventions,
                                   ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
-                                  fingerprint=qual.fingerprint)
+                                  fingerprint=qual.fingerprint,
+                                  current_values=current_knob_values(
+                                      cfg.engine, {k for s in library for k in s.knob_values}))
+    baseline_noops = [c for c in ranked if c.baseline_noop is not None]
+    (run_dir / "baseline_noop.json").write_text(json.dumps(
+        [{"name": c.spec.name, "reason": c.baseline_noop} for c in baseline_noops], indent=2))
     (run_dir / "ranked_candidates.json").write_text(
         json.dumps(
             [
@@ -1141,6 +1147,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     reranks: list[dict[str, Any]] = []
     while queue:
         c = queue.pop(0)
+        if c.baseline_noop is not None:
+            continue
         if c.rejected_reason is not None:
             rejected.append(f"{c.spec.name} ({c.rejected_reason})")
             continue
@@ -1219,10 +1227,16 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 workload=workload, run_id=run_id, runner=runner)
             was = [x.spec.name for x in queue]
             if fresh is not None and fresh.kernels():
+                remaining = [x.spec for x in queue]
+                # Read from the engine running *now*: a kept intervention may have
+                # changed a value, and a kept restart replaces cfg.engine outright.
+                engine_now = getattr(applicator, "engine", None) or cfg.engine
                 queue = select_interventions(
-                    fresh, [x.spec for x in queue], policy, top_n=len(queue),
+                    fresh, remaining, policy, top_n=len(queue),
                     ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
-                    fingerprint=qual.fingerprint)
+                    fingerprint=qual.fingerprint,
+                    current_values=current_knob_values(
+                        engine_now, {k for s in remaining for k in s.knob_values}))
             now = [x.spec.name for x in queue]
             reranks.append({
                 "after": c.spec.name,
@@ -1422,6 +1436,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         "n_claims": len(claims),
         "n_rolled_back": len(rolled_back),
         "n_rejected": len(rejected),
+        "n_baseline_noop": len(baseline_noops),
         "bottleneck_class": ar_run.bottleneck_class,
         "n_autoresearch": len(ar_run.results),
         "scheduler_stats": asdict(sched_summary) if sched_stats.samples else None,
