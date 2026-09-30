@@ -38,10 +38,11 @@ provenance is in `engine_state` and `engine_state_unknown` in the artifact.
 
 ```
 python scripts/search_space/feasible_kimi_mi355x.py --write
-  -> evidence/kimi-mi355x/search_space/feasible.json   (git_commit 21348b5)
+  -> evidence/kimi-mi355x/search_space/feasible.json   (git_commit 60511c1)
 ```
 
-The script calls the loop's own code. Line numbers refer to commit `21348b5`.
+The script calls the loop's own code. Line numbers refer to commit `21348b5`; `gitm/`
+is identical at `60511c1`, which only adds this script, doc and artifact.
 
 | Rule | Code |
 |---|---|
@@ -51,7 +52,7 @@ The script calls the loop's own code. Line numbers refer to commit `21348b5`.
 | hardware | `gitm/optimizer/preconditions.py:37-42` via `applicable()` on a spec projected to its hardware/GPU fields |
 | mutual dependency | `KNOB_PREREQUISITES` (`vllm_knobs.py:240-248`): a dependent lever is feasible only if a feasible lever supplies the prerequisite |
 | deployment | `gitm/scheduler/loop.py:816` condition, using `knob_kind` (`vllm_knobs.py:226-233`) |
-| applicability + safety | `gitm/agents/policy.py:52-124` `select_interventions` |
+| applicability + safety | `gitm/agents/policy.py:52-125` `select_interventions` |
 | ranking | same function, `top_n=5`; sort key at `policy.py:116-124` |
 | coverage × prior | `gitm/optimizer/replay.py` `predict_delta` / `_applies` (lines 48-62) |
 | policy | `qualify()` → `Policy(...)`, exactly as `gitm/scheduler/loop.py:727` |
@@ -86,9 +87,13 @@ at 2 bits each, plus 24 binary knobs at 1 bit each. That gives 2³² = 4,294,967
 unconstrained joint configs.
 
 Autoresearch adds **0 candidates**. The stand-in classifies as `memory_bound`
-(`classify_bottleneck`, from the roofline memory-bound fraction), and every proposer
-returns nothing for that class on this box (`autoresearch.proposals_per_class`). See
-the proposer-exclusion number below.
+(`classify_bottleneck`). The roofline memory-bound fraction gives a score of 3.57,
+which beats the serialized-concurrency score of 1.53
+(`autoresearch.classify_scores`; the threshold is 1.0). The serialized score crosses
+its threshold only because the stand-in lays every kernel end to end. Every proposer returns
+nothing for `memory_bound` on this box (`autoresearch.proposals_per_class`). It also
+returns nothing for `idle_stall`, so the count would stay 0 had the classification
+gone the other way. See the proposer-exclusion number below.
 
 ## Sequential funnel
 
@@ -238,27 +243,33 @@ from this run's artifact (`coverage`), not carried over from an earlier finding.
    - `lm_head`: 0.3%
    - the layer-0 dense `mlp_gate_up` + `mlp_down`: 0.12%
 
-   That is 23.8% in total. Nothing covers:
+   That is 23.8% in total. Nothing covers the other 76.2%:
    - the MoE ops (`moe_*`, **65.4%**, of which `moe_routed` alone is **60.0%**);
    - the MLA projections `attn_q_a/q_b/kv_a/kv_b`, which `classify_op` returns `None`
      for (4.9%);
-   - norms and collectives.
+   - collectives: `tp_all_reduce_attn`, `tp_all_reduce_mlp` and `logits_all_gather`
+     (2.5%);
+   - `rms_norm` (2.2%);
+   - `attn_qnorm_rope_insert` (1.1%);
+   - `embed_tokens` (0.02%).
 2. **Ranking reduces to the prior.** Of the 25 gate survivors
    (`coverage.gate_survivor_coverage`):
    - 16 have identical coverage of 0.2377;
    - 5 have 0.2221 (`attn_score_value` only);
    - 3 have 0 (empty `applies_to_kernels`);
-   - 1 has 0.0156 (`quantization_awq`). With coverage constant, the sort key at
-   `policy.py:116-124` orders by `expected_delta_mean`, which is hand-authored and the
-   same on every model. Sweep points of one knob tie exactly, so the name tiebreak
-   decides which points of `max_num_batched_tokens` get slots 4–5 and which is cut.
+   - 1 has 0.0156 (`quantization_awq`).
+
+   Within a coverage group, the sort key at `policy.py:116-124` orders by
+   `expected_delta_mean`, which is hand-authored and the same on every model. Sweep
+   points of one knob tie exactly, so the name tiebreak decides which points of
+   `max_num_batched_tokens` get slots 4–5 and which is cut.
 3. **The MoE levers aim at the wrong ops.** `enable_expert_parallel`, `enable_eplb`
    and `moe_backend_deep_gemm` all declare `applies_to_kernels: [mlp_gate_up,
-   mlp_down]` (`library.yaml:449, 477, 504`). On this graph the routed-expert work is
+   mlp_down]` (`library.yaml:477`, `:504` and `:449` respectively). On this graph the routed-expert work is
    `moe_routed`, so each of them reaches coverage 0.0012 (`coverage.moe_levers`). All
    three are rejected before ranking anyway, by hardware, prerequisite and dtype
-   respectively. Even if MI355X were added to their hardware lists, they would rank at
-   essentially zero predicted delta.
+   respectively. Even if all three were admitted, they would rank at essentially zero
+   predicted delta.
 4. **Two of five slots measure no-ops** (see the table above). The baseline-equal
    count is 3 of 25 survivors, and 2 of them rank in the top 5 because their priors
    (0.09, 0.08) are among the largest. Branch `loop/skip-baseline-noops` addresses
@@ -279,7 +290,7 @@ are committed, so this checks only whether the pipeline would reach each one.
 | `intervene` | `--kv-cache-dtype fp8` | **rejected** (hardware) | `kv_cache_dtype_fp8` has `requires_hardware [A100, H100, L40S]` (`library.yaml:60`) |
 | `int-ep` | `--enable-expert-parallel` | **rejected** (hardware) | `enable_expert_parallel` has `requires_hardware [A100, H100, H200]` (`library.yaml:484`); also high_risk; coverage 0.0012 even if admitted |
 | `int-moe-triton` | env `VLLM_ROCM_USE_AITER_MOE=0` | **not representable** | no library entry, not in `_KNOBS`, not on the proposer surface |
-| `int-mla-triton` | `--attention-backend TRITON_MLA` | **not representable** | the only backend lever is `attention_backend_flashinfer` (env `VLLM_ATTENTION_BACKEND=FLASHINFER`), which is hardware-rejected |
+| `int-mla-triton` | `--attention-backend TRITON_MLA` | **not representable** | the only attention-backend lever is `attention_backend_flashinfer` (env `VLLM_ATTENTION_BACKEND=FLASHINFER`), which is hardware-rejected |
 | `int-rccl-ring` | env `NCCL_ALGO=Ring` | **not representable** | no collective-algorithm lever exists |
 | `int-tp4` | TP=4 | **not representable** | only `tensor_parallel_size_2` exists, and it is hardware-rejected |
 | `int-eager` | `--enforce-eager` | **not representable** (opposite direction) | the library only has `cuda_graphs_enable` (`enforce_eager=False`), a baseline no-op that takes slot 2 |
@@ -316,7 +327,8 @@ question 4.
 1. **No measured Kimi/MI355X residual profile is committed, so every ranked number
    above runs on the predicted graph as a stand-in. This needs sign-off.**
    - Coverage shares are shares of *predicted* time.
-   - Residuals are zero by construction, so the autoresearch target op
+   - Residuals are zero by construction, apart from nanosecond rounding (max |r_kt|
+     7.5e-5, `autoresearch.max_abs_residual_r_kt`), so the autoresearch target op
      (`mlp_gate_up`) carries no signal.
    - `qualify()` commits only because the stand-in is not an imported trace and its
      head share is low. A real rocprof capture could flip it and change slot 1.

@@ -1,6 +1,6 @@
 {
   "generated_by": "scripts/search_space/feasible_kimi_mi355x.py",
-  "git_commit": "21348b5185bdb73aa97c80f73270e77bf12592b6",
+  "git_commit": "60511c126498cd63a6be408d699d967b92a24cbb",
   "baseline": {
     "model": {
       "catalogue_entry": "kimi-k2.5",
@@ -207,6 +207,13 @@
     "bottleneck_class": "memory_bound",
     "target_op": "mlp_gate_up",
     "target_note": "stand-in residuals are zero by construction (trace == prediction), so the largest-residual target op carries no signal",
+    "max_abs_residual_r_kt": 7.4760765550324e-05,
+    "classify_scores": {
+      "memory": 3.571623215550283,
+      "serialized_concurrency": 1.527027027027027,
+      "threshold": 1.0,
+      "code": "gitm/agents/autoresearch.py classify_bottleneck"
+    },
     "proposals": 0,
     "proposal_names": [],
     "proposals_per_class": {

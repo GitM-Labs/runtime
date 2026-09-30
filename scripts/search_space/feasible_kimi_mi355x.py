@@ -52,6 +52,7 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
+import gitm.agents.autoresearch as _ar  # noqa: E402
 from gitm.agents.autoresearch import (  # noqa: E402
     EngineArgsProposer,
     FallbackProposer,
@@ -758,6 +759,14 @@ def analyse() -> dict[str, Any]:
             "target_op": ar_run.target.op if ar_run.target else None,
             "target_note": "stand-in residuals are zero by construction (trace == prediction), "
                            "so the largest-residual target op carries no signal",
+            "max_abs_residual_r_kt": max((abs(r.r_kt) for r in res.per_kernel), default=0.0),
+            "classify_scores": {
+                "memory": (_ar._roofline_memory_fraction(res) or 0.0) / _ar._MEMCPY_THRESHOLD,
+                "serialized_concurrency": _ar._serialized_fraction(trace.kernels())
+                                          / _ar._SC_THRESHOLD,
+                "threshold": 1.0,
+                "code": "gitm/agents/autoresearch.py classify_bottleneck",
+            },
             "proposals": len(ar),
             "proposal_names": [c.name for c in ar],
             "proposals_per_class": {
