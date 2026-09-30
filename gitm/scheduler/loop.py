@@ -34,13 +34,28 @@ from gitm.optimizer.apply import (
     LiveEngineApplicator,
     apply_intervention,
 )
-from gitm.optimizer.attribution import attribute
+from gitm.optimizer.attribution import (
+    AnalysisStatus,
+    RankedHypotheses,
+    attribute,
+    granger_evidence,
+)
 from gitm.optimizer.collective_signal import collective_causes, worst_device_comm
 from gitm.optimizer.deviation import deviation_summary, deviation_trace, write_deviation_jsonl
 from gitm.optimizer.dr import attribute_dr
 from gitm.optimizer.history import load_history
-from gitm.optimizer.measure import measure_trace, measurement_claims, measurement_summary
-from gitm.optimizer.monitor import check_invariants, residuals
+from gitm.optimizer.measure import (
+    MEASURE_LIMITATIONS,
+    measure_trace,
+    measurement_claims,
+    measurement_summary,
+)
+from gitm.optimizer.monitor import (
+    LIMITATIONS,
+    check_invariants,
+    measured_serialized_fraction,
+    residuals,
+)
 from gitm.optimizer.qualification import qualify
 from gitm.optimizer.report import Claim, build_provenance, write_report
 from gitm.optimizer.scheduler_attribution import scheduler_causes
@@ -436,33 +451,96 @@ def _clamp_pct(value: float) -> float:
     return max(-1.0, min(1.0, value))
 
 
-def _agg_kt_residual(res: Any) -> float:
+@dataclass
+class KtResidualInfo:
+    """The run-level kernel-time residual and how it was computed."""
+
+    value: float | None  # None: no kernel matched the graph
+    clamped: bool  # True when _clamp_pct changed the value
+    method: str  # "duration_weighted" | "median_ratio" | "none"
+
+
+def _row_pred_s(kr: Any) -> float | None:
+    """The prediction a row's own residual was taken against.
+
+    An interval row (heterogeneous op, layer unknown) carries the nearest class's
+    ``t_pred_s`` but a residual of 0 anywhere inside the class span. Rebuilding
+    from ``t_pred_s`` would score an in-band kernel as a deviation; deriving the
+    prediction from ``r_kt`` keeps the aggregate consistent with the row.
+    """
+    t_obs, t_pred = getattr(kr, "t_obs_s", None), getattr(kr, "t_pred_s", None)
+    if t_obs is not None and getattr(kr, "interval_based", False):
+        return float(t_obs) / (1.0 + float(kr.r_kt))
+    return None if t_pred is None else float(t_pred)
+
+
+def _agg_kt_residual_info(res: Any) -> KtResidualInfo:
     """Run-level kernel-time residual for the report: duration-weighted
     ``sum(obs - pred) / sum(pred)`` when timings are available, else the
     median per-kernel ratio. Same value for every catalog claim in a run."""
     rows = list(getattr(res, "per_kernel", []))
     if not rows:
-        return 0.0
+        return KtResidualInfo(value=None, clamped=False, method="none")
 
-    total_obs = sum(float(kr.t_obs_s) for kr in rows if getattr(kr, "t_obs_s", None) is not None)
-    total_pred = sum(float(kr.t_pred_s) for kr in rows if getattr(kr, "t_pred_s", None) is not None)
+    timed = [(float(kr.t_obs_s), p) for kr in rows
+             if getattr(kr, "t_obs_s", None) is not None and (p := _row_pred_s(kr)) is not None]
+    total_pred = sum(p for _, p in timed)
     if total_pred > 0.0:
-        value = (total_obs - total_pred) / total_pred
+        raw = (sum(o for o, _ in timed) - total_pred) / total_pred
+        method = "duration_weighted"
     else:
         kts = sorted(float(kr.r_kt) for kr in rows)
         mid = len(kts) // 2
-        value = kts[mid] if len(kts) % 2 else (kts[mid - 1] + kts[mid]) / 2.0
-    return _clamp_pct(value)
+        raw = kts[mid] if len(kts) % 2 else (kts[mid - 1] + kts[mid]) / 2.0
+        method = "median_ratio"
+    value = _clamp_pct(raw)
+    return KtResidualInfo(value=value, clamped=value != raw, method=method)
 
 
-def _ar_target_residual(ar_run: AutoresearchRun, fallback: float = 0.0) -> float:
+def _agg_kt_residual(res: Any) -> float | None:
+    """:func:`_agg_kt_residual_info`'s value; None when no kernel matched."""
+    return _agg_kt_residual_info(res).value
+
+
+def _ar_target_residual(ar_run: AutoresearchRun, fallback: float | None = None) -> float | None:
     """Residual for autoresearch claims.
 
     Prefer the largest-residual op that autoresearch targeted; when there is no
     target, fall back to the run-level kernel-time residual so generated claims
-    do not all display a misleading +0.0% gap.
+    do not all display a misleading +0.0% gap. None when neither exists.
     """
     return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else fallback
+
+
+# Shared by the HFT, OpenFold and edge intervention results, which all measure
+# the captured trace with measure_trace and prove the lever with their own A/B.
+
+def _intervention_evidence(mres: Any, ab_proof: str) -> str:
+    """Claim evidence: the Granger status and stream concurrency, or which A/B
+    proved the intervention when no trace was captured."""
+    if not mres.n_kernels:
+        return f"no CUPTI trace captured on this box; intervention proven by the {ab_proof}"
+    return (
+        f"{granger_evidence(mres.granger, pairs_in='apply_result.json')}; "
+        f"serialized-concurrency={mres.serialized_text} over {mres.n_kernels} kernels"
+    )
+
+
+def _intervention_residual(mres: Any) -> dict[str, Any]:
+    """The claim's stream-concurrency residual, or why there is none."""
+    value = mres.serialized_measured
+    return {"residual_value": value,
+            "residual_note": None if value is not None else "fewer than 2 kernels captured"}
+
+
+def _intervention_record(mres: Any) -> dict[str, Any]:
+    """The measurement fields every apply_result.json carries."""
+    return {
+        "serialized_concurrency_fraction": mres.serialized_measured,
+        "families": mres.families,
+        "granger": mres.granger.summary(),
+        "limitations": list(MEASURE_LIMITATIONS),
+    }
 
 
 RERANK_MODES = ("off", "recapture")
@@ -761,9 +839,18 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
 
     # Phase 2 — residuals + attribution
     res = residuals(trace, graph)
+    kt_info = _agg_kt_residual_info(res)
     violations = check_invariants(res)  # multi-basis confirmed
     hypotheses = attribute(res, graph)  # Granger
-    dr_hypotheses = attribute_dr(res, graph)  # doubly-robust, corroborating
+    # DR imports statsmodels.api on its own (dr.py); a failure there must not
+    # take the Granger record and the report down with it.
+    try:
+        dr_hypotheses = attribute_dr(res, graph)  # doubly-robust, corroborating
+    except Exception as exc:  # any estimator failure is recorded, not raised
+        status = (AnalysisStatus.UNAVAILABLE if isinstance(exc, ImportError)
+                  else AnalysisStatus.FAILED)
+        dr_hypotheses = RankedHypotheses(hypotheses=[], status=status)
+        dr_hypotheses.record_failure(type(exc).__name__, exc)
 
     (run_dir / "violations.json").write_text(
         json.dumps(
@@ -783,18 +870,30 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     (run_dir / "residuals.json").write_text(
         json.dumps(
             {
+                "schema_version": 1,
                 "n_kernel_residuals": len(res.per_kernel),
+                "coverage": {
+                    **res.coverage(),
+                    "kt_residual": kt_info.value,
+                    "clamped": kt_info.clamped,
+                    "residual_method": kt_info.method,
+                },
+                "limitations": list(LIMITATIONS),
                 "n_violations": len(violations),
-                "serialized_concurrency_fraction": res.serialized_concurrency_fraction,
+                "serialized_concurrency_fraction": measured_serialized_fraction(
+                    res.serialized_concurrency_fraction, res.n_kernels_seen
+                ),
                 "top_hypotheses_granger": [
                     {"cause": h.cause_op, "effect": h.effect_op, "p_value": h.p_value}
                     for h in hypotheses.top(5)
                 ],
+                "granger": hypotheses.summary(),
                 "top_hypotheses_doubly_robust": [
                     {"cause": h.cause_op, "effect": h.effect_op, "p_value": h.p_value,
-                     "notes": h.notes}
+                     "notes": h.notes, "degraded": h.degraded}
                     for h in dr_hypotheses.top(5)
                 ],
+                "dr": dr_hypotheses.summary(),
                 # Engine-scheduler causes (from the vLLM stats adapter) ranked
                 # alongside the kernel-level hypotheses (the engine-signal causal link).
                 "scheduler_causes": [
@@ -916,7 +1015,9 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     verification: list[VerificationRecord] = []
     # Aggregate kernel-time residual for the report (was hardcoded 0.0). Same for
     # every claim in a run — it describes the run's gap vs the predicted graph.
-    kt_residual = _agg_kt_residual(res)
+    # None when no kernel matched the graph; the claim then says so.
+    kt_residual = kt_info.value
+    kt_note = None if kt_residual is not None else "no kernels matched the graph"
     # A queue rather than a fixed list. `for c in ranked` walked an order decided
     # before a single candidate had been measured, so nothing the run learned
     # could reach the next choice until the following run read the export back.
@@ -969,9 +1070,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 f"baseline {ab.baseline_tps:.1f} → candidate {ab.candidate_tps:.1f} tok/s"
             )
         else:
-            causal_evidence = ", ".join(
-                f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
-            ) or "no strong causal signal"
+            causal_evidence = granger_evidence(hypotheses)
         if result.error is not None and result.measured_delta is None:
             causal_evidence += f"; apply failed: {result.error}"
         motivating = _find_motivating_cause(c.spec)
@@ -983,6 +1082,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 summary=c.spec.summary,
                 residual_invariant="kernel_time",
                 residual_value=kt_residual,
+                residual_note=kt_note,
                 causal_evidence=causal_evidence,
                 intervention_name=c.spec.name,
                 predicted_delta=c.predicted_delta,
@@ -1077,9 +1177,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     else:
         ar_run = AutoresearchRun(bottleneck_class=classify_bottleneck(trace, res), results=[])
 
-    ar_granger_evidence = ", ".join(
-        f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
-    ) or "no strong causal signal"
+    ar_granger_evidence = granger_evidence(hypotheses)
     ar_residual = _ar_target_residual(ar_run, kt_residual)
     for r in ar_run.results:
         if not r.applicable:
@@ -1108,6 +1206,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 summary=r.spec.summary,
                 residual_invariant="kernel_time",
                 residual_value=ar_residual,
+                residual_note=None if ar_residual is not None else "no kernels matched the graph",
                 causal_evidence=evidence,
                 intervention_name=r.spec.name,
                 predicted_delta=r.predicted_delta,
@@ -1232,9 +1331,11 @@ def _measurement_result(
             {
                 "n_kernels": result.n_kernels,
                 "n_memcpy": result.n_memcpy,
-                "serialized_concurrency_fraction": result.serialized_fraction,
+                "serialized_concurrency_fraction": result.serialized_measured,
                 "n_violations": len(result.violations),
                 "families": result.families,
+                "granger": result.granger.summary(),
+                "limitations": list(MEASURE_LIMITATIONS),
                 "top_hypotheses": [
                     {"cause": h.cause_op, "effect": h.effect_op, "p_value": h.p_value}
                     for h in result.top_hypotheses
@@ -1326,22 +1427,7 @@ def _hft_intervention_result(
     ab = applicator.last_result
 
     # Prove: one claim carrying the measured delta, gated on identical output.
-    top = mres.top_hypotheses
-    if top:
-        evidence = (
-            f"top hypothesis: {top[0].cause_op[:30]} → {top[0].effect_op[:30]} "
-            f"(p={top[0].p_value:.3g}); serialized-concurrency={mres.serialized_fraction:.3f}"
-        )
-    elif mres.n_kernels:
-        evidence = (
-            f"serialized-concurrency={mres.serialized_fraction:.3f} over "
-            f"{mres.n_kernels} kernels"
-        )
-    else:
-        evidence = (
-            "no CUPTI trace captured on this box; intervention proven by the "
-            "on-backend baseline-vs-candidate A/B"
-        )
+    evidence = _intervention_evidence(mres, "on-backend baseline-vs-candidate A/B")
 
     claims: list[Claim] = []
     rolled_back: list[str] = []
@@ -1350,7 +1436,7 @@ def _hft_intervention_result(
             Claim(
                 summary=spec.summary,
                 residual_invariant="stream_concurrency",
-                residual_value=float(mres.serialized_fraction),
+                **_intervention_residual(mres),
                 causal_evidence=evidence,
                 intervention_name=spec.name,
                 predicted_delta=predicted,
@@ -1375,8 +1461,7 @@ def _hft_intervention_result(
                 "baseline_events_per_second": getattr(ab, "baseline_eps", None),
                 "candidate_events_per_second": getattr(ab, "candidate_eps", None),
                 "speedup": getattr(ab, "speedup", None),
-                "serialized_concurrency_fraction": mres.serialized_fraction,
-                "families": mres.families,
+                **_intervention_record(mres),
             },
             indent=2,
         )
@@ -1398,7 +1483,7 @@ def _hft_intervention_result(
         summary=(
             f"HFT intervention {spec.name!r}: {verdict}. "
             f"{mres.n_kernels:,} kernels observed, serialized-concurrency="
-            f"{mres.serialized_fraction:.3f}."
+            f"{mres.serialized_text}."
         ),
     )
     _write_report(run_dir, report_md)
@@ -1460,22 +1545,7 @@ def _openfold_intervention_result(
     )
     ab = applicator.last_result  # AF2ABResult
 
-    top = mres.top_hypotheses
-    if top:
-        evidence = (
-            f"top hypothesis: {top[0].cause_op[:30]} → {top[0].effect_op[:30]} "
-            f"(p={top[0].p_value:.3g}); serialized-concurrency={mres.serialized_fraction:.3f}"
-        )
-    elif mres.n_kernels:
-        evidence = (
-            f"serialized-concurrency={mres.serialized_fraction:.3f} over "
-            f"{mres.n_kernels} kernels"
-        )
-    else:
-        evidence = (
-            "no CUPTI trace captured on this box; intervention proven by the "
-            "on-backend fp32-vs-bf16 A/B"
-        )
+    evidence = _intervention_evidence(mres, "on-backend fp32-vs-bf16 A/B")
 
     claims: list[Claim] = []
     rolled_back: list[str] = []
@@ -1484,7 +1554,7 @@ def _openfold_intervention_result(
             Claim(
                 summary=spec.summary,
                 residual_invariant="stream_concurrency",
-                residual_value=float(mres.serialized_fraction),
+                **_intervention_residual(mres),
                 causal_evidence=evidence,
                 intervention_name=spec.name,
                 # plDDT-equivalence is the AF2 correctness gate (vs byte-identical).
@@ -1512,8 +1582,7 @@ def _openfold_intervention_result(
                 "baseline_structures_per_hour": getattr(ab, "baseline_sph", None),
                 "candidate_structures_per_hour": getattr(ab, "candidate_sph", None),
                 "speedup": getattr(ab, "speedup", None),
-                "serialized_concurrency_fraction": mres.serialized_fraction,
-                "families": mres.families,
+                **_intervention_record(mres),
             },
             indent=2,
         )
@@ -1535,7 +1604,7 @@ def _openfold_intervention_result(
         summary=(
             f"AF2 intervention {spec.name!r}: {verdict}. "
             f"{mres.n_kernels:,} kernels observed, serialized-concurrency="
-            f"{mres.serialized_fraction:.3f}."
+            f"{mres.serialized_text}."
         ),
     )
     _write_report(run_dir, report_md)
@@ -1599,22 +1668,7 @@ def _edge_intervention_result(
     )
     ab = applicator.last_result  # EdgeABResult
 
-    top = mres.top_hypotheses
-    if top:
-        evidence = (
-            f"top hypothesis: {top[0].cause_op[:30]} → {top[0].effect_op[:30]} "
-            f"(p={top[0].p_value:.3g}); serialized-concurrency={mres.serialized_fraction:.3f}"
-        )
-    elif mres.n_kernels:
-        evidence = (
-            f"serialized-concurrency={mres.serialized_fraction:.3f} over "
-            f"{mres.n_kernels} kernels"
-        )
-    else:
-        evidence = (
-            "no CUPTI trace captured on this box; intervention proven by the "
-            "on-backend fp32-vs-fp16 A/B"
-        )
+    evidence = _intervention_evidence(mres, "on-backend fp32-vs-fp16 A/B")
 
     claims: list[Claim] = []
     rolled_back: list[str] = []
@@ -1623,7 +1677,7 @@ def _edge_intervention_result(
             Claim(
                 summary=spec.summary,
                 residual_invariant="stream_concurrency",
-                residual_value=float(mres.serialized_fraction),
+                **_intervention_residual(mres),
                 causal_evidence=evidence,
                 intervention_name=spec.name,
                 # detection-equivalence is the edge correctness gate.
@@ -1649,8 +1703,7 @@ def _edge_intervention_result(
                 "baseline_frames_per_second": getattr(ab, "baseline_eps", None),
                 "candidate_frames_per_second": getattr(ab, "candidate_eps", None),
                 "speedup": getattr(ab, "speedup", None),
-                "serialized_concurrency_fraction": mres.serialized_fraction,
-                "families": mres.families,
+                **_intervention_record(mres),
             },
             indent=2,
         )
@@ -1672,7 +1725,7 @@ def _edge_intervention_result(
         summary=(
             f"edge intervention {spec.name!r}: {verdict}. "
             f"{mres.n_kernels:,} kernels observed, serialized-concurrency="
-            f"{mres.serialized_fraction:.3f}."
+            f"{mres.serialized_text}."
         ),
     )
     _write_report(run_dir, report_md)

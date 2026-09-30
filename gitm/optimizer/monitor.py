@@ -10,6 +10,7 @@ invariants so attribution doesn't need per-invariant logic.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 
 import numpy as np
 
@@ -50,12 +51,63 @@ class KernelResidual:
         return self.n_classes > 1 and self.layer is None
 
 
+#: Label for kernels whose name and NVTX range name no op (``observed_op`` is None).
+UNCLASSIFIED = "<unclassified>"
+
+#: What every run's residuals cannot measure yet, written next to them so no
+#: number is read as covering more than it does.
+LIMITATIONS = (
+    "Granger series are ordered by launch, not step",
+    "stream concurrency is not measured against a planned concurrent set",
+    "memory traffic is not computed",
+)
+
+
+class CoverageStatus(str, Enum):
+    OK = "ok"
+    NO_MATCHES = "no_matches"
+
+
 @dataclass
 class Residuals:
-    """Residuals against predicted graph. Per-kernel + per-stream-set."""
+    """Residuals against predicted graph. Per-kernel + per-stream-set.
+
+    The coverage fields say how much of the trace the residuals describe. They
+    are filled by :func:`residuals`; a hand-built ``Residuals`` (measure.py,
+    runtime_driver.py) leaves them at their defaults.
+    """
 
     per_kernel: list[KernelResidual] = field(default_factory=list)
     serialized_concurrency_fraction: float = 0.0
+    n_kernels_seen: int = 0
+    n_kernels_dropped: int = 0
+    dropped_time_s: float = 0.0
+    #: Dropped kernels by reason: :data:`UNCLASSIFIED`, or the classified op the
+    #: graph has no node for.
+    dropped_ops: dict[str, int] = field(default_factory=dict)
+    #: Graph ops that no kernel matched.
+    unobserved_predicted_ops: list[str] = field(default_factory=list)
+
+    def coverage(self) -> dict:
+        """JSON-ready coverage record for ``residuals.json``."""
+        matched_s = sum(kr.t_obs_s or 0.0 for kr in self.per_kernel)
+        total_s = matched_s + self.dropped_time_s
+        return {
+            "status": (CoverageStatus.OK if self.per_kernel else CoverageStatus.NO_MATCHES).value,
+            "n_kernels_seen": self.n_kernels_seen,
+            "n_kernels_matched": len(self.per_kernel),
+            "n_kernels_dropped": self.n_kernels_dropped,
+            "dropped_ops": dict(self.dropped_ops),
+            "unobserved_predicted_ops": list(self.unobserved_predicted_ops),
+            "matched_time_s": matched_s,
+            "dropped_time_s": self.dropped_time_s,
+            "matched_time_fraction": matched_s / total_s if total_s > 0 else None,
+        }
+
+    def _drop(self, reason: str, duration_s: float) -> None:
+        self.n_kernels_dropped += 1
+        self.dropped_time_s += duration_s
+        self.dropped_ops[reason] = self.dropped_ops.get(reason, 0) + 1
 
 
 def _class_key(pn: PredictedNode) -> tuple[float, float]:
@@ -123,7 +175,7 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
     obs = trace.kernels()
     pred = graph.nodes
 
-    res = Residuals()
+    res = Residuals(n_kernels_seen=len(obs))
     # Every node of one (op, layer), in emission order. Usually one; more when a
     # layer launches the same op more than once — the two expert GEMMs of an MoE
     # layer are both ``moe_routed`` (one ``fused_moe_kernel`` per GEMM), GLM
@@ -154,14 +206,16 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
             ordinal[id(ok)] = seq[i % len(seq)]
 
     for ok in obs:
+        t_obs = max((ok.end_ns - ok.start_ns) / 1e9, 1e-12)
         op = observed_op(ok.name, ok.range_op)
         if op is None:
+            res._drop(UNCLASSIFIED, t_obs)
             continue
         cls = list(classes.get(op, {}).values())
         if not cls:
+            res._drop(op, t_obs)
             continue
 
-        t_obs = max((ok.end_ns - ok.start_ns) / 1e9, 1e-12)
         b_obs = (
             ok.bytes_read + ok.bytes_written
             if ok.bytes_read is not None and ok.bytes_written is not None
@@ -200,8 +254,29 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
             )
         )
 
+    matched_ops = {kr.op for kr in res.per_kernel}
+    res.unobserved_predicted_ops = sorted(op for op in classes if op not in matched_ops)
     res.serialized_concurrency_fraction = _serialized_fraction(obs)
     return res
+
+
+#: Stream concurrency needs one adjacent kernel pair to measure anything.
+MIN_KERNELS_FOR_CONCURRENCY = 2
+
+
+def measured_serialized_fraction(fraction: float, n_kernels: int) -> float | None:
+    """The fraction for an artifact: None when fewer than 2 kernels were seen.
+
+    With no adjacent pair nothing was measured, and ``_serialized_fraction``'s
+    0.0 would read as "fully overlapped", the best result.
+    """
+    return fraction if n_kernels >= MIN_KERNELS_FOR_CONCURRENCY else None
+
+
+def serialized_text(fraction: float, n_kernels: int) -> str:
+    """``0.123``, or why there is no value, for report and summary text."""
+    measured = measured_serialized_fraction(fraction, n_kernels)
+    return f"{measured:.3f}" if measured is not None else "n/a (fewer than 2 kernels)"
 
 
 def _serialized_fraction(obs: list[KernelEvent]) -> float:

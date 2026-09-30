@@ -310,15 +310,17 @@ def main(argv: list[str] | None = None) -> int:
     import numpy as np
 
     from gitm import __version__
-    from gitm.optimizer.attribution import attribute
+    from gitm.optimizer.attribution import RankedHypotheses, granger_evidence
+    from gitm.optimizer.measure import MEASURE_LIMITATIONS, attribute_families
     from gitm.optimizer.monitor import (
         KernelResidual,
         Residuals,
         _serialized_fraction,
         check_invariants,
+        measured_serialized_fraction,
+        serialized_text,
     )
     from gitm.optimizer.report import Claim, Provenance, write_report
-    from gitm.planner.graph import predict_graph
     from gitm.tracer import capture
 
     stage = args.stage or Path(os.environ.get("GITM_BENCH_STAGE", "/workspace/hft/staging/hft"))
@@ -404,6 +406,7 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     violations = []
+    ranked = RankedHypotheses(hypotheses=[])
     top_hyps: list = []
     sc = 0.0
     if kernels:
@@ -423,7 +426,7 @@ def main(argv: list[str] | None = None) -> int:
         v_raw = check_invariants(res, multi_basis=False)
         violations = v_mb
         print(
-            f"serialized_concurrency_fraction = {sc:.3f}  |  "
+            f"serialized_concurrency_fraction = {serialized_text(sc, len(kernels))}  |  "
             f"violations multi-basis={len(v_mb)} raw={len(v_raw)} "
             f"(filter dropped {len(v_raw) - len(v_mb)})"
         )
@@ -448,20 +451,24 @@ def main(argv: list[str] | None = None) -> int:
             )
         fams = sorted({kr.op for kr in res_attr.per_kernel})
         print(f"attribution families (>= {MIN_ATTR} samples): {fams}")
-        ranked = attribute(res_attr, predict_graph())
+        ranked = attribute_families(res_attr, fam_counts, MIN_ATTR)
         top_hyps = ranked.top(5)
+        print(f"Granger {ranked.status.value}: {ranked.pairs_completed}/{ranked.pairs_attempted} pairs")
         print(
-            "top Granger hypotheses:",
+            "top Granger pairs (exploratory):",
             [(h.cause_op, h.effect_op, round(h.p_value, 4)) for h in top_hyps] or "none",
         )
 
-    measure["serialized_concurrency_fraction"] = sc
+    measure["serialized_concurrency_fraction"] = measured_serialized_fraction(sc, len(kernels))
     measure["n_violations"] = len(violations)
+    measure["granger"] = ranked.summary()
+    measure["limitations"] = list(MEASURE_LIMITATIONS)
     measure["top_hypotheses"] = [
         {"cause": h.cause_op, "effect": h.effect_op, "p_value": h.p_value} for h in top_hyps
     ]
 
-    (args.outdir / f"{args.workload}_seed{args.seed}_measure.json").write_text(
+    measure_name = f"{args.workload}_seed{args.seed}_measure.json"
+    (args.outdir / measure_name).write_text(
         json.dumps(measure, indent=2) + "\n"
     )
 
@@ -481,13 +488,8 @@ def main(argv: list[str] | None = None) -> int:
         trace_path=str(trace_path),
     )
     claims: list[Claim] = []
+    ev = granger_evidence(ranked, pairs_in=measure_name)
     for v in violations[:5]:
-        ev = (
-            f"top hypothesis: {top_hyps[0].cause_op[:30]} -> {top_hyps[0].effect_op[:30]} "
-            f"(p={top_hyps[0].p_value:.3g})"
-            if top_hyps
-            else "no ranked hypothesis"
-        )
         claims.append(
             Claim(
                 summary=f"{v.invariant} deviation on {v.node_op}",
@@ -503,14 +505,16 @@ def main(argv: list[str] | None = None) -> int:
         run_summary = (
             f"HFT cuDF/CuPy on {gpu_name}: {events_per_second:,.0f} events/s over {n:,} events; "
             f"{len(kernels):,} kernels captured, {len(violations)} invariant deviation(s), "
-            f"serialized-concurrency={sc:.3f}. Measurement run — no interventions applied."
+            f"serialized-concurrency={serialized_text(sc, len(kernels))}. "
+            "Measurement run — no interventions applied."
         )
     else:
         run_summary = (
             f"nuScenes CenterPoint-PointPillar (10-sweep) on {gpu_name}: "
             f"{events_per_second:,.2f} frames/s over {n:,} frames; "
             f"{len(kernels):,} kernels captured, {len(violations)} invariant deviation(s), "
-            f"serialized-concurrency={sc:.3f}. Measurement run — no interventions applied."
+            f"serialized-concurrency={serialized_text(sc, len(kernels))}. "
+            "Measurement run — no interventions applied."
         )
     report_md = write_report(
         claims,
@@ -523,7 +527,9 @@ def main(argv: list[str] | None = None) -> int:
     report_path.write_text(report_md)
     print(f"\nwrote: {trace_path}\n       {tele_path}\n       {report_path}\n       "
           f"{args.outdir / f'{args.workload}_seed{args.seed}_measure.json'}")
-    print("PASS: workload ran under the runtime; all details measured.")
+    # Not "all details measured": Granger or concurrency can be n/a; the
+    # report and measure JSON say which.
+    print("PASS: workload ran under the runtime; see the report for what was measured.")
     return 0
 
 

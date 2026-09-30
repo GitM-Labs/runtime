@@ -45,6 +45,9 @@ jobs:
       - name: Install package (dev + bench extras)
         run: |
           python -m pip install -U pip
+          # Deliberately without constraints.txt: CI resolves the newest allowed
+          # dependencies as a drift canary (statsmodels 0.15 broke Granger).
+          # Production images pin versions through constraints.txt.
           pip install -e ".[dev,bench]"
 
       - name: Run pytest
