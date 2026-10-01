@@ -7,6 +7,9 @@ still in progress — #4 (hot-swap vs restart-apply) and #2 (stats → attributi
 
 from __future__ import annotations
 
+import re
+
+import numpy as np
 import pytest
 
 from gitm.kernels.spec import InterventionSpec
@@ -490,9 +493,11 @@ def test_ar_target_residual_uses_the_search_target_not_a_hardcoded_zero():
     from gitm.agents.autoresearch import AutoresearchRun, ResidualTarget
     from gitm.scheduler.loop import _ar_target_residual
 
-    # No target found (nothing exceeded its predicted ceiling) -> honest 0.0.
+    # No target found (nothing exceeded its predicted ceiling): the run-level
+    # residual when there is one, else None. A 0.0 here read as "on target".
     empty = AutoresearchRun(bottleneck_class="idle_stall", results=[], target=None)
-    assert _ar_target_residual(empty) == 0.0
+    assert _ar_target_residual(empty) is None
+    assert _ar_target_residual(empty, 0.12) == 0.12
 
     # A real target -> its residual surfaces, clamped like every other residual.
     modest = AutoresearchRun(
@@ -506,3 +511,133 @@ def test_ar_target_residual_uses_the_search_target_not_a_hardcoded_zero():
         target=ResidualTarget(op="attn_score_value", residual=17.8, n_kernels=8),
     )
     assert _ar_target_residual(huge) == 1.0
+
+
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [(ImportError("No module named 'statsmodels.api'"), "unavailable"),
+     (np.linalg.LinAlgError("Singular matrix"), "failed")],
+)
+def test_run_loop_survives_dr_failure_and_records_granger_status(tmp_path, monkeypatch, error, status):
+    """A DR failure (dr.py imports statsmodels.api on its own, and its numpy math
+    can raise) must not lose the Granger record or the report."""
+    import json
+    from contextlib import contextmanager
+    from pathlib import Path
+
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .conftest import make_kernel, make_trace
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [make_kernel(f"paged_attention_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 80)
+                   for i in range(80)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    def dr_without_statsmodels(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "attribute_dr", dr_without_statsmodels)
+
+    out = run_loop(LoopConfig(engine=_FullEngine(), workload="vllm-decode", budget="24h",
+                              scratch=str(tmp_path), top_n_interventions=3))
+
+    residuals = json.loads((Path(out["run_dir"]) / "residuals.json").read_text())
+    assert residuals["dr"]["status"] == status
+    assert residuals["dr"]["first_errors"] == {type(error).__name__: str(error)}
+    assert residuals["dr"]["pairs_attempted"] == 0  # same record shape as a DR that ran
+    assert residuals["granger"]["status"] in {"ok", "partial", "failed", "insufficient_data"}
+    assert "top_hypotheses_granger" in residuals  # legacy key kept for readers
+    assert "no strong causal signal" not in out["report_md"]
+
+
+_OP_PAIR = re.compile(r"\S+\s*(→|->)\s*\S+\s*\(p=")
+
+
+def _two_op_capture(n_per_op: int = 40):
+    """A capture whose kernels classify to two graph ops, enough for Granger."""
+    from contextlib import contextmanager
+
+    import numpy as np
+
+    from .conftest import make_kernel, make_trace
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        rng = np.random.default_rng(0)
+        kernels, t = [], 0
+        for _ in range(n_per_op):
+            for name, base in (("_ZN5flash24flash_fwd_splitkv_kernel", 30_000),
+                               ("silu_and_mul_kernel", 8_000)):
+                dur = int(base * (1 + rng.normal(0, 0.2)))
+                kernels.append(make_kernel(name, start_ns=t, end_ns=t + dur))
+                t += dur + 100
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    return fake_capture
+
+
+def _run_two_op_loop(tmp_path, monkeypatch):
+    """Predict-only loop run (no engine), so no claim has a live A/B and every
+    catalog claim's evidence is the Granger text."""
+    import json
+    from pathlib import Path
+
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    monkeypatch.setattr(loop, "capture", _two_op_capture())
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    out = run_loop(LoopConfig(engine=None, workload="vllm-decode", budget="24h",
+                              scratch=str(tmp_path), top_n_interventions=5))
+    residuals = json.loads((Path(out["run_dir"]) / "residuals.json").read_text())
+    return out, residuals
+
+
+def test_run_loop_granger_completes_on_installed_statsmodels(tmp_path, monkeypatch):
+    """Through the real loop and the installed statsmodels, Granger runs to
+    completion, and no claim shows an op pair."""
+    pytest.importorskip("statsmodels.tsa.stattools")
+    out, residuals = _run_two_op_loop(tmp_path, monkeypatch)
+
+    granger = residuals["granger"]
+    assert granger["status"] == "ok", granger
+    assert granger["pairs_completed"] == granger["pairs_attempted"] == 2
+    assert {p["exploratory"] for p in granger["top_pairs"]} == {True}
+    assert len(residuals["top_hypotheses_granger"]) == 2
+    # DR's record is its real outcome, not a blanket "ok" for "did not raise".
+    dr = residuals["dr"]
+    assert dr["status"] in {"ok", "partial", "failed", "insufficient_data"}
+    assert {"pairs_attempted", "pairs_completed", "warnings", "reason"} <= dr.keys()
+    if dr["status"] == "insufficient_data":
+        assert dr["reason"]
+    claim_rows = [line for line in out["report_md"].splitlines() if re.match(r"\| \d+ \|", line)]
+    assert claim_rows
+    assert all("Granger ran (2/2 op pairs) but is not used as evidence" in row for row in claim_rows)
+    assert not _OP_PAIR.search(out["report_md"])
+    assert "no strong causal signal" not in out["report_md"]
+
+
+def test_run_loop_keeps_legacy_granger_key_on_partial(tmp_path, monkeypatch):
+    """Readers of top_hypotheses_granger still get the pairs that completed."""
+    stattools = pytest.importorskip("statsmodels.tsa.stattools")
+    real = stattools.grangercausalitytests
+    calls = {"n": 0}
+
+    def fail_first_pair(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("boom")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(stattools, "grangercausalitytests", fail_first_pair)
+    out, residuals = _run_two_op_loop(tmp_path, monkeypatch)
+
+    assert residuals["granger"]["status"] == "partial"
+    assert residuals["granger"]["failures"] == {"ValueError": 1}
+    assert len(residuals["top_hypotheses_granger"]) == 1
+    assert "1 of 2 op pairs failed (ValueError: 1)" in out["report_md"]

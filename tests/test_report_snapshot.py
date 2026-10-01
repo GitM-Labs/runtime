@@ -58,7 +58,7 @@ def _fixed_claims() -> list[Claim]:
             summary="Set PagedAttention block size to 16",
             residual_invariant="kernel_time",
             residual_value=0.35,
-            causal_evidence="mlp_gate_up→attn_score_value (p=0.02)",
+            causal_evidence="live A/B: kept (+4.8% decode throughput, via restart)",
             intervention_name="kv_cache_block_size_16",
             predicted_delta=0.05,
             measured_delta=0.048,
@@ -68,7 +68,7 @@ def _fixed_claims() -> list[Claim]:
             summary="Raise GPU memory utilization to 0.92",
             residual_invariant="memory_traffic",
             residual_value=0.28,
-            causal_evidence="paged_attention→attn_out_proj (p=0.04)",
+            causal_evidence="Granger ran (20/20 op pairs) but is not used as evidence: series are ordered by launch, not step; pairs in residuals.json",
             intervention_name="gpu_memory_utilization_092",
             predicted_delta=0.03,
             measured_delta=None,  # unverified

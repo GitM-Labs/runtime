@@ -342,51 +342,94 @@ def write_deviation_jsonl(reduced: Trace, path: str | Path) -> None:
     """
     write_trace_jsonl(path, reduced)
 
-def stream_observed(path: str | Path, *, pid: int | None = None,
-                    device: int | None = None) -> tuple[dict[str, list], int, int, int]:
-    """``(per_op, n_kernels, total_ns, span_ns)`` from a trace, without loading it.
+def _kernel_records(path: str | Path, *, pid: int | None, device: int | None,
+                    skipped: dict[str, int] | None):
+    """``(record, start_ns, end_ns)`` for each readable kernel line of a trace.
 
-    ``per_op`` maps a predicted-op name to ``[count, total_ns]``, with
-    ``"<unmodeled>"`` collecting every kernel that classifies to no node. The
-    NVTX range identity wins when present, exactly as in
-    :func:`deviation_summary`, so the two agree on what a kernel is.
+    Streams the file. Records filtered on purpose (non-kernel events, another
+    ``pid``/``device``) are skipped silently. Records that could not be read are
+    counted in ``skipped``: ``bad_encoding`` (not UTF-8), ``malformed_line`` (not
+    a JSON object, e.g. a line cut off when a capture died mid-write),
+    ``bad_timestamps`` (a kernel whose start/end are missing, not integers, or
+    not increasing) and ``bad_fields`` (a name or range op that is not a string,
+    or a pid or device id that is not an integer).
     """
     import json
 
-    per_op: dict[str, list] = {}
-    n = total = 0
-    t_min: int | None = None
-    t_max: int | None = None
-    cache: dict[tuple[str, str | None], str | None] = {}
+    def _skip(reason: str) -> None:
+        if skipped is not None:
+            skipped[reason] = skipped.get(reason, 0) + 1
 
-    with Path(path).open(encoding="utf-8") as fh:
-        for line in fh:
+    # Decoded per line, so one corrupt byte costs one record, not the file.
+    with Path(path).open("rb") as fh:
+        for raw in fh:
+            try:
+                line = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                _skip("bad_encoding")
+                continue
             try:
                 d = json.loads(line)
             except ValueError:
+                if not line.isspace():  # a blank line is not a record
+                    _skip("malformed_line")
                 continue
-            if not isinstance(d, dict) or d.get("kind") != "kernel":
+            if not isinstance(d, dict):
+                _skip("malformed_line")
+                continue
+            if d.get("kind") != "kernel":
                 continue
             if pid is not None and d.get("pid") != pid:
                 continue
             if device is not None and d.get("device_id") != device:
                 continue
             start, end = d.get("start_ns"), d.get("end_ns")
-            if not isinstance(start, int) or not isinstance(end, int) or end <= start:
+            if (not isinstance(start, int) or not isinstance(end, int)
+                    or isinstance(start, bool) or isinstance(end, bool) or end <= start):
+                _skip("bad_timestamps")
                 continue
-            name = d.get("name") or ""
-            key = (name, d.get("range_op"))
-            if key not in cache:
-                cache[key] = observed_op(*key)
-            op = cache[key]
-            slot = per_op.setdefault(op or "<unmodeled>", [0, 0])
-            dur = max(0, end - start)
-            slot[0] += 1
-            slot[1] += dur
-            n += 1
-            total += dur
-            t_min = start if t_min is None or start < t_min else t_min
-            t_max = end if t_max is None or end > t_max else t_max
+            if (not all(isinstance(d.get(k), str | None) for k in ("name", "range_op"))
+                    or not all(isinstance(d.get(k), int | None) and not isinstance(d.get(k), bool)
+                               for k in ("pid", "device_id"))):
+                _skip("bad_fields")
+                continue
+            yield d, start, end
+
+
+def stream_observed(path: str | Path, *, pid: int | None = None,
+                    device: int | None = None,
+                    skipped: dict[str, int] | None = None,
+                    ) -> tuple[dict[str, list], int, int, int]:
+    """``(per_op, n_kernels, total_ns, span_ns)`` from a trace, without loading it.
+
+    ``per_op`` maps a predicted-op name to ``[count, total_ns]``, with
+    ``"<unmodeled>"`` collecting every kernel that classifies to no node. The
+    NVTX range identity wins when present, exactly as in
+    :func:`deviation_summary`, so the two agree on what a kernel is.
+
+    ``skipped``, when given, counts records that could not be read (see
+    :func:`_kernel_records`).
+    """
+    per_op: dict[str, list] = {}
+    n = total = 0
+    t_min: int | None = None
+    t_max: int | None = None
+    cache: dict[tuple[str, str | None], str | None] = {}
+
+    for d, start, end in _kernel_records(path, pid=pid, device=device, skipped=skipped):
+        name = d.get("name") or ""
+        key = (name, d.get("range_op"))
+        if key not in cache:
+            cache[key] = observed_op(*key)
+        op = cache[key]
+        slot = per_op.setdefault(op or "<unmodeled>", [0, 0])
+        dur = max(0, end - start)
+        slot[0] += 1
+        slot[1] += dur
+        n += 1
+        total += dur
+        t_min = start if t_min is None or start < t_min else t_min
+        t_max = end if t_max is None or end > t_max else t_max
 
     span = (t_max - t_min) if (t_min is not None and t_max is not None) else 0
     return per_op, n, total, span
@@ -394,23 +437,10 @@ def stream_observed(path: str | Path, *, pid: int | None = None,
 
 def observed_scopes(path: str | Path, *, pid=None, device=None) -> set[tuple]:
     """Worker/device identities, never inferred from a process-local device ID."""
-    import json
-
-    scopes = set()
-    with Path(path).open(encoding="utf-8") as fh:
-        for line in fh:
-            try:
-                d = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(d, dict) or d.get("kind") != "kernel":
-                continue
-            if pid is not None and d.get("pid") != pid:
-                continue
-            if device is not None and d.get("device_id") != device:
-                continue
-            scopes.add((d.get("pid"), d.get("device_id")))
-    return scopes
+    # The same validated records the readers aggregate: a record they reject
+    # must neither crash this scan nor add a worker of its own.
+    return {(d.get("pid"), d.get("device_id"))
+            for d, _start, _end in _kernel_records(path, pid=pid, device=device, skipped=None)}
 
 
 def phase_anchors(path: str | Path, *, pid: int | None = None,
@@ -422,38 +452,19 @@ def phase_anchors(path: str | Path, *, pid: int | None = None,
     so anchors land every few microseconds — dense enough that most untagged
     kernels sit between two that agree.
     """
-    import json
-
     from gitm.tracer.kernel_taxonomy import classify_phase
 
     cache: dict[str, str | None] = {}
     out: list[tuple[int, str]] = []
-    with Path(path).open(encoding="utf-8") as fh:
-        for line in fh:
-            # Cheap reject before paying for json.loads. Deliberately not
-            # '"kind":"kernel"' — pydantic writes compact JSON but json.dumps
-            # spaces after the colon, and a prefilter that silently matches only
-            # one spelling finds zero anchors and disables propagation without
-            # any error.
-            if '"kernel"' not in line:
-                continue
-            try:
-                d = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(d, dict) or d.get("kind") != "kernel":
-                continue
-            if pid is not None and d.get("pid") != pid:
-                continue
-            if device is not None and d.get("device_id") != device:
-                continue
-            name, start = d.get("name") or "", d.get("start_ns")
-            if start is None:
-                continue
-            if name not in cache:
-                cache[name] = classify_phase(name)
-            if cache[name]:
-                out.append((int(start), cache[name]))
+    # The same validated records the phase readers aggregate (and count skips
+    # for): a record they reject must not become the anchor that labels its
+    # neighbours.
+    for d, start, _end in _kernel_records(path, pid=pid, device=device, skipped=None):
+        name = d.get("name") or ""
+        if name not in cache:
+            cache[name] = classify_phase(name)
+        if cache[name]:
+            out.append((start, cache[name]))
     out.sort()
     return out
 
@@ -478,7 +489,6 @@ def stream_by_phase(path: str | Path, *, propagate: bool = True,
     step boundary and should not be believed.
     """
     import bisect
-    import json
     import statistics
 
     from gitm.tracer.kernel_taxonomy import classify_kernel, classify_phase
@@ -495,46 +505,34 @@ def stream_by_phase(path: str | Path, *, propagate: bool = True,
     gaps: list[int] = []
     n_direct = n_inferred = n_unknown = 0
 
-    with Path(path).open(encoding="utf-8") as fh:
-        for line in fh:
-            try:
-                d = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(d, dict) or d.get("kind") != "kernel":
-                continue
-            if pid is not None and d.get("pid") != pid:
-                continue
-            if device is not None and d.get("device_id") != device:
-                continue
-            start, end = d.get("start_ns"), d.get("end_ns")
-            if not isinstance(start, int) or not isinstance(end, int) or end <= start:
-                continue
-            name = d.get("name") or ""
-            if name not in ph_cache:
-                ph_cache[name] = classify_phase(name)
-                bk_cache[name] = classify_kernel(name)
+    skipped: dict[str, int] = {}
+    for d, start, end in _kernel_records(path, pid=pid, device=device, skipped=skipped):
+        name = d.get("name") or ""
+        if name not in ph_cache:
+            ph_cache[name] = classify_phase(name)
+            bk_cache[name] = classify_kernel(name)
 
-            phase = ph_cache[name]
-            if phase is not None:
-                n_direct += 1
-            elif times:
-                i = bisect.bisect_left(times, start)
-                cands = [j for j in (i - 1, i) if 0 <= j < len(times)]
-                j = min(cands, key=lambda j: abs(times[j] - start))
-                phase = anchors[j][1]
-                gaps.append(abs(times[j] - start))
-                n_inferred += 1
-            else:
-                phase = "unknown"
-                n_unknown += 1
+        phase = ph_cache[name]
+        if phase is not None:
+            n_direct += 1
+        elif times:
+            i = bisect.bisect_left(times, start)
+            cands = [j for j in (i - 1, i) if 0 <= j < len(times)]
+            j = min(cands, key=lambda j: abs(times[j] - start))
+            phase = anchors[j][1]
+            gaps.append(abs(times[j] - start))
+            n_inferred += 1
+        else:
+            phase = "unknown"
+            n_unknown += 1
 
-            slot = by_phase.setdefault(phase, {}).setdefault(bk_cache[name], [0, 0])
-            slot[0] += 1
-            slot[1] += max(0, end - start)
+        slot = by_phase.setdefault(phase, {}).setdefault(bk_cache[name], [0, 0])
+        slot[0] += 1
+        slot[1] += max(0, end - start)
 
     stats = {
         "n_direct": n_direct,
+        "skipped_records": skipped,
         "n_inferred": n_inferred,
         "n_unknown": n_unknown,
         "n_anchors": len(anchors),
@@ -582,6 +580,12 @@ def render_by_phase(by_phase, stats) -> str:
             "    Milliseconds means the inference crossed a step boundary — under chunked\n"
             "    prefill a single step mixes both phases, and no name can separate those."
         )
+    skipped = stats.get("skipped_records") or {}
+    if skipped:
+        out.append(
+            f"\n  skipped {sum(skipped.values()):,} unreadable record(s): "
+            + ", ".join(f"{k} {v:,}" for k, v in sorted(skipped.items()))
+        )
     return "\n".join(out)
 
 
@@ -610,7 +614,6 @@ def stream_observed_by_phase(
     no anchors at all. That is the honest answer, not a failure.
     """
     import bisect
-    import json
     import statistics
 
     from gitm.tracer.kernel_taxonomy import classify_phase
@@ -629,62 +632,50 @@ def stream_observed_by_phase(
     t_min: int | None = None
     t_max: int | None = None
 
-    with Path(path).open(encoding="utf-8") as fh:
-        for line in fh:
-            try:
-                d = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(d, dict) or d.get("kind") != "kernel":
-                continue
-            if pid is not None and d.get("pid") != pid:
-                continue
-            if device is not None and d.get("device_id") != device:
-                continue
-            start, end = d.get("start_ns"), d.get("end_ns")
-            if not isinstance(start, int) or not isinstance(end, int) or end <= start:
-                continue
+    skipped: dict[str, int] = {}
+    for d, start, end in _kernel_records(path, pid=pid, device=device, skipped=skipped):
 
-            name = d.get("name") or ""
-            ident = (name, d.get("range_op"))
-            if ident not in op_cache:
-                op_cache[ident] = observed_op(*ident)
-            op = op_cache[ident] or "<unmodeled>"
+        name = d.get("name") or ""
+        ident = (name, d.get("range_op"))
+        if ident not in op_cache:
+            op_cache[ident] = observed_op(*ident)
+        op = op_cache[ident] or "<unmodeled>"
 
-            layer = d.get("range_layer")
-            if not isinstance(layer, int):
-                layer = None
+        layer = d.get("range_layer")
+        if not isinstance(layer, int):
+            layer = None
 
-            if name not in ph_cache:
-                ph_cache[name] = classify_phase(name)
-            phase = ph_cache[name]
-            direct = phase is not None
-            if direct:
-                n_direct += 1
-            elif times:
-                i = bisect.bisect_left(times, start)
-                cands = [j for j in (i - 1, i) if 0 <= j < len(times)]
-                j = min(cands, key=lambda j: abs(times[j] - start))
-                phase = anchors[j][1]
-                gaps.append(abs(times[j] - start))
-                n_inferred += 1
-            else:
-                phase = "unknown"
-                n_unknown += 1
+        if name not in ph_cache:
+            ph_cache[name] = classify_phase(name)
+        phase = ph_cache[name]
+        direct = phase is not None
+        if direct:
+            n_direct += 1
+        elif times:
+            i = bisect.bisect_left(times, start)
+            cands = [j for j in (i - 1, i) if 0 <= j < len(times)]
+            j = min(cands, key=lambda j: abs(times[j] - start))
+            phase = anchors[j][1]
+            gaps.append(abs(times[j] - start))
+            n_inferred += 1
+        else:
+            phase = "unknown"
+            n_unknown += 1
 
-            dur = max(0, end - start)
-            slot = per_key.setdefault((op, layer, phase), [0, 0, 0])
-            slot[0] += 1
-            slot[1] += dur
-            if direct:
-                slot[2] += dur
-            n += 1
-            total += dur
-            t_min = start if t_min is None or start < t_min else t_min
-            t_max = end if t_max is None or end > t_max else t_max
+        dur = max(0, end - start)
+        slot = per_key.setdefault((op, layer, phase), [0, 0, 0])
+        slot[0] += 1
+        slot[1] += dur
+        if direct:
+            slot[2] += dur
+        n += 1
+        total += dur
+        t_min = start if t_min is None or start < t_min else t_min
+        t_max = end if t_max is None or end > t_max else t_max
 
     stats = {
         "n_direct": n_direct,
+        "skipped_records": skipped,
         "n_inferred": n_inferred,
         "n_unknown": n_unknown,
         "n_anchors": len(anchors),
@@ -848,16 +839,30 @@ def main(argv: list[str] | None = None) -> int:
     phase_report = (stream_by_phase(args.trace, pid=args.pid, device=args.device)
                     if args.by_phase else None)
     if args.by_phase and not args.model:
+        # An unreadable trace yields an empty table; exiting 0 would pass it off
+        # as a trace with no kernels in any phase.
+        n_read = sum(c for buckets in phase_report[0].values() for c, _ in buckets.values())
         if args.as_json:
             print(json.dumps({"by_phase": phase_report[0], "phase_stats": phase_report[1]}))
         else:
             print(render_by_phase(*phase_report))
-        return 0
+        return 0 if n_read else 1
 
+    skipped: dict[str, int] = {}
     per_op, n_kernels, total_ns, span_ns = stream_observed(
-        args.trace, pid=args.pid, device=args.device)
+        args.trace, pid=args.pid, device=args.device, skipped=skipped)
+    skipped_note = (
+        f"skipped {sum(skipped.values()):,} unreadable record(s): "
+        + ", ".join(f"{k} {v:,}" for k, v in sorted(skipped.items()))
+        if skipped else ""
+    )
     if not n_kernels:
-        print(f"no kernel records in {args.trace} — nothing to subtract.")
+        if args.as_json:
+            print(json.dumps({"trace": str(args.trace), "n_kernels": 0,
+                              "skipped_records": skipped, "error": "no kernel records"}))
+        else:
+            print(f"no kernel records in {args.trace} — nothing to subtract."
+                  + (f" ({skipped_note})" if skipped_note else ""))
         return 1
 
     pred: dict[str, float] | None = None
@@ -903,6 +908,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({
             "trace": str(args.trace),
             "n_kernels": n_kernels,
+            "skipped_records": skipped,
             "device_time_s": total_ns / 1e9,
             "window_s": span_ns / 1e9,
             "steps": args.steps,
@@ -927,6 +933,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(render_deviation(per_op, pred, n_kernels=n_kernels, total_ns=total_ns,
                            span_ns=span_ns, steps=args.steps, band=band))
+    if skipped_note:
+        print(f"\n{skipped_note}")
     if phase_report:
         print("\nPhase diagnostic (inferred phases do not isolate a decode-only window):")
         print(render_by_phase(*phase_report))
