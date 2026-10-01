@@ -163,3 +163,27 @@ def test_an_unwrapped_config_object_still_reads():
 
     assert spec is not None
     assert spec.n_layers == 32
+
+
+def test_an_inert_indexer_survives_into_the_spec():
+    """Getting the family right is not enough. With no ``indexer_types``, the
+    GLM reader falls back to a frequency rule and gives the model a full
+    indexer every fourth layer — work Kimi does not do, on a checkpoint that
+    ships no indexer tensors. The residuals stay wrong while the label looks
+    right."""
+    from gitm.planner.registry import spec_from_hf_config
+
+    spec = spec_from_hf_config(WRAPPED_MOE, name="kimi-k2.5")
+
+    assert spec.n_full_indexer_layers == 0, "manufactured indexer layers"
+
+
+def test_a_live_indexer_keeps_its_frequency_schedule():
+    """The other direction: a checkpoint whose indexer does bind must keep the
+    fallback, or this trades one wrong graph for another."""
+    from gitm.planner.glm_graph import spec_from_hf_config as glm_spec
+
+    spec = glm_spec({**WRAPPED_MOE["text_config"], "index_topk": 2048,
+                     "model_type": "glm_moe_dsa"}, name="glm")
+
+    assert spec.n_full_indexer_layers > 0

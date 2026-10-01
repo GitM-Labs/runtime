@@ -1087,6 +1087,32 @@ def _op_dtype_overrides(
     return tuple(sorted(found.items()))
 
 
+def _indexer_schedule(
+    cfg: dict[str, Any], declared: tuple[str, ...], n_layers: int
+) -> tuple[str, ...]:
+    """The per-layer indexer schedule, with an inert indexer written down.
+
+    An explicit ``indexer_types`` is read verbatim. Where the checkpoint gives
+    none, :meth:`GlmMoeDsaModelSpec.indexer_kind` falls back to a frequency
+    rule — ``full`` every ``index_topk_freq`` layers — which is how GLM-5.2 is
+    laid out.
+
+    That fallback manufactures work for a checkpoint whose indexer never binds.
+    Kimi K2.5 sets ``index_topk`` to ``max_position_embeddings`` and ships no
+    indexer tensors at all; priced on the frequency rule it gains a full
+    indexer every fourth layer, so the family is right and the graph still
+    describes a model that does not exist. Getting the family right is not
+    enough on its own — the indexer-off state has to survive into the spec.
+    """
+    if declared:
+        return declared
+    from gitm.planner.moe_graph import has_active_indexer
+
+    if has_active_indexer(cfg):
+        return ()
+    return (SHARED_INDEXER,) * n_layers
+
+
 def spec_from_hf_config(
     cfg: dict[str, Any], *, name: str | None = None
 ) -> GlmMoeDsaModelSpec:
@@ -1167,7 +1193,7 @@ def spec_from_hf_config(
         index_head_dim=_int("index_head_dim", 128),
         index_topk=_int("index_topk", 2048),
         index_topk_freq=_int("index_topk_freq", 4),
-        indexer_types=_types("indexer_types"),
+        indexer_types=_indexer_schedule(cfg, _types("indexer_types"), n_layers),
         n_routed_experts=_req("n_routed_experts"),
         n_shared_experts=_int("n_shared_experts", 1),
         num_experts_per_tok=_req("num_experts_per_tok"),
