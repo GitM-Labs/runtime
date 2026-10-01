@@ -141,4 +141,9 @@ def test_write_verification_writes_readable_json(tmp_path):
     out = write_verification([rec], _prov(), tmp_path / "verification.json")
     doc = json.loads(open(out).read())
     assert doc["results"][0]["knob"] == "max_num_seqs"
-    assert doc["protocol"]["metric"].startswith("decode throughput")
+    # Names both measurement paths: the gate-decided A/B in tokens/sec, and a
+    # harness-converted comparison in requests/sec. One blanket description
+    # over both would misstate the units for whichever it did not mean.
+    metric = doc["protocol"]["metric"]
+    assert "decode throughput (tokens/sec)" in metric
+    assert "harness" in metric

@@ -170,8 +170,6 @@ def build_export(
     changes what ``metric`` says was measured.
     """
     degradations = list(getattr(provenance, "degradations", None) or [])
-    # Each record states its own unit; the protocol line only summarises them.
-    units = {r.unit for r in records}
     return {
         "schema": SCHEMA,
         "provenance": {
@@ -184,26 +182,37 @@ def build_export(
         },
         "environment": _environment(gpu_sku),
         "protocol": {
-            "metric": _metric(units),
+            # Per record, because a harness-converted comparison measures
+            # requests/sec over a serving window and derives ``kept`` from the
+            # number rather than from a rollback gate, and because a live probe
+            # that could not count tokens measured something else and says so
+            # in the record's ``unit``. One blanket description over all of them
+            # would misstate the units for some.
+            "metric": "per record: see `via` and `unit` — 'hot-swap'/'restart' are "
+                      "decode throughput (tokens/sec) under the rollback gate, unless "
+                      "`unit` names what the probe counted instead (runs/sec, "
+                      "decode_steps/sec, events/sec); 'harness' is serving "
+                      "throughput in requests/sec (`unit` says whether it is goodput), "
+                      "kept derived from the measured delta",
             "reps": "each side benchmarked `reps` times; std is the sample stdev",
             "agreement_band": (
                 "relative band around our numbers within which a re-measurement "
                 f"agrees; floored at {MIN_NOISE_BAND:.0%} because a single-rep A/B "
                 "reports zero scatter"
             ),
-            "kept": "decided by the rollback gate (min_keep_delta), not by delta >= 0",
+            # Same split as `metric`: the gate is what decides `kept` for a
+            # run this process supervised, and there is no gate behind a
+            # harness arm — it ran standalone on a cluster, so there was
+            # nothing to roll back and the measured delta is the whole
+            # decision. Saying "the gate decided" over both would claim a
+            # provenance half these records do not have.
+            "kept": "per record: see `via` — 'hot-swap'/'restart' are decided by "
+                    "the rollback gate (min_keep_delta), not by delta >= 0; "
+                    "'harness' has no gate behind it and is decided by the "
+                    "measured delta clearing `agreement_band`",
         },
         "results": [r.to_dict() for r in records],
     }
-
-
-def _metric(units: set[str]) -> str:
-    """The protocol's one-line metric, summarising each record's own ``unit``."""
-    if units <= {"tokens/sec"}:
-        return "decode throughput (tokens/sec)"
-    if len(units) == 1:
-        return f"throughput ({next(iter(units))}; the runner reported no token count)"
-    return "throughput; unit per record, see results[].unit"
 
 
 def write_verification(

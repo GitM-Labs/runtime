@@ -443,9 +443,9 @@ def test_verification_records_carry_their_own_degradations_and_unit():
     rec = build_record(spec, ab, NS(rolled_back=False), degradations=[unit])
     assert rec.degradations[0]["stage"] == AB_UNIT
     doc = build_export([rec], _provenance(DegradationLog()))
-    assert "runs/sec" in doc["protocol"]["metric"]
+    assert doc["results"][0]["unit"] == "runs/sec" and "`unit`" in doc["protocol"]["metric"]
     clean = build_record(spec, ab, NS(rolled_back=False))
-    assert "tokens/sec" in build_export([clean], _provenance(DegradationLog()))["protocol"]["metric"]
+    assert build_export([clean], _provenance(DegradationLog()))["results"][0]["unit"] == "tokens/sec"
 
 
 # ── autoresearch contingencies ───────────────────────────────────────────────
