@@ -103,7 +103,7 @@ def _safe_id(value: Any) -> Any | None:
         return None
     if isinstance(value, bool):
         return int(value)
-    if isinstance(value, (int, str)):
+    if isinstance(value, int | str):
         return value
     # Arrays / dicts / floats are not valid pid/device provenance on the wire.
     return None
@@ -198,10 +198,10 @@ def _scan_jsonl(path: Path) -> dict[str, Any]:
         if rank is not None:
             ranks.add(rank)
         node = rec.get("node")
-        if isinstance(node, (str, int)):
+        if isinstance(node, str | int):
             nodes.add(node)
         shard = rec.get("shard")
-        if isinstance(shard, (str, int)):
+        if isinstance(shard, str | int):
             shards.add(shard)
         key = (pid, device, start_i, end_i, name if isinstance(name, str) else None)
         if key in seen:
@@ -456,7 +456,7 @@ def _wall_window_ns(
     if (
         isinstance(start, int)
         and end is None
-        and isinstance(window_s, (int, float))
+        and isinstance(window_s, int | float)
         and window_s > 0
     ):
         end = start + int(float(window_s) * 1e9)
@@ -1520,7 +1520,7 @@ def qualify_run(
                         )
                     )
 
-            deltas = [b - a for a, b in zip(stamps, stamps[1:]) if b >= a]
+            deltas = [b - a for a, b in zip(stamps, stamps[1:], strict=False) if b >= a]
             if not deltas:
                 checks.append(
                     CheckResult(
