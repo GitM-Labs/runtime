@@ -388,8 +388,8 @@ def _kernel_records(path: str | Path, *, pid: int | None, device: int | None,
                     or isinstance(start, bool) or isinstance(end, bool) or end <= start):
                 _skip("bad_timestamps")
                 continue
-            if (not all(isinstance(d.get(k), (str, type(None))) for k in ("name", "range_op"))
-                    or not all(isinstance(d.get(k), (int, type(None))) and not isinstance(d.get(k), bool)
+            if (not all(isinstance(d.get(k), str | None) for k in ("name", "range_op"))
+                    or not all(isinstance(d.get(k), int | None) and not isinstance(d.get(k), bool)
                                for k in ("pid", "device_id"))):
                 _skip("bad_fields")
                 continue
