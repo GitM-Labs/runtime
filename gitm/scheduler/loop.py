@@ -223,6 +223,10 @@ def _model_spec_from_hf(hf: Any):
     """
     if hf is None:
         return None
+    # Same wrapper, read off an object rather than a dict: a multimodal config
+    # carries the decode shapes on ``hf.text_config``, and reading ``hidden_size``
+    # from the wrapper raises straight into the except below.
+    hf = getattr(hf, "text_config", None) or hf
     try:
         from gitm.planner.roofline import ModelSpec
 
@@ -398,13 +402,17 @@ def _execution_graph_family(engine: Any, hw: Any, batch: Any):
     comparison basis against the in-process trace, rather than predicting one
     rank against an all-rank capture.
     """
-    from gitm.planner.registry import detect_family
+    from gitm.planner.registry import detect_family, text_config
     from gitm.planner.registry import spec_from_hf_config as family_spec
     from gitm.planner.roofline import ShardingConfig
 
     hf = _hf_config_from_engine(engine)
     if hf is not None:
-        cfg = _hf_config_dict(hf)
+        # The wrapper is stripped once here rather than inside each reader: a
+        # multimodal checkpoint keeps every decode shape under ``text_config``,
+        # and a predicate reading the top level finds nothing and resolves to
+        # ``dense``.
+        cfg = text_config(_hf_config_dict(hf))
         family = detect_family(cfg)
         name = str(cfg.get("model_type") or family)
         if family == "sparse_moe":

@@ -9,11 +9,37 @@ from gitm.planner.graph import Graph
 from gitm.planner.roofline import BatchConfig, HardwareSpec, ShardingConfig
 
 
+def text_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The text sub-config, or the config itself.
+
+    Some checkpoints ship a multimodal wrapper whose top level carries only
+    ``architectures``, the vision tower and the token ids; every shape the
+    decode graph needs sits under ``text_config``.
+
+    Hoisted here from ``hybrid_graph``, which learned this first and alone. The
+    other predicates read the top level, so a wrapped sparse-MoE checkpoint
+    failed every family test and resolved to ``dense`` — and the dense reader
+    then failed on the same missing ``hidden_size`` and fell back to the
+    Llama-2-7B default. An 8x MI355X run against Kimi K2.5 produced
+    ``"family": "dense"`` with 161 nodes on exactly that path: not a coarser
+    graph, a graph of a different model, with every residual measured against
+    it.
+
+    Applied at dispatch rather than inside each reader, so a fourth family
+    cannot forget it. Idempotent — a config with no wrapper comes back
+    unchanged, which is why the readers that already descend keep working.
+    """
+    inner = cfg.get("text_config")
+    return inner if isinstance(inner, dict) else cfg
+
+
 def detect_family(cfg: dict[str, Any]) -> str:
     """``"hybrid"`` | ``"glm_moe_dsa"`` | ``"sparse_moe"`` | ``"dense"`` for a config."""
     from gitm.planner.glm_graph import is_glm_moe_dsa_config
     from gitm.planner.hybrid_graph import is_hybrid_moe_config
     from gitm.planner.moe_graph import is_sparse_moe_config
+
+    cfg = text_config(cfg)
 
     # The hybrid guard reads ``num_experts``; GLM and V4 both spell it
     # ``n_routed_experts``, so they fall through it. GLM must be tested *before*
@@ -31,6 +57,7 @@ def detect_family(cfg: dict[str, Any]) -> str:
 
 def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None):
     """Build whichever model spec the detected family uses."""
+    cfg = text_config(cfg)
     family = detect_family(cfg)
     if family == "hybrid":
         from gitm.planner.hybrid_graph import spec_from_hf_config as _hybrid
@@ -67,6 +94,7 @@ def predict_for_config(
         checkpoint whose shape was never read would produce residuals against a
         model of something else.
     """
+    cfg = text_config(cfg)
     family = detect_family(cfg)
     if family == "hybrid":
         from gitm.planner.hybrid_graph import predict_hybrid_graph
