@@ -1017,7 +1017,21 @@ def is_glm_moe_dsa_config(cfg: dict[str, Any]) -> bool:
     if str(cfg.get("model_type", "")).lower() == "glm_moe_dsa":
         return True
     archs = cfg.get("architectures") or []
-    return any("glmmoedsa" in str(a).lower() for a in archs)
+    if any("glmmoedsa" in str(a).lower() for a in archs):
+        return True
+    # Structural fallback, for the checkpoints that are this shape without
+    # saying so. This graph models MLA attention over a mixture FFN; the DSA
+    # indexer is an addition it prices when present. A checkpoint with MLA
+    # (``q_lora_rank`` + ``kv_lora_rank``), routed experts, and no indexer that
+    # ever binds is therefore exactly what this models — Kimi K2.5 is the live
+    # case, and the catalogue entry already assigns it ``family: glm_moe_dsa``
+    # by hand. DeepSeek-V4 carries a live indexer and so still falls through to
+    # ``is_sparse_moe_config``, which is the family that prices one.
+    from gitm.planner.moe_graph import has_active_indexer
+
+    mla = cfg.get("q_lora_rank") and cfg.get("kv_lora_rank")
+    routed = cfg.get("n_routed_experts") and cfg.get("num_experts_per_tok")
+    return bool(mla and routed and not has_active_indexer(cfg))
 
 
 #: Which graph op each ``modules_to_not_convert`` entry belongs to. Substring

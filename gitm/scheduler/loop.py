@@ -208,6 +208,13 @@ def _hf_config_dict(hf: Any) -> dict[str, Any]:
     q = raw.get("quantization_config")
     if q is not None and not isinstance(q, dict):
         raw["quantization_config"] = q.to_dict() if hasattr(q, "to_dict") else dict(vars(q))
+    # Same treatment for the multimodal wrapper's text sub-config, and for the
+    # same reason. ``vars()`` is shallow, so on a config with no ``to_dict`` the
+    # inner config stays an *object*; ``registry.text_config`` unwraps dicts, so
+    # a wrapped MoE would still read as dense on exactly that engine shape.
+    inner = raw.get("text_config")
+    if inner is not None and not isinstance(inner, dict):
+        raw["text_config"] = inner.to_dict() if hasattr(inner, "to_dict") else dict(vars(inner))
     return raw
 
 

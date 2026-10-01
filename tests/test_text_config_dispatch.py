@@ -17,25 +17,43 @@ from __future__ import annotations
 
 from gitm.planner.registry import detect_family
 
-#: Kimi K2.5-shaped: DeepSeek-V4-class sparse MoE (routed experts + sparse
-#: attention machinery) behind a multimodal wrapper. Trimmed to the fields the
-#: predicates read.
+#: Kimi K2.5, from `gitm/planner/models/kimi-k2.5.yaml` and the config.json it
+#: cites. Dense MLA over a mixture FFN behind a multimodal wrapper. `index_topk`
+#: is 262144 — equal to `max_position_embeddings`, which is how this checkpoint
+#: switches the DSA indexer off: `min(kv_len, topk)` can never bind. An earlier
+#: draft of this fixture invented `index_topk: 2048`, which made the test pass
+#: by describing a model that does not exist.
 WRAPPED_MOE = {
-    "architectures": ["KimiForConditionalGeneration"],
+    "architectures": ["KimiK25ForConditionalGeneration"],
     "model_type": "kimi",
     "vision_config": {"hidden_size": 1152},
     "text_config": {
+        "architectures": ["DeepseekV3ForCausalLM"],
+        "model_type": "kimi_k2",
         "hidden_size": 7168,
         "num_hidden_layers": 61,
-        "num_attention_heads": 128,
-        "num_key_value_heads": 128,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 64,
         "intermediate_size": 18432,
         "vocab_size": 163840,
+        "max_position_embeddings": 262144,
+        "q_lora_rank": 1536,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 128,
         "n_routed_experts": 384,
         "num_experts_per_tok": 8,
         "moe_intermediate_size": 2048,
-        "index_topk": 2048,
+        "index_topk": 262144,
     },
+}
+
+#: The same shape with a *live* indexer — DeepSeek-V4's. This is what separates
+#: the two MoE graphs, and it must not follow Kimi.
+WRAPPED_DSA = {
+    "architectures": ["DeepseekV4ForConditionalGeneration"],
+    "text_config": {**WRAPPED_MOE["text_config"], "index_topk": 2048},
 }
 
 #: The same model with nothing wrapped — the shape the predicates were written
@@ -44,14 +62,41 @@ WRAPPED_MOE = {
 FLAT_MOE = dict(WRAPPED_MOE["text_config"])
 
 
-def test_a_wrapped_sparse_moe_is_not_read_as_dense():
+def test_a_wrapped_moe_is_not_read_as_dense():
     """The bug, directly. Without the descent this returns "dense" and the run
     is priced against Llama-2-7B."""
-    assert detect_family(WRAPPED_MOE) == "sparse_moe"
+    assert detect_family(WRAPPED_MOE) == "glm_moe_dsa"
 
 
 def test_an_unwrapped_config_is_unaffected():
-    assert detect_family(FLAT_MOE) == "sparse_moe"
+    assert detect_family(FLAT_MOE) == "glm_moe_dsa"
+
+
+def test_an_inert_indexer_is_not_a_sparse_attention_checkpoint():
+    """`index_topk == max_position_embeddings` is how Kimi switches the DSA
+    indexer off. Reading the field's presence rather than its value sends dense
+    MLA to the graph that prices indexer nodes and a compressed-KV latent it
+    does not have."""
+    assert detect_family(WRAPPED_MOE) == "glm_moe_dsa"
+
+
+def test_a_live_indexer_still_reaches_the_sparse_moe_graph():
+    """The separator has to keep working in the other direction, or this fix
+    just moves DeepSeek-V4 onto the wrong graph instead."""
+    assert detect_family(WRAPPED_DSA) == "sparse_moe"
+
+
+def test_a_wrapper_cannot_delete_the_family_identity():
+    """`is_glm_moe_dsa_config` keys on `model_type`/`architectures`, and the
+    registry says that check has to win. If the wrapper is the only place the
+    family is named, descending must not throw it away."""
+    wrapped_glm = {
+        "architectures": ["GlmMoeDsaForCausalLM"],
+        "model_type": "glm_moe_dsa",
+        "text_config": {**WRAPPED_MOE["text_config"], "index_topk": 2048},
+    }
+
+    assert detect_family(wrapped_glm) == "glm_moe_dsa"
 
 
 def test_a_wrapped_config_builds_a_spec_describing_the_inner_model():
@@ -73,7 +118,7 @@ def test_the_predicted_graph_is_not_the_llama_default():
 
     graph, family = predict_for_config(WRAPPED_MOE, name="kimi-k2.5")
 
-    assert family == "sparse_moe"
+    assert family == "glm_moe_dsa"
     assert len(graph.nodes) != 161, "this is the Llama-2-7B default graph"
 
 
