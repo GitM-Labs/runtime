@@ -280,6 +280,7 @@ class LiveSpec:
     source_path: Path
     model_ref: str
     applied_overrides: dict[str, Any] = field(default_factory=dict)
+    checkpoint_evidence: dict[str, Any] = field(default_factory=dict)
     family: str = "sparse_moe"
     ok: bool = True
 
@@ -364,7 +365,25 @@ def live_moe_spec(
             model_ref=model_ref,
         )
 
-    if family in ("hybrid", "glm_moe_dsa"):
+    checkpoint_evidence: dict[str, Any] = {}
+    if str(cfg.get("model_type", "")).lower() == "deepseek_v32":
+        from gitm.planner.checkpoint_evidence import (
+            revision_from_snapshot,
+            verify_deepseek_checkpoint,
+        )
+        from gitm.planner.model_catalogue import load_spec
+
+        try:
+            revision = revision_from_snapshot(cfg_path)
+            checkpoint_evidence = verify_deepseek_checkpoint(
+                cfg_path, cfg_path.with_name("model.safetensors.index.json"),
+                revision=revision,
+            )
+            spec = load_spec("deepseek-v3.2")
+        except (OSError, ValueError, KeyError) as e:
+            return LiveSpecError(reason=f"DeepSeek V3.2 static verification failed: {e}",
+                                 model_ref=model_ref)
+    elif family in ("hybrid", "glm_moe_dsa"):
         from gitm.planner.registry import spec_from_hf_config as _family_spec
 
         try:
@@ -410,5 +429,6 @@ def live_moe_spec(
         source_path=cfg_path,
         model_ref=model_ref,
         applied_overrides=overrides,
+        checkpoint_evidence=checkpoint_evidence,
         family=family,
     )

@@ -149,6 +149,9 @@ class GlmMoeDsaModelSpec:
     #: The MTP block reuses the main model's index instead of recomputing it,
     #: and the weight map agrees: it carries no indexer tensors.
     index_share_for_mtp_iteration: bool = True
+    #: Some MTP checkpoints store a separate embedding, output head, and
+    #: hidden/embedding fusion matrix instead of sharing the backbone's tables.
+    mtp_separate_embedding_head: bool = False
 
     # ── precision ────────────────────────────────────────────────────────────
     weight_dtype: str = "bf16"
@@ -163,6 +166,9 @@ class GlmMoeDsaModelSpec:
     #: A tuple, not a mapping, so the spec stays hashable. Read from the
     #: checkpoint, never assumed — see the module docstring.
     op_dtype_overrides: tuple[tuple[str, str], ...] = ()
+    #: Stored precision may differ from the graph's execution precision. For
+    #: example DeepSeek's router is stored bf16 but priced as fp32 compute.
+    stored_dtype_overrides: tuple[tuple[str, str], ...] = ()
 
     # ── derived shapes / schedule ────────────────────────────────────────────
 
@@ -191,6 +197,13 @@ class GlmMoeDsaModelSpec:
             if name == op:
                 return dtype
         return default
+
+    def stored_dtype_for(self, op: str, default: str) -> str:
+        """Storage width for a tensor class, independent of GEMM precision."""
+        for name, dtype in self.stored_dtype_overrides:
+            if name == op:
+                return dtype
+        return self.dtype_for(op, default)
 
     def mlp_kind(self, layer: int) -> str:
         """``"dense"`` | ``"sparse"`` for ``layer``'s FFN."""
@@ -340,8 +353,12 @@ def model_weight_bytes(
     ew = weight_bytes(spec.dtype_for("moe_routed", spec.expert_dtype))
     sw = weight_bytes(spec.dtype_for("moe_shared", spec.expert_dtype))
     ww = weight_bytes(spec.weight_dtype)
-    rw = weight_bytes(spec.dtype_for("moe_router", spec.weight_dtype))
-    iw = weight_bytes(spec.dtype_for("attn_index_proj", spec.weight_dtype))
+    rw = weight_bytes(spec.stored_dtype_for("moe_router", spec.weight_dtype))
+    index_dtype = spec.dtype_for("attn_index_proj", spec.weight_dtype)
+    iw = weight_bytes(index_dtype)
+    index_gate_width = weight_bytes(
+        spec.stored_dtype_for("attn_index_weights_proj", index_dtype)
+    )
     lw = weight_bytes(spec.dtype_for("lm_head", spec.weight_dtype))
     tw = weight_bytes(spec.dtype_for("embed_tokens", spec.weight_dtype))
     h = spec.hidden
@@ -378,10 +395,9 @@ def model_weight_bytes(
     # Indexer weights live only on ``full`` layers (proven: ``shared`` layers carry
     # none). Replicated across ranks, as vLLM builds the indexer ReplicatedLinear.
     # ``wq_b`` from the query latent, ``wk`` from hidden, and the per-head gate.
-    indexer_per_full = (
+    indexer_projections = (
         spec.q_lora_rank * spec.index_n_heads * spec.index_head_dim
         + h * spec.index_head_dim
-        + h * spec.index_n_heads
     )
 
     # Untied input embedding and vocabulary projection: two tensors, priced
@@ -389,13 +405,25 @@ def model_weight_bytes(
     # one without the other. Both stay wide on GLM-5.2-FP8, which is 1.9 GB of
     # resident footprint an fp8 read would halve on paper and not on disk.
     embed = spec.vocab * h * (tw + lw) / tp
+    mtp_aux = 0.0
+    if spec.mtp_separate_embedding_head:
+        mtp_aux = spec.num_nextn_predict_layers * (
+            spec.vocab * h * (
+                weight_bytes(spec.stored_dtype_for("mtp_embed_tokens", spec.weight_dtype))
+                + weight_bytes(spec.stored_dtype_for("mtp_lm_head", spec.weight_dtype))) / tp
+            + 2 * h * h * weight_bytes(
+                spec.stored_dtype_for("mtp_eh_proj", spec.weight_dtype)
+            )
+        )
 
     return (
         experts
         + shared_exp
         + router
-        + n_full_idx * indexer_per_full * iw
+        + n_full_idx * (indexer_projections * iw
+                        + h * spec.index_n_heads * index_gate_width)
         + embed
+        + mtp_aux
         + (n_attn * attn_per_layer + dense_ffn) * ww
     )
 
@@ -904,10 +932,10 @@ def predict_glm_graph(
         )
     )
 
-    lm_w = weight_bytes(spec.dtype_for("lm_head", spec.weight_dtype))
-    lm_dtype = spec.dtype_for("lm_head", spec.weight_dtype)
-
     def add_lm_head(rows: float, layer: int | None) -> None:
+        key = "mtp_lm_head" if layer is not None and spec.mtp_separate_embedding_head else "lm_head"
+        lm_dtype = spec.dtype_for(key, spec.weight_dtype)
+        lm_w = weight_bytes(lm_dtype)
         f, b = _linear(rows, spec.hidden, spec.vocab // max(1, sh.tp), aw, lm_w)
         g.nodes.append(
             PredictedNode(
@@ -964,11 +992,14 @@ def predict_glm_graph(
     ):
         draft_batch = replace(batch, prefill_tokens=0, speculative_tokens=0)
         for stage in range(batch.speculative_tokens):
-            _emit_layer(
-                g, spec, hw, spec.n_layers + stage,
-                batch=draft_batch, sh=sh,
-                force_full_indexer=not spec.index_share_for_mtp_iteration,
-            )
+            if spec.mtp_separate_embedding_head:
+                dtype = spec.dtype_for("mtp_embed_tokens", spec.weight_dtype)
+                g.nodes.append(PredictedNode(
+                    "embed_tokens", spec.n_layers + stage,
+                    roofline("embed_tokens", 0.0,
+                             draft_batch.batch * spec.hidden * (weight_bytes(dtype) + aw),
+                             hw, dtype, serial_launches=1, estimated=True),
+                ))
             # ``enorm`` and ``hnorm``: the MTP block normalises the embedding and
             # the carried hidden state separately before fusing them. Two kernels,
             # bf16 on the FP8 checkpoint, and they sit inside the serial chain.
@@ -996,9 +1027,14 @@ def predict_glm_graph(
                     ),
                 )
             )
-            # There is no ``mtp.*.lm_head`` in the checkpoint — the draft shares the
-            # backbone's, which means it re-reads the same vocabulary weights and
-            # gets no cheaper for being a draft.
+            _emit_layer(
+                g, spec, hw, spec.n_layers + stage,
+                batch=draft_batch, sh=sh,
+                force_full_indexer=not spec.index_share_for_mtp_iteration,
+            )
+            # Some checkpoints share the backbone head; DeepSeek V3.2 carries a
+            # separate ``shared_head.head``. Both emit the canonical lm_head op,
+            # but the resident weights and dtype come from the declared module.
             add_lm_head(draft_batch.batch, spec.n_layers + stage)
 
     return g
@@ -1016,8 +1052,11 @@ def is_glm_moe_dsa_config(cfg: dict[str, Any]) -> bool:
     """
     if str(cfg.get("model_type", "")).lower() == "glm_moe_dsa":
         return True
+    if str(cfg.get("model_type", "")).lower() == "deepseek_v32":
+        return True
     archs = cfg.get("architectures") or []
-    return any("glmmoedsa" in str(a).lower() for a in archs)
+    return any("glmmoedsa" in str(a).lower() or "deepseekv32" in str(a).lower()
+               for a in archs)
 
 
 #: Which graph op each ``modules_to_not_convert`` entry belongs to. Substring
@@ -1083,6 +1122,12 @@ def spec_from_hf_config(
     are the IndexShare and dense/sparse schedules, and a rule guessed from the
     frequencies would misplace layers while producing a plausible total.
     """
+    if str(cfg.get("model_type", "")).lower() == "deepseek_v32":
+        raise ValueError(
+            "DeepSeek V3.2 config.json lacks an indexer schedule and serving choices; "
+            "verify its pinned tensor index with verify_deepseek_checkpoint and "
+            "load the catalogue spec. Refusing GLM defaults."
+        )
 
     def _int(key: str, default: int) -> int:
         try:

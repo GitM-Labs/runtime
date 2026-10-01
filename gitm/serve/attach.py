@@ -479,6 +479,7 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
         },
         "batch": {"batch": resolved.batch.batch, "kv_cache_len": resolved.batch.kv_cache_len},
         "applied_overrides": resolved.applied_overrides,
+        "checkpoint_evidence": resolved.checkpoint_evidence,
         "total_pred_s": g.total_pred_s,
         "has_unpriced_collectives": g.has_unpriced_collectives,
         "has_fallback_peaks": g.has_fallback_peaks,
@@ -506,6 +507,9 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
         f"{g.total_pred_s * 1e3:.2f} ms/step "
         f"(TP={sh.tp} EP={sh.ep} DP={sh.dp}, {dtypes})"
     )
+    if resolved.checkpoint_evidence.get("unverified"):
+        print("    - exploratory prediction; UNVERIFIED: "
+              + ", ".join(resolved.checkpoint_evidence["unverified"]))
     if g.has_unpriced_collectives:
         print("    - collectives are unpriced (SKU has no interconnect bandwidth in the catalogue)")
     if g.has_fallback_peaks:
