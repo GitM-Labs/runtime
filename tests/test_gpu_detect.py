@@ -101,3 +101,20 @@ def test_an_explicit_count_still_wins(monkeypatch):
     pctx = ctx.build_planner_context(_Engine(world_size=8), workload="vllm-decode", num_gpus=2)
 
     assert pctx.gate.num_gpus == 2
+
+
+def test_nothing_is_probed_when_both_answers_are_already_known(monkeypatch):
+    """The cluster's own configuration: GITM_GPU_SKU set and a live engine that
+    knows its world size. Neither NVML nor torch has anything to contribute, and
+    `get_device_name` initialises a CUDA/HIP context — a side effect the planner
+    should not cause for a value it already has."""
+    asked = []
+    monkeypatch.setattr(ctx, "_query_nvml", lambda: (asked.append("nvml"), (None, None))[1])
+    monkeypatch.setattr(ctx, "_query_torch", lambda: (asked.append("torch"), (None, None))[1])
+    monkeypatch.setenv("GITM_GPU_SKU", "MI355X")
+
+    pctx = ctx.build_planner_context(_Engine(world_size=8), workload="vllm-decode")
+
+    assert asked == [], f"probed the device for nothing: {asked}"
+    assert "MI355X" in pctx.peak.name
+    assert pctx.gate.num_gpus == 8
