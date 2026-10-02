@@ -97,3 +97,54 @@ def test_a_snapshot_path_prefers_the_catalogue_over_its_own_config(tmp_path):
 
     assert family == "glm_moe_dsa"
     assert "catalogue" in note, "read the raw config instead of the entry"
+
+
+# --------------------------------------------------------------------------- #
+# the owner is part of the identity                                            #
+# --------------------------------------------------------------------------- #
+def test_another_org_with_the_same_basename_is_refused():
+    """`other-org/Kimi-K2.5` is not moonshotai's checkpoint. Matching on the
+    last path segment handed it that entry and would have priced a different
+    model as Kimi — the exact failure this resolution exists to prevent."""
+    with pytest.raises(FileNotFoundError):
+        load_entry("other-org/Kimi-K2.5")
+
+
+def test_a_local_directory_named_like_an_entry_is_not_that_entry(tmp_path):
+    """A checkpoint directory that happens to be called `kimi-k2.5` is its own
+    model, not the catalogue's."""
+    d = tmp_path / "kimi-k2.5"
+    d.mkdir()
+
+    with pytest.raises(FileNotFoundError):
+        load_entry(str(d))
+
+
+def test_a_config_json_inside_a_snapshot_still_reaches_the_entry(tmp_path):
+    """Passing the config.json directly used to return before the catalogue was
+    consulted, so the richer entry was skipped for the file beside it."""
+    from gitm.planner.registry import _load
+
+    snap = tmp_path / "models--moonshotai--Kimi-K2.5" / "snapshots" / "abc123"
+    snap.mkdir(parents=True)
+    (snap / "config.json").write_text(json.dumps({"hidden_size": 1, "model_type": "x"}))
+
+    _spec, family, note = _load(str(snap / "config.json"))
+
+    assert family == "glm_moe_dsa"
+    assert "catalogue" in note
+
+
+def test_a_broken_entry_is_not_reported_as_a_missing_one(tmp_path, monkeypatch):
+    """`load_entry` also raises FileNotFoundError when an entry's `extends` base
+    is gone. Catching that as 'no entry' would blame the caller's name for a
+    fault in the catalogue, and silently price from a raw config instead."""
+    import gitm.planner.model_catalogue as mc
+    from gitm.planner.registry import _load
+
+    monkeypatch.setattr(mc, "_resolve", lambda n: tmp_path / "x.yaml")
+    monkeypatch.setattr(mc, "load_entry",
+                        lambda n: (_ for _ in ()).throw(FileNotFoundError("missing base")))
+
+    with pytest.raises(FileNotFoundError, match="missing base"):
+        _load("kimi-k2.5")

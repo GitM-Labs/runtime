@@ -60,16 +60,26 @@ def _resolve(name_or_path: str | Path) -> Path:
     p = Path(name_or_path)
     if p.suffix in (".yaml", ".yml") and p.is_file():
         return p
-    candidate = CATALOGUE_DIR / f"{p.name}.yaml"
-    if candidate.is_file():
-        return candidate
-    # Case-insensitive stem: `Kimi-K2.5` and `kimi-k2.5` are the same entry, and
-    # which one a caller holds depends on whether it came from a filename or
-    # from the checkpoint.
-    stem = p.name.lower()
-    for path in CATALOGUE_DIR.glob("*.yaml"):
-        if path.stem.lower() == stem:
-            return path
+
+    # A qualified id or a path is never matched on its last segment. The owner
+    # is part of the identity: `other-org/Kimi-K2.5` is not moonshotai's
+    # checkpoint, and a local directory that happens to be called `kimi-k2.5` is
+    # not it either. Taking the basename would hand both the wrong entry and
+    # price them as a model they are not — the exact failure this resolution
+    # exists to prevent.
+    bare = "/" not in str(name_or_path) and "\\" not in str(name_or_path) and not p.is_dir()
+    if bare:
+        candidate = CATALOGUE_DIR / f"{p.name}.yaml"
+        if candidate.is_file():
+            return candidate
+        # Case-insensitive: which spelling a caller holds depends on whether it
+        # came from a filename or from the checkpoint.
+        stem = p.name.lower()
+        for path in CATALOGUE_DIR.glob("*.yaml"):
+            if path.stem.lower() == stem:
+                return path
+
+    # Qualified forms match the declared `name:` in full, owner included.
     for probe in (str(name_or_path), _model_id_from_cache_path(name_or_path)):
         if probe and (found := _by_declared_name(probe)) is not None:
             return found
