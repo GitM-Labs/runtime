@@ -362,19 +362,31 @@ def build_planner_context(
     ``GITM_GPU_SKU`` overrides NVML (useful in CI / on a box without pynvml).
     """
     env_sku = os.environ.get("GITM_GPU_SKU")
+    # Settle the count first, from what is already in hand. What gates a
+    # collective lever is whether *this run* has collectives, not what the box
+    # holds — so an explicit count, then the engine's world size, before any
+    # device is asked anything. Deciding this up front is also what keeps the
+    # probes below from running for a value already known: with GITM_GPU_SKU
+    # set and a live engine, nothing needs to be discovered at all.
+    world = num_gpus or _engine_world_size(engine)
+
     # Only touch NVML if something it provides is actually missing.
     nvml_name = nvml_count = None
-    if env_sku is None or num_gpus is None:
+    if env_sku is None or world is None:
         nvml_name, nvml_count = _query_nvml()
-    # NVML answers for NVIDIA alone, so ask torch where it did not. Only when
-    # something is still missing — a working NVML is not second-guessed.
+
+    # NVML answers for NVIDIA alone, so ask torch where it did not — and only
+    # for something still missing. The probe is not free: `get_device_name`
+    # initialises a CUDA/HIP context, which is a side effect the planner should
+    # not have when it already knows both answers.
+    need_sku = env_sku is None and nvml_name is None
+    need_count = world is None and nvml_count is None
     torch_name = torch_count = None
-    if (env_sku is None and nvml_name is None) or (num_gpus is None and nvml_count is None):
+    if need_sku or need_count:
         torch_name, torch_count = _query_torch()
+
     sku = env_sku or nvml_name or torch_name
-    # The run's world size before any device count: what gates a collective
-    # lever is whether *this run* has collectives, not what the box holds.
-    n = num_gpus or _engine_world_size(engine) or nvml_count or torch_count or 1
+    n = world or nvml_count or torch_count or 1
     peak = peak_for_sku(sku)
     dtype = _engine_dtype(engine)
     kv_len = _engine_kv_len(engine)
