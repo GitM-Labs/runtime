@@ -148,3 +148,25 @@ def test_a_broken_entry_is_not_reported_as_a_missing_one(tmp_path, monkeypatch):
 
     with pytest.raises(FileNotFoundError, match="missing base"):
         _load("kimi-k2.5")
+
+
+def test_a_checkpoint_directory_keeps_its_own_name(tmp_path):
+    """Reading `config.json` out of a directory must not rename the model after
+    the file that answered — two local checkpoints would then be reported
+    identically in the table, the sweep and the JSON output."""
+    from gitm.planner.registry import _load
+
+    d = tmp_path / "my-local-ckpt"
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps({
+        "hidden_size": 7168, "num_hidden_layers": 61, "num_attention_heads": 64,
+        "vocab_size": 163840, "intermediate_size": 18432,
+        "q_lora_rank": 1536, "kv_lora_rank": 512,
+        "n_routed_experts": 384, "num_experts_per_tok": 8,
+        "moe_intermediate_size": 2048,
+    }))
+
+    spec, _family, _note = _load(str(d))
+
+    assert not spec.name.endswith("config.json"), spec.name
+    assert spec.name == str(d)
