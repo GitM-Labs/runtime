@@ -240,14 +240,17 @@ def _load(model: str) -> tuple[Any, str, str]:
 
     # No entry: read the checkpoint itself, from a config.json path or from the
     # directory holding one.
-    if p.is_dir() and (p / "config.json").is_file():
-        p = p / "config.json"
-    if p.suffix == ".json" and p.is_file():
-        cfg = json.loads(p.read_text())
+    cfg_path = p / "config.json" if p.is_dir() else p
+    if cfg_path.suffix == ".json" and cfg_path.is_file():
+        cfg = json.loads(cfg_path.read_text())
         family = detect_family(cfg)
         if family == "dense":
             return None, family, "config.json (no provenance)"
-        return (spec_from_hf_config(cfg, name=str(p)), family,
+        # Named by what the caller asked for, not by the file that answered. A
+        # directory is how a local checkpoint is identified; reporting every one
+        # of them as `.../config.json` makes two of them indistinguishable in the
+        # table, the sweep and the JSON output.
+        return (spec_from_hf_config(cfg, name=model), family,
                 "config.json (no provenance)")
 
     raise FileNotFoundError(
