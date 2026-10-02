@@ -212,25 +212,46 @@ def _hardware(sku: str | None) -> HardwareSpec:
 
 def _load(model: str) -> tuple[Any, str, str]:
     """``(spec, family, provenance_note)`` from a catalogue name or a config path."""
-    from gitm.planner.model_catalogue import available, load_entry, load_spec
+    from gitm.planner.model_catalogue import _resolve, available, load_entry, load_spec
 
     p = Path(model)
-    if p.suffix == ".json" and p.is_file():
-        cfg = json.loads(p.read_text())
-        # Family first: the dense reader raises, and the caller wants to decline
-        # with a message rather than surface a NotImplementedError.
-        family = detect_family(cfg)
-        if family == "dense":
-            return None, family, "config.json (no provenance)"
-        return (spec_from_hf_config(cfg, name=str(p)), family,
-                "config.json (no provenance)")
 
-    if model in available() or Path(model).suffix in (".yaml", ".yml"):
+    # The catalogue first, for every form including a path. An entry carries a
+    # corrected family and fields fitted by hand that a raw config does not, so
+    # where both exist the entry is the better answer — and a `config.json`
+    # inside an HF snapshot is exactly that case: the directory above it still
+    # names the model. `_resolve` takes a stem, a model id, or a cache path.
+    #
+    # Existence is tested separately from loading: `load_entry` also raises
+    # FileNotFoundError when an entry's `extends` base is missing, and catching
+    # that here would report a broken entry as an absent one and quietly fall
+    # back to the raw config.
+    try:
+        _resolve(model)
+    except FileNotFoundError:
+        entry = None
+    else:
         entry = load_entry(model)
+    if entry is not None:
         prov = entry.get("provenance", {})
         est = [e.get("field") for e in prov.get("estimated", [])]
         note = f"catalogue; fitted fields: {est or 'none'}"
         return load_spec(model), entry["family"], note
+
+    # No entry: read the checkpoint itself, from a config.json path or from the
+    # directory holding one.
+    cfg_path = p / "config.json" if p.is_dir() else p
+    if cfg_path.suffix == ".json" and cfg_path.is_file():
+        cfg = json.loads(cfg_path.read_text())
+        family = detect_family(cfg)
+        if family == "dense":
+            return None, family, "config.json (no provenance)"
+        # Named by what the caller asked for, not by the file that answered. A
+        # directory is how a local checkpoint is identified; reporting every one
+        # of them as `.../config.json` makes two of them indistinguishable in the
+        # table, the sweep and the JSON output.
+        return (spec_from_hf_config(cfg, name=model), family,
+                "config.json (no provenance)")
 
     raise FileNotFoundError(
         f"no catalogue entry or config.json at {model!r}. "

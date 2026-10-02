@@ -19,14 +19,70 @@ def available() -> list[str]:
     return sorted(p.stem for p in CATALOGUE_DIR.glob("*.yaml"))
 
 
+def _model_id_from_cache_path(name_or_path: str | Path) -> str | None:
+    """The model id inside a HuggingFace cache path, or ``None``.
+
+    Under ``HF_HUB_OFFLINE=1`` there is no hub call to resolve an id against, so
+    vLLM reports the local snapshot directory instead — the id never reaches us
+    as an id. The cache layout still encodes it: ``models--org--name`` is
+    ``org/name``, so the entry is recoverable without a network round trip.
+    """
+    for part in Path(name_or_path).parts:
+        if part.startswith("models--"):
+            return part[len("models--"):].replace("--", "/")
+    return None
+
+
+def _by_declared_name(wanted: str) -> Path | None:
+    """The entry whose own ``name:`` field is ``wanted``, case-insensitively.
+
+    Entries are keyed by file stem — ``kimi-k2.5`` — and nothing a running
+    engine holds looks like that. What it reports is the model id, which is the
+    entry's ``name:`` field: ``moonshotai/Kimi-K2.5``. Matched here so the
+    catalogue is reachable by the name a checkpoint actually arrives under, and
+    not only by the one its file happens to have.
+    """
+    import yaml
+
+    wanted = wanted.strip().lower()
+    for path in sorted(CATALOGUE_DIR.glob("*.yaml")):
+        try:
+            declared = (yaml.safe_load(path.read_text()) or {}).get("name")
+        except Exception:
+            continue
+        if declared and str(declared).strip().lower() == wanted:
+            return path
+    return None
+
+
 def _resolve(name_or_path: str | Path) -> Path:
-    """A catalogue name or a path to a YAML file, resolved to a path."""
+    """A catalogue name, a model id, a YAML path, or an HF cache path."""
     p = Path(name_or_path)
     if p.suffix in (".yaml", ".yml") and p.is_file():
         return p
-    candidate = CATALOGUE_DIR / f"{p.name}.yaml"
-    if candidate.is_file():
-        return candidate
+
+    # A qualified id or a path is never matched on its last segment. The owner
+    # is part of the identity: `other-org/Kimi-K2.5` is not moonshotai's
+    # checkpoint, and a local directory that happens to be called `kimi-k2.5` is
+    # not it either. Taking the basename would hand both the wrong entry and
+    # price them as a model they are not — the exact failure this resolution
+    # exists to prevent.
+    bare = "/" not in str(name_or_path) and "\\" not in str(name_or_path) and not p.is_dir()
+    if bare:
+        candidate = CATALOGUE_DIR / f"{p.name}.yaml"
+        if candidate.is_file():
+            return candidate
+        # Case-insensitive: which spelling a caller holds depends on whether it
+        # came from a filename or from the checkpoint.
+        stem = p.name.lower()
+        for path in CATALOGUE_DIR.glob("*.yaml"):
+            if path.stem.lower() == stem:
+                return path
+
+    # Qualified forms match the declared `name:` in full, owner included.
+    for probe in (str(name_or_path), _model_id_from_cache_path(name_or_path)):
+        if probe and (found := _by_declared_name(probe)) is not None:
+            return found
     raise FileNotFoundError(
         f"no catalogue entry {str(name_or_path)!r}. Available: {available() or 'none'}. "
         "Pass a catalogue name or a path to a YAML file."
