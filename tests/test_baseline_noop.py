@@ -161,3 +161,63 @@ def test_run_loop_records_baseline_noops_apart_from_rejections(tmp_path, monkeyp
     assert out["summary"]["n_baseline_noop"] == len(noops)
     # Skipped, not rejected, and never applied.
     assert "cuda_graphs_enable (" not in out["report_md"]
+
+
+def test_run_loop_skips_and_records_a_lever_the_recapture_rerank_finds_is_now_a_noop(
+    tmp_path, monkeypatch,
+):
+    """Both levers set max_num_seqs=512 on an engine running 64, so neither is a
+    no-op at Phase 3. The first wins its A/B and is kept via restart; the re-rank
+    after the recapture reads the restarted engine, finds the second already at
+    512, and it must be skipped and recorded rather than applied again."""
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .conftest import make_kernel, make_trace
+    from .test_intra_run_rerank import _Runner
+
+    first = _spec("seqs_512", {"max_num_seqs": 512}, mean=0.08)
+    duplicate = _spec("seqs_512_from_sweep", {"max_num_seqs": 512}, mean=0.04)
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [make_kernel(f"k_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 80)
+                   for i in range(80)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    rankings: list[dict[str, str | None]] = []
+    real_select = loop.select_interventions
+
+    def recording_select(*a, **kw):
+        ranked = real_select(*a, **kw)
+        rankings.append({c.spec.name: c.baseline_noop for c in ranked})
+        return ranked
+
+    applied: list[str] = []
+    real_apply = loop.apply_intervention
+
+    def recording_apply(spec, *a, **kw):
+        applied.append(spec.name)
+        return real_apply(spec, *a, **kw)
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "load_library", lambda workload=None: [first, duplicate])
+    monkeypatch.setattr(loop, "select_interventions", recording_select)
+    monkeypatch.setattr(loop, "apply_intervention", recording_apply)
+
+    out = run_loop(LoopConfig(engine=_FullEngine(), workload="vllm-decode", budget="24h",
+                              scratch=str(tmp_path), workload_runner=_Runner(),
+                              rerank="recapture"))
+
+    phase3, rerank = rankings[0], rankings[1]
+    assert phase3["seqs_512_from_sweep"] is None
+    assert "max_num_seqs=512" in rerank["seqs_512_from_sweep"]
+
+    assert "seqs_512" in applied
+    assert "seqs_512_from_sweep" not in applied
+
+    noops = json.loads((Path(out["run_dir"]) / "baseline_noop.json").read_text())
+    assert [n["name"] for n in noops] == ["seqs_512_from_sweep"]
+    assert "max_num_seqs=512" in noops[0]["reason"]
+    assert out["summary"]["n_baseline_noop"] == 1

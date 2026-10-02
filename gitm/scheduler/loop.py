@@ -1575,8 +1575,6 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                                   current_values=current_knob_values(
                                       cfg.engine, {k for s in library for k in s.knob_values}))
     baseline_noops = [c for c in ranked if c.baseline_noop is not None]
-    (run_dir / "baseline_noop.json").write_text(json.dumps(
-        [{"name": c.spec.name, "reason": c.baseline_noop} for c in baseline_noops], indent=2))
     (run_dir / "ranked_candidates.json").write_text(
         json.dumps(
             [
@@ -1839,6 +1837,9 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             break
         c = queue.pop(0)
         if c.baseline_noop is not None:
+            # Phase 3's no-ops are already listed; one a re-rank caught is not.
+            if all(n.spec.name != c.spec.name for n in baseline_noops):
+                baseline_noops.append(c)
             continue
         if c.rejected_reason is not None:
             rejected.append(f"{c.spec.name} ({c.rejected_reason})")
@@ -2082,6 +2083,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         (run_dir / "rerank.json").write_text(json.dumps({
             "mode": cfg.rerank, "steps": reranks,
         }, indent=2))
+    (run_dir / "baseline_noop.json").write_text(json.dumps(
+        [{"name": c.spec.name, "reason": c.baseline_noop} for c in baseline_noops], indent=2))
 
     # Phase 4b - agentic autoresearch through the catalog gate/rollback path.
     # The same rule as Phase 4: no pass, and no candidate within it, that the
