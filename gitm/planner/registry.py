@@ -225,12 +225,29 @@ def _load(model: str) -> tuple[Any, str, str]:
         return (spec_from_hf_config(cfg, name=str(p)), family,
                 "config.json (no provenance)")
 
-    if model in available() or Path(model).suffix in (".yaml", ".yml"):
+    # The catalogue before any config.json, including for a path: an entry
+    # carries a corrected family and hand-fitted fields that a raw config does
+    # not, so where both exist the entry is the better answer. `_resolve` takes
+    # a stem, a model id, or an HF cache snapshot path — under HF_HUB_OFFLINE
+    # the last is what the engine reports, and it still encodes the id.
+    try:
         entry = load_entry(model)
+    except FileNotFoundError:
+        entry = None
+    if entry is not None:
         prov = entry.get("provenance", {})
         est = [e.get("field") for e in prov.get("estimated", [])]
         note = f"catalogue; fitted fields: {est or 'none'}"
         return load_spec(model), entry["family"], note
+
+    # A plain checkpoint directory is not in the catalogue and need not be.
+    if p.is_dir() and (p / "config.json").is_file():
+        cfg = json.loads((p / "config.json").read_text())
+        family = detect_family(cfg)
+        if family == "dense":
+            return None, family, "config.json (no provenance)"
+        return (spec_from_hf_config(cfg, name=str(p)), family,
+                "config.json (no provenance)")
 
     raise FileNotFoundError(
         f"no catalogue entry or config.json at {model!r}. "
