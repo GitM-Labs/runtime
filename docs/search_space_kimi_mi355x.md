@@ -101,6 +101,10 @@ Source: artifact `funnel`. Joint configs are feasible ones: the product over kno
 (values + 1), minus combinations that set a dependent knob without its prerequisite
 (the `joint_configs` function in the script).
 
+> **PROVISIONAL — ranking stage.** The "after ranking" row (5 ranked candidates) is
+> based on the predicted-graph stand-in, not a measured trace. The rejection stages
+> above it do not depend on the trace.
+
 | Stage | Candidates | Knobs | Bits | Joint configs (feasible / unconstrained) |
 |---|---:|---:|---:|---|
 | raw | 36 | 28 | 32 | 3,221,225,472 / 4,294,967,296 |
@@ -110,7 +114,7 @@ Source: artifact `funnel`. Joint configs are feasible ones: the product over kno
 | after mutual dependency | 27 | 19 | 23 | 8,388,608 |
 | after deployment | 27 | 19 | 23 | 8,388,608 |
 | after applicability + safety | 25 | 17 | 21 | 2,097,152 |
-| after ranking | 5 | 4 | 5 | 24 |
+| after ranking **(PROVISIONAL: predicted-graph stand-in)** | 5 | 4 | 5 | 24 |
 
 What each stage removes:
 
@@ -210,6 +214,11 @@ should only remove whole knobs. Ranking drops 20 points and 16 bits:
 
 Source: artifact `phase3_top_n_on_main`. This is the exact Phase 3 call
 (`loop.py:743`) over the scoped, expanded library.
+
+> **PROVISIONAL.** This top 5 is ranked against the predicted-graph stand-in, not a
+> measured trace. Once a measured trace is available (the arm B baseline capture, rag
+> 4096/512, c=64; see open question 1), ranking will be re-run against it. Expect the
+> top 5 and the slot order to change; do not treat this table as final.
 
 | Slot | Lever | Predicted delta | Note |
 |---|---|---:|---|
@@ -335,6 +344,17 @@ question 4.
 
    The coverage finding (dense vocabulary vs MoE graph) is structural and does not
    depend on the profile. The exact shares, slot order and qualification outcome do.
+
+   **Target trace: arm B baseline capture, rag 4096/512, c=64.** This is the same
+   operating point the e8 loop measures. Once it exists, ranking will be re-run
+   against it, and the current top 5 and its slot order should be expected to change
+   rather than treated as final.
+   - Not yet committed.
+   - Capturing it on the cluster is pending a kubeconfig from Adit.
+   - An existing capture under `/mnt/shared/rex/results/` (Adit's rex runs) could
+     also work if something close already exists there. That path was checked from a
+     local dev machine and was not reachable ("No such file or directory"), so it
+     has not yet been ruled in or out from the cluster side.
 2. The model revision and vLLM version are not pinned in the repo. Only the image
    digest is.
 3. Several engine values are vLLM defaults assumed for this image:
