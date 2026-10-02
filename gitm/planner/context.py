@@ -361,7 +361,11 @@ def build_planner_context(
 
     ``GITM_GPU_SKU`` overrides NVML (useful in CI / on a box without pynvml).
     """
-    env_sku = os.environ.get("GITM_GPU_SKU")
+    # Empty is unset. `GITM_GPU_SKU=` in a manifest or an exported-but-unset
+    # shell variable arrives as "", which is not None — so every `is None` test
+    # below would read it as an answer, skip detection, and leave the SKU to the
+    # A100 default on a box NVML could have identified.
+    env_sku = (os.environ.get("GITM_GPU_SKU") or "").strip() or None
     # Settle the count first, from what is already in hand. What gates a
     # collective lever is whether *this run* has collectives, not what the box
     # holds — so an explicit count, then the engine's world size, before any

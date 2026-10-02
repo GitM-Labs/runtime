@@ -118,3 +118,23 @@ def test_nothing_is_probed_when_both_answers_are_already_known(monkeypatch):
     assert asked == [], f"probed the device for nothing: {asked}"
     assert "MI355X" in pctx.peak.name
     assert pctx.gate.num_gpus == 8
+
+
+def test_an_empty_override_does_not_count_as_an_answer(monkeypatch):
+    """`GITM_GPU_SKU=` in a manifest arrives as "", not None. Treated as set it
+    suppresses detection and leaves the A100 default on a box that could have
+    been identified."""
+    monkeypatch.setattr(ctx, "_query_nvml", lambda: ("NVIDIA H200", 4))
+    monkeypatch.setenv("GITM_GPU_SKU", "")
+
+    pctx = ctx.build_planner_context(_Engine(world_size=8), workload="vllm-decode")
+
+    assert pctx.peak is not None, "fell through to the A100 default"
+    assert "H200" in pctx.peak.name
+
+
+def test_a_whitespace_override_is_also_unset(monkeypatch):
+    monkeypatch.setattr(ctx, "_query_nvml", lambda: ("NVIDIA H200", 4))
+    monkeypatch.setenv("GITM_GPU_SKU", "   ")
+
+    assert "H200" in ctx.build_planner_context(None, workload="vllm-decode").peak.name
