@@ -217,6 +217,65 @@ def _query_nvml() -> tuple[str | None, int | None]:
         return None, None
 
 
+def _query_torch() -> tuple[str | None, int | None]:
+    """(device name, count) through torch, which speaks both vendors.
+
+    The fallback for :func:`_query_nvml`, which is pynvml and therefore NVIDIA
+    only. On ROCm, ``torch.cuda`` *is* the ROCm API and reports the AMD device —
+    ``"AMD Instinct MI355X"`` — which ``peak_for_sku`` matches on substring, so
+    the peaks already in the table become reachable without a second lookup
+    path.
+
+    Without this an 8x MI355X run resolved no SKU, fell through to
+    ``HardwareSpec()`` (A100-SXM4-80GB), and priced every roofline floor against
+    the wrong silicon while reporting that it had done so.
+
+    ``device_count`` is read before ``get_device_name`` so a box with the
+    runtime but no visible device returns ``(None, 0)`` instead of raising.
+    """
+    try:
+        import torch
+
+        n = int(torch.cuda.device_count())
+        if n <= 0:
+            return None, 0
+        return str(torch.cuda.get_device_name(0)), n
+    except Exception:
+        return None, None
+
+
+def _engine_world_size(engine: Any) -> int | None:
+    """Ranks in this run, or ``None``.
+
+    Not the box's device count: ``num_gpus`` feeds ``has_collective``, which
+    gates levers declaring ``requires_collective``, and a TP=1 job on an
+    eight-GPU node has no collectives to speak of. Telling it otherwise admits
+    candidates whose whole premise is a collective that will never run — and on
+    a cluster that insists on full-node allocation, TP=1 on eight GPUs is a
+    normal thing to be doing.
+
+    Duck-typed across vLLM version drift, like every other engine read here.
+    """
+    if engine is None:
+        return None
+    for path in (
+        "llm_engine.vllm_config.parallel_config.world_size",
+        "llm_engine.parallel_config.world_size",
+        "vllm_config.parallel_config.world_size",
+    ):
+        obj: Any = engine
+        for attr in path.split("."):
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if obj:
+            try:
+                return int(obj)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def peak_for_sku(sku: str | None) -> HardwarePeak | None:
     """Look up dense peaks for a SKU string (substring match), else None."""
     if not sku:
@@ -307,8 +366,15 @@ def build_planner_context(
     nvml_name = nvml_count = None
     if env_sku is None or num_gpus is None:
         nvml_name, nvml_count = _query_nvml()
-    sku = env_sku or nvml_name
-    n = num_gpus or nvml_count or 1
+    # NVML answers for NVIDIA alone, so ask torch where it did not. Only when
+    # something is still missing — a working NVML is not second-guessed.
+    torch_name = torch_count = None
+    if (env_sku is None and nvml_name is None) or (num_gpus is None and nvml_count is None):
+        torch_name, torch_count = _query_torch()
+    sku = env_sku or nvml_name or torch_name
+    # The run's world size before any device count: what gates a collective
+    # lever is whether *this run* has collectives, not what the box holds.
+    n = num_gpus or _engine_world_size(engine) or nvml_count or torch_count or 1
     peak = peak_for_sku(sku)
     dtype = _engine_dtype(engine)
     kv_len = _engine_kv_len(engine)
