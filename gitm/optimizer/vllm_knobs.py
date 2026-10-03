@@ -21,6 +21,7 @@ set a structural field that the running engine won't actually honor.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -264,6 +265,49 @@ def unmet_prerequisite(engine: Any | None, knob: str) -> str | None:
         return f"prerequisite {prereq!r} not enabled on this engine"
     except AttributeError:
         return f"prerequisite {prereq!r} unknown on this engine"
+
+
+def current_knob_values(engine: Any | None, knobs: Iterable[str]) -> dict[str, Any]:
+    """The engine's current value for each of ``knobs`` it can report.
+
+    A knob that can't be read is left out rather than recorded as ``None``: an
+    absent value must never compare equal to a lever's target.
+    """
+    if engine is None:
+        return {}
+    out: dict[str, Any] = {}
+    for knob in knobs:
+        try:
+            out[knob] = get_knob(engine, knob)
+        except AttributeError:
+            continue
+    return out
+
+
+def noop_reason(spec: InterventionSpec, current_values: Mapping[str, Any]) -> str | None:
+    """Why applying ``spec`` would change nothing, or ``None`` if it would.
+
+    A no-op only when *every* knob the lever sets is present in
+    ``current_values`` and already equals the target. One unreadable or
+    different knob keeps the lever. ``True`` and ``1`` are not the same setting.
+    """
+    values = spec.knob_values
+    if not values:
+        return None
+    for knob, target in values.items():
+        if knob not in current_values:
+            return None
+        current = current_values[knob]
+        if isinstance(current, bool) != isinstance(target, bool) or current != target:
+            return None
+    return "baseline no-op: engine already runs " + ", ".join(
+        f"{k}={v!r}" for k, v in values.items()
+    )
+
+
+def baseline_noop(engine: Any | None, spec: InterventionSpec) -> str | None:
+    """:func:`noop_reason` against the engine's current values; ``None`` without an engine."""
+    return noop_reason(spec, current_knob_values(engine, spec.knob_values))
 
 
 def resolve_relative_value(spec: InterventionSpec, engine: Any | None) -> InterventionSpec:
