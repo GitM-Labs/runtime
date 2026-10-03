@@ -1121,6 +1121,34 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     def _has_structural_knob(spec: Any) -> bool:
         return any(knob_kind(k) == "structural" for k in spec.knob_values)
 
+    # Shared veto for library levers (Phase 4) and autoresearch candidates
+    # (Phase 4b): a candidate that can't be enacted on this engine is "not
+    # evaluable here", not a regression.
+    def _unenactable(spec: Any) -> str | None:
+        if (
+            cfg.engine is not None
+            and live_restart_fn is None
+            and _has_structural_knob(spec)
+        ):
+            return "structural knob: needs engine restart, no restart_fn"
+        values = spec.knob_values
+        # The engine running *now*: a Phase-4 restart that was kept has
+        # replaced cfg.engine, and a prerequisite it turned on (or off) is
+        # visible only on the engine the applicator holds.
+        engine_now = getattr(applicator, "engine", None) or cfg.engine
+        for k in values:
+            reason = unmet_prerequisite(engine_now, k)
+            if reason is None:
+                continue
+            prereq = next(
+                (p for needle, p in KNOB_PREREQUISITES if needle in k.lower()),
+                None,
+            )
+            if prereq in values:
+                continue
+            return reason
+        return None
+
     claims: list[Claim] = []
     rolled_back: list[str] = []
     rejected: list[str] = []
@@ -1144,12 +1172,13 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         if c.rejected_reason is not None:
             rejected.append(f"{c.spec.name} ({c.rejected_reason})")
             continue
-        # Live + structural knob + no restart hook → it *cannot* be enacted on the
-        # running engine, so it's "not evaluable here", not a regression. Mark it
-        # rejected (honest) instead of attempting an apply that would roll back and
-        # read as "tried and lost" — and skip the wasted baseline benchmark.
-        if cfg.engine is not None and live_restart_fn is None and _has_structural_knob(c.spec):
-            rejected.append(f"{c.spec.name} (structural knob: needs engine restart, no restart_fn)")
+        # Live + structural knob + no restart hook, or an unmet prerequisite → it
+        # *cannot* be enacted on the running engine. Mark it rejected (honest)
+        # instead of attempting an apply that would roll back and read as "tried
+        # and lost" — and skip the wasted baseline benchmark.
+        unenactable = _unenactable(c.spec)
+        if unenactable is not None:
+            rejected.append(f"{c.spec.name} ({unenactable})")
             continue
         # Snapshot the engine config BEFORE the apply: a hot-swap mutates these
         # kwargs in place and a restart replaces the engine outright, so reading
@@ -1250,32 +1279,6 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # Phase 4b - agentic autoresearch through the catalog gate/rollback path.
     if time.time_ns() - started_ns < int(budget_s * 1e9):
         proposer = FallbackProposer(EngineArgsProposer(), TableProposer())
-
-        def _unenactable(spec: Any) -> str | None:
-            if (
-                cfg.engine is not None
-                and live_restart_fn is None
-                and _has_structural_knob(spec)
-            ):
-                return "structural knob: needs engine restart, no restart_fn"
-            values = spec.knob_values
-            # The engine running *now*: a Phase-4 restart that was kept has
-            # replaced cfg.engine, and a prerequisite it turned on (or off) is
-            # visible only on the engine the applicator holds.
-            engine_now = getattr(applicator, "engine", None) or cfg.engine
-            for k in values:
-                reason = unmet_prerequisite(engine_now, k)
-                if reason is None:
-                    continue
-                prereq = next(
-                    (p for needle, p in KNOB_PREREQUISITES if needle in k.lower()),
-                    None,
-                )
-                if prereq in values:
-                    continue
-                return reason
-            return None
-
         ar_run = autoresearch(
             trace,
             applicator=applicator,

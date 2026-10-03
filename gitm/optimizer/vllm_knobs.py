@@ -253,7 +253,12 @@ def unmet_prerequisite(engine: Any | None, knob: str) -> str | None:
     the rejection reason. No engine -> can't verify -> reject (conservative,
     like :func:`knob_kind`'s unknown-defaults-unsafe default)."""
     lname = knob.lower()
-    prereq = next((p for needle, p in KNOB_PREREQUISITES if needle in lname), None)
+    # Substring needles can match the prerequisite flag itself ("dbo" in
+    # "enable_dbo"); a flag is never its own prerequisite.
+    prereq = next(
+        (p for needle, p in KNOB_PREREQUISITES if needle in lname and p.lower() != lname),
+        None,
+    )
     if prereq is None:
         return None
     if engine is None:
