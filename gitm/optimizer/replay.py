@@ -92,10 +92,25 @@ def predict_delta_from_files(trace_path: Path, intervention_path: Path) -> float
 
 
 def _load_trace_jsonl(path: Path) -> Trace:
-    lines = path.read_text(encoding="utf-8").splitlines()
-    if not lines:
+    """Read a trace file into a :class:`Trace`.
+
+    Streamed line by line rather than read whole. A real capture runs to
+    hundreds of thousands of kernels, and ``read_text().splitlines()`` holds the
+    entire file *and* the list of its lines before a single event is parsed — two
+    full copies on top of the events themselves. The events still have to fit in
+    memory; this just stops the file contents doubling that.
+    """
+    header: dict | None = None
+    events_raw = []
+    with path.open(encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            if header is None:
+                header = json.loads(line).get("_header", {})
+                continue
+            events_raw.append(json.loads(line))
+    if header is None:
         raise ValueError(f"empty trace file: {path}")
-    header = json.loads(lines[0]).get("_header", {})
-    events_raw = [json.loads(line) for line in lines[1:] if line.strip()]
     # Pydantic discriminates the union by ``kind``
     return Trace.model_validate({**header, "events": events_raw})

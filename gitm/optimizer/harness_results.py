@@ -42,13 +42,16 @@ from gitm.optimizer.verification_export import VerificationRecord, write_verific
 __all__ = [
     "Capture",
     "fingerprint_of",
+    "realises",
     "resolve_lever",
     "LAUNCH_ONLY_FLAGS",
     "CaptureError",
     "read_capture",
     "knob_difference",
     "compare",
+    "sweep_id",
     "write_comparison",
+    "write_comparisons",
 ]
 
 SUMMARY_NAME = "serving_summary.json"
@@ -154,7 +157,7 @@ def _as_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _realises(value: Any, spec_value: Any) -> bool:
+def realises(value: Any, spec_value: Any) -> bool:
     """Whether an arm setting a knob to ``value`` is the setting ``spec_value``.
 
     A lever is a knob *and* the value it puts there — :func:`apply_intervention`
@@ -197,7 +200,7 @@ def resolve_lever(knob: str, value: Any, library: Iterable[Any]) -> Any | None:
     matches = [s for s in library if s.knob == knob_name]
     if value is None:
         return next((s for s in matches if isinstance(s.value, bool) and not s.value), None)
-    return next((s for s in matches if _realises(value, s.value)), None)
+    return next((s for s in matches if realises(value, s.value)), None)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -425,22 +428,97 @@ def compare(
     )
 
 
+def sweep_id(baseline: Capture, candidates: Iterable[Capture]) -> str:
+    """A run id for this sweep, derived from what it measured.
+
+    Not from the directory paths. Paths identify a copy, not a sweep: an
+    operator who re-downloads the same results into a second directory gets a
+    different id, the existing-export refusal does not fire, and history counts
+    one sweep twice — reading it as corroboration of itself, which is the single
+    thing the record is least able to be.
+
+    Derived instead from the model, the load shape, and each arm's server argv
+    with the throughput it produced. Two ingests of the same measurements agree
+    wherever the files live; a re-run of the same arms that measured something
+    different is a different sweep, which it is.
+    """
+    def arm(c: Capture) -> str:
+        return f"{'|'.join(c.serve_argv)}={c.throughput!r}"
+
+    parts = [
+        str(baseline.served_model),
+        "|".join(f"{k}={v}" for k, v in sorted(baseline.load.items())),
+        arm(baseline),
+        # Sorted, so naming the same arms in another order is the same sweep.
+        *sorted(arm(c) for c in candidates),
+    ]
+    return "harness-" + hashlib.sha256("\n".join(parts).encode()).hexdigest()[:12]
+
+
 def write_comparison(
     baseline: Capture, candidate: Capture, *, out_dir: str | Path,
     library: Iterable[Any], gpu_sku: str | None = None,
     fingerprint: str | None = None, run_id: str | None = None,
 ) -> str:
-    """Write the comparison as a ``verification.json`` under ``out_dir``.
+    """Write one comparison as a ``verification.json`` under ``out_dir``.
 
-    ``fingerprint`` is computed from the candidate's own trace when not given,
-    by the same rule :func:`gitm.optimizer.qualification.fingerprint` uses. It is
-    never defaulted to the model name: the loop filters history on the trace
-    digest, so a record filed under ``Kimi-K2.5`` is written and then filtered
-    straight back out — invisible, not merely coarse.
+    The single-arm case of :func:`write_comparisons`, which holds the
+    documentation for both.
+    """
+    return write_comparisons(
+        baseline, [candidate], out_dir=out_dir, library=library,
+        gpu_sku=gpu_sku, fingerprint=fingerprint, run_id=run_id)
+
+
+def write_comparisons(
+    baseline: Capture, candidates: Iterable[Capture], *, out_dir: str | Path,
+    library: Iterable[Any], gpu_sku: str | None = None,
+    fingerprint: str | None = None, run_id: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Write every candidate's comparison against one baseline, as one export.
+
+    A harness sweep is one baseline and several arms, so that is the shape this
+    takes. They land in a single export rather than one directory per arm
+    because they *are* one run: same baseline, same workload, same box, and
+    :func:`gitm.optimizer.history.load_history` aggregates records across an
+    export exactly as it does across directories. Splitting them would also mean
+    inventing a run id per arm, and a run id is how a result is traced back to
+    the thing that produced it.
+
+    ``fingerprint`` is computed from a trace when not given, by the same rule
+    :func:`gitm.optimizer.qualification.fingerprint` uses. It is never defaulted
+    to the model name: the loop filters history on the trace digest, so a record
+    filed under ``Kimi-K2.5`` is written and then filtered straight back out —
+    invisible, not merely coarse.
+
+    The trace comes from the **baseline**, and only from an accepted candidate if
+    the baseline has none. The digest is over kernel shapes, and a lever changes
+    shapes — so an arm's own digest differs from the baseline's, while the
+    workload is the same one by construction (``compare`` refuses two arms that
+    disagree on model, load or tracing). Keying a sweep on the baseline is what
+    makes every arm of it findable under one workload, and what makes it the same
+    key ``gitm propose`` ranks history under. Keying on a candidate instead left
+    the two commands filing and looking under different digests, so a measured
+    result could not reach the next proposal.
+
+    Taking ``candidates[0]`` as given was wrong for two further reasons, and both
+    still hold: a refused arm is not part of this sweep, and an untraced first
+    arm raised and discarded a sweep whose other arms were fine.
+
+    Every arm is compared, and one unusable arm does not discard the others:
+    :func:`compare` refuses an arm that is not an A/B of the baseline, and that
+    refusal belongs to that arm. The caller gets the reasons back through
+    :class:`CaptureError` only when *nothing* could be compared, because an
+    export with no records is a file that says a sweep produced no evidence.
 
     Refuses to overwrite an existing export. A reused run id would otherwise
-    replace a directory's records with this single comparison, and the loop's own
-    exports live under the same tree.
+    replace a directory's records, and the loop's own exports live under the
+    same tree.
+
+    ``dry_run`` performs every check and writes nothing, returning the path it
+    would have written. It exists so ``--dry-run`` can refuse what the real
+    command would refuse, rather than predicting a write that cannot happen.
     """
     out_dir = Path(out_dir)
     export = out_dir / EXPORT_NAME
@@ -449,12 +527,67 @@ def write_comparison(
             f"{export} already exists. Writing here would replace whatever it "
             "records; pick a run id that is not in use.")
 
-    record = compare(baseline, candidate, library=library)
+    candidates = list(candidates)
+    if not candidates:
+        raise CaptureError("no candidate arms to compare against the baseline")
+
+    records: list[VerificationRecord] = []
+    accepted: list[Capture] = []
+    refused: list[str] = []
+    for cand in candidates:
+        try:
+            records.append(compare(baseline, cand, library=library))
+            accepted.append(cand)
+        except CaptureError as exc:
+            refused.append(f"{cand.path.name}: {exc}")
+    if not records:
+        raise CaptureError(
+            "no arm could be compared against this baseline:\n  "
+            + "\n  ".join(refused))
+
+    unfingerprintable: list[str] = []
+    if fingerprint is None:
+        for source in (baseline, *accepted):
+            try:
+                fingerprint = fingerprint_of(source)
+                break
+            except CaptureError as exc:
+                # Its own list, not ``refused``. These arms were compared and
+                # their measurements are in the export; saying they were refused
+                # would tell the operator a result was dropped when it was kept.
+                unfingerprintable.append(f"{source.path.name}: {exc}")
+        if fingerprint is None:
+            raise CaptureError(
+                "neither the baseline nor any accepted arm could be "
+                "fingerprinted, so these results cannot be filed against a "
+                "workload the loop would recognise. Pass --fingerprint, or "
+                "capture with tracing on:\n  " + "\n  ".join(unfingerprintable))
+
+    if dry_run:
+        return str(export)
+
     out_dir.mkdir(parents=True, exist_ok=True)
+    # The sidecar first. The export is what the "already exists" check guards, so
+    # publishing it before the account of what was refused means a failure in
+    # between leaves records on disk, no reasons beside them, and a retry
+    # refused. Written in the order a reader needs them to be complete.
+    if refused or unfingerprintable:
+        # Beside the export, not inside it: the export is the evidence the
+        # ranking reads, and an arm that could not be compared is not evidence
+        # about a lever. It still has to be visible, or a sweep of nine that
+        # ingested four looks like a sweep of four.
+        #
+        # The two lists are separate because they mean opposite things to a
+        # reader checking a partial sweep. ``refused`` is a measurement that did
+        # not make it in. ``not_fingerprintable`` is one that did, from an arm
+        # that merely could not supply the workload digest.
+        (out_dir / "ingest_refused.json").write_text(
+            json.dumps({"refused": refused,
+                        "not_fingerprintable": unfingerprintable}, indent=2) + "\n")
     prov = Provenance(
         workload_id="vllm-serve",
-        fingerprint=fingerprint or fingerprint_of(candidate),
+        fingerprint=fingerprint,
         run_id=run_id or out_dir.name,
         git_sha="", gitm_version="", started_at_ns=0, ended_at_ns=0,
     )
-    return write_verification([record], prov, export, gpu_sku=gpu_sku)
+    return write_verification(records, prov, export, gpu_sku=gpu_sku)
