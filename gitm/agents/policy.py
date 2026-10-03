@@ -4,11 +4,23 @@ Ranking is a precedence tuple rather than one blended number, for the reason
 :mod:`gitm.playbook.match` gives: terms answering different questions should not
 be collapsed into a scalar where one can quietly outvote another. Gate first,
 then evidence quality, then magnitude, then a deterministic tie-break.
+
+``recoverable`` adds a second pre-filter beside the safety one, and it is the
+only place the trace decides *whether* a lever is a candidate rather than just
+how it scores. The two are different questions: ``predict_delta`` asks how much
+of the step a lever touches, and an op-scoped lever aimed at a region already
+running at its predicted floor scores well on that and can recover nothing. It
+is a filter and not a term in the sort on purpose — ``recoverable`` is a
+duration and ``expected_delta_mean`` is a fraction of the step, so a product of
+them is not a quantity anything measures (:mod:`gitm.agents.targeting` declines
+the same combination for the same reason). Dropping a lever that provably cannot
+help needs no new arithmetic; ordering the survivors by how much they might help
+would, and that stays an open question.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from gitm.kernels.spec import InterventionSpec
@@ -49,6 +61,55 @@ class Policy:
     use_history: bool = False
 
 
+def _at_its_floor(
+    spec: InterventionSpec, recoverable: Mapping[str, float | None]
+) -> str | None:
+    """Why this lever cannot recover anything, or ``None`` if it might.
+
+    The question is narrower than "does this lever touch a region at its floor".
+    It is "does this lever's *gain* come from making that region faster" — only
+    then does the region's floor bound what the lever can deliver. So the lever
+    has to have said so, via ``recovers_kernel_time``.
+
+    That rules out most of the catalogue, correctly. Five of the six levers
+    scoped to ``attn_score_value`` work through cache capacity, host swap or
+    avoided recomputation rather than through faster attention kernels, and none
+    of them need attention to be above its floor to pay off. ``applies_to_kernels``
+    answers which kernels a lever touches, which is what coverage needs; reading
+    it as a claim about mechanism is a different and wrong question, and would
+    reject those five on a sound measurement.
+
+    A ``whole_step`` lever is never ruled out: it reshapes the step itself —
+    batch shape, admission order, graph capture — so no per-op gap speaks to it.
+
+    Then, per op, three states, and the lever survives any of them:
+
+    * **present and positive** — the region is over its floor. Keep.
+    * **present and ``None``** — the op's layers disagree and the gap cannot be
+      judged (see :func:`~gitm.optimizer.monitor.recoverable_by_op`). Keep: an
+      unanswered question is not a no.
+    * **absent** — no kernel of that op was classified in this window. Keep.
+      Absence is ambiguous between "did not run" and "ran but the classifier
+      could not name it", and on a trace where most kernels match no graph op the
+      second is the common case. Rejecting on absence would discard levers for a
+      reason that is about graph coverage rather than about the lever.
+
+    A lever is dropped only when **every** op it names was measured, soundly, at
+    or under its predicted floor. Every op it names, not every op that happened
+    to be in the map: one op at its floor beside another that was never judged is
+    partial evidence, and the catalogue does carry multi-op levers
+    (``quantization_awq`` names five) where that distinction decides the outcome.
+    """
+    if spec.whole_step or not spec.applies_to_kernels:
+        return None
+    if not spec.recovers_kernel_time:
+        return None
+    judged = [(op, recoverable.get(op)) for op in spec.applies_to_kernels]
+    if any(gap is None or gap > 0 for _, gap in judged):
+        return None
+    return ", ".join(op for op, _ in judged) + " at predicted floor"
+
+
 def select_interventions(
     trace: Trace,
     library: Iterable[InterventionSpec],
@@ -59,6 +120,7 @@ def select_interventions(
     history: History | None = None,
     gpu_sku: str | None = None,
     fingerprint: str | None = None,
+    recoverable: Mapping[str, float | None] | None = None,
 ) -> list[RankedCandidate]:
     """Rank the library for this trace, rejected candidates last.
 
@@ -69,6 +131,12 @@ def select_interventions(
     about an MI355X, and scoring one from the other is the mistake the record's
     GPU key exists to prevent. No SKU therefore means no substitution, not a
     guess at which box the record came from.
+
+    ``recoverable`` maps op to seconds above its predicted floor
+    (:func:`gitm.optimizer.monitor.recoverable_by_op`). Passed in rather than
+    derived, for the same reason ``history`` is: ranking stays a pure function of
+    what it is given. Omit it and nothing is gated on the trace, which is the
+    behaviour every caller had before.
     """
     use_history = policy.use_history and history is not None and gpu_sku is not None
     candidates: list[RankedCandidate] = []
@@ -79,6 +147,10 @@ def select_interventions(
             ok, why = applicable(spec, ctx)
             if not ok:
                 reason = f"not_applicable: {why}"
+        if reason is None and recoverable is not None:
+            at_floor = _at_its_floor(spec, recoverable)
+            if at_floor is not None:
+                reason = f"no_recoverable_time: {at_floor}"
         if reason is None and policy.skip_high_risk and spec.safety.tier == "high_risk":
             reason = "policy.skip_high_risk"
         elif reason is None and (spec.safety.requires_qualification_commit and not policy.require_qualification_commit):

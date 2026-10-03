@@ -230,3 +230,77 @@ def test_replay_validation_within_tolerance():
     assert result.passed
     assert result.mean_abs_rel_err <= 0.20
     assert result.frac_within_tol > 0.7
+
+
+# ── recoverable_by_op: time above the floor, without a step count ────────────
+
+
+def _res(*entries):
+    """A Residuals holding hand-built per-kernel entries."""
+    from gitm.optimizer.monitor import KernelResidual, Residuals
+
+    r = Residuals()
+    for op, t_obs, t_pred, n_classes, layer in entries:
+        r.per_kernel.append(KernelResidual(
+            op=op, layer=layer, r_kt=(t_obs - t_pred) / t_pred, r_mt=None,
+            t_obs_s=t_obs, t_pred_s=t_pred, n_classes=n_classes,
+        ))
+    return r
+
+
+def test_recoverable_sums_each_launch_against_its_own_prediction():
+    """No step count anywhere: every residual is already one launch against the
+    prediction for that launch, so the gaps just add up."""
+    from gitm.optimizer.monitor import recoverable_by_op
+
+    got = recoverable_by_op(_res(
+        ("gemm", 0.003, 0.001, 1, 0),   # 2 ms over
+        ("gemm", 0.002, 0.001, 1, 1),   # 1 ms over
+        ("attn", 0.001, 0.001, 1, 0),   # at its floor
+    ))
+    assert got["gemm"] == pytest.approx(0.003)
+    assert got["attn"] == 0.0
+
+
+def test_a_kernel_under_its_floor_does_not_offset_one_over_it():
+    """Recoverable time is per launch and cannot go negative: a fast kernel is
+    not headroom the slow one can borrow."""
+    from gitm.optimizer.monitor import recoverable_by_op
+
+    got = recoverable_by_op(_res(
+        ("gemm", 0.0005, 0.001, 1, 0),  # under
+        ("gemm", 0.003, 0.001, 1, 1),   # 2 ms over
+    ))
+    assert got["gemm"] == pytest.approx(0.002)
+
+
+def test_an_interval_residual_at_zero_is_unjudgeable_not_at_floor():
+    """Its prediction is whichever layer sits nearest the observation, so the
+    gap is biased to zero by construction. Reporting 0.0 would let the policy
+    discard a lever aimed at a region that is genuinely over."""
+    from gitm.optimizer.monitor import recoverable_by_op
+
+    got = recoverable_by_op(_res(("moe_routed", 0.001, 0.001, 3, None)))
+    assert got["moe_routed"] is None
+
+
+def test_a_sound_positive_gap_survives_an_interval_kernel_beside_it():
+    """The interval kernels can only add to a positive gap, so the number is
+    still sound and more useful than 'unjudgeable'."""
+    from gitm.optimizer.monitor import recoverable_by_op
+
+    got = recoverable_by_op(_res(
+        ("moe_routed", 0.003, 0.001, 1, 0),      # point, 2 ms over
+        ("moe_routed", 0.001, 0.001, 3, None),   # interval, reads zero
+    ))
+    assert got["moe_routed"] == pytest.approx(0.002)
+
+
+def test_an_op_with_no_kernels_is_absent_rather_than_zero():
+    """Absence has to stay distinguishable from 'ran at its floor': a kernel the
+    classifier could not name never reaches residuals at all."""
+    from gitm.optimizer.monitor import recoverable_by_op
+
+    got = recoverable_by_op(_res(("gemm", 0.002, 0.001, 1, 0)))
+    assert "attn" not in got
+    assert recoverable_by_op(_res()) == {}

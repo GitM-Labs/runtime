@@ -61,7 +61,7 @@ from gitm.optimizer.deviation import deviation_summary, deviation_trace, write_d
 from gitm.optimizer.dr import attribute_dr
 from gitm.optimizer.history import load_history
 from gitm.optimizer.measure import measure_trace, measurement_claims, measurement_summary
-from gitm.optimizer.monitor import check_invariants, residuals
+from gitm.optimizer.monitor import check_invariants, recoverable_by_op, residuals
 from gitm.optimizer.qualification import qualify
 from gitm.optimizer.report import Claim, build_provenance, write_report
 from gitm.optimizer.scheduler_attribution import scheduler_causes
@@ -1066,9 +1066,35 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             "gpu_sku": pctx.sku,
             "fingerprint": qual.fingerprint,
         }, indent=2))
+    # Where time is actually recoverable, per op, from the residuals already
+    # computed above. This is the first thing in selection that depends on the
+    # trace rather than on the catalogue: a lever whose gain comes from speeding
+    # up a region measured at its predicted floor is not a candidate, however
+    # well it scores.
+    #
+    # A floor is only usable here if it was priced for this run, which takes two
+    # things and not one:
+    #
+    # * the graph must be this model's. Against a default dense graph the floors
+    #   describe another model entirely.
+    # * the hardware peaks must have resolved. This one is the trap: the A100
+    #   fallback on a *faster* device predicts floors slower than the device
+    #   actually achieves, so observed comes in under predicted, every gap reads
+    #   zero, and the gate rejects the whole op-scoped catalogue on what looks
+    #   like a clean measurement. The hardware fallback is already recorded as
+    #   affecting residuals, and this gate consumes residuals.
+    #
+    # A defaulted *batch* is not in that list because it fails the other way: at
+    # batch 1 the floors are far too low, so everything reads as over its floor
+    # and nothing is filtered. Useless, but not wrong. Same for the kv_cache_len
+    # default, which understates the attention floor and so keeps attention
+    # levers rather than dropping them.
+    _floors_priced_for_this_run = (graph_default_why is None
+                                   and getattr(pctx, "peak", None) is not None)
+    _recoverable = recoverable_by_op(res) if _floors_priced_for_this_run else None
     ranked = select_interventions(trace, library, policy, top_n=cfg.top_n_interventions,
                                   ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
-                                  fingerprint=qual.fingerprint)
+                                  fingerprint=qual.fingerprint, recoverable=_recoverable)
     (run_dir / "ranked_candidates.json").write_text(
         json.dumps(
             [
@@ -1079,6 +1105,25 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 }
                 for c in ranked
             ],
+            indent=2,
+        )
+    )
+    # The gate's own input, saved beside what it decided. A lever dropped for
+    # "no_recoverable_time" is a claim about the trace, and the claim is only
+    # checkable if the measured gaps are written down next to it.
+    (run_dir / "recoverable_ops.json").write_text(
+        json.dumps(
+            {
+                "basis": ("per-kernel residuals against this model's graph"
+                          if _recoverable is not None else None),
+                "not_gated_because": (
+                    None if _recoverable is not None
+                    else "the predicted graph is a default, so its per-op floors "
+                         "describe another model" if graph_default_why is not None
+                    else "no GPU peaks resolved, so the floors were priced on the "
+                         "A100 fallback and a faster device reads as at its floor"),
+                "recoverable_s": _recoverable,
+            },
             indent=2,
         )
     )
@@ -1219,6 +1264,18 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 workload=workload, run_id=run_id, runner=runner)
             was = [x.spec.name for x in queue]
             if fresh is not None and fresh.kernels():
+                # Deliberately not gated on recoverable time. The fresh trace
+                # would have to be compared against ``graph``, which was priced
+                # for the engine as it opened — and by this point a kept
+                # whole-step candidate may have changed the batch shape the
+                # floors assume, so an op could read as at a floor that no
+                # longer describes the running workload. Re-pricing the graph
+                # needs the engine re-sampled, which this path does not do.
+                #
+                # Little is lost: the queue was already filtered at selection,
+                # so re-gating could only add rejections, and those are exactly
+                # the ones resting on the stale floors. Coverage is still
+                # recomputed per trace, which is what re-ranking is for.
                 queue = select_interventions(
                     fresh, [x.spec for x in queue], policy, top_n=len(queue),
                     ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,

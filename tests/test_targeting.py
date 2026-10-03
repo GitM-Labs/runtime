@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 
-from gitm.agents.targeting import levers_for, render_targets, targets
+from gitm.agents.targeting import levers_for, levers_naming, render_targets, targets
 from gitm.kernels.library import load_library
 from gitm.kernels.spec import Applicability, InterventionSpec, SafetyGate
 from gitm.optimizer.deviation_table import UNMODELED, from_trace
@@ -190,3 +190,31 @@ def test_layer_rows_stay_distinguishable_in_the_rendered_table(tmp_path):
 
     assert long_a in rendered, "the L10 row lost its layer suffix"
     assert long_b in rendered, "the L11 row lost its layer suffix"
+
+
+def test_both_sides_of_the_join_agree_on_what_aims_at_an_op(tmp_path):
+    """``levers_for`` (from a deviation row) and ``levers_naming`` (from an op,
+    which is how the policy gate reaches it) must mean the same thing. They
+    share one definition precisely so this cannot drift."""
+    library = [_spec("a", ["moe_routed"]), _spec("b", ["gemm"]), _spec("c", [])]
+    row = _one_row(tmp_path, "fused_moe_kernel", "moe_routed").rows[0]
+    assert row.op == "moe_routed"
+    assert levers_for(row, library) == levers_naming(row.op, library)
+    assert [s.name for s in levers_naming("moe_routed", library)] == ["a"]
+
+
+def test_unmodeled_has_no_levers_even_though_the_raw_join_would_match():
+    """The guard belongs to the row, not the join: UNMODELED is a coverage gap,
+    and a lever naming it literally would otherwise be reported as aimed at it."""
+    from gitm.optimizer.deviation_table import DeviationRow
+
+    library = [_spec("literal", [UNMODELED])]
+    row = DeviationRow(
+        region=UNMODELED, op=UNMODELED, layer=None, phase="decode", bound=None,
+        roofline_bound=None, bound_mixed=False, kernels=1, observed_ms=1.0,
+        predicted_ms=None, gap_ms=None, recoverable_ms=0.0, share_of_device=1.0,
+        gap_share=0.0, modeled=False, phase_confidence=1.0,
+        floor_attribution="none", verdict="unmodeled",
+    )
+    assert levers_for(row, library) == []
+    assert len(levers_naming(UNMODELED, library)) == 1

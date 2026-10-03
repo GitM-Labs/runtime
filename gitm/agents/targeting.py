@@ -45,7 +45,7 @@ from gitm.optimizer.deviation_table import (
     rank_by_recoverable,
 )
 
-__all__ = ["Target", "levers_for", "targets", "render_targets"]
+__all__ = ["Target", "levers_for", "levers_naming", "targets", "render_targets"]
 
 
 @dataclass(frozen=True)
@@ -67,16 +67,27 @@ class Target:
         return not self.levers
 
 
-def levers_for(row: DeviationRow, library: Iterable[InterventionSpec]) -> list[InterventionSpec]:
-    """Levers that name ``row.op`` in their declared scope.
+def levers_naming(op: str, library: Iterable[InterventionSpec]) -> list[InterventionSpec]:
+    """Levers that name ``op`` in their declared scope.
 
-    Op identity only — no substring fallback. A lever earns a row by naming the
-    op the graph and the classifier agree on, and a coincidental substring is how
-    an untargeted lever gets tagged as targeted.
+    Op identity only — no substring fallback. A lever earns an op by naming the
+    one the graph and the classifier agree on, and a coincidental substring is
+    how an untargeted lever gets tagged as targeted.
+
+    Split out from :func:`levers_for` because the same join is now made from two
+    different sides: from a deviation row here, and from the per-kernel residuals
+    in :func:`gitm.agents.policy.select_interventions`, which has no table. One
+    definition, so the two cannot drift into disagreeing about what "aims at"
+    means.
     """
+    return [s for s in library if op in s.applies_to_kernels]
+
+
+def levers_for(row: DeviationRow, library: Iterable[InterventionSpec]) -> list[InterventionSpec]:
+    """Levers that name ``row.op`` in their declared scope."""
     if row.op == UNMODELED:
         return []
-    return [s for s in library if row.op in s.applies_to_kernels]
+    return levers_naming(row.op, library)
 
 
 def targets(

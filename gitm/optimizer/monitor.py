@@ -204,6 +204,48 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
     return res
 
 
+def recoverable_by_op(res: Residuals) -> dict[str, float | None]:
+    """Per op: seconds observed above its predicted floor, or ``None`` if unjudgeable.
+
+    Each residual already pairs one kernel launch against the prediction for
+    *that* launch, so summing ``max(0, t_obs - t_pred)`` over an op's kernels
+    gives the time it spent above its floor across the window directly. That
+    matters: :mod:`gitm.optimizer.deviation_table` reaches the same quantity by
+    scaling a one-step floor by a step count, and it says plainly that nothing
+    can derive that count from a trace. Pairing per launch needs no step count
+    at all, which is what makes this usable from inside the loop.
+
+    ``None`` means *cannot be judged*, and is not the same as zero. An
+    interval-based residual (the op's layers disagree and this kernel's layer is
+    unknown — see :class:`KernelResidual.interval_based`) is measured against
+    whichever layer's prediction sits nearest the observation, so its gap is
+    biased toward zero by construction. Reading that as "at its floor" would
+    discard a lever aimed at a region that is genuinely over, so an op whose gap
+    comes out at zero while it still has interval-based kernels is reported as
+    unjudgeable instead. A positive gap from the point residuals alone is sound
+    either way — the interval kernels can only add to it — so it is reported as
+    the number.
+
+    An op with no kernels in the window simply does not appear. That is
+    deliberately *not* reported as zero: a kernel whose op the classifier could
+    not name is excluded from residuals altogether, so absence means "no
+    evidence here", not "ran at its floor".
+    """
+    point: dict[str, float] = {}
+    interval: dict[str, bool] = {}
+    for r in res.per_kernel:
+        if r.interval_based or r.t_obs_s is None or r.t_pred_s is None:
+            interval[r.op] = True
+            point.setdefault(r.op, 0.0)
+            continue
+        point[r.op] = point.get(r.op, 0.0) + max(0.0, r.t_obs_s - r.t_pred_s)
+
+    out: dict[str, float | None] = {}
+    for op, gap in point.items():
+        out[op] = gap if gap > 0 else (None if interval.get(op) else 0.0)
+    return out
+
+
 def _serialized_fraction(obs: list[KernelEvent]) -> float:
     """Fraction of adjacent kernel pairs that executed serialized.
 
