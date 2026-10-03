@@ -28,7 +28,7 @@ from gitm.agents.autoresearch import (
     classify_bottleneck,
 )
 from gitm.agents.policy import Policy, select_interventions
-from gitm.kernels.library import load_library
+from gitm.kernels.library import load_library, parse_skips, skipped_by
 from gitm.optimizer.apply import (
     Applicator,
     DryRunApplicator,
@@ -254,6 +254,16 @@ class LoopConfig:
     #: always behaved. ``"recapture"`` traces the workload again after each
     #: applied candidate and re-ranks what is left against it.
     rerank: str = "off"
+    #: Levers this run must not try, as names or knobs with shell globs (see
+    #: :func:`gitm.kernels.library.skipped_by`). Merged with ``GITM_SKIP_LEVERS``
+    #: so a Kubernetes manifest can set it without a new flag in the pod spec.
+    #:
+    #: Exists because a lever can hang the model rather than merely regress: on
+    #: Kimi at TP=8 on ROCm, n-gram speculative decoding stalls in an RCCL
+    #: all-gather, and it ranks first in the catalogue, so every run met it
+    #: before anything else. Without this the only way past was to edit the
+    #: library.
+    skip_levers: tuple[str, ...] = ()
     # Optional explicit driver for the embedded/engine path. When unset, the
     # loop looks up ``workload`` in the workload registry (gitm.workloads).
     workload_runner: WorkloadRunner | None = None
@@ -831,14 +841,87 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         )
     )
 
+    # Parsed here, above the curated-intervention branches below, because each of
+    # those *returns*. Parsing it at the catalogue instead left hft, openfold and
+    # edge applying the very lever the operator excluded, which is worse than the
+    # flag not existing: it was asked for and silently ignored.
+    _skips = parse_skips([*cfg.skip_levers, os.environ.get("GITM_SKIP_LEVERS") or ""])
+    _excluded: list[dict[str, str]] = []
+
+    def _record_skip(spec: Any, source: str) -> str | None:
+        """Note the exclusion of ``spec`` and return the pattern, or ``None``.
+
+        Deduplicated on lever and source: autoresearch proposes the same knob
+        repeatedly, and a count that grew with each proposal would describe the
+        proposer rather than what the run held back.
+        """
+        if not _skips:
+            return None
+        why = skipped_by(spec, _skips)
+        if why is None:
+            return None
+        entry = {"lever": spec.name, "knob": spec.knob, "pattern": why, "source": source}
+        if entry not in _excluded:
+            _excluded.append(entry)
+        return why
+
+    def _write_skips() -> None:
+        """Written whether or not anything was excluded, so an empty list is the
+        evidence that nothing was held back quietly."""
+        (run_dir / "skipped_levers.json").write_text(
+            json.dumps({"patterns": list(_skips), "excluded": _excluded}, indent=2))
+
+    def _with_skips(result: dict[str, Any]) -> dict[str, Any]:
+        """Put the exclusion count in a curated path's summary too.
+
+        The curated results are built by their own functions and returned
+        straight out, so without this an operator comparing two run summaries
+        sees the count on a catalogue run and nothing on an hft one — and has to
+        open the run directory to find out whether anything was held back.
+        """
+        summary = result.get("summary")
+        if isinstance(summary, dict):
+            summary["n_skipped_levers"] = len(_excluded)
+        return result
+
+    def _curated_skipped(spec_fn: Any, source: str) -> bool:
+        """Whether the one curated lever on this workload was excluded.
+
+        Read through a factory because each lives behind a lazy import in its own
+        result function, and importing all three eagerly would pull three
+        benchmark stacks into every run.
+        """
+        if not _skips:
+            return False
+        try:
+            spec = spec_fn()
+        except Exception:  # noqa: BLE001 - an unimportable benchmark is not a skip
+            return False
+        if _record_skip(spec, source) is None:
+            return False
+        _write_skips()
+        return True
+
+    # Written before the curated branches, each of which returns: the file is
+    # promised whether or not anything was excluded, and an empty list is the
+    # evidence that nothing was held back. Rewritten later as exclusions are
+    # recorded.
+    _write_skips()
+
     # HFT carries a real, output-verified intervention on its runner. Apply+prove
     # it through the rollback gate — the A/B runs on the active backend, so the
     # delta is measured even on a box without CUPTI. (Runs before the empty-trace
     # guard for that reason; attribution below is included only if kernels exist.)
     if workload in _HFT_INTERVENTION_WORKLOADS:
         applicator = getattr(runner, "applicator", None)
-        if applicator is not None:
-            return _hft_intervention_result(
+
+        def _hft_spec():
+            from gitm.benchmarks.hft.optimize import hft_intervention_spec
+
+            return hft_intervention_spec()
+
+        if applicator is not None and not _curated_skipped(_hft_spec, "hft"):
+            return _with_skips(_hft_intervention_result(
                 degradations=degradations,
                 run_dir=run_dir,
                 run_id=run_id,
@@ -848,7 +931,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 applicator=applicator,
                 started_ns=started_ns,
                 trace_path=trace_path,
-            )
+            ))
 
     # OpenFold/AF2 carries the bf16 intervention on its runner. Same pattern as
     # HFT: apply+prove through the rollback gate (measure() runs the fp32-vs-bf16
@@ -856,8 +939,14 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # still runs on a box without CUPTI; attribution is included if kernels exist.
     if workload in _OPENFOLD_INTERVENTION_WORKLOADS:
         applicator = getattr(runner, "applicator", None)
-        if applicator is not None:
-            return _openfold_intervention_result(
+
+        def _openfold_spec():
+            from benchmarks.biotech.optimize import openfold_intervention_spec
+
+            return openfold_intervention_spec()
+
+        if applicator is not None and not _curated_skipped(_openfold_spec, "openfold"):
+            return _with_skips(_openfold_intervention_result(
                 degradations=degradations,
                 run_dir=run_dir,
                 run_id=run_id,
@@ -867,7 +956,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 applicator=applicator,
                 started_ns=started_ns,
                 trace_path=trace_path,
-            )
+            ))
 
     # Edge (kitti/nuscenes) carries the fp16 intervention on its runner. Same
     # pattern as HFT/AF2: apply+prove through the rollback gate (measure() runs
@@ -875,8 +964,18 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # trace guard so the A/B still runs on a box without CUPTI.
     if workload in _EDGE_INTERVENTION_WORKLOADS:
         applicator = getattr(runner, "applicator", None)
-        if applicator is not None:
-            return _edge_intervention_result(
+
+        def _edge_spec():
+            from gitm.benchmarks.edge.optimize import edge_intervention_spec
+
+            # The same resolution _edge_intervention_result makes. Checking the
+            # module default instead meant the guard and the run disagreed about
+            # which lever this is: excluding the applicator's own lever did not
+            # stop it, and excluding the default one stopped a lever nobody named.
+            return getattr(applicator, "spec", None) or edge_intervention_spec()
+
+        if applicator is not None and not _curated_skipped(_edge_spec, "edge"):
+            return _with_skips(_edge_intervention_result(
                 degradations=degradations,
                 run_dir=run_dir,
                 run_id=run_id,
@@ -886,7 +985,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 applicator=applicator,
                 started_ns=started_ns,
                 trace_path=trace_path,
-            )
+            ))
 
     # Guard: if the tracer captured nothing (no GPU/shim, or the workload never
     # ran), do NOT proceed to attribution + emit claims — that fabricates a
@@ -1044,11 +1143,17 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # pctx was built earlier (Phase 1) so its hardware peak could feed predict_graph.
     # Relative/swept levers resolve against the live engine here, once, before
     # ranking. See expand_relative_candidates.
+    # Levers the operator excluded, applied before anything resolves them against
+    # the engine, and outside load_library so the exclusion covers this run only
+    # and the catalogue on disk stays the catalogue.
+    _catalogue = [s for s in load_library(workload=workload)
+                  if _record_skip(s, "catalogue") is None]
     library = [
         resolved
-        for s in load_library(workload=workload)
+        for s in _catalogue
         for resolved in expand_relative_candidates(s, cfg.engine)
     ]
+    _write_skips()
     policy = Policy(require_qualification_commit=qual.commit, skip_high_risk=not qual.commit,
                     use_history=use_history)
     # Read once per run, filtered to this box. A lever measured on another GPU is
@@ -1252,6 +1357,13 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         proposer = FallbackProposer(EngineArgsProposer(), TableProposer())
 
         def _unenactable(spec: Any) -> str | None:
+            # The exclusion has to reach here too. Autoresearch proposes its own
+            # candidates rather than drawing from the catalogue, so a knob the
+            # operator excluded because it hangs the model would otherwise come
+            # straight back as a proposal.
+            why = _record_skip(spec, "autoresearch")
+            if why is not None:
+                return f"excluded by --skip-lever {why!r}"
             if (
                 cfg.engine is not None
                 and live_restart_fn is None
@@ -1298,6 +1410,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             reason=f"budget {cfg.budget} exhausted by Phase 4",
             severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,)))
     degradations.extend(ar_run.degradations)
+    # Again, now that autoresearch has had its proposals vetoed: an exclusion
+    # that only stopped a proposal is still something the run held back, and a
+    # file written before that pass would report none of them.
+    _write_skips()
 
     ar_granger_evidence = ", ".join(
         f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
@@ -1424,6 +1540,9 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         "n_rejected": len(rejected),
         "bottleneck_class": ar_run.bottleneck_class,
         "n_autoresearch": len(ar_run.results),
+        # In the summary, not only the run dir: a reader comparing two runs needs
+        # to know one of them was not asked to try everything.
+        "n_skipped_levers": len(_excluded),
         "scheduler_stats": asdict(sched_summary) if sched_stats.samples else None,
         "report_path": str(run_dir / "report.md"),
     }

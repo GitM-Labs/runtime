@@ -91,6 +91,14 @@ def _parser() -> argparse.ArgumentParser:
              "'recapture' traces the workload again after each applied candidate "
              "and re-ranks what is left against it; 'off' keeps the opening order.",
     )
+    run.add_argument(
+        "--skip-lever", action="append", metavar="PATTERN", default=None,
+        help="Do not try this lever. Matches its name or the knob it sets, with "
+             "shell globs and ignoring case (e.g. 'speculative*' or "
+             "num_speculative_tokens). Repeatable, or comma-separated. Also read "
+             "from GITM_SKIP_LEVERS. A skipped lever is recorded in the run so it "
+             "is not mistaken for one that was tried and failed.",
+    )
     hist = run.add_mutually_exclusive_group()
     hist.add_argument(
         "--use-history", dest="use_history", action="store_true", default=None,
@@ -459,6 +467,7 @@ def main(argv: list[str] | None = None) -> int:
             scratch=args.scratch,
             use_history=_resolve_use_history(args),
             rerank=args.rerank,
+            skip_levers=args.skip_lever,
         )
         summary = result.get("summary", {})
         if args.report is not None:
