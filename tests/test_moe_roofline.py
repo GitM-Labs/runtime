@@ -459,9 +459,46 @@ def test_batch_config_from_stats_uses_observed_concurrency():
     class Sched:
         n_samples = 12
         mean_running = 15.6
+        mean_bounded_inflight = 64.0  # ignored: the running count is the batch
+        max_num_seqs = 256
 
-    cfg = _batch_config_from_stats(Sched())
+    cfg, source = _batch_config_from_stats(Sched())
     assert cfg is not None and cfg.batch == 16  # rounded
+    assert source == "running"
+
+
+def test_batch_config_falls_back_to_in_flight_requests():
+    """The offline engine keeps its scheduler in another process, so the running
+    count is unreachable and the in-flight count is all there is."""
+    from gitm.scheduler.loop import _batch_config_from_stats
+
+    class Sched:
+        n_samples = 12
+        mean_running = None
+        mean_bounded_inflight = 31.4
+        max_num_seqs = 256
+
+    cfg, source = _batch_config_from_stats(Sched())
+    assert cfg is not None and cfg.batch == 31
+    assert source == "unfinished"
+
+
+def test_batch_config_takes_the_bound_already_applied_per_sample():
+    """The bounding is per sample, in ``summarize``. This reads the bounded field
+    and does not re-apply a cap to an average, which would be the wrong number
+    (see test_each_sample_is_bounded_before_averaging_not_after)."""
+    from gitm.scheduler.loop import _batch_config_from_stats
+
+    class Sched:
+        n_samples = 12
+        mean_running = None
+        mean_unfinished = 400.0        # raw, unbounded — must not be used
+        mean_bounded_inflight = 17.0
+        max_num_seqs = 32
+
+    cfg, source = _batch_config_from_stats(Sched())
+    assert cfg is not None and cfg.batch == 17
+    assert source == "unfinished"
 
 
 def test_batch_config_falls_back_when_no_samples():
@@ -472,14 +509,29 @@ def test_batch_config_falls_back_when_no_samples():
     class NoSamples:
         n_samples = 0
         mean_running = 8.0
+        mean_bounded_inflight = 8.0
+        max_num_seqs = 256
 
     class NoRunning:
         n_samples = 5
         mean_running = None
+        mean_bounded_inflight = None
+        max_num_seqs = 256
 
-    assert _batch_config_from_stats(None) is None
-    assert _batch_config_from_stats(NoSamples()) is None
-    assert _batch_config_from_stats(NoRunning()) is None
+    class NoCapacity:
+        """An in-flight count with nothing to bound it stays unused: unbounded it
+        is queue depth plus batch, which on a drain workload is neither.
+        ``summarize`` leaves the bounded field None in that case."""
+        n_samples = 5
+        mean_running = None
+        mean_unfinished = 400.0
+        mean_bounded_inflight = None
+        max_num_seqs = None
+
+    assert _batch_config_from_stats(None) == (None, None)
+    assert _batch_config_from_stats(NoSamples()) == (None, None)
+    assert _batch_config_from_stats(NoRunning()) == (None, None)
+    assert _batch_config_from_stats(NoCapacity()) == (None, None)
 
 
 def test_wrong_batch_badly_misprices_expert_traffic():
@@ -505,3 +557,28 @@ def test_total_prediction_is_finite_and_positive_across_shapes():
             assert g.total_pred_s > 0
             assert all(n.prediction.t_pred_s >= 0 for n in g.nodes)
             assert all(n.prediction.bytes > 0 for n in g.nodes)
+
+
+def test_a_graph_carries_the_batch_it_was_priced_with_defaults_included():
+    """``predicted_graph.json`` reports the batch by reading it off the graph, so
+    the graph has to hold the effective config and not just what was passed in.
+    Every ``predict_*`` entry point does ``batch = batch or BatchConfig()`` and
+    stores the result; rebuilding that fallback at the artifact would be a second
+    copy of it, free to drift from the one that did the pricing."""
+    from gitm.planner.graph import predict_graph
+    from gitm.planner.moe_graph import predict_moe_graph
+    from gitm.planner.roofline import BatchConfig, ShardingConfig
+
+    defaulted = predict_graph(model=ModelSpec(), hw=H100, batch=None)
+    assert defaulted.batch.batch == 1          # the documented default
+    assert defaulted.batch.kv_cache_len == 128
+
+    given = predict_graph(model=ModelSpec(), hw=H100, batch=BatchConfig(batch=17))
+    assert given.batch.batch == 17
+
+    # Same invariant on the MoE path, which is the one the cluster run took.
+    from gitm.planner.moe_graph import spec_from_hf_config
+    from tests.test_moe_graph import V4_BASE_CONFIG
+    moe = predict_moe_graph(spec_from_hf_config(V4_BASE_CONFIG), H100, None, ShardingConfig())
+    assert moe.batch.batch == 1
+    assert moe.batch.kv_cache_len == 128

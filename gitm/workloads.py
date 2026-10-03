@@ -595,6 +595,16 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     # while GITM_RESTART_MODE=serial releases the baseline before candidate build.
     _gpu_mem = os.environ.get("GITM_VLLM_GPU_MEM")
     _base_kwargs: dict[str, Any] = {}
+    # Ask the engine to keep its statistics. ``LLM()`` injects
+    # ``disable_log_stats=True`` whenever the caller does not pass it
+    # (vllm/entrypoints/llm.py), which switches off two things gitm reads: the
+    # scheduler's ``make_stats()``, which returns ``None`` outright when stats
+    # are off, and the per-request ``RequestStateStats`` that carry arrival and
+    # first-token timestamps. Without them the decode batch falls back to 1 and
+    # every residual is measured against a ceiling ~30x under the floor, and
+    # TTFT/TPOT come back empty. Set before GITM_VLLM_EXTRA_JSON is merged, so a
+    # run that wants the overhead gone can still say so.
+    _base_kwargs["disable_log_stats"] = False
     if _gpu_mem is not None:
         _base_kwargs["gpu_memory_utilization"] = float(_gpu_mem)
     # Optional KV-cache dtype (GITM_VLLM_KV_DTYPE, e.g. "fp8"). Lets the baseline

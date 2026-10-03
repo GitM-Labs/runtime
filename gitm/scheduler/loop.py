@@ -386,20 +386,40 @@ _ATTN_ALIASES: dict[str, tuple[str, ...]] = {
 _QUANT_WEIGHT_BYTES: dict[str, int] = {"fp8": 1, "compressed-tensors": 1, "modelopt_fp8": 1}
 
 
-def _batch_config_from_stats(sched: Any):
-    """A :class:`BatchConfig` carrying the *observed* decode batch, or ``None``.
+def _batch_config_from_stats(sched: Any) -> tuple[Any, str | None]:
+    """``(BatchConfig, source)`` carrying the *observed* decode batch, or ``(None, None)``.
 
     ``predict_graph``'s default is ``batch=1``. That is wrong for any real serving
     window and especially wrong for a mixture-of-experts model, where weight
     traffic scales with the distinct experts a batch activates: at top-8 of 256,
     a batch of 1 touches 8 experts but a batch of 16 touches ~100, so scoring a
     batch-16 step against the batch-1 ceiling understates expert traffic by more
-    than 10x. ``mean_running`` is vLLM's own count of concurrently running
-    sequences, which is exactly the decode batch.
+    than 10x.
 
-    Returns ``None`` (caller falls back to the default) when no scheduler samples
-    were taken — a CPU box, a dry run, or an engine that exposes no stats. Better
-    a documented default than a fabricated batch.
+    Two sources, in order of directness:
+
+    ``mean_running`` is vLLM's own count of concurrently running sequences, which
+    *is* the decode batch. It is also the one most often missing: it comes off the
+    scheduler, and for the offline ``LLM`` engine the scheduler lives in a separate
+    process (``VLLM_ENABLE_V1_MULTIPROCESSING`` defaults on), so nothing in this
+    process can reach it.
+
+    ``mean_bounded_inflight`` comes from ``get_num_unfinished_requests()``, a
+    method on the engine handle itself and therefore readable whatever the engine
+    core does. It counts requests in flight rather than requests decoding, so
+    each sample is an upper bound: anything the scheduler has admitted is
+    decoding, anything it has not is queued. Bounding each sample by
+    ``max_num_seqs`` — the most the engine will ever decode at once — turns that
+    into the batch wherever the queue is what the surplus is, which is the shape
+    of every workload gitm submits (all prompts at once, then drain). The
+    bounding happens per sample in :func:`~gitm.tracer.vllm_stats.summarize`,
+    which is not the same as bounding the average and is the reason this reads a
+    separate field rather than clamping ``mean_unfinished`` here. Without a
+    capacity to bound against it stays unused rather than becoming a guess.
+
+    Returns ``(None, None)`` when neither is available — a CPU box, a dry run, or
+    an engine that exposes no stats. Better a documented default than a fabricated
+    batch, and the caller records which of the two it got.
 
     ``kv_cache_len`` is deliberately left at its default: nothing in the sampled
     stats gives a token count (``peak_gpu_cache_usage`` is a fraction of blocks,
@@ -409,11 +429,19 @@ def _batch_config_from_stats(sched: Any):
     from gitm.planner.roofline import BatchConfig
 
     if sched is None or getattr(sched, "n_samples", 0) == 0:
-        return None
+        return None, None
+
+    def _batch(value: Any) -> Any:
+        return BatchConfig(batch=max(int(round(float(value))), 1))
+
     running = getattr(sched, "mean_running", None)
-    if running is None or running < 1:
-        return None
-    return BatchConfig(batch=max(int(round(float(running))), 1))
+    if running is not None and running >= 1:
+        return _batch(running), "running"
+
+    bounded = getattr(sched, "mean_bounded_inflight", None)
+    if bounded is not None and bounded >= 1:
+        return _batch(bounded), "unfinished"
+    return None, None
 
 
 def _read_int_aliases(hf: Any, table: dict[str, tuple[str, ...]]) -> dict[str, Any]:
@@ -613,13 +641,27 @@ def _ab_evidence(ab: Any, rolled_back: bool, measured_under: Iterable[Any]) -> s
 
 
 def _record_graph_basis(
-    log: DegradationLog, *, pctx: Any, batch: Any, sched: Any, graph_default_why: str | None
+    log: DegradationLog, *, pctx: Any, batch: Any, batch_source: str | None,
+    sched: Any, graph_default_why: str | None,
 ) -> None:
     """Record each default the predicted graph was built on.
 
     The model is ``unreliable``: a default dense graph is another model, and
-    residuals against it describe nothing about this run. Hardware and batch are
+    residuals against it describe nothing about this run. Hardware is
     ``approximate``: the graph is still this model, priced under a stated default.
+
+    Having to default the *batch* is ``unreliable`` too, and used not to be.
+    ``approximate`` was the first reading, on the same grounds as hardware —
+    same model, stated default — but the measured gap on an MoE decode is ~30x
+    (5.1 ms/step predicted against ~157 ms observed, 74% of kernels matching no
+    graph op, 99.96% of residuals violating). A ceiling an order of magnitude
+    under the floor describes this run no better than the wrong model does: every
+    deviation computed against it is noise rather than a measurement with error
+    bars. So it belongs with the default dense graph, and it ``AFFECTS_CLAIMS``
+    as well as residuals, because the ranking reads the table it poisons.
+
+    A batch that was *observed* but bounded (see ``_batch_config_from_stats``)
+    stays ``approximate`` — that is a real measurement with a stated caveat.
     """
     if graph_default_why is not None:
         log.record(GRAPH_MODEL, used="default dense graph (Llama-2-7B shape)",
@@ -635,7 +677,14 @@ def _record_graph_basis(
         n = getattr(sched, "n_samples", 0) if sched is not None else 0
         log.record(GRAPH_BATCH, used="batch=1",
                    reason=("no scheduler samples (no engine stats in the window)" if not n
-                           else "scheduler samples carry no running-sequence count"),
+                           else "no running-sequence count and no in-flight count to "
+                                "fall back to (or no max_num_seqs to bound it)"),
+                   severity=UNRELIABLE, affects=(AFFECTS_RESIDUALS, AFFECTS_CLAIMS))
+    elif batch_source == "unfinished":
+        log.record(GRAPH_BATCH, used=f"batch={batch.batch} from in-flight requests",
+                   reason="the scheduler exposed no running count, so the batch is the "
+                          "mean in-flight request count clamped to max_num_seqs — an "
+                          "upper bound, exact only while nothing is queued",
                    severity=APPROXIMATE, affects=(AFFECTS_RESIDUALS,))
     log.record(GRAPH_BATCH, used="kv_cache_len=128 (BatchConfig default)",
                reason="the sampled scheduler stats carry no context length",
@@ -943,10 +992,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # larger, so predicting a batch-16 step at the batch-1 default understates
     # expert traffic ~12x. Read the real concurrency off the sampled scheduler
     # rather than defaulting.
-    _batch = _batch_config_from_stats(sched_summary)
+    _batch, _batch_source = _batch_config_from_stats(sched_summary)
     graph, family, graph_default_why = _execution_graph_basis(cfg.engine, _hw, _batch)
-    _record_graph_basis(degradations, pctx=pctx, batch=_batch, sched=sched_summary,
-                        graph_default_why=graph_default_why)
+    _record_graph_basis(degradations, pctx=pctx, batch=_batch, batch_source=_batch_source,
+                        sched=sched_summary, graph_default_why=graph_default_why)
     is_moe = family != "dense"
     _graph_summary: dict[str, Any] = {
         "graph": "moe" if is_moe else "dense",
@@ -968,6 +1017,25 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         )
     # What the graph was built from, beside what it is: a residual is only as
     # good as the model, hardware and batch it was predicted for.
+    #
+    # The batch is stated outright rather than left to be read out of ``basis``.
+    # ``basis`` is built from degradations, and a batch read straight off the
+    # engine's running count is not a degradation — so on the one path where the
+    # batch is fully trustworthy the artifact said nothing about it at all, and a
+    # reader could not tell which batch priced the graph or where it came from.
+    # That is the path whose number you most want recorded when comparing two
+    # runs.
+    # Read off the graph rather than rebuilt from ``_batch``: every predict_*
+    # entry point does ``batch = batch or BatchConfig()`` and stores the result,
+    # so the graph holds the config it was actually priced with, defaults
+    # included. Reconstructing it here would be a second copy of that fallback,
+    # free to drift from the one that did the work.
+    _eff_batch = getattr(graph, "batch", None)
+    _graph_summary["batch"] = {
+        "batch": getattr(_eff_batch, "batch", None),
+        "kv_cache_len": getattr(_eff_batch, "kv_cache_len", None),
+        "source": _batch_source or "default",
+    }
     _graph_summary["basis"] = [d.to_dict() for d in degradations
                                if d.stage in (GRAPH_MODEL, GRAPH_HARDWARE, GRAPH_BATCH)]
     (run_dir / "predicted_graph.json").write_text(json.dumps(_graph_summary, indent=2))

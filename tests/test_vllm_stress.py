@@ -141,6 +141,55 @@ def test_summarize_single_sample():
     assert summ.peak_running == 2
 
 
+def test_summarize_in_flight_ignores_the_idle_head_and_tail():
+    """The sampler snapshots before the workload is submitted and after it
+    drains. Averaging those zeros in would halve the batch the graph is priced
+    for, so only the samples that had work in flight count."""
+    from gitm.tracer.vllm_stats import SchedulerSample
+
+    samples = [SchedulerSample(t_ns=0, num_unfinished=0),
+               SchedulerSample(t_ns=1, num_unfinished=16),
+               SchedulerSample(t_ns=2, num_unfinished=16),
+               SchedulerSample(t_ns=3, num_unfinished=0)]
+    summ = summarize(samples, max_num_seqs=256)
+    assert summ.mean_unfinished == 16.0
+    assert summ.peak_unfinished == 16
+    assert summ.mean_bounded_inflight == 16.0  # nothing above capacity to bound
+    assert summ.max_num_seqs == 256
+
+
+def test_each_sample_is_bounded_before_averaging_not_after():
+    """gitm submits every prompt at once, so in-flight starts above capacity and
+    drains through it. Bounding the average instead of each sample reads such a
+    window as if it sat at capacity throughout: 64 and 2 in flight at a cap of 32
+    is a mean batch of 17, not 32."""
+    from gitm.tracer.vllm_stats import SchedulerSample
+
+    samples = [SchedulerSample(t_ns=0, num_unfinished=64),
+               SchedulerSample(t_ns=1, num_unfinished=2)]
+    summ = summarize(samples, max_num_seqs=32)
+    assert summ.mean_unfinished == 33.0        # the raw observation, unbounded
+    assert summ.mean_bounded_inflight == 17.0  # the batch
+    assert min(summ.mean_unfinished, 32) == 32.0  # what bounding the mean gives
+
+
+def test_bounded_inflight_needs_a_capacity():
+    from gitm.tracer.vllm_stats import SchedulerSample
+
+    summ = summarize([SchedulerSample(t_ns=0, num_unfinished=64)])
+    assert summ.mean_unfinished == 64.0
+    assert summ.mean_bounded_inflight is None
+
+
+def test_summarize_in_flight_absent_when_never_exposed():
+    from gitm.tracer.vllm_stats import SchedulerSample
+
+    summ = summarize([SchedulerSample(t_ns=0, num_waiting=3)])
+    assert summ.mean_unfinished is None and summ.peak_unfinished is None
+    assert summ.mean_bounded_inflight is None
+    assert summarize([]).mean_unfinished is None
+
+
 # --------------------------------------------------------------------------- #
 # scheduler_causes edge cases                                                 #
 # --------------------------------------------------------------------------- #
