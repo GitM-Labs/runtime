@@ -13,6 +13,7 @@ import os
 import re
 import time
 import uuid
+import warnings
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -40,7 +41,6 @@ from gitm.optimizer.attribution import attribute
 from gitm.optimizer.collective_signal import collective_causes, worst_device_comm
 from gitm.optimizer.degradation import (
     AB_PROBE,
-    AB_RESTART_MODE,
     AB_UNIT,
     AB_UNITS,
     AFFECTS_AB,
@@ -1337,13 +1337,20 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             "cannot_fit": applicator.restart_mode_warning,
         }, indent=2))
         if applicator.restart_mode_warning:
-            # Said once, at the start. The alternative is learning it from an
-            # OOM traceback per candidate, which is how the last run spent 93%
-            # of its budget.
-            degradations.record(
-                AB_RESTART_MODE, used="restart_mode='parallel'",
-                reason=applicator.restart_mode_warning,
-                severity=UNRELIABLE, affects=(AFFECTS_AB,))
+            # Warned, not recorded as a degradation. A run-wide AFFECTS_AB entry
+            # would mark every candidate unreliable, including the hot-swapped
+            # ones that never reach a rebuild — excluding their perfectly good
+            # measurements from history and from the report's verified count.
+            # The condition only harms candidates that need a restart, and those
+            # already carry their own error when the rebuild is refused.
+            #
+            # Said once, at the start, because the alternative is learning it
+            # from an OOM traceback per candidate: how the last run spent 93% of
+            # its budget.
+            warnings.warn(
+                "gitm: structural candidates cannot be measured in this run — "
+                + applicator.restart_mode_warning,
+                RuntimeWarning, stacklevel=2)
     else:
         applicator = DryRunApplicator()
 
