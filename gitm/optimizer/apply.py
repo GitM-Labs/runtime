@@ -464,16 +464,27 @@ class LiveEngineApplicator:
             engine, restart_mode, self._baseline_restart_fn)
         self.restart_mode_warning: str | None = None
         if restart_mode == "parallel" and restart_fn is not None:
-            # Against the baseline's own fraction, since no candidate is in hand
-            # yet. A lever that changes the fraction is checked again, with its
-            # own value, at the rebuild.
-            fits, why = parallel_restart_fits(engine)
+            # Against a candidate that inherits the baseline's fraction, since
+            # no real candidate is in hand yet. That covers most of the
+            # catalogue but not all of it, so this says what it actually
+            # checked: a lever that *lowers* gpu_memory_utilization can still
+            # fit, and is re-checked with its own value at the rebuild. Claiming
+            # structural candidates are impossible would have an operator
+            # dismiss a measurement that would have worked.
+            fits, _ = parallel_restart_fits(engine)
             if not fits:
+                room = max(1.0 - (gpu_fraction(engine) or 0.0), 0.0)
                 # Recorded, not raised: a run whose candidates are all
                 # hot-swappable never reaches a rebuild and should not be
                 # stopped here. The caller surfaces this so the operator learns
                 # it when the run starts rather than per dead candidate.
-                self.restart_mode_warning = why
+                self.restart_mode_warning = (
+                    f"the baseline holds {gpu_fraction(engine):.0%} of each "
+                    f"device, so in restart_mode='parallel' only a candidate "
+                    f"that lowers gpu_memory_utilization to {room:.2f} or less "
+                    f"can be built beside it. Every other structural candidate "
+                    f"will be refused. Use restart_mode='serial' to release the "
+                    f"baseline first, or build with GITM_VLLM_GPU_MEM<=0.50")
         self._restart_fn = restart_fn
         self._restart_mode = restart_mode
         self._getter = getter or get_knob
