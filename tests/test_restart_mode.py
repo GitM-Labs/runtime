@@ -146,3 +146,62 @@ def test_the_warning_is_raised_at_construction_not_per_candidate():
     assert _applicator(0.9, restart_mode="parallel").restart_mode_warning
     assert _applicator(0.45, restart_mode="parallel").restart_mode_warning is None
     assert _applicator(0.9, restart_mode="serial").restart_mode_warning is None
+
+
+# --- the candidate's own fraction, not twice the baseline's ----------------
+
+
+def test_a_lever_that_changes_the_fraction_is_measured_on_its_own_value():
+    """`gpu_memory_utilization_dynamic` exists to change this number, so the
+    candidate does not always ask for what the baseline holds. Doubling the
+    baseline gets that wrong in both directions."""
+    # Would pass a doubling check (0.45 x 2 = 0.9) and needs 135%.
+    fits, why = parallel_restart_fits(_Engine(0.45), {"gpu_memory_utilization": 0.9})
+    assert not fits and "135%" in why and "candidate asks for 90%" in why
+
+    # Would fail a doubling check (0.6 x 2 = 1.2) and fits exactly.
+    fits, _ = parallel_restart_fits(_Engine(0.6), {"gpu_memory_utilization": 0.4})
+    assert fits
+
+
+def test_a_lever_on_another_knob_leaves_the_candidate_inheriting():
+    fits, why = parallel_restart_fits(_Engine(0.45), {"tensor_parallel_size": 4})
+    assert fits and "0.45 + candidate 0.45" in why
+
+
+def test_an_unreadable_candidate_value_falls_back_to_the_baseline():
+    fits, _ = parallel_restart_fits(_Engine(0.45), {"gpu_memory_utilization": "lots"})
+    assert fits
+
+
+# --- one source for "can the baseline be rebuilt" --------------------------
+
+
+def test_a_baseline_rebuild_passed_as_an_argument_is_enough_for_serial():
+    """It used to read the engine attribute while the apply path used the
+    constructor argument, so a caller supplying only the argument got parallel
+    despite having a rebuild available."""
+    engine = _Engine(0.9, baseline_restart=False)
+    app = LiveEngineApplicator(
+        engine, throughput_fn=lambda e: 1.0,
+        restart_fn=lambda e, v: engine,
+        baseline_restart_fn=lambda old: engine)
+    assert app._restart_mode == "serial"
+
+
+def test_a_baseline_rebuild_on_the_engine_is_enough_for_serial():
+    """The other direction, which was worse: it resolved to serial and then
+    failed every structural apply because the argument was missing."""
+    app = LiveEngineApplicator(
+        _Engine(0.9), throughput_fn=lambda e: 1.0,
+        restart_fn=lambda e, v: _Engine(0.9))
+    assert app._restart_mode == "serial"
+    assert app._baseline_restart_fn is not None
+    app.apply(_structural_spec())      # reaches the rebuild rather than raising
+
+
+def test_no_rebuild_anywhere_still_falls_back_to_parallel():
+    app = LiveEngineApplicator(
+        _Engine(0.45, baseline_restart=False), throughput_fn=lambda e: 1.0,
+        restart_fn=lambda e, v: _Engine(0.45))
+    assert app._restart_mode == "parallel"
