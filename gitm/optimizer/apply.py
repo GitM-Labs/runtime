@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -473,7 +474,12 @@ class LiveEngineApplicator:
             # dismiss a measurement that would have worked.
             fits, _ = parallel_restart_fits(engine)
             if not fits:
+                # Floored to the precision it is printed at, not rounded. A
+                # baseline of 0.585 leaves 0.415, and rounding that to "0.42"
+                # hands out a limit the fit check then refuses at 1.005 — a
+                # number that looks like an answer and is not one.
                 room = max(1.0 - (gpu_fraction(engine) or 0.0), 0.0)
+                room = math.floor(room * 100) / 100
                 # Recorded, not raised: a run whose candidates are all
                 # hot-swappable never reaches a rebuild and should not be
                 # stopped here. The caller surfaces this so the operator learns
