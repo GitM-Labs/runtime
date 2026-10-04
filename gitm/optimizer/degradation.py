@@ -59,6 +59,8 @@ GRAPH_BATCH = "graph.batch"
 WORKLOAD_RUNNER = "workload.runner"
 AB_PROBE = "ab.throughput_probe"
 AB_UNIT = "ab.throughput_unit"
+#: The A/B ran in a restart mode that cannot build the candidate it needs.
+AB_RESTART_MODE = "ab.restart_mode"
 AR_CATALOG = "autoresearch.catalog"
 AR_PROPOSER = "autoresearch.proposer"
 AR_TARGET = "autoresearch.target"
