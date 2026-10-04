@@ -1348,7 +1348,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             # from an OOM traceback per candidate: how the last run spent 93% of
             # its budget.
             warnings.warn(
-                "gitm: structural candidates cannot be measured in this run — "
+                "gitm: most structural candidates will be refused in this run — "
                 + applicator.restart_mode_warning,
                 RuntimeWarning, stacklevel=2)
     else:
