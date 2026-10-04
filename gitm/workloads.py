@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import os
 import socket
+import time
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -543,6 +545,68 @@ def _openfold_factory(cfg: LoopConfig) -> WorkloadRunner:
     )
     return run
 
+#: What vLLM names the processes that hold the model. ``EngineCore`` for a
+#: single engine, ``EngineCore_DP{n}`` under data parallelism
+#: (vllm/v1/engine/utils.py). Matching on the name keeps this to vLLM's own
+#: workers: a run has other children, and reaping one of those to free a GPU
+#: would be a cure worse than the disease.
+ENGINE_WORKER_PREFIX = "EngineCore"
+
+
+def reap_engine_workers(timeout_s: float = 30.0) -> list[str]:
+    """Wait for vLLM's engine-core workers to exit. Returns what had to be forced.
+
+    The model lives in those processes, not in this one. ``VLLM_ENABLE_V1_MULTIPROCESSING``
+    defaults on, so the weights and the KV cache are held by a child, and until
+    that child is gone its GPU memory is gone with it — the next engine build
+    then reports ``Free memory 0.0/287.98 GiB`` and the run ends there.
+
+    Calling ``shutdown()`` is not the same as the memory coming back, which is
+    why this waits instead of trusting the call. vLLM's ``MPClient.shutdown``
+    no-ops when its finalizer has already run, and gitm's teardown stops at the
+    first ``shutdown`` attribute it finds, which may not be the one that owns the
+    workers. Either way the call returns and the processes are still up.
+
+    Escalation is deliberate and ordered: wait, then ``terminate``, then
+    ``kill``. Terminating a worker mid-CUDA-teardown is not free, but it is
+    bounded, and the alternative is a run that cannot rebuild a baseline and
+    loses everything it had left to measure.
+    """
+    import multiprocessing as mp
+
+    # active_children() also joins any child that has already exited, so this
+    # clears the finished ones before deciding who is late.
+    workers = [p for p in mp.active_children()
+               if (p.name or "").startswith(ENGINE_WORKER_PREFIX)]
+    if not workers:
+        return []
+
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    for proc in workers:
+        proc.join(max(0.0, deadline - time.monotonic()))
+
+    forced: list[str] = []
+    for proc in workers:
+        if not proc.is_alive():
+            continue
+        how = "terminate"
+        try:
+            proc.terminate()
+            proc.join(5.0)
+            if proc.is_alive():
+                how = "kill"
+                proc.kill()
+                proc.join(2.0)
+        except Exception as exc:  # noqa: BLE001 - a worker we cannot signal is
+            # still worth naming; swallowing it would report a clean teardown.
+            forced.append(f"{proc.name} (pid {proc.pid}): {how} failed: {exc}")
+            continue
+        forced.append(
+            f"{proc.name} (pid {proc.pid}): did not exit within {timeout_s:.0f}s, "
+            f"{how}d" + ("" if not proc.is_alive() else " and still alive"))
+    return forced
+
+
 @register("vllm-decode")
 def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     """Launch a vLLM decode job inside the tracer capture window.
@@ -708,6 +772,23 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
                 delattr(engine, attr)
             except Exception:
                 pass
+
+        # Before the allocator cleanup below, which only touches this process.
+        # The device memory belongs to the workers, so nothing is free until
+        # they are gone.
+        try:
+            forced = reap_engine_workers(
+                float(os.environ.get("GITM_SHUTDOWN_TIMEOUT_S", "30")))
+        except Exception:  # noqa: BLE001 - teardown must not raise into the run
+            forced = []
+        if forced:
+            # Warned, not swallowed: a worker that needed killing is how a later
+            # baseline rebuild comes to fail, and tracing that back from
+            # "Free memory 0.0" is most of a day.
+            warnings.warn(
+                "gitm had to force vLLM engine workers down during teardown; "
+                "GPU memory may still be settling: " + "; ".join(forced),
+                RuntimeWarning, stacklevel=2)
 
         try:
             import gc
