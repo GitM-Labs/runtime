@@ -34,11 +34,13 @@ from gitm.optimizer.apply import (
     DryRunApplicator,
     LiveEngineApplicator,
     apply_intervention,
+    resolve_restart_mode,
 )
 from gitm.optimizer.attribution import attribute
 from gitm.optimizer.collective_signal import collective_causes, worst_device_comm
 from gitm.optimizer.degradation import (
     AB_PROBE,
+    AB_RESTART_MODE,
     AB_UNIT,
     AB_UNITS,
     AFFECTS_AB,
@@ -1312,17 +1314,36 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # claimed as won.
     live_restart_fn = getattr(cfg.engine, "gitm_restart_fn", None) if cfg.engine else None
     if cfg.engine is not None:
+        # Serial wherever a baseline rebuild is available, rather than parallel
+        # by default. Parallel holds the baseline and the candidate at once, and
+        # at any realistic gpu_memory_utilization the second one cannot fit: it
+        # is what cost the MI355X run 27 of its 29 candidates.
+        _restart_mode, _restart_why = resolve_restart_mode(
+            cfg.engine, os.environ.get("GITM_RESTART_MODE"))
         applicator: Applicator = LiveEngineApplicator(
             cfg.engine,
             throughput_fn=_engine_throughput_fn(cfg.engine, runner, degradations),
             restart_fn=live_restart_fn,
             baseline_restart_fn=getattr(cfg.engine, "gitm_baseline_restart_fn", None),
-            restart_mode=os.environ.get("GITM_RESTART_MODE", "parallel"),
+            restart_mode=_restart_mode,
             reps=int(os.environ.get("GITM_AB_REPS", "1")),
             # Compatibility escape hatch for custom scheduling-classified knobs
             # that should still be measured through engine rebuild.
             force_restart=os.environ.get("GITM_KNOBS_VIA_RESTART") == "1",
         )
+        (run_dir / "restart_mode.json").write_text(json.dumps({
+            "mode": _restart_mode,
+            "why": _restart_why,
+            "cannot_fit": applicator.restart_mode_warning,
+        }, indent=2))
+        if applicator.restart_mode_warning:
+            # Said once, at the start. The alternative is learning it from an
+            # OOM traceback per candidate, which is how the last run spent 93%
+            # of its budget.
+            degradations.record(
+                AB_RESTART_MODE, used="restart_mode='parallel'",
+                reason=applicator.restart_mode_warning,
+                severity=UNRELIABLE, affects=(AFFECTS_AB,))
     else:
         applicator = DryRunApplicator()
 
