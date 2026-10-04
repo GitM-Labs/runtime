@@ -205,3 +205,19 @@ def test_no_rebuild_anywhere_still_falls_back_to_parallel():
         _Engine(0.45, baseline_restart=False), throughput_fn=lambda e: 1.0,
         restart_fn=lambda e, v: _Engine(0.45))
     assert app._restart_mode == "parallel"
+
+
+def test_the_startup_warning_says_what_it_actually_checked():
+    """It compares the baseline against a candidate that inherits its fraction,
+    which is most of the catalogue but not all. Saying structural candidates are
+    impossible would have an operator dismiss a measurement that would have
+    worked — a 0.6 baseline still admits a candidate at 0.4."""
+    warning = _applicator(0.6, restart_mode="parallel").restart_mode_warning
+    assert warning
+    assert "0.40 or less" in warning          # the room that is actually left
+    assert "cannot be measured" not in warning
+    assert "Every other structural candidate will be refused" in warning
+
+    # And that candidate is indeed allowed when it turns up.
+    fits, _ = parallel_restart_fits(_Engine(0.6), {"gpu_memory_utilization": 0.4})
+    assert fits
