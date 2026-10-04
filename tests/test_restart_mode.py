@@ -223,17 +223,29 @@ def test_the_startup_warning_says_what_it_actually_checked():
     assert fits
 
 
-@pytest.mark.parametrize("baseline", [0.51, 0.585, 0.6, 0.666, 0.75, 0.9, 0.99])
-def test_the_limit_the_warning_prints_is_one_the_check_accepts(baseline):
-    """The invariant, not an example. A rounded limit is worse than none: a
-    baseline of 0.585 leaves 0.415, and printing "0.42" hands the operator a
-    number the fit check then refuses at 1.005."""
+@pytest.mark.parametrize("baseline", [b / 100 for b in range(51, 100)])
+def test_the_limit_the_warning_prints_is_exactly_the_largest_that_fits(baseline):
+    """The invariant over every two-decimal baseline, in both directions.
+
+    Both halves have been wrong. Rounding ``1 - 0.585`` to ``0.42`` offered a
+    candidate the check then refused at 1.005. Flooring it understated the room
+    at 13 of these 49 baselines — including 0.9, vLLM's own default, where 0.10
+    fits and the warning said 0.09. One tells the operator to use a setting that
+    will be rejected; the other tells them to discard one that would have worked.
+    """
     import re
 
     warning = _applicator(baseline, restart_mode="parallel").restart_mode_warning
     assert warning, f"no warning at baseline {baseline}"
-
     stated = float(re.search(r"to ([0-9.]+) or less", warning).group(1))
+
     fits, why = parallel_restart_fits(
         _Engine(baseline), {"gpu_memory_utilization": stated})
-    assert fits, f"warning offered {stated} at baseline {baseline}, but: {why}"
+    assert fits, f"offered {stated} at baseline {baseline}, but: {why}"
+
+    # And it is the *largest* such value: one more hundredth must not fit, or
+    # the warning is telling the operator to leave room they did not need to.
+    over = round(stated + 0.01, 2)
+    assert not parallel_restart_fits(
+        _Engine(baseline), {"gpu_memory_utilization": over})[0], (
+        f"offered {stated} at baseline {baseline}, but {over} also fits")
