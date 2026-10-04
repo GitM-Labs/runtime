@@ -84,6 +84,17 @@ def test_unmet_prerequisite():
     assert "unknown on this engine" in unmet_prerequisite(object(), "dbo_prefill_token_threshold")
 
 
+def test_prerequisite_flag_is_not_its_own_prerequisite():
+    # ("dbo", "enable_dbo") substring-matches enable_dbo itself; turning the flag
+    # on must not demand that it already be on.
+    off = _EngineWithFlags(enable_dbo=False)
+    assert unmet_prerequisite(off, "enable_dbo") is None
+    assert unmet_prerequisite(None, "enable_dbo") is None
+    assert unmet_prerequisite(object(), "enable_dbo") is None
+    # The knobs the flag gates are still gated by it.
+    assert unmet_prerequisite(off, "dbo_decode_token_threshold") is not None
+
+
 def test_resolve_relative_value():
     relative = _spec("max_num_batched_tokens", 8192)
     relative.value_multiplier = 2.0
@@ -463,6 +474,34 @@ def test_run_loop_scheduler_stats_feed_attribution_and_claims(tmp_path, monkeypa
     assert "max_num_seqs" in out["report_md"]
     # Scheduler summary surfaced in the run summary (synchronous first sample).
     assert out["summary"]["scheduler_stats"] is not None
+
+
+def test_run_loop_vetoes_library_lever_with_unmet_prerequisite(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .conftest import make_kernel, make_trace
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [make_kernel(f"paged_attention_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 80)
+                   for i in range(80)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    # _FullEngine has no enable_expert_parallel and no enable_dbo.
+    out = run_loop(LoopConfig(engine=_FullEngine(), workload="vllm-decode", budget="24h",
+                              scratch=str(tmp_path), top_n_interventions=50))
+
+    report = out["report_md"]
+    # The library lever is vetoed before apply, same as an autoresearch candidate.
+    assert "enable_eplb (prerequisite 'enable_expert_parallel' unknown on this engine)" in report
+    # enable_dbo is its own prerequisite flag, so it is not vetoed for lacking itself.
+    assert "enable_dbo (prerequisite" not in report
 
 def test_report_kernel_time_residual_uses_weighted_total_and_clamps():
     from gitm.optimizer.monitor import KernelResidual, Residuals
