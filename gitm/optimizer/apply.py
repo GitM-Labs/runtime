@@ -319,35 +319,59 @@ def gpu_fraction(engine: Any) -> float | None:
         return _DEFAULT_GPU_FRACTION
 
 
-def parallel_restart_fits(engine: Any) -> tuple[bool, str]:
+def parallel_restart_fits(
+    engine: Any, values: dict[str, Any] | None = None
+) -> tuple[bool, str]:
     """Whether a candidate engine can be built while the baseline is still up.
 
-    Parallel mode holds both at once, so each may have at most half the device.
-    The check is arithmetic rather than a free-memory reading: the candidate asks
-    for the same fraction the baseline already holds, so ``2 x fraction > 1``
-    settles it without a device query and without a CUDA context in this process.
+    Parallel mode holds both at once, so what matters is the *sum* of the two
+    fractions, not twice the baseline's. Those are usually the same number,
+    because a restart candidate inherits the baseline's kwargs — but not always:
+    ``gpu_memory_utilization_dynamic`` is a catalogue lever whose whole purpose
+    is to change this fraction, so a candidate carrying it asks for something
+    else. Doubling the baseline gets that case wrong in both directions: it
+    passes 0.45 beside a 0.9 candidate that needs 135%, and refuses 0.6 beside a
+    0.4 candidate that fits exactly.
+
+    The check stays arithmetic rather than a free-memory reading. Both numbers
+    are knowable from kwargs, so no device query and no CUDA context in a
+    process that does not otherwise carry one.
 
     This is the failure that cost the MI355X run 27 of its 29 candidates. The
     constraint was documented in ``workloads.py`` and enforced nowhere, so every
     structural candidate built into a device the baseline had 90% of, and died.
     """
-    fraction = gpu_fraction(engine)
-    if fraction is None:
+    baseline = gpu_fraction(engine)
+    if baseline is None:
         # Not a handle gitm built, so nothing says what it holds. Refusing here
         # would block a deployment that supplies its own restart_fn on a number
         # it never gave us.
         return True, "this engine does not say what fraction of the device it holds"
-    if fraction * 2 <= 1.0:
-        return True, f"two engines at {fraction:.2f} of the device fit"
+
+    candidate = baseline
+    if values and "gpu_memory_utilization" in values:
+        try:
+            candidate = float(values["gpu_memory_utilization"])
+        except (TypeError, ValueError):
+            candidate = baseline
+
+    total = baseline + candidate
+    if total <= 1.0:
+        return True, (
+            f"baseline {baseline:.2f} + candidate {candidate:.2f} "
+            f"= {total:.2f} of the device")
+    same = "" if candidate == baseline else f" and the candidate asks for {candidate:.0%}"
     return False, (
-        f"the baseline holds {fraction:.0%} of each device, so a candidate built "
-        f"beside it would need {fraction * 2:.0%}. Use restart_mode='serial' to "
+        f"the baseline holds {baseline:.0%} of each device{same}, so building "
+        f"them side by side needs {total:.0%}. Use restart_mode='serial' to "
         f"release the baseline first, or build with "
         f"GITM_VLLM_GPU_MEM<={0.5:.2f} to leave room for both"
     )
 
 
-def resolve_restart_mode(engine: Any, requested: str | None) -> tuple[str, str]:
+def resolve_restart_mode(
+    engine: Any, requested: str | None, baseline_restart_fn: Any = None
+) -> tuple[str, str]:
     """``(mode, why)`` for this engine. ``requested`` wins when it is given.
 
     Serial is the better default wherever it is available: it releases the
@@ -360,13 +384,21 @@ def resolve_restart_mode(engine: Any, requested: str | None) -> tuple[str, str]:
 
     Parallel remains the fallback for a deployment that supplies no
     ``baseline_restart_fn``, because there serial has nothing to restore with.
+
+    That callback is passed in rather than read off the engine, so the mode is
+    decided by the same one the apply path will use. Reading the engine
+    attribute here while the applicator held a constructor argument let the two
+    disagree, and both disagreements were bad: a caller supplying only the
+    argument got parallel despite having a rebuild available, and one supplying
+    only the attribute got serial and then failed every structural apply for
+    want of the argument.
     """
     if requested:
         if requested not in {"parallel", "serial"}:
             raise ValueError(
                 f"restart_mode must be 'parallel' or 'serial', got {requested!r}")
         return requested, "set explicitly"
-    if getattr(engine, "gitm_baseline_restart_fn", None) is None:
+    if (baseline_restart_fn or getattr(engine, "gitm_baseline_restart_fn", None)) is None:
         return "parallel", (
             "no baseline_restart_fn, so serial has nothing to rebuild the "
             "baseline with")
@@ -418,13 +450,23 @@ class LiveEngineApplicator:
     ) -> None:
         self.engine = engine
         self._tps = throughput_fn
+        # The engine's own hook is the fallback, so a caller handing over an
+        # engine gitm built need not re-pass what is already on it. One effective
+        # callback, and the mode is decided from that same one rather than from a
+        # second source that can disagree with it.
+        self._baseline_restart_fn = baseline_restart_fn or getattr(
+            engine, "gitm_baseline_restart_fn", None)
         # None means "work it out from this engine", so the choice is made by one
         # rule wherever an applicator is built. Defaulting the parameter to
         # "parallel" put the trap one level below the loop: a direct caller got
         # the mode that cannot build a candidate at any realistic memory cap.
-        restart_mode, _ = resolve_restart_mode(engine, restart_mode)
+        restart_mode, _ = resolve_restart_mode(
+            engine, restart_mode, self._baseline_restart_fn)
         self.restart_mode_warning: str | None = None
         if restart_mode == "parallel" and restart_fn is not None:
+            # Against the baseline's own fraction, since no candidate is in hand
+            # yet. A lever that changes the fraction is checked again, with its
+            # own value, at the rebuild.
             fits, why = parallel_restart_fits(engine)
             if not fits:
                 # Recorded, not raised: a run whose candidates are all
@@ -433,7 +475,6 @@ class LiveEngineApplicator:
                 # it when the run starts rather than per dead candidate.
                 self.restart_mode_warning = why
         self._restart_fn = restart_fn
-        self._baseline_restart_fn = baseline_restart_fn
         self._restart_mode = restart_mode
         self._getter = getter or get_knob
         self._setter = setter or set_knob
@@ -522,7 +563,7 @@ class LiveEngineApplicator:
             # is identical either way for this candidate, but an OOM traceback
             # from inside vLLM says nothing about which mode caused it or what
             # to do, and it repeats once per candidate for the whole run.
-            fits, why = parallel_restart_fits(old_engine)
+            fits, why = parallel_restart_fits(old_engine, values)
             if not fits:
                 raise StructuralKnobRequiresRestart(
                     f"knob(s) {', '.join(values)} need an engine rebuild, and "
