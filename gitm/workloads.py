@@ -553,8 +553,42 @@ def _openfold_factory(cfg: LoopConfig) -> WorkloadRunner:
 ENGINE_WORKER_PREFIX = "EngineCore"
 
 
-def reap_engine_workers(timeout_s: float = 30.0) -> list[str]:
-    """Wait for vLLM's engine-core workers to exit. Returns what had to be forced.
+def _shutdown_timeout() -> float:
+    """Seconds to wait for workers before forcing them, from the environment.
+
+    A bad value warns and falls back rather than raising: this is read on the
+    teardown path, and an exception there would skip the cleanup entirely.
+    """
+    raw = os.environ.get("GITM_SHUTDOWN_TIMEOUT_S")
+    if not raw:
+        return 30.0
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        warnings.warn(
+            f"GITM_SHUTDOWN_TIMEOUT_S={raw!r} is not a number; waiting 30s for "
+            "engine workers instead", RuntimeWarning, stacklevel=2)
+        return 30.0
+
+
+def engine_worker_pids() -> set[int]:
+    """PIDs of vLLM engine-core processes that are children of this one.
+
+    Sampled around an engine build so each engine can be told which workers are
+    *its* own. The name alone cannot do that: in parallel restart mode the
+    baseline and the candidate are up at the same time and their workers are
+    named identically, so a name-matched sweep during the candidate's teardown
+    would take the baseline's down with it — and the restore path then
+    reactivates a baseline engine whose workers are gone.
+    """
+    import multiprocessing as mp
+
+    return {p.pid for p in mp.active_children()
+            if (p.name or "").startswith(ENGINE_WORKER_PREFIX) and p.pid}
+
+
+def reap_engine_workers(pids: set[int] | None, timeout_s: float = 30.0) -> list[str]:
+    """Wait for *these* engine-core workers to exit. Returns what had to be forced.
 
     The model lives in those processes, not in this one. ``VLLM_ENABLE_V1_MULTIPROCESSING``
     defaults on, so the weights and the KV cache are held by a child, and until
@@ -571,13 +605,22 @@ def reap_engine_workers(timeout_s: float = 30.0) -> list[str]:
     ``kill``. Terminating a worker mid-CUDA-teardown is not free, but it is
     bounded, and the alternative is a run that cannot rebuild a baseline and
     loses everything it had left to measure.
+
+    ``pids`` is what makes that safe. It comes from
+    :func:`engine_worker_pids` sampled around the build, so only the engine
+    being shut down loses its workers.
     """
     import multiprocessing as mp
 
+    if not pids:
+        # Either this engine ran its core in-process, or its workers are not
+        # multiprocessing children of ours. Nothing here can be attributed to
+        # it, and reaping by name instead would be reaping somebody else's.
+        return []
+
     # active_children() also joins any child that has already exited, so this
     # clears the finished ones before deciding who is late.
-    workers = [p for p in mp.active_children()
-               if (p.name or "").startswith(ENGINE_WORKER_PREFIX)]
+    workers = [p for p in mp.active_children() if p.pid in pids]
     if not workers:
         return []
 
@@ -776,11 +819,18 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         # Before the allocator cleanup below, which only touches this process.
         # The device memory belongs to the workers, so nothing is free until
         # they are gone.
+        #
+        # The timeout is resolved outside the try. Parsing it inside meant a
+        # typo'd GITM_SHUTDOWN_TIMEOUT_S raised, the handler set `forced` to
+        # empty, and the whole reap was skipped silently — the teardown this
+        # exists to perform, disabled by a bad environment variable with no
+        # warning.
         try:
             forced = reap_engine_workers(
-                float(os.environ.get("GITM_SHUTDOWN_TIMEOUT_S", "30")))
-        except Exception:  # noqa: BLE001 - teardown must not raise into the run
-            forced = []
+                getattr(engine, "gitm_worker_pids", None), _shutdown_timeout())
+        except Exception as exc:  # noqa: BLE001 - teardown must not raise into
+            # the run, but a reap that could not run is not a clean teardown.
+            forced = [f"worker cleanup failed: {exc}"]
         if forced:
             # Warned, not swallowed: a worker that needed killing is how a later
             # baseline rebuild comes to fail, and tracing that back from
@@ -810,7 +860,13 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
             pass
 
     def _build_engine(kwargs: dict[str, Any]) -> Any:
+        # Sampled either side of the build so this engine knows which workers
+        # are its own. In parallel restart mode two engines are up at once and
+        # their workers share a name, so ownership is the only thing that keeps
+        # a candidate's teardown from taking the baseline's workers with it.
+        before = engine_worker_pids()
         engine = LLM(model=model, **kwargs)
+        engine.gitm_worker_pids = engine_worker_pids() - before
         engine.gitm_llm_kwargs = dict(kwargs)
         engine.gitm_shutdown_fn = _shutdown_engine
         engine.gitm_activate_fn = _activate_engine
