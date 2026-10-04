@@ -370,6 +370,29 @@ def parallel_restart_fits(
     )
 
 
+def _largest_fitting_candidate(engine: Any) -> float:
+    """The biggest fraction a candidate can take and still fit beside this baseline.
+
+    Asked of :func:`parallel_restart_fits` rather than computed alongside it,
+    because the operator acts on this number and the check is what will judge
+    them. Deriving it separately put the two at odds in both directions:
+    rounding ``1 - 0.585`` to ``0.42`` offered a candidate the check then
+    refused at 1.005, and flooring it understated the room at 13 of the 49
+    two-decimal baselines — including 0.9, which is vLLM's own default, where
+    0.10 fits and the warning said 0.09.
+
+    Floor first, then ask whether one more hundredth is accepted. Two decimals
+    because that is the precision the warning prints at, and a limit the
+    operator cannot type is not a limit.
+    """
+    room = max(1.0 - (gpu_fraction(engine) or 0.0), 0.0)
+    limit = math.floor(room * 100) / 100
+    nxt = round(limit + 0.01, 2)
+    if parallel_restart_fits(engine, {"gpu_memory_utilization": nxt})[0]:
+        return nxt
+    return limit
+
+
 def resolve_restart_mode(
     engine: Any, requested: str | None, baseline_restart_fn: Any = None
 ) -> tuple[str, str]:
@@ -474,12 +497,7 @@ class LiveEngineApplicator:
             # dismiss a measurement that would have worked.
             fits, _ = parallel_restart_fits(engine)
             if not fits:
-                # Floored to the precision it is printed at, not rounded. A
-                # baseline of 0.585 leaves 0.415, and rounding that to "0.42"
-                # hands out a limit the fit check then refuses at 1.005 — a
-                # number that looks like an answer and is not one.
-                room = max(1.0 - (gpu_fraction(engine) or 0.0), 0.0)
-                room = math.floor(room * 100) / 100
+                room = _largest_fitting_candidate(engine)
                 # Recorded, not raised: a run whose candidates are all
                 # hot-swappable never reaches a rebuild and should not be
                 # stopped here. The caller surfaces this so the operator learns
