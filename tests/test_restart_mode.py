@@ -221,3 +221,19 @@ def test_the_startup_warning_says_what_it_actually_checked():
     # And that candidate is indeed allowed when it turns up.
     fits, _ = parallel_restart_fits(_Engine(0.6), {"gpu_memory_utilization": 0.4})
     assert fits
+
+
+@pytest.mark.parametrize("baseline", [0.51, 0.585, 0.6, 0.666, 0.75, 0.9, 0.99])
+def test_the_limit_the_warning_prints_is_one_the_check_accepts(baseline):
+    """The invariant, not an example. A rounded limit is worse than none: a
+    baseline of 0.585 leaves 0.415, and printing "0.42" hands the operator a
+    number the fit check then refuses at 1.005."""
+    import re
+
+    warning = _applicator(baseline, restart_mode="parallel").restart_mode_warning
+    assert warning, f"no warning at baseline {baseline}"
+
+    stated = float(re.search(r"to ([0-9.]+) or less", warning).group(1))
+    fits, why = parallel_restart_fits(
+        _Engine(baseline), {"gpu_memory_utilization": stated})
+    assert fits, f"warning offered {stated} at baseline {baseline}, but: {why}"
