@@ -289,6 +289,90 @@ class StructuralKnobRequiresRestart(RuntimeError):
     """
 
 
+#: What vLLM gives an engine when nobody says otherwise. A restart candidate
+#: inherits the baseline's kwargs, so both engines ask for the same fraction.
+_DEFAULT_GPU_FRACTION = 0.9
+
+
+def gpu_fraction(engine: Any) -> float | None:
+    """The device fraction this engine was built to hold, or ``None`` if unknown.
+
+    Read off the kwargs it was built with rather than measured off the device.
+    Measuring would mean initialising CUDA in this process to ask, which on the
+    offline engine is a context the parent does not otherwise carry — and the
+    number we need is the one the *next* engine will ask for, which is this one
+    by construction: a restart candidate inherits the baseline's kwargs.
+
+    Two absences that are not the same. An engine with ``gitm_llm_kwargs`` and no
+    ``gpu_memory_utilization`` in them is one gitm built without an explicit cap,
+    so it holds vLLM's own default — which is the case the MI355X run was in.
+    An engine with no ``gitm_llm_kwargs`` at all is somebody else's handle, and
+    what it holds is genuinely unknown; guessing the default there would refuse
+    a restart on a number nobody supplied.
+    """
+    kwargs = getattr(engine, "gitm_llm_kwargs", None)
+    if kwargs is None:
+        return None
+    try:
+        return float(kwargs.get("gpu_memory_utilization", _DEFAULT_GPU_FRACTION))
+    except (TypeError, ValueError):
+        return _DEFAULT_GPU_FRACTION
+
+
+def parallel_restart_fits(engine: Any) -> tuple[bool, str]:
+    """Whether a candidate engine can be built while the baseline is still up.
+
+    Parallel mode holds both at once, so each may have at most half the device.
+    The check is arithmetic rather than a free-memory reading: the candidate asks
+    for the same fraction the baseline already holds, so ``2 x fraction > 1``
+    settles it without a device query and without a CUDA context in this process.
+
+    This is the failure that cost the MI355X run 27 of its 29 candidates. The
+    constraint was documented in ``workloads.py`` and enforced nowhere, so every
+    structural candidate built into a device the baseline had 90% of, and died.
+    """
+    fraction = gpu_fraction(engine)
+    if fraction is None:
+        # Not a handle gitm built, so nothing says what it holds. Refusing here
+        # would block a deployment that supplies its own restart_fn on a number
+        # it never gave us.
+        return True, "this engine does not say what fraction of the device it holds"
+    if fraction * 2 <= 1.0:
+        return True, f"two engines at {fraction:.2f} of the device fit"
+    return False, (
+        f"the baseline holds {fraction:.0%} of each device, so a candidate built "
+        f"beside it would need {fraction * 2:.0%}. Use restart_mode='serial' to "
+        f"release the baseline first, or build with "
+        f"GITM_VLLM_GPU_MEM<={0.5:.2f} to leave room for both"
+    )
+
+
+def resolve_restart_mode(engine: Any, requested: str | None) -> tuple[str, str]:
+    """``(mode, why)`` for this engine. ``requested`` wins when it is given.
+
+    Serial is the better default wherever it is available: it releases the
+    baseline before building the candidate, so the candidate gets the whole
+    device instead of whatever the baseline left. Parallel's only advantage is
+    not paying for a baseline rebuild, and it buys that by requiring both
+    engines resident — which at any realistic ``gpu_memory_utilization`` is
+    impossible. The default used to be parallel, and 93% of one run's candidates
+    died of it.
+
+    Parallel remains the fallback for a deployment that supplies no
+    ``baseline_restart_fn``, because there serial has nothing to restore with.
+    """
+    if requested:
+        if requested not in {"parallel", "serial"}:
+            raise ValueError(
+                f"restart_mode must be 'parallel' or 'serial', got {requested!r}")
+        return requested, "set explicitly"
+    if getattr(engine, "gitm_baseline_restart_fn", None) is None:
+        return "parallel", (
+            "no baseline_restart_fn, so serial has nothing to rebuild the "
+            "baseline with")
+    return "serial", "the default: parallel needs both engines resident at once"
+
+
 class LiveEngineApplicator:
     """Apply a knob (or a joint set — see ``InterventionSpec.knobs``) to a live
     (vLLM) engine, gated by a real decode-throughput A/B.
@@ -326,7 +410,7 @@ class LiveEngineApplicator:
         throughput_fn: Callable[[Any], float],
         restart_fn: Callable[[Any, dict[str, Any]], Any] | None = None,
         baseline_restart_fn: Callable[[Any], Any] | None = None,
-        restart_mode: str = "parallel",
+        restart_mode: str | None = None,
         getter: Callable[[Any, str], Any] | None = None,
         setter: Callable[[Any, str, Any], None] | None = None,
         reps: int = 1,
@@ -334,8 +418,20 @@ class LiveEngineApplicator:
     ) -> None:
         self.engine = engine
         self._tps = throughput_fn
-        if restart_mode not in {"parallel", "serial"}:
-            raise ValueError(f"restart_mode must be 'parallel' or 'serial', got {restart_mode!r}")
+        # None means "work it out from this engine", so the choice is made by one
+        # rule wherever an applicator is built. Defaulting the parameter to
+        # "parallel" put the trap one level below the loop: a direct caller got
+        # the mode that cannot build a candidate at any realistic memory cap.
+        restart_mode, _ = resolve_restart_mode(engine, restart_mode)
+        self.restart_mode_warning: str | None = None
+        if restart_mode == "parallel" and restart_fn is not None:
+            fits, why = parallel_restart_fits(engine)
+            if not fits:
+                # Recorded, not raised: a run whose candidates are all
+                # hot-swappable never reaches a rebuild and should not be
+                # stopped here. The caller surfaces this so the operator learns
+                # it when the run starts rather than per dead candidate.
+                self.restart_mode_warning = why
         self._restart_fn = restart_fn
         self._baseline_restart_fn = baseline_restart_fn
         self._restart_mode = restart_mode
@@ -422,6 +518,15 @@ class LiveEngineApplicator:
                 self._prev = None
                 raise
         else:
+            # Refuse a build that cannot fit rather than let it OOM. The failure
+            # is identical either way for this candidate, but an OOM traceback
+            # from inside vLLM says nothing about which mode caused it or what
+            # to do, and it repeats once per candidate for the whole run.
+            fits, why = parallel_restart_fits(old_engine)
+            if not fits:
+                raise StructuralKnobRequiresRestart(
+                    f"knob(s) {', '.join(values)} need an engine rebuild, and "
+                    f"restart_mode='parallel' cannot provide one: {why}")
             new_engine = self._restart_fn(old_engine, values)
         if new_engine is None:
             if self._restart_mode == "serial":

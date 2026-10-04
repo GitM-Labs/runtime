@@ -141,8 +141,10 @@ def test_restart_ab_under_the_default_probe_is_an_error_not_a_result():
     from gitm.optimizer.apply import LiveEngineApplicator, apply_intervention
     from gitm.scheduler.loop import _engine_throughput_fn
 
-    original = SimpleNamespace(gitm_llm_kwargs={})
-    rebuilt = SimpleNamespace(gitm_llm_kwargs={})
+    # A cap that leaves room for both engines, so the restart is reachable and
+    # this stays a test about the probe rather than about memory.
+    original = SimpleNamespace(gitm_llm_kwargs={'gpu_memory_utilization': 0.4})
+    rebuilt = SimpleNamespace(gitm_llm_kwargs={'gpu_memory_utilization': 0.4})
     log = DegradationLog()
     spec = InterventionSpec.model_validate(dict(
         name="restart_test", summary="s", knob="max_num_seqs", value=64,
