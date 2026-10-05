@@ -286,12 +286,17 @@ def test_autoresearch_counts_what_it_never_reached(monkeypatch):
     import gitm.agents.autoresearch as ar
     from gitm.agents.policy import RankedCandidate
 
-    specs = [_spec(f"knob_{i}", 1) for i in range(6)]
-    # Survivors and gate rejections interleaved after the one that loses the engine.
+    specs = [_spec(f"knob_{i}", 1) for i in range(7)]
+    # Survivors, gate rejections and a known loser from history, interleaved
+    # after the one that loses the engine.
     rejected = {"knob_2", "knob_4"}
+    measured_loser = "knob_6"
     monkeypatch.setattr(ar, "select_interventions", lambda *a, **kw: [
-        RankedCandidate(spec=s, predicted_delta=0.05,
-                        rejected_reason="policy.skip_high_risk" if s.name in rejected else None)
+        RankedCandidate(
+            spec=s,
+            predicted_delta=-0.05 if s.name == measured_loser else 0.05,
+            delta_source="measured" if s.name == measured_loser else "prior",
+            rejected_reason="policy.skip_high_risk" if s.name in rejected else None)
         for s in specs])
 
     class _Proposer:
@@ -310,9 +315,12 @@ def test_autoresearch_counts_what_it_never_reached(monkeypatch):
 
     assert calls["n"] == 1
     assert run.n_untried == 3  # knob_1, knob_3, knob_5
-    # The gate's rejections needed no engine, so they are still recorded.
-    assert [r.spec.name for r in run.results if not r.applicable] == ["knob_2", "knob_4"]
-    assert len(run.results) == 3
+    # The gate's rejections and the history verdict needed no engine, so they
+    # are still recorded rather than counted untried.
+    not_applied = {r.spec.name: r.rejected_reason for r in run.results if not r.applicable}
+    assert set(not_applied) == {"knob_2", "knob_4", "knob_6"}
+    assert not_applied["knob_6"].startswith("history:")
+    assert len(run.results) == 4
 
 
 def test_phase4_still_records_what_the_gate_rejected(tmp_path, monkeypatch):

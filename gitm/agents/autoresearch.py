@@ -1276,16 +1276,20 @@ def _autoresearch_pass(
         # candidates are recorded but never applied; survivors go through the
         # rollback-gated apply. Both land in one result shape.
         reason = c.rejected_reason
-        if lost and reason is None:
-            n_untried += 1
-            continue
         # Autoresearch applies every survivor, not a top-N, so the ranking alone
         # cannot stop a known loser: sorted last, it still ran. A candidate this
         # box already measured at no gain is a result in hand, not an experiment,
         # and re-running it spends an A/B (often a restart) to learn it again.
-        if not lost and reason is None and c.delta_source == "measured" and c.predicted_delta <= 0:
+        # Checked before the lost-engine exit below: like the gate, it is a
+        # verdict from the record, and needs no engine to reach.
+        if reason is None and c.delta_source == "measured" and c.predicted_delta <= 0:
             reason = f"history: measured {c.predicted_delta:+.1%} on this box; not re-run"
-        if not lost and reason is None and reject is not None:
+        if lost and reason is None:
+            n_untried += 1
+            continue
+        # The caller's veto can read the engine (a prerequisite, a restart hook),
+        # so it is only asked while there is one.
+        if reason is None and reject is not None:
             reason = reject(c.spec)
         pre_cfg: dict | None = None
         post_cfg: dict | None = None
