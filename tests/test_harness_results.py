@@ -464,3 +464,98 @@ def test_the_export_does_not_claim_a_gate_that_never_ran(tmp_path):
         assert protocol[field].startswith("per record"), f"{field} is stated as a blanket claim"
     assert "requests/sec" in protocol["metric"]
     assert "measured delta" in protocol["kept"]
+
+
+# --------------------------------------------------------------------------- #
+# an attached capture, which records what it found rather than what it launched #
+# --------------------------------------------------------------------------- #
+def _attach_arm(root, name, *, cmdline, rps=40.0, traceable=True, model="Kimi-K2.5"):
+    """A directory in the shape `gitm capture attach` writes it.
+
+    No `serve_argv` and no `tracing`: attach did not launch the server, so it
+    records what it read out of /proc under `target` instead.
+    """
+    d = root / name
+    d.mkdir(parents=True, exist_ok=True)
+    write_trace_jsonl(d / "trace.jsonl", _trace())
+    (d / "serving_summary.json").write_text(json.dumps({
+        "mode": "drive", "wall_s": 300.0,
+        "client": {"latency_source": "client", "n_failed_requests": 0,
+                   "n_requests": 512, "goodput_rps": rps, "window_s": 300.0},
+    }))
+    (d / "run_manifest.json").write_text(json.dumps({
+        "workload_id": "vllm-attach", "capture_mode": "attach",
+        "served_model": model, "load": LOAD,
+        "target": {"pid": 1234, "cmdline": cmdline, "traceable": traceable},
+    }))
+    return d
+
+
+SERVE_CMD = ["/usr/bin/python", ".venv/bin/vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct",
+             "--port", "8000", "--enforce-eager"]
+
+
+def test_an_attached_capture_reports_the_flags_the_server_was_running(tmp_path):
+    """`serve_argv` is the shape `capture serve` writes. Reading only that left
+    every attached baseline with no flags at all — and the baseline's flags are
+    what every proposed arm is built from."""
+    cap = read_capture(_attach_arm(tmp_path, "attached", cmdline=SERVE_CMD))
+    assert cap.serve_argv == ("--port", "8000", "--enforce-eager")
+
+
+def test_everything_up_to_serve_is_dropped(tmp_path):
+    """The interpreter, the console script, the subcommand and the positional
+    model are how the server was invoked, not what it was configured with, and
+    knob_difference compares flags."""
+    cap = read_capture(_attach_arm(tmp_path, "a", cmdline=SERVE_CMD))
+    assert not any(tok in cap.serve_argv for tok in
+                   ("/usr/bin/python", ".venv/bin/vllm", "serve",
+                    "Qwen/Qwen2.5-0.5B-Instruct"))
+
+
+def test_a_flag_removal_lever_is_reachable_against_an_attached_baseline(tmp_path):
+    """The sharp end. `cuda_graphs_enable` is realised by *removing*
+    `--enforce-eager`, so an empty baseline reported it unreachable on a server
+    that was started with it."""
+    base = read_capture(_attach_arm(tmp_path, "base", cmdline=SERVE_CMD))
+    cand = read_capture(_attach_arm(
+        tmp_path, "cand", rps=50.0,
+        cmdline=[*SERVE_CMD[:-1]]))          # same, minus --enforce-eager
+
+    knobs = knob_difference(base, cand)
+    assert knobs == {"--enforce-eager": None}
+    assert resolve_lever("--enforce-eager", None, LIB).name == "cuda_graphs_enable"
+
+
+def test_tracing_is_inferred_so_an_attached_arm_can_be_compared(tmp_path):
+    """comparable_key includes tracing, because tracing costs throughput. Left
+    at None on every attached capture, two of them compared with each other but
+    never against a launched one — and the refusal would have read as a data
+    mismatch rather than a gap in what was recorded."""
+    on = read_capture(_attach_arm(tmp_path, "on", cmdline=SERVE_CMD))
+    off = read_capture(_attach_arm(tmp_path, "off", cmdline=SERVE_CMD, traceable=False))
+    assert on.tracing == "cupti"
+    assert off.tracing == "off"
+
+
+def test_a_manifest_with_neither_shape_yields_no_flags_rather_than_raising(tmp_path):
+    d = tmp_path / "bare"
+    d.mkdir()
+    write_trace_jsonl(d / "trace.jsonl", _trace())
+    (d / "serving_summary.json").write_text(json.dumps({
+        "mode": "drive", "wall_s": 1.0,
+        "client": {"latency_source": "client", "n_failed_requests": 0,
+                   "n_requests": 1, "goodput_rps": 1.0, "window_s": 1.0}}))
+    (d / "run_manifest.json").write_text(json.dumps({"served_model": "m", "load": LOAD}))
+    cap = read_capture(d)
+    assert cap.serve_argv == () and cap.tracing is None
+
+
+def test_a_launched_capture_still_wins_on_its_own_field(tmp_path):
+    """serve_argv is authoritative where it exists; the /proc fallback is only
+    for the path that has none."""
+    d = _attach_arm(tmp_path, "both", cmdline=SERVE_CMD)
+    m = json.loads((d / "run_manifest.json").read_text())
+    m["serve_argv"] = ["--tensor-parallel-size", "2"]
+    (d / "run_manifest.json").write_text(json.dumps(m))
+    assert read_capture(d).serve_argv == ("--tensor-parallel-size", "2")
