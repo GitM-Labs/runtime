@@ -331,12 +331,29 @@ def _v1_scheduler_stats(scheduler: Any) -> dict[str, Any]:
 
 
 def _max_num_seqs(engine: Any) -> int | None:
+    """The most sequences this engine will decode at once, or ``None``.
+
+    The decode batch is bounded by this, so without it the in-flight count
+    cannot be turned into a batch and the graph falls back to ``batch=1``. That
+    is not hypothetical: the first full local run captured ``mean_unfinished``
+    of 243 and still priced its graph at 1, because none of the paths below
+    reached the value. Every residual in that run read ``+100%``.
+
+    The paths are tried in order and the first non-``None`` wins. The vLLM 0.30
+    one is ``llm_engine.vllm_config.scheduler_config`` — ``LLM`` holds the
+    engine, the engine holds the config, and the config holds the scheduler's.
+    Both halves of that chain were already listed separately and the two were
+    never joined, which is the whole of the bug.
+    """
     val = _first_attr(
         engine,
         "scheduler_config.max_num_seqs",
         "engine.scheduler_config.max_num_seqs",
         "llm_engine.scheduler_config.max_num_seqs",
         "vllm_config.scheduler_config.max_num_seqs",
+        # vLLM 0.30: LLM -> LLMEngine.vllm_config -> SchedulerConfig.
+        "llm_engine.vllm_config.scheduler_config.max_num_seqs",
+        "engine.vllm_config.scheduler_config.max_num_seqs",
     )
     return int(val) if isinstance(val, int) and val > 0 else None
 

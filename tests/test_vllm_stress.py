@@ -306,3 +306,68 @@ def test_env_knob_restore_to_none_unsets(monkeypatch):
     set_knob(object(), "VLLM_ATTENTION_BACKEND", None)
     import os
     assert "VLLM_ATTENTION_BACKEND" not in os.environ
+
+
+# ── the capacity that turns an in-flight count into a batch ─────────────────
+
+
+def test_max_num_seqs_is_found_on_the_shape_vllm_actually_presents():
+    """The first full local run captured `mean_unfinished` of 243 and still
+    priced its graph at batch=1, because none of the probed paths reached
+    `max_num_seqs`. The bounded figure needs a capacity, so without one the
+    whole in-flight fallback is dead and every residual reads +100%.
+
+    vLLM 0.30: LLM -> LLMEngine.vllm_config -> SchedulerConfig. Both halves of
+    that chain were listed separately and never joined.
+    """
+    from types import SimpleNamespace as N
+
+    from gitm.tracer.vllm_stats import _max_num_seqs
+
+    llm = N(llm_engine=N(vllm_config=N(scheduler_config=N(max_num_seqs=256))))
+    assert _max_num_seqs(llm) == 256
+
+
+def test_max_num_seqs_still_found_on_the_older_shapes():
+    """Each path is a vLLM version that presented the config somewhere else.
+    Adding one must not cost the others."""
+    from types import SimpleNamespace as N
+
+    from gitm.tracer.vllm_stats import _max_num_seqs
+
+    assert _max_num_seqs(N(scheduler_config=N(max_num_seqs=64))) == 64
+    assert _max_num_seqs(N(engine=N(scheduler_config=N(max_num_seqs=32)))) == 32
+    assert _max_num_seqs(N(llm_engine=N(scheduler_config=N(max_num_seqs=16)))) == 16
+    assert _max_num_seqs(N(vllm_config=N(scheduler_config=N(max_num_seqs=8)))) == 8
+
+
+def test_an_engine_that_says_nothing_yields_none_rather_than_a_guess():
+    """None keeps the in-flight count unused. A guessed capacity would clamp a
+    real measurement to an invented ceiling."""
+    from types import SimpleNamespace as N
+
+    from gitm.tracer.vllm_stats import _max_num_seqs
+
+    assert _max_num_seqs(N()) is None
+    assert _max_num_seqs(N(scheduler_config=N(max_num_seqs=0))) is None
+    assert _max_num_seqs(N(scheduler_config=N(max_num_seqs="many"))) is None
+
+
+def test_the_capacity_is_what_makes_the_batch_readable_end_to_end():
+    """The chain this fixes: capacity -> bounded in-flight -> a batch that is
+    not 1."""
+    from types import SimpleNamespace as N
+
+    from gitm.scheduler.loop import _batch_config_from_stats
+    from gitm.tracer.vllm_stats import SchedulerSample, _max_num_seqs, summarize
+
+    samples = [SchedulerSample(t_ns=i, num_unfinished=243) for i in range(5)]
+    llm = N(llm_engine=N(vllm_config=N(scheduler_config=N(max_num_seqs=256))))
+
+    summ = summarize(samples, max_num_seqs=_max_num_seqs(llm))
+    assert summ.max_num_seqs == 256
+    assert summ.mean_bounded_inflight == 243.0
+
+    cfg, source = _batch_config_from_stats(summ)
+    assert cfg is not None and cfg.batch == 243, "still falling back to batch=1"
+    assert source == "unfinished"
