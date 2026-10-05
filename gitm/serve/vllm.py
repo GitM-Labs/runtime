@@ -675,12 +675,22 @@ def apply_tracing_env(env, trace_path, *, nvtx: bool, no_trace: bool) -> None:
     """
     from gitm.tracer import injection
 
+    # The process settings are not part of what distinguishes the arms, so both
+    # get them. Starting the traced arm's workers with spawn and the untraced
+    # arm's with fork would make the overhead comparison measure the start
+    # method as well as the collector. setdefault, so a start method the
+    # operator exported is kept rather than silently replaced.
+    process = injection.AMD_PROCESS_ENV if injection.detect_vendor() == "amd" else {}
+    for key, value in process.items():
+        env.setdefault(key, value)
+
     if no_trace:
         for var in (injection.ENV_LIB, injection.ENV_ROCP, injection.ENV_OUT,
                     injection.ENV_NVTX, injection.ENV_NVTX_INJECT):
             env.pop(var, None)
         return
-    env.update(injection.run_env(trace_path, nvtx=nvtx))
+    env.update({k: v for k, v in injection.run_env(trace_path, nvtx=nvtx).items()
+                if k not in process})
 
 
 def launch_and_capture(args, serve_argv: list[str] | None = None):
