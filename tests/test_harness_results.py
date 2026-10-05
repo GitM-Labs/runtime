@@ -553,15 +553,41 @@ def test_two_attached_arms_compare_but_an_attached_and_a_launched_one_do_not(tmp
     assert read_capture(launched).comparable_key != a.comparable_key
 
 
-def test_a_module_launched_server_keeps_its_flags(tmp_path):
-    """`python -m vllm.entrypoints.openai.api_server` is a launch form discovery
-    already supports, and it has no `serve` token. Anchoring on one would have
-    returned no flags — the same bug, for a different way of starting it."""
+@pytest.mark.parametrize("cmdline,expected", [
+    # Console script: the shebang puts the interpreter at argv[0].
+    (["/usr/bin/python", ".venv/bin/vllm", "serve", "Kimi-K2.5",
+      "--port", "8000", "--enforce-eager"],
+     ("--port", "8000", "--enforce-eager")),
+    # Module form, which discovery supports and which has no `serve` token.
+    (["/usr/bin/python", "-m", "vllm.entrypoints.openai.api_server",
+      "--model", "Kimi-K2.5", "--port", "8000"],
+     ("--model", "Kimi-K2.5", "--port", "8000")),
+    # A launcher brings its own options, and they come first.
+    (["torchrun", "--nproc-per-node", "2", "-m",
+      "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5"],
+     ("--model", "Kimi-K2.5")),
+    # A profiler wrapper, same shape with a `--` separator of its own.
+    (["nsys", "profile", "-o", "out", "--", "python", "-m",
+      "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5"],
+     ("--model", "Kimi-K2.5")),
+])
+def test_the_flags_start_after_the_vllm_entry_point(tmp_path, cmdline, expected):
+    """Everything before is how the server was invoked; everything after is what
+    it was configured with.
+
+    Two cheaper anchors are both wrong. A `serve` token misses the module form
+    entirely. The first `--` picks up the launcher's own options — under
+    torchrun it starts at `--nproc-per-node`, and a proposed arm would hand the
+    server a flag it has never heard of.
+    """
+    cap = read_capture(_attach_arm(tmp_path, "arm", cmdline=cmdline))
+    assert cap.serve_argv == expected
+
+
+def test_a_command_line_that_is_not_vllm_yields_no_flags(tmp_path):
     cap = read_capture(_attach_arm(
-        tmp_path, "module",
-        cmdline=["/usr/bin/python", "-m", "vllm.entrypoints.openai.api_server",
-                 "--model", "Kimi-K2.5", "--port", "8000", "--enforce-eager"]))
-    assert cap.serve_argv == ("--model", "Kimi-K2.5", "--port", "8000", "--enforce-eager")
+        tmp_path, "other", cmdline=["python", "train.py", "--lr", "0.1"]))
+    assert cap.serve_argv == ()
 
 
 def test_a_manifest_with_neither_shape_yields_no_flags_rather_than_raising(tmp_path):

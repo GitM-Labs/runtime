@@ -38,6 +38,7 @@ from typing import Any
 from gitm.optimizer.history import EXPORT_NAME
 from gitm.optimizer.report import Provenance
 from gitm.optimizer.verification_export import VerificationRecord, write_verification
+from gitm.serve.discover import vllm_argv_start
 
 __all__ = [
     "Capture",
@@ -294,18 +295,20 @@ def _argv_from_attach(manifest: dict[str, Any]) -> list[str]:
     invoked, not what it was configured with, and ``knob_difference`` compares
     flags.
 
-    Anchoring on a ``serve`` token would have missed a launch form discovery
-    already supports — ``python -m vllm.entrypoints.openai.api_server --model m
-    …`` has no ``serve`` in it, and would have come back with no flags at all:
-    the same bug this function exists to fix, for a different way of starting
-    the server. The first ``--`` is the boundary under every form.
+    Where the flags start is :func:`gitm.serve.discover.vllm_argv_start`, which
+    anchors on the vLLM entry point. Two cheaper anchors are both wrong. A
+    ``serve`` token misses ``python -m vllm.entrypoints.openai.api_server …``,
+    a form discovery already supports, which then comes back with no flags at
+    all. The first ``--`` picks up a launcher's own options — under
+    ``torchrun --nproc-per-node 2 -m vllm… --model m`` it starts at
+    ``--nproc-per-node``, and a proposed arm would hand the server a flag it has
+    never heard of.
     """
     cmdline = (manifest.get("target") or {}).get("cmdline")
     if not isinstance(cmdline, list):
         return []
-    first_flag = next(
-        (i for i, tok in enumerate(cmdline) if str(tok).startswith("--")), len(cmdline))
-    return [str(a) for a in cmdline[first_flag:]]
+    start = vllm_argv_start([str(a) for a in cmdline])
+    return [] if start is None else [str(a) for a in cmdline[start:]]
 
 
 def _tracing_from_attach(manifest: dict[str, Any]) -> str | None:

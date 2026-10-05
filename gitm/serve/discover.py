@@ -91,6 +91,33 @@ def is_vllm_server(cmdline: list[str]) -> bool:
     return any(p.search(joined) for p in _VLLM_PATTERNS[1:])
 
 
+def vllm_argv_start(cmdline: list[str]) -> int | None:
+    """Index of the first *server* flag in a vLLM command line, or ``None``.
+
+    Everything before it is how the server was invoked — an interpreter, a
+    launcher and its own options, a console script, a module path, the ``serve``
+    subcommand, the positional model. Everything from it is what the server was
+    configured with, which is what a comparison between two arms comes down to.
+
+    Anchored on the vLLM entry point rather than on the first ``--``, because a
+    launcher brings its own options and they come first: under
+    ``torchrun --nproc-per-node 2 -m vllm.entrypoints.openai.api_server --model
+    m``, the first ``--`` belongs to torchrun. Copying that into a proposed arm
+    would hand the server a flag it has never heard of.
+
+    Uses the same patterns :func:`is_vllm_server` matches on, so what counts as
+    "the vLLM part of this command line" has one definition.
+    """
+    for i, token in enumerate(cmdline):
+        if not any(p.search(str(token)) for p in _VLLM_PATTERNS):
+            continue
+        for j in range(i + 1, len(cmdline)):
+            if str(cmdline[j]).startswith("--"):
+                return j
+        return None
+    return None
+
+
 def iter_pids(proc: Path = PROC) -> list[int]:
     try:
         return sorted(int(p.name) for p in proc.iterdir() if p.name.isdigit())
