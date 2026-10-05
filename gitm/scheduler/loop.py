@@ -1605,6 +1605,11 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # file written before that pass would report none of them.
     _write_skips()
 
+    # A kept restart replaced the engine and released the one cfg.engine still
+    # points at: hand the caller the live engine, not a shut-down handle.
+    if cfg.engine is not None:
+        cfg.engine = getattr(applicator, "engine", cfg.engine)
+
     ar_granger_evidence = ", ".join(
         f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
     ) or "no strong causal signal"

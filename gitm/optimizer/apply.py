@@ -22,6 +22,7 @@ from __future__ import annotations
 import copy
 import gc
 import math
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -204,6 +205,12 @@ def apply_intervention(
                            error=f"regression {delta:+.3f} < keep threshold "
                                  f"{min_keep_delta:+.3f}, restored")
 
+    # Kept: whatever restore() would have needed is now garbage (for a restart,
+    # the whole previous engine). Optional hook — only applicators holding
+    # releasable state implement it.
+    commit = getattr(applicator, "commit", None)
+    if callable(commit):
+        commit()
     return ApplyResult(True, rolled_back=False, measured_delta=delta)
 
 
@@ -217,6 +224,10 @@ def _audit(
         audit.record(event, spec.name, cause, **detail)
     except Exception:
         pass
+
+
+def _warn_release(step: str, exc: Exception) -> None:
+    warnings.warn(f"engine release step {step!r} failed: {exc}", RuntimeWarning, stacklevel=3)
 
 
 def _knob_values(spec: Any) -> dict[str, Any]:
@@ -721,6 +732,18 @@ class LiveEngineApplicator:
                 f"could not rebuild the baseline engine ({cause}): {exc}") from exc
         self._activate(self.engine)
 
+    def commit(self) -> None:
+        """The candidate was kept: release what restore() would have swapped back.
+
+        In parallel mode that is the previous engine, still holding its GPUs.
+        Without this, the next snapshot() drops the only handle to it and it stays
+        resident for the rest of the process — the next candidate is then built
+        beside two engines, not one.
+        """
+        if self._prev is not None and self._prev[0] == "restart":
+            self._shutdown(self._prev[1])
+        self._prev = None
+
     @staticmethod
     def _activate(engine: Any) -> None:
         fn = getattr(engine, "gitm_activate_fn", None)
@@ -732,13 +755,18 @@ class LiveEngineApplicator:
 
     @staticmethod
     def _shutdown(engine: Any) -> None:
-        """Best-effort release of an engine before/after a restart A/B."""
+        """Best-effort release of an engine before/after a restart A/B.
+
+        Never raises (a failed release must not abort the A/B), but every failed
+        step is warned: a swallowed failure looks exactly like a clean release,
+        and the next engine build is what pays for it.
+        """
         custom = getattr(engine, "gitm_shutdown_fn", None)
         if callable(custom):
             try:
                 custom(engine)
-            except Exception:
-                pass
+            except Exception as exc:
+                _warn_release("gitm_shutdown_fn", exc)
 
         for path in ("shutdown", "llm_engine.shutdown", "engine.shutdown"):
             obj: Any = engine
@@ -749,18 +777,20 @@ class LiveEngineApplicator:
             if callable(obj):
                 try:
                     obj()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _warn_release(path, exc)
                 break
+        gc.collect()
         try:
-            gc.collect()
             import torch
-
+        except ImportError:
+            return  # CPU-only box: nothing to empty
+        try:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
-        except Exception:
-            pass
+        except Exception as exc:
+            _warn_release("cuda cache release", exc)
 
     def measure(self, spec: InterventionSpec) -> float | None:
         baseline = self._baseline_tps if self._baseline_tps is not None else self._bench_stats()[0]
