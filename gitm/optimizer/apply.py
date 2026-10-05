@@ -46,6 +46,21 @@ class ApplyResult:
     rolled_back: bool
     measured_delta: float | None
     error: str | None = None
+    #: The baseline could not be put back after this candidate, so whatever the
+    #: applicator mutates is in a state nothing measured. A caller holding more
+    #: candidates must stop: every A/B after this one would be taken against an
+    #: unknown baseline, or against no engine at all.
+    restore_failed: bool = False
+
+
+class RestoreFailed(RuntimeError):
+    """The baseline could not be restored, and the target is in an unknown state.
+
+    Raised by an applicator rather than letting the rebuild's own exception
+    escape, so :func:`apply_intervention` can tell "the candidate failed" (the
+    normal case, which it rolls back) from "the rollback failed" (which it cannot
+    do anything about and must not try twice).
+    """
 
 
 class Applicator(Protocol):
@@ -87,11 +102,42 @@ def apply_intervention(
         return ApplyResult(False, rolled_back=False, measured_delta=None,
                            error=f"snapshot failed, nothing applied: {exc}")
 
+    def _unrestored(applied: bool, delta: float | None, cause: str,
+                    exc: BaseException) -> ApplyResult:
+        """The result for a candidate whose rollback itself failed.
+
+        Returned, never raised. A restore that fails is a baseline rebuild that
+        could not get the memory back, and raising it here ended the whole run
+        with no report — losing every A/B already measured at exactly the point
+        the run most needed to write them down. ``rolled_back`` is False because
+        nothing was rolled back; saying otherwise would tell the reader the
+        baseline is in place.
+        """
+        _audit(audit, "restore_failed", spec, knobs=_knob_values(spec),
+               cause=f"{cause}; restore failed: {exc}")
+        return ApplyResult(applied, rolled_back=False, measured_delta=delta,
+                           error=f"{cause}; restore failed: {exc}",
+                           restore_failed=True)
+
+    def _rollback(applied: bool, delta: float | None, cause: str) -> ApplyResult | None:
+        """Restore the snapshot. ``None`` on success, else the unrestored result."""
+        try:
+            applicator.restore(snapshot)
+        except Exception as exc:
+            return _unrestored(applied, delta, cause, exc)
+        return None
+
     # Step 2: apply. A bad value (validation error) rolls straight back.
     try:
         applicator.apply(spec)
+    except RestoreFailed as exc:
+        # The applicator already tried to put the baseline back inside apply and
+        # could not. Calling restore() again would retry the same rebuild that
+        # just failed.
+        return _unrestored(False, None, "apply failed", exc)
     except Exception as exc:
-        applicator.restore(snapshot)
+        if (bad := _rollback(False, None, f"apply failed: {exc}")) is not None:
+            return bad
         _audit(audit, "revert", spec, cause=f"apply failed, restored: {exc}",
                knobs=_knob_values(spec))
         return ApplyResult(False, rolled_back=True, measured_delta=None,
@@ -102,7 +148,8 @@ def apply_intervention(
     try:
         delta = applicator.measure(spec)
     except Exception as exc:
-        applicator.restore(snapshot)
+        if (bad := _rollback(False, None, f"measure failed: {exc}")) is not None:
+            return bad
         _audit(audit, "revert", spec, cause=f"measure failed, restored: {exc}",
                knobs=_knob_values(spec))
         return ApplyResult(False, rolled_back=True, measured_delta=None,
@@ -120,13 +167,15 @@ def apply_intervention(
         try:
             why = spec.correctness_gate(spec)
         except Exception as exc:
-            applicator.restore(snapshot)
+            if (bad := _rollback(True, delta, f"correctness gate crashed: {exc}")) is not None:
+                return bad
             _audit(audit, "revert", spec, knobs=_knob_values(spec),
                    cause=f"correctness gate crashed, restored: {exc}")
             return ApplyResult(True, rolled_back=True, measured_delta=delta,
                                error=f"correctness gate crashed, restored: {exc}")
         if why is not None:
-            applicator.restore(snapshot)
+            if (bad := _rollback(True, delta, f"correctness gate failed: {why}")) is not None:
+                return bad
             _audit(audit, "revert", spec, knobs=_knob_values(spec),
                    cause=f"correctness gate failed: {why}")
             return ApplyResult(True, rolled_back=True, measured_delta=delta,
@@ -134,7 +183,9 @@ def apply_intervention(
 
     # Step 4: keep-or-rollback on the regression threshold.
     if delta is not None and delta < min_keep_delta:
-        applicator.restore(snapshot)
+        cause = f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}"
+        if (bad := _rollback(True, delta, cause)) is not None:
+            return bad
         _audit(audit, "revert", spec, knobs=_knob_values(spec),
                cause=f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}")
         return ApplyResult(True, rolled_back=True, measured_delta=delta,
@@ -589,9 +640,8 @@ class LiveEngineApplicator:
             self._prev = ("serial_restart", restore_baseline)
             try:
                 new_engine = self._restart_fn(old_engine, values)
-            except Exception:
-                self.engine = restore_baseline()
-                self._prev = None
+            except Exception as exc:
+                self._rebuild_baseline(restore_baseline, f"candidate build failed: {exc}")
                 raise
         else:
             # Refuse a build that cannot fit rather than let it OOM. The failure
@@ -607,8 +657,7 @@ class LiveEngineApplicator:
         if new_engine is None:
             if self._restart_mode == "serial":
                 _, restore_baseline = self._prev
-                self.engine = restore_baseline()
-                self._prev = None
+                self._rebuild_baseline(restore_baseline, "restart_fn produced no engine")
             raise StructuralKnobRequiresRestart(
                 f"restart_fn produced no engine for knob(s) {', '.join(values)}"
             )
@@ -633,11 +682,32 @@ class LiveEngineApplicator:
         elif tag == "serial_restart":
             _, restore_baseline = self._prev
             self._shutdown(self.engine)  # drop the candidate engine we built
-            self.engine = restore_baseline()
-            self._activate(self.engine)
+            self._rebuild_baseline(restore_baseline, "rolling back the candidate")
+            return
         # Consume the restore record so a second restore() can't re-undo (or
         # re-shutdown the already-discarded candidate engine) a second time.
         self._prev = None
+
+    def _rebuild_baseline(self, restore_baseline: Callable[[], Any], cause: str) -> None:
+        """Build the baseline engine again after a serial restart, and make it live.
+
+        The record is consumed whether or not the rebuild works. A rebuild that
+        fails is almost always one that could not get the device memory back, and
+        trying it a second time from ``restore()`` fails the same way — that
+        second attempt, with nothing around it to catch it, is what used to end
+        the run without a report.
+
+        Activated as well as assigned. The workload runner drives whichever
+        engine was last activated, so a rebuilt baseline that is only assigned
+        here leaves the runner on the engine that was just shut down.
+        """
+        self._prev = None
+        try:
+            self.engine = restore_baseline()
+        except Exception as exc:
+            raise RestoreFailed(
+                f"could not rebuild the baseline engine ({cause}): {exc}") from exc
+        self._activate(self.engine)
 
     @staticmethod
     def _activate(engine: Any) -> None:

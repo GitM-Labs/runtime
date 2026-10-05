@@ -1307,6 +1307,11 @@ def autoresearch_v0(
                               if degradations is not None and applied is not None else []),
             )
         )
+        if applied is not None and applied.restore_failed:
+            # The baseline is gone, so every candidate after this one would be
+            # measured against nothing. The caller reads the flag off this last
+            # result and records why the pass ended early.
+            break
     return results
 
 

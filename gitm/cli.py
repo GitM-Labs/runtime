@@ -753,7 +753,16 @@ def main(argv: list[str] | None = None) -> int:
         _warn_degraded(summary, result.get("run_dir"))
         # Non-zero so automation notices a run that measured nothing (no GPU /
         # CUPTI shim, or the workload never ran) instead of seeing a fake pass.
-        return 3 if summary.get("status") == "no_data" else 0
+        if summary.get("status") == "no_data":
+            return 3
+        if summary.get("engine_lost"):
+            # The report is complete for what was tried, but the run stopped
+            # early with the engine in an unknown state. A job that exits 0 here
+            # reads as a finished run to whatever scheduled it.
+            print(f"gitm run: stopped early, the engine could not be restored: "
+                  f"{summary['engine_lost']}", file=sys.stderr)
+            return 5
+        return 0
 
     if args.cmd == "replay":
         from gitm.optimizer.replay import predict_delta_from_files
