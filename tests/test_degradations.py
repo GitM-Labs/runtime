@@ -179,6 +179,7 @@ def test_probe_without_a_token_count_says_runs_per_second():
 
 
 def test_decode_steps_are_labelled_as_steps_not_tokens():
+    from gitm.optimizer.apply import ApplyResult
     from gitm.optimizer.verification_export import build_record
     from gitm.scheduler.loop import _ab_evidence, _engine_throughput_fn
 
@@ -193,7 +194,7 @@ def test_decode_steps_are_labelled_as_steps_not_tokens():
     text = _ab_evidence(ab, rolled_back=False, measured_under=list(log))
     assert "steps/s" in text and "tok/s" not in text
     spec = SimpleNamespace(name="l", summary="s", knob="k", value=1, source="t")
-    rec = build_record(spec, ab, SimpleNamespace(rolled_back=False), degradations=list(log))
+    rec = build_record(spec, ab, ApplyResult(True, rolled_back=False, measured_delta=0.0), degradations=list(log))
     assert rec.unit == "decode_steps/sec"
 
 
@@ -470,17 +471,18 @@ def test_a_clean_report_has_no_degradations_section():
 def test_verification_records_carry_their_own_degradations_and_unit():
     from types import SimpleNamespace as NS
 
+    from gitm.optimizer.apply import ApplyResult
     from gitm.optimizer.verification_export import build_export, build_record
 
     spec = NS(name="lever", summary="s", knob="k", value=1, source="t")
     ab = NS(baseline_tps=1.0, candidate_tps=1.1, speedup=1.1, baseline_std=0.0,
             candidate_std=0.0, reps=1, rel_std=0.0, significant=True, via="hot-swap")
     unit = Degradation(AB_UNIT, used="runs/sec", reason="r", affects=(AFFECTS_AB,))
-    rec = build_record(spec, ab, NS(rolled_back=False), degradations=[unit])
+    rec = build_record(spec, ab, ApplyResult(True, rolled_back=False, measured_delta=0.0), degradations=[unit])
     assert rec.degradations[0]["stage"] == AB_UNIT
     doc = build_export([rec], _provenance(DegradationLog()))
     assert doc["results"][0]["unit"] == "runs/sec" and "`unit`" in doc["protocol"]["metric"]
-    clean = build_record(spec, ab, NS(rolled_back=False))
+    clean = build_record(spec, ab, ApplyResult(True, rolled_back=False, measured_delta=0.0))
     assert build_export([clean], _provenance(DegradationLog()))["results"][0]["unit"] == "tokens/sec"
 
 

@@ -51,6 +51,18 @@ class ApplyResult:
     #: unknown baseline, or against no engine at all.
     restore_failed: bool = False
 
+    @property
+    def kept(self) -> bool:
+        """Whether the gate kept this candidate. The one place that is decided.
+
+        Not ``not rolled_back``. A candidate whose restore failed was not rolled
+        back, but it was not kept either: every restore follows a rejection, so
+        the gate had already said no. Reading ``not rolled_back`` as kept turned a
+        candidate measured at -20% whose rollback then failed into a kept result,
+        which history counts as a win.
+        """
+        return not self.rolled_back and not self.restore_failed
+
 
 class RestoreFailed(RuntimeError):
     """The baseline could not be restored, and the target is in an unknown state.

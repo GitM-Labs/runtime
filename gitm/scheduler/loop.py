@@ -636,7 +636,9 @@ def _ar_target_residual(ar_run: AutoresearchRun, fallback: float = 0.0) -> float
     return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else fallback
 
 
-def _ab_evidence(ab: Any, rolled_back: bool, measured_under: Iterable[Any]) -> str:
+def _ab_evidence(
+    ab: Any, rolled_back: bool, measured_under: Iterable[Any], *, restore_failed: bool = False,
+) -> str:
     """The claim sentence for a live A/B, in the unit the probe actually measured.
 
     ``measured_under`` is this candidate's own list
@@ -644,7 +646,8 @@ def _ab_evidence(ab: Any, rolled_back: bool, measured_under: Iterable[Any]) -> s
     in a later A/B says nothing about the unit of this one.
     """
     what, unit, _export = AB_UNITS[ab_unit(measured_under)]
-    outcome = "rolled back" if rolled_back else "kept"
+    outcome = ("not kept, baseline not restored" if restore_failed
+               else "rolled back" if rolled_back else "kept")
     return (
         f"live A/B: {outcome} ({ab.speedup - 1.0:+.1%} {what}, via {ab.via}); "
         f"baseline {ab.baseline_tps:.1f} → candidate {ab.candidate_tps:.1f} {unit}"
@@ -1404,7 +1407,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         # from the authoritative ApplyResult (the real gate decision), not from
         # EngineABResult.kept (a measure-time delta>=0 indicator).
         if ab is not None:
-            causal_evidence = _ab_evidence(ab, result.rolled_back, measured_under)
+            causal_evidence = _ab_evidence(ab, result.rolled_back, measured_under,
+                                           restore_failed=result.restore_failed)
         else:
             causal_evidence = ", ".join(
                 f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
@@ -1428,6 +1432,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 # with its real (small) number, not a distorted one.
                 measured_delta=((ab.speedup - 1.0) if ab is not None else result.measured_delta),
                 rolled_back=result.rolled_back,
+                restore_failed=result.restore_failed,
                 unreliable_ab=unreliable_ab(measured_under) if ab is not None else [],
             )
         )
@@ -1557,12 +1562,11 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                        if r.apply_result is not None and r.apply_result.restore_failed), None)
     if engine_lost is None and lost_in_ar is not None:
         engine_lost = lost_in_ar.apply_error or f"restore failed after {lost_in_ar.spec.name}"
-        # What autoresearch had ranked but never reached is not counted: its
-        # proposals are generated per pass, so there is no fixed queue to measure
-        # against, unlike Phase 4's.
+        n_untried = ar_run.n_untried
         degradations.record(
             ENGINE_LOST, used=f"an autoresearch pass that stopped after {lost_in_ar.spec.name}",
-            reason=engine_lost, severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
+            reason=f"{engine_lost}; {n_untried} ranked candidate(s) not tried",
+            severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
     # Again, now that autoresearch has had its proposals vetoed: an exclusion
     # that only stopped a proposal is still something the run held back, and a
     # file written before that pass would report none of them.
@@ -1579,8 +1583,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         if r.rolled_back:
             rolled_back.append(r.spec.name)
         ar_ab = r.ab_result
+        ar_lost = r.apply_result is not None and r.apply_result.restore_failed
         if ar_ab is not None:
-            evidence = _ab_evidence(ar_ab, r.rolled_back, r.degradations)
+            evidence = _ab_evidence(ar_ab, r.rolled_back, r.degradations,
+                                    restore_failed=ar_lost)
         else:
             evidence = ar_granger_evidence
         if r.measured_delta is None and r.apply_error:
@@ -1600,6 +1606,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 predicted_delta=r.predicted_delta,
                 measured_delta=true_delta,
                 rolled_back=r.rolled_back,
+                restore_failed=ar_lost,
                 unreliable_ab=unreliable_ab(r.degradations) if ar_ab is not None else [],
             )
         )
