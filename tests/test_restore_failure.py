@@ -286,9 +286,13 @@ def test_autoresearch_counts_what_it_never_reached(monkeypatch):
     import gitm.agents.autoresearch as ar
     from gitm.agents.policy import RankedCandidate
 
-    specs = [_spec(f"knob_{i}", 1) for i in range(4)]
+    specs = [_spec(f"knob_{i}", 1) for i in range(6)]
+    # Survivors and gate rejections interleaved after the one that loses the engine.
+    rejected = {"knob_2", "knob_4"}
     monkeypatch.setattr(ar, "select_interventions", lambda *a, **kw: [
-        RankedCandidate(spec=s, predicted_delta=0.05) for s in specs])
+        RankedCandidate(spec=s, predicted_delta=0.05,
+                        rejected_reason="policy.skip_high_risk" if s.name in rejected else None)
+        for s in specs])
 
     class _Proposer:
         def propose(self, cls, target_op=None):
@@ -305,5 +309,32 @@ def test_autoresearch_counts_what_it_never_reached(monkeypatch):
     run = ar.autoresearch(_trace(), applicator=object(), proposer=_Proposer())
 
     assert calls["n"] == 1
-    assert len(run.results) == 1
-    assert run.n_untried == 3
+    assert run.n_untried == 3  # knob_1, knob_3, knob_5
+    # The gate's rejections needed no engine, so they are still recorded.
+    assert [r.spec.name for r in run.results if not r.applicable] == ["knob_2", "knob_4"]
+    assert len(run.results) == 3
+
+
+def test_phase4_still_records_what_the_gate_rejected(tmp_path, monkeypatch):
+    """Breaking on a lost engine dropped the gate's rejections queued behind it:
+    they reached neither n_rejected nor n_untried."""
+    from gitm.agents.policy import RankedCandidate
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield _trace(run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    queue = [("a", None), ("b", "policy.skip_high_risk"), ("c", None), ("d", "not_applicable: x")]
+    monkeypatch.setattr(loop, "select_interventions", lambda *a, **kw: [
+        RankedCandidate(spec=_spec(name, 1), predicted_delta=0.05, rejected_reason=why)
+        for name, why in queue])
+    monkeypatch.setattr(loop, "apply_intervention", lambda *a, **kw: ApplyResult(
+        False, rolled_back=False, measured_delta=None, error="restore failed",
+        restore_failed=True))
+
+    out = loop.run_loop(loop.LoopConfig(budget="30s", scratch=str(tmp_path),
+                                        workload_runner=_Runner()))
+    assert out["summary"]["n_untried"] == 1   # c
+    assert out["summary"]["n_rejected"] == 2  # b, d

@@ -1265,19 +1265,27 @@ def _autoresearch_pass(
 
     results: list[AutoresearchResult] = []
     n_untried = 0
-    for i, c in enumerate(ranked):
+    # Set once a restore fails. The pass keeps walking the ranking, but only to
+    # record what the gate had already rejected — that verdict needs no engine,
+    # and dropping it would leave those candidates in neither the rejected count
+    # nor the untried one. Every survivor after that point is counted untried.
+    lost = False
+    for c in ranked:
         # Gate rejection wins; else the caller's veto (e.g. a live structural knob
         # with no restart hook) can reject before we touch the engine. Rejected
         # candidates are recorded but never applied; survivors go through the
         # rollback-gated apply. Both land in one result shape.
         reason = c.rejected_reason
+        if lost and reason is None:
+            n_untried += 1
+            continue
         # Autoresearch applies every survivor, not a top-N, so the ranking alone
         # cannot stop a known loser: sorted last, it still ran. A candidate this
         # box already measured at no gain is a result in hand, not an experiment,
         # and re-running it spends an A/B (often a restart) to learn it again.
-        if reason is None and c.delta_source == "measured" and c.predicted_delta <= 0:
+        if not lost and reason is None and c.delta_source == "measured" and c.predicted_delta <= 0:
             reason = f"history: measured {c.predicted_delta:+.1%} on this box; not re-run"
-        if reason is None and reject is not None:
+        if not lost and reason is None and reject is not None:
             reason = reject(c.spec)
         pre_cfg: dict | None = None
         post_cfg: dict | None = None
@@ -1319,10 +1327,9 @@ def _autoresearch_pass(
         )
         if applied is not None and applied.restore_failed:
             # The baseline is gone, so every candidate after this one would be
-            # measured against nothing. The caller reads the flag off this last
+            # measured against nothing. The caller reads the flag off this
             # result and records why the pass ended early.
-            n_untried = sum(1 for x in ranked[i + 1:] if x.rejected_reason is None)
-            break
+            lost = True
     return results, n_untried
 
 
