@@ -1467,6 +1467,11 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         if result.restore_failed:
             engine_lost = result.error or f"restore failed after {c.spec.name}"
             n_untried = sum(1 for x in queue if x.rejected_reason is None)
+            # What the gate rejected is a verdict that needed no engine, so it is
+            # still recorded. Breaking here without it left those candidates in
+            # neither the rejected list nor the untried count.
+            rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
+                            for x in queue if x.rejected_reason is not None)
             # Approximate, not unreliable. The A/Bs measured before this one
             # were taken against a sound baseline, and an unreliable mark here
             # would exclude them from history along with everything else.
