@@ -429,3 +429,17 @@ def test_a_truncated_final_line_is_still_reported(tmp_path, monkeypatch):
         _w.simplefilter("always")
         injection.read_shards()
     assert any("malformed or incomplete" in str(c.message) for c in caught)
+
+
+def test_vllm_factory_stays_on_fork_without_an_importable_main(monkeypatch):
+    """Under python -c, stdin or a notebook a spawned child has no __main__ to
+    re-import, so spawn would fail even the first engine. The factory leaves fork
+    in place and says what that costs on ROCm."""
+    import sys
+    import types
+
+    monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    monkeypatch.setitem(sys.modules, "__main__", types.ModuleType("__main__"))
+    with pytest.warns(RuntimeWarning, match="no importable __main__"):
+        env = _factory_env(monkeypatch, "amd")
+    assert "VLLM_WORKER_MULTIPROC_METHOD" not in env

@@ -444,6 +444,44 @@ def test_the_traced_arms_differ_only_by_the_nvtx_variables():
     assert correlated[injection.ENV_NVTX] == "1"
 
 
+def test_on_amd_every_arm_starts_its_workers_the_same_way(monkeypatch):
+    """The arms of an overhead measurement differ only in tracing. A traced arm
+    on spawn against an untraced arm on fork would measure the start method too,
+    so the untraced arm gets it as well rather than having it cleared."""
+    from gitm.serve.vllm import apply_tracing_env
+    from gitm.tracer import injection
+
+    monkeypatch.setattr(injection, "detect_vendor", lambda: "amd")
+    traced: dict[str, str] = {}
+    untraced: dict[str, str] = {}
+    apply_tracing_env(traced, "/tmp/t.jsonl", nvtx=False, no_trace=False)
+    apply_tracing_env(untraced, "/tmp/t.jsonl", nvtx=False, no_trace=True)
+
+    assert traced["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+    assert untraced["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+    assert injection.ENV_ROCP in traced and injection.ENV_ROCP not in untraced
+
+
+def test_serve_keeps_a_start_method_the_operator_chose(monkeypatch):
+    from gitm.serve.vllm import apply_tracing_env
+    from gitm.tracer import injection
+
+    monkeypatch.setattr(injection, "detect_vendor", lambda: "amd")
+    env = {"VLLM_WORKER_MULTIPROC_METHOD": "fork"}
+    apply_tracing_env(env, "/tmp/t.jsonl", nvtx=False, no_trace=False)
+    assert env["VLLM_WORKER_MULTIPROC_METHOD"] == "fork"
+
+
+def test_serve_leaves_the_start_method_alone_on_nvidia(monkeypatch):
+    from gitm.serve.vllm import apply_tracing_env
+    from gitm.tracer import injection
+
+    monkeypatch.setattr(injection, "detect_vendor", lambda: "nvidia")
+    env: dict[str, str] = {}
+    apply_tracing_env(env, "/tmp/t.jsonl", nvtx=False, no_trace=False)
+    assert "VLLM_WORKER_MULTIPROC_METHOD" not in env
+
+
 def test_an_untraced_run_still_writes_its_serving_summary(tmp_path):
     """The baseline arm of an overhead measurement produces no trace by design, and
     its serving_summary IS the measurement. It is written only after the workload has

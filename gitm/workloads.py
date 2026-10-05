@@ -543,6 +543,19 @@ def _openfold_factory(cfg: LoopConfig) -> WorkloadRunner:
     )
     return run
 
+def _main_is_importable() -> bool:
+    """Whether a spawned child could re-import this process's ``__main__``.
+
+    Spawn starts the child by importing ``__main__`` from its file. A script or a
+    console script has one; ``python -c``, a stdin heredoc and a notebook kernel
+    do not, and a spawned engine dies before it builds.
+    """
+    import sys
+
+    path = getattr(sys.modules.get("__main__"), "__file__", None)
+    return bool(path) and Path(path).is_file()
+
+
 @register("vllm-decode")
 def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     """Launch a vLLM decode job inside the tracer capture window.
@@ -592,12 +605,25 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
 
     # Before vLLM is imported or any engine is built, because it decides how the
     # EngineCore child starts. ``capture serve`` gets the same settings from
-    # run_env(); this covers `gitm run` launched with the collector variables
-    # exported by hand, which is how the runbook does it. setdefault, so an
-    # operator who chose a start method keeps it.
+    # apply_tracing_env(); this covers `gitm run` launched with the collector
+    # variables exported by hand, which is how the runbook does it. setdefault,
+    # so an operator who chose a start method keeps it.
     if injection.active_vendor() == "amd":
-        for key, value in injection.AMD_PROCESS_ENV.items():
-            os.environ.setdefault(key, value)
+        if _main_is_importable():
+            for key, value in injection.AMD_PROCESS_ENV.items():
+                os.environ.setdefault(key, value)
+        elif "VLLM_WORKER_MULTIPROC_METHOD" not in os.environ:
+            # Spawn would fail to start even the first engine here: the child
+            # re-imports __main__, and `python -c`, a stdin heredoc or a notebook
+            # has none to import. Left on fork, which works at TP>1 and is the
+            # known empty-trace case at TP=1, so say which.
+            import warnings
+
+            warnings.warn(
+                "gitm: this process has no importable __main__ (python -c, stdin, "
+                "or a notebook), so vLLM's workers stay on fork. On ROCm a forked "
+                "EngineCore records no kernels at TP=1. Run from a script file or "
+                "the gitm command to get a trace.", RuntimeWarning, stacklevel=2)
 
     from vllm import LLM, SamplingParams
 

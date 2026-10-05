@@ -59,8 +59,8 @@ LIB_NAME = "libgitm_inject.so"
 #: ``ROCP_TOOL_LIBRARIES`` the way it was in the parent.
 #:
 #: Spawn re-imports ``__main__`` in the child, so the launching script must be
-#: importable. The ``gitm`` console script is; ``python -c`` and stdin heredocs
-#: are not, and ``workloads`` already names that failure when it happens.
+#: importable. The ``gitm`` console script is; ``python -c``, stdin heredocs and
+#: notebooks are not, and the vLLM factory leaves those on fork with a warning.
 AMD_PROCESS_ENV: dict[str, str] = {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}
 
 # How long to wait, after the workload finishes, for in-flight CUPTI buffers in
