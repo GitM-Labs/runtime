@@ -48,6 +48,7 @@ from gitm.optimizer.degradation import (
     AFFECTS_RESIDUALS,
     APPROXIMATE,
     AR_SKIPPED,
+    ENGINE_LOST,
     GRAPH_BATCH,
     GRAPH_HARDWARE,
     GRAPH_MODEL,
@@ -1385,6 +1386,11 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # applied or rejected, cannot return.
     queue = list(ranked)
     reranks: list[dict[str, Any]] = []
+    # Set when a candidate's rollback failed. From then on there is no baseline
+    # to measure against, so the run stops trying candidates and goes straight
+    # to writing up what it has.
+    engine_lost: str | None = None
+    n_untried = 0
     while queue:
         c = queue.pop(0)
         if c.rejected_reason is not None:
@@ -1453,6 +1459,17 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 unreliable_ab=unreliable_ab(measured_under) if ab is not None else [],
             )
         )
+        if result.restore_failed:
+            engine_lost = result.error or f"restore failed after {c.spec.name}"
+            n_untried = sum(1 for x in queue if x.rejected_reason is None)
+            # Approximate, not unreliable. The A/Bs measured before this one
+            # were taken against a sound baseline, and an unreliable mark here
+            # would exclude them from history along with everything else.
+            degradations.record(
+                ENGINE_LOST, used=f"a run that stopped after {c.spec.name}",
+                reason=f"{engine_lost}; {n_untried} ranked candidate(s) not tried",
+                severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
+            break
         if time.time_ns() - started_ns >= int(budget_s * 1e9):
             break
 
@@ -1506,7 +1523,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         }, indent=2))
 
     # Phase 4b - agentic autoresearch through the catalog gate/rollback path.
-    if time.time_ns() - started_ns < int(budget_s * 1e9):
+    if engine_lost is None and time.time_ns() - started_ns < int(budget_s * 1e9):
         proposer = FallbackProposer(EngineArgsProposer(), TableProposer())
 
         def _unenactable(spec: Any) -> str | None:
@@ -1560,9 +1577,20 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         ar_run = AutoresearchRun(bottleneck_class=classify_bottleneck(trace, res), results=[])
         ar_run.degradations.append(Degradation(
             AR_SKIPPED, used="no autoresearch pass",
-            reason=f"budget {cfg.budget} exhausted by Phase 4",
+            reason=(f"engine lost in Phase 4: {engine_lost}" if engine_lost is not None
+                    else f"budget {cfg.budget} exhausted by Phase 4"),
             severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,)))
     degradations.extend(ar_run.degradations)
+    lost_in_ar = next((r for r in ar_run.results
+                       if r.apply_result is not None and r.apply_result.restore_failed), None)
+    if engine_lost is None and lost_in_ar is not None:
+        engine_lost = lost_in_ar.apply_error or f"restore failed after {lost_in_ar.spec.name}"
+        # What autoresearch had ranked but never reached is not counted: its
+        # proposals are generated per pass, so there is no fixed queue to measure
+        # against, unlike Phase 4's.
+        degradations.record(
+            ENGINE_LOST, used=f"an autoresearch pass that stopped after {lost_in_ar.spec.name}",
+            reason=engine_lost, severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
     # Again, now that autoresearch has had its proposals vetoed: an exclusion
     # that only stopped a proposal is still something the run held back, and a
     # file written before that pass would report none of them.
@@ -1696,6 +1724,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         # In the summary, not only the run dir: a reader comparing two runs needs
         # to know one of them was not asked to try everything.
         "n_skipped_levers": len(_excluded),
+        # Set when a rollback failed and the run stopped trying candidates. The
+        # report is still written; this is what says it is a partial one.
+        "engine_lost": engine_lost,
+        "n_untried": n_untried,
         "scheduler_stats": asdict(sched_summary) if sched_stats.samples else None,
         "report_path": str(run_dir / "report.md"),
     }
