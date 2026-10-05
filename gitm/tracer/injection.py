@@ -49,6 +49,20 @@ ENV_SETTLE = "GITM_TRACE_SETTLE_S"
 
 LIB_NAME = "libgitm_inject.so"
 
+#: Process settings a traced vLLM run needs on AMD, beyond the collector hook.
+#:
+#: vLLM forks ``EngineCore`` by default, and on ROCm the parent has usually
+#: initialised HIP by then. The forked child inherits that runtime without the
+#: rocprofiler tool attached, so it launches every kernel and records none: the
+#: run completes and the trace is empty (known problem P1-1, seen at TP=1 on
+#: MI355X). ``spawn`` starts the child fresh, and the tool is loaded again from
+#: ``ROCP_TOOL_LIBRARIES`` the way it was in the parent.
+#:
+#: Spawn re-imports ``__main__`` in the child, so the launching script must be
+#: importable. The ``gitm`` console script is; ``python -c`` and stdin heredocs
+#: are not, and ``workloads`` already names that failure when it happens.
+AMD_PROCESS_ENV: dict[str, str] = {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}
+
 # How long to wait, after the workload finishes, for in-flight CUPTI buffers in
 # other processes to land on disk. We cannot reach into the child to force a
 # flush, so the injected library flushes on a period (GITM_TRACE_FLUSH_MS, default
@@ -173,7 +187,7 @@ def run_env(
     """
     out = str(Path(out_path).resolve())
     if (vendor or detect_vendor()) == "amd":
-        env = {ENV_ROCP: str(rocm_lib_path()), ENV_OUT: out}
+        env = {ENV_ROCP: str(rocm_lib_path()), ENV_OUT: out, **AMD_PROCESS_ENV}
         if nvtx:
             env[ENV_NVTX] = "1"
             shim = _rocm_shim_path()

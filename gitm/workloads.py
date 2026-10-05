@@ -588,6 +588,17 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
 
     import time
 
+    from gitm.tracer import injection
+
+    # Before vLLM is imported or any engine is built, because it decides how the
+    # EngineCore child starts. ``capture serve`` gets the same settings from
+    # run_env(); this covers `gitm run` launched with the collector variables
+    # exported by hand, which is how the runbook does it. setdefault, so an
+    # operator who chose a start method keeps it.
+    if injection.active_vendor() == "amd":
+        for key, value in injection.AMD_PROCESS_ENV.items():
+            os.environ.setdefault(key, value)
+
     from vllm import LLM, SamplingParams
 
     # Optional GPU-memory cap (GITM_VLLM_GPU_MEM, e.g. 0.45). Structural restart

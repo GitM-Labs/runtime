@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 
 import pytest
 
@@ -95,6 +96,51 @@ def test_run_env_nvidia_shape_is_unchanged(tmp_path):
     env = injection.run_env(tmp_path / "t.jsonl", vendor="nvidia")
     assert injection.ENV_LIB in env
     assert injection.ENV_ROCP not in env
+
+
+def test_run_env_amd_starts_vllm_workers_with_spawn(tmp_path):
+    """A forked EngineCore on ROCm keeps the parent's HIP runtime but not the
+    rocprofiler tool, so it records nothing (P1-1). Spawn reloads the tool."""
+    env = injection.run_env(tmp_path / "t.jsonl", vendor="amd")
+    assert env["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+
+
+def test_run_env_nvidia_leaves_the_start_method_alone(tmp_path):
+    env = injection.run_env(tmp_path / "t.jsonl", vendor="nvidia")
+    assert "VLLM_WORKER_MULTIPROC_METHOD" not in env
+
+
+def _factory_env(monkeypatch, vendor):
+    """What the vLLM factory leaves in the environment before importing vLLM.
+
+    vLLM is blocked from importing, so the factory stops right after the point
+    under test instead of building an engine.
+    """
+    import sys
+
+    from gitm import workloads
+
+    monkeypatch.delenv("GITM_VLLM_SYNTHETIC", raising=False)
+    monkeypatch.setattr(injection, "active_vendor", lambda: vendor)
+    monkeypatch.setitem(sys.modules, "vllm", None)
+    with pytest.raises(ImportError):
+        workloads._vllm_decode_factory(None)
+    return os.environ
+
+
+def test_vllm_factory_defaults_spawn_on_amd(monkeypatch):
+    monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    assert _factory_env(monkeypatch, "amd")["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+
+
+def test_vllm_factory_keeps_an_explicit_start_method(monkeypatch):
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "fork")
+    assert _factory_env(monkeypatch, "amd")["VLLM_WORKER_MULTIPROC_METHOD"] == "fork"
+
+
+def test_vllm_factory_leaves_the_start_method_alone_on_nvidia(monkeypatch):
+    monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    assert "VLLM_WORKER_MULTIPROC_METHOD" not in _factory_env(monkeypatch, "nvidia")
 
 
 # --------------------------------------------------------------------------- #
