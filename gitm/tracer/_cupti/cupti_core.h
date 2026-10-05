@@ -88,6 +88,13 @@ typedef struct {
     uint32_t thread_id;
     uint32_t marker_id;
     int      marker_flags;
+    /* CUDA-graph identity, kernel records only; both zero for a kernel launched
+     * outside a graph. Every kernel a graph replay runs shares the correlation_id
+     * of the one cudaGraphLaunch, so the launch-enclosing NVTX range names the
+     * replay, not the op. graph_node_id is what can name the op: it is the key a
+     * capture-time node -> range map joins on (docs/kernel_identity.md). */
+    uint32_t graph_id;
+    uint64_t graph_node_id;
 } gitm_record;
 
 /** Whether RUNTIME/MARKER collection is on (GITM_TRACE_NVTX). Exposed so both

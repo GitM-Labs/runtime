@@ -309,3 +309,109 @@ def test_an_anonymous_gemm_resolves_through_vllms_own_ranges():
     ])
     (kernel,) = [e for e in events if e.kind == "kernel"]
     assert (kernel.range_op, kernel.range_layer) == ("moe_routed", 1)
+
+
+# ── CUDA graphs ─────────────────────────────────────────────────────────────
+#
+# A graph replay is one cudaGraphLaunch, and every kernel it runs carries that
+# launch's correlation_id. The range around the launch names the replay, not
+# the op, so it must not become range_op. See correlate.py, "CUDA graphs".
+
+
+def _graph_kernel(name, corr_id, graph_id, node_id, t=0):
+    k = _kernel(name, corr_id=corr_id, dev_start=t, dev_end=t + 10)
+    k["graph_id"] = graph_id
+    k["graph_node_id"] = node_id
+    return k
+
+
+def _graph_node(node_id, name="", cloned_from=None):
+    return {"kind": "graph_node", "graph_node_id": node_id, "name": name,
+            "cloned_from": cloned_from}
+
+
+def test_graph_replay_does_not_take_the_launch_range_as_op():
+    """Two kernels from one replay share the launch's correlation_id. Before this,
+    both got L5/qkv_proj because that was the range open around the launch."""
+    records = [
+        _marker("L5/qkv_proj", thread_id=1, start=0, end=1000),
+        _runtime(corr_id=9, thread_id=1, host_start=100, host_end=120),  # cudaGraphLaunch
+        _graph_kernel("nvjet_gemm", corr_id=9, graph_id=3, node_id=41),
+        _graph_kernel("fused_moe_kernel", corr_id=9, graph_id=3, node_id=42, t=20),
+    ]
+    out = correlate_kernels_to_ranges(records)
+    assert [o["range_op"] for o in out] == [None, None]
+    assert [o["range_layer"] for o in out] == [None, None]
+    assert [o["launch_range"] for o in out] == ["L5/qkv_proj", "L5/qkv_proj"]
+
+
+def test_graph_node_map_names_each_replayed_kernel():
+    records = [
+        _marker("decode_step", thread_id=1, start=0, end=1000),
+        _runtime(corr_id=9, thread_id=1, host_start=100, host_end=120),
+        _graph_node(41, "L0/qkv_proj"),
+        _graph_node(42, "L0/moe_routed"),
+        _graph_kernel("nvjet_gemm", corr_id=9, graph_id=3, node_id=41),
+        _graph_kernel("fused_moe_kernel", corr_id=9, graph_id=3, node_id=42, t=20),
+    ]
+    out = correlate_kernels_to_ranges(records)
+    assert [(o["range_op"], o["range_layer"]) for o in out] == [
+        ("qkv_proj", 0), ("moe_routed", 0)]
+    assert {o["launch_range"] for o in out} == {"decode_step"}
+
+
+def test_graph_node_resolves_through_clones():
+    """Whether a kernel reports the captured node or its instantiated clone is
+    not assumed; both resolve to the range the original was captured under."""
+    records = [
+        _graph_node(41, "L2/attn_out_proj"),
+        _graph_node(900, cloned_from=41),
+        _graph_node(901, cloned_from=900),
+        _graph_kernel("k_orig", corr_id=1, graph_id=3, node_id=41),
+        _graph_kernel("k_clone", corr_id=2, graph_id=4, node_id=901),
+    ]
+    out = correlate_kernels_to_ranges(records)
+    assert [(o["range_op"], o["range_layer"]) for o in out] == [
+        ("attn_out_proj", 2), ("attn_out_proj", 2)]
+
+
+def test_graph_node_clone_cycle_resolves_to_none():
+    records = [
+        _graph_node(1, cloned_from=2),
+        _graph_node(2, cloned_from=1),
+        _graph_kernel("k", corr_id=1, graph_id=3, node_id=1),
+    ]
+    assert correlate_kernels_to_ranges(records)[0]["range_op"] is None
+
+
+def test_graph_id_zero_is_an_eager_launch():
+    """CUPTI reports graphId 0 for a kernel launched outside a graph."""
+    records = [
+        _marker("L1/qkv_proj", thread_id=1, start=0, end=100),
+        _runtime(corr_id=1, thread_id=1, host_start=10, host_end=20),
+        _graph_kernel("k", corr_id=1, graph_id=0, node_id=0),
+    ]
+    out = correlate_kernels_to_ranges(records)
+    assert (out[0]["range_op"], out[0]["range_layer"]) == ("qkv_proj", 1)
+    assert "launch_range" not in out[0]
+
+
+def test_decode_carries_graph_identity_and_maps_zero_to_none():
+    from gitm.tracer._cupti_decode import decode_records
+
+    base = {"kind": "kernel", "start_ns": 0, "end_ns": 10, "device_id": 0,
+            "stream_id": 7, "grid": [1, 1, 1], "block": [1, 1, 1]}
+    records = [
+        _start(1, "decode_step", 0, thread=1),
+        _end(1, 1000, thread=1),
+        _runtime(corr_id=9, thread_id=1, host_start=100, host_end=120),
+        {**base, "name": "g", "correlation_id": 9, "graph_id": 3, "graph_node_id": 41},
+        {**base, "name": "e", "correlation_id": 10, "graph_id": 0, "graph_node_id": 0,
+         "start_ns": 20, "end_ns": 30},
+        {**base, "name": "old", "correlation_id": 11, "start_ns": 40, "end_ns": 50},
+    ]
+    g, e, old = decode_records(records)
+    assert (g.graph_id, g.graph_node_id, g.launch_range) == (3, 41, "decode_step")
+    assert g.range_op is None
+    assert (e.graph_id, e.graph_node_id, e.launch_range) == (None, None, None)
+    assert (old.graph_id, old.graph_node_id) == (None, None)
