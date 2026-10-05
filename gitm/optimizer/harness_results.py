@@ -268,6 +268,55 @@ def _find_trace(path: Path, manifest: dict[str, Any]) -> Path | None:
     return Path(declared) if declared else None
 
 
+def _argv_from_attach(manifest: dict[str, Any]) -> list[str]:
+    """The server's flags from an ``attach`` manifest, which has no ``serve_argv``.
+
+    ``gitm capture serve`` launches the server and records the argv it used.
+    ``gitm capture attach`` did not launch it, so it records what it found in
+    ``/proc`` instead, under ``target.cmdline`` — the whole command, interpreter
+    and all.
+
+    Reading only ``serve_argv`` meant every attached capture came back with no
+    flags at all. That is not a missing nicety: the baseline's flags are what
+    every proposed arm is built from, so a sweep proposed against an attached
+    baseline would launch servers carrying one flag and nothing else. It also
+    silently inverted a lever — ``cuda_graphs_enable`` is realised by *removing*
+    ``--enforce-eager``, so an empty baseline reports it unreachable on a server
+    that was in fact started with it.
+
+    Everything up to and including ``serve`` is dropped: the interpreter, the
+    console script, the subcommand and the positional model are how the server
+    was invoked, not what it was configured with, and ``knob_difference``
+    compares flags.
+    """
+    cmdline = (manifest.get("target") or {}).get("cmdline")
+    if not isinstance(cmdline, list) or "serve" not in cmdline:
+        return []
+    rest = cmdline[cmdline.index("serve") + 1:]
+    # Drop the positional model argument, if any; flags start at the first "--".
+    first_flag = next((i for i, tok in enumerate(rest) if str(tok).startswith("--")), len(rest))
+    return [str(a) for a in rest[first_flag:]]
+
+
+def _tracing_from_attach(manifest: dict[str, Any]) -> str | None:
+    """Whether an attached capture was traced, which its summary does not say.
+
+    ``comparable_key`` includes this because tracing costs throughput, so an arm
+    traced against one that was not measures the tracer rather than the knob.
+    Left at ``None`` on every attached capture, two of them compared fine with
+    each other but never against a launched one, and the reason would have read
+    as a mismatch in the data rather than a gap in what was recorded.
+
+    ``nvtx`` is deliberately not inferred: the attach preflight does not
+    establish it, and guessing it would make two genuinely different captures
+    look alike.
+    """
+    target = manifest.get("target")
+    if not isinstance(target, dict) or "traceable" not in target:
+        return None
+    return "cupti" if target.get("traceable") else "off"
+
+
 def read_capture(path: str | Path) -> Capture:
     """One arm's directory, read into a :class:`Capture`.
 
@@ -286,13 +335,15 @@ def read_capture(path: str | Path) -> Capture:
     trace_path = _find_trace(path, manifest)
 
     argv = manifest.get("serve_argv")
+    if not isinstance(argv, list):
+        argv = _argv_from_attach(manifest)
     load = manifest.get("load")
     return Capture(
         path=path,
         served_model=manifest.get("served_model"),
         serve_argv=tuple(str(a) for a in argv) if isinstance(argv, list) else (),
         load=load if isinstance(load, dict) else {},
-        tracing=summary.get("tracing"),
+        tracing=summary.get("tracing") or _tracing_from_attach(manifest),
         throughput=throughput,
         window_s=window,
         goodput=is_goodput,
