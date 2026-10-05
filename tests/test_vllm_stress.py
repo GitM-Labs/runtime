@@ -353,21 +353,47 @@ def test_an_engine_that_says_nothing_yields_none_rather_than_a_guess():
     assert _max_num_seqs(N(scheduler_config=N(max_num_seqs="many"))) is None
 
 
-def test_the_capacity_is_what_makes_the_batch_readable_end_to_end():
-    """The chain this fixes: capacity -> bounded in-flight -> a batch that is
-    not 1."""
+def test_the_capacity_reaches_the_batch_through_the_sampler_a_run_uses():
+    """The whole chain, driven the way a live capture drives it.
+
+    Calling ``summarize(max_num_seqs=_max_num_seqs(engine))`` by hand would
+    prove the two pieces and not the join between them — and the join is
+    exactly what failed. ``SchedulerStatsSampler.summary()`` is what a run
+    actually calls, and it is the thing that has to carry the capacity from the
+    engine into the summary.
+    """
     from types import SimpleNamespace as N
 
     from gitm.scheduler.loop import _batch_config_from_stats
-    from gitm.tracer.vllm_stats import SchedulerSample, _max_num_seqs, summarize
+    from gitm.tracer.vllm_stats import SchedulerSample, SchedulerStatsSampler
 
-    samples = [SchedulerSample(t_ns=i, num_unfinished=243) for i in range(5)]
-    llm = N(llm_engine=N(vllm_config=N(scheduler_config=N(max_num_seqs=256))))
+    engine = N(llm_engine=N(vllm_config=N(scheduler_config=N(max_num_seqs=256))))
+    sampler = SchedulerStatsSampler(engine)
+    # What the collector would have gathered over the window.
+    sampler.samples = [SchedulerSample(t_ns=i, num_unfinished=243) for i in range(5)]
 
-    summ = summarize(samples, max_num_seqs=_max_num_seqs(llm))
-    assert summ.max_num_seqs == 256
+    summ = sampler.summary()
+    assert summ.max_num_seqs == 256, "the sampler did not carry the capacity through"
     assert summ.mean_bounded_inflight == 243.0
 
     cfg, source = _batch_config_from_stats(summ)
     assert cfg is not None and cfg.batch == 243, "still falling back to batch=1"
     assert source == "unfinished"
+
+
+def test_an_engine_with_no_capacity_still_falls_back_through_the_sampler():
+    """The failure this reproduces: in-flight captured, capacity absent, batch
+    back to 1. It is what the first full run did."""
+    from types import SimpleNamespace as N
+
+    from gitm.scheduler.loop import _batch_config_from_stats
+    from gitm.tracer.vllm_stats import SchedulerSample, SchedulerStatsSampler
+
+    sampler = SchedulerStatsSampler(N())          # says nothing about capacity
+    sampler.samples = [SchedulerSample(t_ns=i, num_unfinished=243) for i in range(5)]
+
+    summ = sampler.summary()
+    assert summ.mean_unfinished == 243.0          # captured
+    assert summ.max_num_seqs is None              # but nothing to bound it
+    assert summ.mean_bounded_inflight is None
+    assert _batch_config_from_stats(summ) == (None, None)
