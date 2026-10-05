@@ -64,6 +64,10 @@ AR_PROPOSER = "autoresearch.proposer"
 AR_TARGET = "autoresearch.target"
 AR_EMPTY = "autoresearch.no_proposals"
 AR_SKIPPED = "autoresearch.skipped"
+#: The baseline could not be restored after a candidate, so the run stopped
+#: trying candidates. What was measured before it stands; what was queued after
+#: it was never tried.
+ENGINE_LOST = "engine.lost"
 
 # Artifacts a degradation can rest under. ``ab`` is the one history keys on.
 AFFECTS_RESIDUALS = "residuals"
