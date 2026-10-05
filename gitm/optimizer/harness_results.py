@@ -54,6 +54,11 @@ __all__ = [
     "write_comparisons",
 ]
 
+#: What an attached capture can honestly say about its tracing: the collector was
+#: running, and whether NVTX markers were on is not recorded. Distinct from both
+#: ``"cupti"`` and ``"cupti+nvtx"`` on purpose — see :func:`_tracing_from_attach`.
+TRACING_NVTX_UNKNOWN = "cupti(nvtx:unknown)"
+
 SUMMARY_NAME = "serving_summary.json"
 MANIFEST_NAME = "run_manifest.json"
 
@@ -284,18 +289,23 @@ def _argv_from_attach(manifest: dict[str, Any]) -> list[str]:
     ``--enforce-eager``, so an empty baseline reports it unreachable on a server
     that was in fact started with it.
 
-    Everything up to and including ``serve`` is dropped: the interpreter, the
-    console script, the subcommand and the positional model are how the server
-    was invoked, not what it was configured with, and ``knob_difference``
-    compares flags.
+    Everything before the first flag is dropped: the interpreter, the console
+    script, the subcommand and the positional model are how the server was
+    invoked, not what it was configured with, and ``knob_difference`` compares
+    flags.
+
+    Anchoring on a ``serve`` token would have missed a launch form discovery
+    already supports — ``python -m vllm.entrypoints.openai.api_server --model m
+    …`` has no ``serve`` in it, and would have come back with no flags at all:
+    the same bug this function exists to fix, for a different way of starting
+    the server. The first ``--`` is the boundary under every form.
     """
     cmdline = (manifest.get("target") or {}).get("cmdline")
-    if not isinstance(cmdline, list) or "serve" not in cmdline:
+    if not isinstance(cmdline, list):
         return []
-    rest = cmdline[cmdline.index("serve") + 1:]
-    # Drop the positional model argument, if any; flags start at the first "--".
-    first_flag = next((i for i, tok in enumerate(rest) if str(tok).startswith("--")), len(rest))
-    return [str(a) for a in rest[first_flag:]]
+    first_flag = next(
+        (i for i, tok in enumerate(cmdline) if str(tok).startswith("--")), len(cmdline))
+    return [str(a) for a in cmdline[first_flag:]]
 
 
 def _tracing_from_attach(manifest: dict[str, Any]) -> str | None:
@@ -307,14 +317,25 @@ def _tracing_from_attach(manifest: dict[str, Any]) -> str | None:
     each other but never against a launched one, and the reason would have read
     as a mismatch in the data rather than a gap in what was recorded.
 
-    ``nvtx`` is deliberately not inferred: the attach preflight does not
-    establish it, and guessing it would make two genuinely different captures
-    look alike.
+    What it cannot say is whether NVTX was on. An attach target records
+    ``traceable``, ``inject_lib`` and ``trace_out``, and nothing about markers —
+    so ``"cupti"`` would be a claim that NVTX was *off*, which is not something
+    the manifest establishes. A traced arm with markers and one without would
+    then compare as though they matched, and the marker overhead would land on
+    whatever knob was under test.
+
+    So the label says what is known: traced, NVTX unestablished. It equals
+    itself, so two attached arms still compare; it equals neither ``"cupti"``
+    nor ``"cupti+nvtx"``, so an attached arm and a launched one are refused
+    rather than quietly compared. That refusal is the honest outcome until the
+    attach path records the marker setting it can already read off the server's
+    environment — which is the real fix, and belongs where the capture is
+    written rather than where it is read.
     """
     target = manifest.get("target")
     if not isinstance(target, dict) or "traceable" not in target:
         return None
-    return "cupti" if target.get("traceable") else "off"
+    return TRACING_NVTX_UNKNOWN if target.get("traceable") else "off"
 
 
 def read_capture(path: str | Path) -> Capture:

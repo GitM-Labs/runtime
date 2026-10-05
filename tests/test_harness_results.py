@@ -18,6 +18,7 @@ import pytest
 
 from gitm.kernels.library import load_library
 from gitm.optimizer.harness_results import (
+    TRACING_NVTX_UNKNOWN,
     CaptureError,
     compare,
     fingerprint_of,
@@ -527,15 +528,40 @@ def test_a_flag_removal_lever_is_reachable_against_an_attached_baseline(tmp_path
     assert resolve_lever("--enforce-eager", None, LIB).name == "cuda_graphs_enable"
 
 
-def test_tracing_is_inferred_so_an_attached_arm_can_be_compared(tmp_path):
-    """comparable_key includes tracing, because tracing costs throughput. Left
-    at None on every attached capture, two of them compared with each other but
-    never against a launched one — and the refusal would have read as a data
-    mismatch rather than a gap in what was recorded."""
+def test_tracing_says_what_the_manifest_establishes_and_no_more(tmp_path):
+    """An attach target records `traceable` and nothing about markers, so
+    "cupti" would be a claim that NVTX was *off*. A traced arm with markers and
+    one without would then compare as though they matched, and the marker
+    overhead would land on whatever knob was under test."""
     on = read_capture(_attach_arm(tmp_path, "on", cmdline=SERVE_CMD))
     off = read_capture(_attach_arm(tmp_path, "off", cmdline=SERVE_CMD, traceable=False))
-    assert on.tracing == "cupti"
+    assert on.tracing == TRACING_NVTX_UNKNOWN
+    assert on.tracing not in ("cupti", "cupti+nvtx")
     assert off.tracing == "off"
+
+
+def test_two_attached_arms_compare_but_an_attached_and_a_launched_one_do_not(tmp_path):
+    """The label equals itself, so the common case still works; it equals
+    neither tracing mode a launched capture reports, so that pairing is refused
+    rather than quietly compared."""
+    a = read_capture(_attach_arm(tmp_path, "a", cmdline=SERVE_CMD))
+    b = read_capture(_attach_arm(tmp_path, "b", cmdline=SERVE_CMD, rps=50.0))
+    assert a.comparable_key == b.comparable_key
+
+    launched = _arm(tmp_path, "launched", argv=["--port", "8000", "--enforce-eager"],
+                    tracing="cupti")
+    assert read_capture(launched).comparable_key != a.comparable_key
+
+
+def test_a_module_launched_server_keeps_its_flags(tmp_path):
+    """`python -m vllm.entrypoints.openai.api_server` is a launch form discovery
+    already supports, and it has no `serve` token. Anchoring on one would have
+    returned no flags — the same bug, for a different way of starting it."""
+    cap = read_capture(_attach_arm(
+        tmp_path, "module",
+        cmdline=["/usr/bin/python", "-m", "vllm.entrypoints.openai.api_server",
+                 "--model", "Kimi-K2.5", "--port", "8000", "--enforce-eager"]))
+    assert cap.serve_argv == ("--model", "Kimi-K2.5", "--port", "8000", "--enforce-eager")
 
 
 def test_a_manifest_with_neither_shape_yields_no_flags_rather_than_raising(tmp_path):
