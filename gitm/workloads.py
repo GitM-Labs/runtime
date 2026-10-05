@@ -73,6 +73,19 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _main_is_importable() -> bool:
+    """Whether a spawned child could re-import this process's ``__main__``.
+
+    Spawn starts the child by importing ``__main__`` from its file. A script or a
+    console script has one; ``python -c``, a stdin heredoc and a notebook kernel
+    do not, and a spawned engine dies before it builds.
+    """
+    import sys
+
+    path = getattr(sys.modules.get("__main__"), "__file__", None)
+    return bool(path) and Path(path).is_file()
+
+
 # --- built-in workloads ------------------------------------------------------
 
 
@@ -542,19 +555,6 @@ def _openfold_factory(cfg: LoopConfig) -> WorkloadRunner:
         stage, seed, n_proteins=n_proteins, max_len=max_len, warmup=warmup, plddt_tol=plddt_tol
     )
     return run
-
-def _main_is_importable() -> bool:
-    """Whether a spawned child could re-import this process's ``__main__``.
-
-    Spawn starts the child by importing ``__main__`` from its file. A script or a
-    console script has one; ``python -c``, a stdin heredoc and a notebook kernel
-    do not, and a spawned engine dies before it builds.
-    """
-    import sys
-
-    path = getattr(sys.modules.get("__main__"), "__file__", None)
-    return bool(path) and Path(path).is_file()
-
 
 @register("vllm-decode")
 def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
