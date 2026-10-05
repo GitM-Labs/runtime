@@ -27,6 +27,9 @@ class Claim:
     predicted_delta: float
     measured_delta: float | None
     rolled_back: bool = False
+    #: The gate rejected this candidate and the baseline could not be put back.
+    #: Not rolled back, and not kept either, so it is counted as neither.
+    restore_failed: bool = False
     #: Unreliable degradations this claim's own A/B was measured under. Its delta
     #: is still shown, but it is not a verified claim.
     unreliable_ab: list[str] = field(default_factory=list)
@@ -115,7 +118,8 @@ def _default_summary(claims: list[Claim]) -> str:
     # A claim whose own A/B was flagged unreliable keeps its row, but the
     # headline does not add it up as verified. Judged per claim: one bad A/B does
     # not discount the others.
-    measured = [c for c in claims if c.measured_delta is not None and not c.rolled_back]
+    measured = [c for c in claims if c.measured_delta is not None
+                and not c.rolled_back and not c.restore_failed]
     verified = [c for c in measured if not c.unreliable_ab]
     bad, stages = _unreliable(measured)
     note = (f" {len(bad)} more not counted: their A/B is unreliable ({', '.join(stages)})."

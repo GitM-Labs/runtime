@@ -243,3 +243,67 @@ def test_a_run_that_kept_its_engine_reports_none(tmp_path, monkeypatch):
                                         workload_runner=_Runner()))
     assert out["summary"]["engine_lost"] is None
     assert out["summary"]["n_untried"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# a candidate whose restore failed is not a kept candidate                     #
+# --------------------------------------------------------------------------- #
+def test_a_failed_restore_is_not_kept():
+    """Every restore follows a rejection, so the gate had already said no.
+    ``not rolled_back`` read as kept would turn a measured regression into a
+    kept result."""
+    lost = ApplyResult(True, rolled_back=False, measured_delta=-0.2,
+                       error="regression; restore failed", restore_failed=True)
+    assert not lost.kept
+    assert ApplyResult(True, rolled_back=False, measured_delta=0.1).kept
+    assert not ApplyResult(True, rolled_back=True, measured_delta=-0.1).kept
+
+
+def test_the_export_does_not_record_a_failed_restore_as_kept():
+    """History maps kept+significant to a win. A -20% whose rollback failed
+    must reach it as a loss."""
+    from gitm.optimizer.apply import EngineABResult
+    from gitm.optimizer.verification_export import build_record
+
+    ab = EngineABResult(knob="block_size", value=16, baseline_tps=100.0,
+                        candidate_tps=80.0, speedup=0.8, kept=False, significant=True)
+    lost = ApplyResult(True, rolled_back=False, measured_delta=-0.2,
+                       error="regression; restore failed", restore_failed=True)
+    assert build_record(_spec(), ab, lost).kept is False
+
+
+def test_the_report_does_not_count_a_failed_restore_as_verified():
+    from gitm.optimizer.report import Claim, _default_summary
+
+    lost = Claim(summary="s", residual_invariant="kernel_time", residual_value=0.0,
+                 causal_evidence="e", intervention_name="block_size",
+                 predicted_delta=0.05, measured_delta=0.3, restore_failed=True)
+    assert _default_summary([lost]).startswith("No claims verified")
+
+
+def test_autoresearch_counts_what_it_never_reached(monkeypatch):
+    """Only the pass knows what it had ranked, so it says how many it skipped."""
+    import gitm.agents.autoresearch as ar
+    from gitm.agents.policy import RankedCandidate
+
+    specs = [_spec(f"knob_{i}", 1) for i in range(4)]
+    monkeypatch.setattr(ar, "select_interventions", lambda *a, **kw: [
+        RankedCandidate(spec=s, predicted_delta=0.05) for s in specs])
+
+    class _Proposer:
+        def propose(self, cls, target_op=None):
+            return specs
+
+    calls = {"n": 0}
+
+    def lost(spec, applicator, **kw):
+        calls["n"] += 1
+        return ApplyResult(False, rolled_back=False, measured_delta=None,
+                           error="restore failed", restore_failed=True)
+
+    monkeypatch.setattr(ar, "apply_intervention", lost)
+    run = ar.autoresearch(_trace(), applicator=object(), proposer=_Proposer())
+
+    assert calls["n"] == 1
+    assert len(run.results) == 1
+    assert run.n_untried == 3

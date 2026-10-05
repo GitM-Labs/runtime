@@ -129,7 +129,7 @@ def build_record(
         agreement_band=max(ab.rel_std, MIN_NOISE_BAND),
         significant=ab.significant,
         # The gate decides, not the measurement — see the module docstring.
-        kept=not apply_result.rolled_back,
+        kept=apply_result.kept,
         via=ab.via,
         baseline_config=dict(baseline_config or {}),
         candidate_config=dict(candidate_config or {}),
