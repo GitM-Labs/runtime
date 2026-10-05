@@ -147,6 +147,22 @@ def test_serial_candidate_and_baseline_both_failing_rebuild_once():
     assert "Free memory" in res.error
 
 
+def test_a_failed_baseline_rebuild_leaves_no_engine():
+    """The baseline was shut down before the failed rebuild. Keeping its handle
+    hands the caller (via cfg.engine) a dead engine that looks live."""
+    def no_candidate(_old, _values):
+        raise RuntimeError("candidate OOM")
+
+    def no_baseline(_old):
+        raise RuntimeError("Free memory 0.0/287.98 GiB")
+
+    app = _serial(_Engine(100.0), restart_fn=no_candidate, baseline_restart_fn=no_baseline)
+    res = apply_intervention(_spec(), app, min_keep_delta=0.0)
+
+    assert res.restore_failed
+    assert app.engine is None
+
+
 def test_serial_rollback_failing_to_rebuild_is_returned():
     def no_baseline(_old):
         raise RuntimeError("Free memory 0.0/287.98 GiB")
@@ -346,3 +362,33 @@ def test_phase4_still_records_what_the_gate_rejected(tmp_path, monkeypatch):
                                         workload_runner=_Runner()))
     assert out["summary"]["n_untried"] == 1   # c
     assert out["summary"]["n_rejected"] == 2  # b, d
+
+
+def test_shutdown_does_not_repeat_a_working_gitm_shutdown_fn():
+    """gitm_shutdown_fn already released the engine; a second generic shutdown
+    redoes teardown and warns when it fails on the released engine."""
+    import warnings
+
+    calls = []
+
+    class _E:
+        def gitm_shutdown_fn(self, _e):
+            calls.append("custom")
+
+        def shutdown(self):
+            calls.append("generic")
+            raise RuntimeError("already shut down")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        LiveEngineApplicator._shutdown(_E())
+    assert calls == ["custom"]
+
+    class _Broken(_E):
+        def gitm_shutdown_fn(self, _e):
+            raise RuntimeError("hook failed")
+
+    calls.clear()
+    with pytest.warns(RuntimeWarning):
+        LiveEngineApplicator._shutdown(_Broken())
+    assert calls == ["generic"]  # the fallback still runs when the hook fails

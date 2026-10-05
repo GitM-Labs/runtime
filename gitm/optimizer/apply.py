@@ -728,6 +728,9 @@ class LiveEngineApplicator:
         try:
             self.engine = restore_baseline()
         except Exception as exc:
+            # The baseline was already shut down: hold nothing rather than a
+            # dead handle the loop would pass back to the caller as live.
+            self.engine = None
             raise RestoreFailed(
                 f"could not rebuild the baseline engine ({cause}): {exc}") from exc
         self._activate(self.engine)
@@ -762,13 +765,17 @@ class LiveEngineApplicator:
         and the next engine build is what pays for it.
         """
         custom = getattr(engine, "gitm_shutdown_fn", None)
+        released = False
         if callable(custom):
             try:
                 custom(engine)
+                released = True
             except Exception as exc:
                 _warn_release("gitm_shutdown_fn", exc)
 
-        for path in ("shutdown", "llm_engine.shutdown", "engine.shutdown"):
+        # Generic shutdown only as a fallback: after a working gitm_shutdown_fn
+        # it would tear down a released engine twice, and warn when that fails.
+        for path in () if released else ("shutdown", "llm_engine.shutdown", "engine.shutdown"):
             obj: Any = engine
             for attr in path.split("."):
                 obj = getattr(obj, attr, None)
