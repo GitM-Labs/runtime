@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,7 +38,7 @@ from typing import Any
 from gitm.optimizer.history import EXPORT_NAME
 from gitm.optimizer.report import Provenance
 from gitm.optimizer.verification_export import VerificationRecord, write_verification
-from gitm.serve.discover import vllm_argv_start
+from gitm.serve.discover import vllm_argv_start, vllm_launch_argv
 
 __all__ = [
     "Capture",
@@ -49,6 +49,8 @@ __all__ = [
     "CaptureError",
     "read_capture",
     "knob_difference",
+    "parse_flags",
+    "boolean_flags",
     "compare",
     "sweep_id",
     "write_comparison",
@@ -93,6 +95,11 @@ class Capture:
     #: The capture's own trace, when it has one. An untraced arm cannot be
     #: fingerprinted, so it cannot be filed against a workload the loop knows.
     trace_path: Path | None = None
+    #: The command that starts this server: entry point, positional model and
+    #: flags. ``serve_argv`` is what two arms are *compared* on; this is what a
+    #: proposed arm is *run* as. They are the same list for a launched capture,
+    #: and differ for an attached one, whose ``serve_argv`` is its flags alone.
+    launch_argv: tuple[str, ...] = ()
 
     @property
     def comparable_key(self) -> tuple:
@@ -359,8 +366,14 @@ def read_capture(path: str | Path) -> Capture:
     trace_path = _find_trace(path, manifest)
 
     argv = manifest.get("serve_argv")
-    if not isinstance(argv, list):
+    if isinstance(argv, list):
+        # A launched capture recorded the command it ran, which is both.
+        launch = argv
+    else:
         argv = _argv_from_attach(manifest)
+        cmdline = (manifest.get("target") or {}).get("cmdline")
+        launch = (vllm_launch_argv([str(a) for a in cmdline])
+                  if isinstance(cmdline, list) else None) or []
     load = manifest.get("load")
     return Capture(
         path=path,
@@ -372,10 +385,59 @@ def read_capture(path: str | Path) -> Capture:
         window_s=window,
         goodput=is_goodput,
         trace_path=trace_path,
+        launch_argv=tuple(str(a) for a in launch),
     )
 
 
-def knob_difference(baseline: Capture, candidate: Capture) -> dict[str, Any]:
+def boolean_flags(library: Iterable[Any]) -> frozenset[str]:
+    """The server flags the catalogue sets to ``True`` or ``False``.
+
+    Those flags never take a value, and that is the only reliable way to read a
+    command line where the model follows one: ``vllm serve --enforce-eager
+    CHECKPOINT``. Guessing which token is the model does not work. The served
+    name can be an alias (``--served-model-name``), and treating the alias as
+    the model then stops it being read as that flag's own value.
+    """
+    return frozenset("--" + s.knob.replace("_", "-") for s in library
+                     if getattr(s, "knob", None) and isinstance(s.value, bool))
+
+
+def parse_flags(
+    argv: Sequence[str], *, booleans: frozenset[str] = frozenset()
+) -> list[tuple[int, str, Any]]:
+    """``[(index, flag, value)]`` for each ``--flag`` in ``argv``.
+
+    The one parser both directions use: :func:`knob_difference` reading an arm
+    back and :func:`gitm.optimizer.experiment_specs.plan_arms` writing one. Two
+    copies of this rule is how an emitter and a reader come to disagree about
+    what an arm says.
+
+    A token after a flag is that flag's value unless it is itself a flag or the
+    flag is one of ``booleans`` (see :func:`boolean_flags`). Without the second
+    rule, ``vllm serve --enforce-eager CHECKPOINT`` read the checkpoint as
+    ``--enforce-eager``'s value, and an arm removing that flag for
+    ``cuda_graphs_enable`` removed the checkpoint with it.
+    """
+    out: list[tuple[int, str, Any]] = []
+    i = 0
+    while i < len(argv):
+        token = str(argv[i])
+        if not token.startswith("--"):
+            i += 1
+            continue
+        nxt = str(argv[i + 1]) if i + 1 < len(argv) else None
+        if token not in booleans and nxt is not None and not nxt.startswith("--"):
+            out.append((i, token, nxt))
+            i += 2
+        else:
+            out.append((i, token, True))
+            i += 1
+    return out
+
+
+def knob_difference(
+    baseline: Capture, candidate: Capture, *, booleans: frozenset[str] = frozenset()
+) -> dict[str, Any]:
     """The server flags the candidate changed, as ``{flag: value}``.
 
     Launch-only flags are excluded: where a server binds says nothing about what
@@ -388,24 +450,12 @@ def knob_difference(baseline: Capture, candidate: Capture) -> dict[str, Any]:
     the candidate *added*, while a removal had moved it as well. The caller
     refuses those rather than attributing them.
     """
-    def flags(argv: tuple[str, ...]) -> dict[str, Any]:
-        out: dict[str, Any] = {}
-        i = 0
-        while i < len(argv):
-            token = argv[i]
-            if not token.startswith("--"):
-                i += 1
-                continue
-            nxt = argv[i + 1] if i + 1 < len(argv) else None
-            if nxt is not None and not nxt.startswith("--"):
-                value, i = nxt, i + 2
-            else:
-                value, i = True, i + 1
-            if token not in LAUNCH_ONLY_FLAGS:
-                out[token] = value
-        return out
+    def flags(c: Capture) -> dict[str, Any]:
+        return {flag: value
+                for _, flag, value in parse_flags(c.serve_argv, booleans=booleans)
+                if flag not in LAUNCH_ONLY_FLAGS}
 
-    base, cand = flags(baseline.serve_argv), flags(candidate.serve_argv)
+    base, cand = flags(baseline), flags(candidate)
     moved = {k: v for k, v in cand.items() if base.get(k) != v}
     moved.update({k: None for k in base if k not in cand})
     return moved
@@ -454,7 +504,8 @@ def compare(
     if not baseline.throughput:
         raise CaptureError(f"{baseline.path.name}: baseline throughput is zero")
 
-    knobs = knob_difference(baseline, candidate)
+    library = list(library)
+    knobs = knob_difference(baseline, candidate, booleans=boolean_flags(library))
     if not knobs:
         raise CaptureError(
             f"{baseline.path.name} and {candidate.path.name} ran the same server "

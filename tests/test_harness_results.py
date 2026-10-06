@@ -611,3 +611,85 @@ def test_a_launched_capture_still_wins_on_its_own_field(tmp_path):
     m["serve_argv"] = ["--tensor-parallel-size", "2"]
     (d / "run_manifest.json").write_text(json.dumps(m))
     assert read_capture(d).serve_argv == ("--tensor-parallel-size", "2")
+
+
+# --------------------------------------------------------------------------- #
+# the launch command, kept apart from the flags arms are compared on           #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("cmdline,expected", [
+    # A console script at any path becomes `vllm`, so the arm runs anywhere.
+    (SERVE_CMD, ("vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct", "--port", "8000",
+                 "--enforce-eager")),
+    # A module keeps its module, run through `python -m`.
+    (["/usr/bin/python", "-m", "vllm.entrypoints.openai.api_server",
+      "--model", "Kimi-K2.5", "--port", "8000"],
+     ("python", "-m", "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5",
+      "--port", "8000")),
+    # Interpreter options change how the server runs, so a module launch keeps
+    # them, and the arms run under the same settings as the baseline.
+    (["/usr/bin/python3.12", "-O", "-m", "vllm.entrypoints.openai.api_server",
+      "--model", "Kimi-K2.5"],
+     ("python", "-O", "-m", "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5")),
+    # An option that takes its value as the next token keeps it.
+    (["/usr/bin/python3", "-X", "dev", "-W", "ignore", "-m",
+      "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5"],
+     ("python", "-X", "dev", "-W", "ignore", "-m",
+      "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5")),
+    # `vllm` takes no interpreter options, so a console script run under them
+    # has no faithful command.
+    (["/usr/bin/python3.12", "-u", ".venv/bin/vllm", "serve", "Kimi-K2.5"], ()),
+    # A launcher shaped how the server ran. Dropping it would start a different
+    # layout from the baseline, so there is no command rather than a wrong one.
+    (["torchrun", "--nproc-per-node", "2", "-m",
+      "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5"], ()),
+    (["nsys", "profile", "-o", "out", "--", "python", "-m",
+      "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5"], ()),
+])
+def test_an_attached_capture_keeps_a_command_that_starts_the_server(
+        tmp_path, cmdline, expected):
+    """An arm is a command the harness runs. Built from the flags alone it
+    started nothing: the entry point and the positional model were gone."""
+    cap = read_capture(_attach_arm(tmp_path, "a", cmdline=cmdline))
+    assert cap.launch_argv == expected
+
+
+def test_a_launched_capture_launches_with_the_command_it_recorded(tmp_path):
+    argv = ["vllm", "serve", "Kimi-K2.5", "--tensor-parallel-size", "8"]
+    cap = read_capture(_arm(tmp_path, "launched", argv=argv))
+    assert cap.launch_argv == tuple(argv) == cap.serve_argv
+
+
+def test_a_boolean_flag_never_takes_the_next_token_as_its_value():
+    """`vllm serve --enforce-eager CHECKPOINT` is valid. Read by lookahead alone
+    the checkpoint became --enforce-eager's value, so removing the flag for
+    cuda_graphs_enable removed the checkpoint with it. The catalogue says which
+    flags are boolean, so the parser asks it rather than guessing the model."""
+    from gitm.optimizer.harness_results import boolean_flags, parse_flags
+
+    assert "--enforce-eager" in boolean_flags(LIB)
+    argv = ["vllm", "serve", "--enforce-eager", "/ckpt/kimi", "--port", "8000"]
+    assert parse_flags(argv, booleans=boolean_flags(LIB)) == [
+        (2, "--enforce-eager", True), (4, "--port", "8000")]
+
+
+def test_an_aliased_model_still_parses():
+    """The served name can be an alias. Treating it as the model, as the first
+    version of this did, stopped it being read as --served-model-name's value."""
+    from gitm.optimizer.harness_results import boolean_flags, parse_flags
+
+    argv = ["vllm", "serve", "--enforce-eager", "/ckpt/kimi",
+            "--served-model-name", "kimi"]
+    assert parse_flags(argv, booleans=boolean_flags(LIB)) == [
+        (2, "--enforce-eager", True), (4, "--served-model-name", "kimi")]
+
+
+def test_an_arm_removing_a_flag_keeps_the_checkpoint_that_follows_it():
+    from gitm.optimizer.experiment_specs import plan_arms
+    from gitm.optimizer.harness_results import boolean_flags
+
+    base = ["vllm", "serve", "--enforce-eager", "/ckpt/kimi",
+            "--served-model-name", "kimi"]
+    lever = next(s for s in LIB if s.name == "cuda_graphs_enable")
+    arms, _ = plan_arms(base, [lever], booleans=boolean_flags(LIB))
+    assert arms[0].serve_argv == ("vllm", "serve", "/ckpt/kimi",
+                                  "--served-model-name", "kimi")

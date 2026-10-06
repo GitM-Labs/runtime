@@ -258,22 +258,11 @@ def _engine_world_size(engine: Any) -> int | None:
     """
     if engine is None:
         return None
-    for path in (
-        "llm_engine.vllm_config.parallel_config.world_size",
-        "llm_engine.parallel_config.world_size",
-        "vllm_config.parallel_config.world_size",
-    ):
-        obj: Any = engine
-        for attr in path.split("."):
-            obj = getattr(obj, attr, None)
-            if obj is None:
-                break
-        if obj:
-            try:
-                return int(obj)
-            except (TypeError, ValueError):
-                return None
-    return None
+    # The same list of places the scheduler lookup reads, not a copy of it.
+    from gitm.tracer.vllm_stats import engine_config_value
+
+    val = engine_config_value(engine, "parallel_config", "world_size")
+    return int(val) if isinstance(val, int) and not isinstance(val, bool) and val > 0 else None
 
 
 def peak_for_sku(sku: str | None) -> HardwarePeak | None:

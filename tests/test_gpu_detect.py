@@ -138,3 +138,29 @@ def test_a_whitespace_override_is_also_unset(monkeypatch):
     monkeypatch.setenv("GITM_GPU_SKU", "   ")
 
     assert "H200" in ctx.build_planner_context(None, workload="vllm-decode").peak.name
+
+
+def test_world_size_is_read_behind_an_engine_attribute():
+    """The layout the scheduler lookup already read and this one did not: the
+    config behind `.engine`. Missed, a TP=1 run on a multi-GPU node was counted
+    as the whole node and admitted levers that need collectives."""
+    from types import SimpleNamespace as NS
+
+    engine = NS(engine=NS(vllm_config=NS(parallel_config=NS(world_size=1))))
+    assert ctx._engine_world_size(engine) == 1
+
+
+def test_world_size_and_max_num_seqs_read_the_same_places():
+    """One list of places for every config value, so the two cannot drift."""
+    from types import SimpleNamespace as NS
+
+    from gitm.tracer.vllm_stats import _max_num_seqs
+
+    for wrap in (lambda c: c, lambda c: NS(engine=c), lambda c: NS(llm_engine=c)):
+        for cfg in (NS(vllm_config=NS(parallel_config=NS(world_size=2),
+                                      scheduler_config=NS(max_num_seqs=64))),
+                    NS(parallel_config=NS(world_size=2),
+                       scheduler_config=NS(max_num_seqs=64))):
+            engine = wrap(cfg)
+            assert ctx._engine_world_size(engine) == 2
+            assert _max_num_seqs(engine) == 64

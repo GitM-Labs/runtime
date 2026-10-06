@@ -50,7 +50,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from gitm.optimizer.harness_results import LAUNCH_ONLY_FLAGS, realises
+from gitm.optimizer.harness_results import LAUNCH_ONLY_FLAGS, parse_flags, realises
 
 __all__ = [
     "Arm",
@@ -127,41 +127,19 @@ class Unreachable:
     reason: str
 
 
-def _parsed(argv: Sequence[str]) -> list[tuple[int, str, Any]]:
-    """``[(index, flag, value)]`` for each flag in ``argv``.
-
-    Uses the same lookahead rule as ``knob_difference``: a token after a flag
-    belongs to it unless that token is itself a flag. Reimplementing the rule
-    differently here is how an emitter and a reader come to disagree about what
-    an arm says.
-    """
-    out: list[tuple[int, str, Any]] = []
-    i = 0
-    while i < len(argv):
-        token = argv[i]
-        if not token.startswith("--"):
-            i += 1
-            continue
-        nxt = argv[i + 1] if i + 1 < len(argv) else None
-        if nxt is not None and not nxt.startswith("--"):
-            out.append((i, token, nxt))
-            i += 2
-        else:
-            out.append((i, token, True))
-            i += 1
-    return out
-
-
-def _find(argv: Sequence[str], flag: str) -> tuple[int, Any] | None:
-    for i, tok, value in _parsed(argv):
+def _find(argv: Sequence[str], flag: str, booleans: frozenset[str] = frozenset()
+          ) -> tuple[int, Any] | None:
+    # The reader's parser, not a copy of it: see parse_flags.
+    for i, tok, value in parse_flags(argv, booleans=booleans):
         if tok == flag:
             return i, value
     return None
 
 
-def _without(argv: Sequence[str], flag: str) -> list[str]:
+def _without(argv: Sequence[str], flag: str, booleans: frozenset[str] = frozenset()
+             ) -> list[str]:
     """``argv`` with ``flag`` and the value that belongs to it removed."""
-    found = _find(argv, flag)
+    found = _find(argv, flag, booleans)
     if found is None:
         return list(argv)
     i, value = found
@@ -169,21 +147,23 @@ def _without(argv: Sequence[str], flag: str) -> list[str]:
     return [*argv[:i], *argv[i + span:]]
 
 
-def _with(argv: Sequence[str], flag: str, value: Any) -> list[str]:
+def _with(argv: Sequence[str], flag: str, value: Any,
+          booleans: frozenset[str] = frozenset()) -> list[str]:
     """``argv`` with ``flag`` set to ``value``, replacing any current setting.
 
     Replaced in place rather than appended, so an arm never carries the same
     flag twice. Two settings of one flag is a server-dependent precedence
     question, and the reader's parser would report only one of them.
     """
-    out = _without(argv, flag)
+    out = _without(argv, flag, booleans)
     if value is True:
         return [*out, flag]
     return [*out, flag, str(value)]
 
 
 def plan_arms(
-    base_argv: Sequence[str], ranked: Iterable[Any], *, max_arms: int | None = None
+    base_argv: Sequence[str], ranked: Iterable[Any], *, max_arms: int | None = None,
+    booleans: frozenset[str] = frozenset(),
 ) -> tuple[list[Arm], list[Unreachable]]:
     """One arm per ranked candidate, plus the candidates that cannot become one.
 
@@ -191,6 +171,10 @@ def plan_arms(
     specs. A candidate the ranking already rejected is not emitted: the gate's
     answer is categorical and re-asking it here would spend cluster time on a
     lever the loop declined locally.
+
+    ``booleans`` are the flags that never take a value (see
+    :func:`~gitm.optimizer.harness_results.boolean_flags`), so a model placed
+    after one is not read as its value and removed with it.
 
     ``max_arms`` is checked before an arm is built rather than after it is
     appended, so it holds on every path. Checking it after meant an
@@ -241,7 +225,7 @@ def plan_arms(
                 "flags it diffs and this arm would read as identical"))
             continue
 
-        current = _find(base, flag)
+        current = _find(base, flag, booleans)
         if spec.value is False:
             if current is None:
                 out.append(Unreachable(
@@ -249,7 +233,7 @@ def plan_arms(
                     f"realised only by removing {flag}, which this baseline does "
                     "not set, so the arm would be the baseline"))
                 continue
-            argv = _without(base, flag)
+            argv = _without(base, flag, booleans)
         elif current is not None and realises(current[1], spec.value):
             out.append(Unreachable(
                 name, knob,
@@ -257,7 +241,7 @@ def plan_arms(
                 "measure nothing"))
             continue
         else:
-            argv = _with(base, flag, spec.value)
+            argv = _with(base, flag, spec.value, booleans)
 
         arms.append(Arm(
             lever=name, knob=knob, value=spec.value,

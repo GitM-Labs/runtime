@@ -330,6 +330,27 @@ def _v1_scheduler_stats(scheduler: Any) -> dict[str, Any]:
     return out
 
 
+#: Where an engine object keeps vLLM's config, across versions and wrappers:
+#: on itself, on ``.engine`` or on ``.llm_engine`` (``LLM`` holds an
+#: ``LLMEngine``), and either directly or under ``vllm_config``.
+_CONFIG_ROOTS = ("", "engine.", "llm_engine.")
+_CONFIG_CONTAINERS = ("", "vllm_config.")
+
+
+def engine_config_value(engine: Any, section: str, field: str) -> Any:
+    """``<section>.<field>`` from wherever this engine keeps its vLLM config.
+
+    One list of places, read by everything that needs a config value. Two
+    lookups each kept their own list before, and they drifted: the scheduler
+    one learned ``engine.vllm_config`` and the world-size one did not, so a TP=1
+    run behind that layout was counted as the whole node and admitted levers that
+    need collectives it never runs.
+    """
+    return _first_attr(engine, *(f"{root}{container}{section}.{field}"
+                                 for root in _CONFIG_ROOTS
+                                 for container in _CONFIG_CONTAINERS))
+
+
 def _max_num_seqs(engine: Any) -> int | None:
     """The most sequences this engine will decode at once, or ``None``.
 
@@ -345,16 +366,7 @@ def _max_num_seqs(engine: Any) -> int | None:
     Both halves of that chain were already listed separately and the two were
     never joined, which is the whole of the bug.
     """
-    val = _first_attr(
-        engine,
-        "scheduler_config.max_num_seqs",
-        "engine.scheduler_config.max_num_seqs",
-        "llm_engine.scheduler_config.max_num_seqs",
-        "vllm_config.scheduler_config.max_num_seqs",
-        # vLLM 0.30: LLM -> LLMEngine.vllm_config -> SchedulerConfig.
-        "llm_engine.vllm_config.scheduler_config.max_num_seqs",
-        "engine.vllm_config.scheduler_config.max_num_seqs",
-    )
+    val = engine_config_value(engine, "scheduler_config", "max_num_seqs")
     return int(val) if isinstance(val, int) and val > 0 else None
 
 

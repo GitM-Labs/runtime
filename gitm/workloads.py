@@ -75,23 +75,6 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
-def _main_is_importable() -> bool:
-    """Whether a spawned child could re-import this process's ``__main__``.
-
-    Spawn starts the child by importing ``__main__`` from its file. A script or a
-    console script has one; ``python -c``, a stdin heredoc and a notebook kernel
-    do not, and a spawned engine dies before it builds.
-    """
-    import sys
-
-    path = getattr(sys.modules.get("__main__"), "__file__", None)
-    return bool(path) and Path(path).is_file()
-
-
-def _warn_release(step: str, exc: Exception) -> None:
-    warnings.warn(f"engine release step {step!r} failed: {exc}", RuntimeWarning, stacklevel=3)
-
-
 # --- built-in workloads ------------------------------------------------------
 
 
@@ -717,27 +700,23 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
 
     from gitm.tracer import injection
 
-    # Before vLLM is imported or any engine is built, because it decides how the
-    # EngineCore child starts. ``capture serve`` gets the same settings from
-    # apply_tracing_env(); this covers `gitm run` launched with the collector
-    # variables exported by hand, which is how the runbook does it. setdefault,
-    # so an operator who chose a start method keeps it.
-    if injection.active_vendor() == "amd":
-        if _main_is_importable():
-            for key, value in injection.AMD_PROCESS_ENV.items():
-                os.environ.setdefault(key, value)
-        elif "VLLM_WORKER_MULTIPROC_METHOD" not in os.environ:
-            # Spawn would fail to start even the first engine here: the child
-            # re-imports __main__, and `python -c`, a stdin heredoc or a notebook
-            # has none to import. Left on fork, which works at TP>1 and is the
-            # known empty-trace case at TP=1, so say which.
-            import warnings
+    # Spawn is what gives a ROCm EngineCore its profiler back (P1-1), but it is
+    # only safe where the entry point is known to survive being re-imported, and
+    # that is not something this factory can establish: a script that exists as
+    # a file can still start the workload at top level, and every spawned worker
+    # would then start it again. So the `gitm run` and `capture serve` commands
+    # choose it, and an embedded caller on AMD that has not is told what that
+    # costs rather than switched over.
+    if (injection.active_vendor() == "amd"
+            and "VLLM_WORKER_MULTIPROC_METHOD" not in os.environ):
+        import warnings
 
-            warnings.warn(
-                "gitm: this process has no importable __main__ (python -c, stdin, "
-                "or a notebook), so vLLM's workers stay on fork. On ROCm a forked "
-                "EngineCore records no kernels at TP=1. Run from a script file or "
-                "the gitm command to get a trace.", RuntimeWarning, stacklevel=2)
+        warnings.warn(
+            "gitm: vLLM's workers will start with fork. On ROCm a forked "
+            "EngineCore records no kernels at TP=1. The gitm command sets "
+            "VLLM_WORKER_MULTIPROC_METHOD=spawn; an embedded caller should set it "
+            "too, from a script whose work runs under `if __name__ == \"__main__\":`.",
+            RuntimeWarning, stacklevel=2)
 
     from vllm import LLM, SamplingParams
 

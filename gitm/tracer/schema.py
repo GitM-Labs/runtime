@@ -42,6 +42,15 @@ class KernelEvent(_TraceEventBase):
     # classify_op(). Never guessed or backfilled; only set by correlation.
     range_op: str | None = None
     range_layer: int | None = None
+    # CUDA-graph identity from the kernel record (CUPTI graphId/graphNodeId).
+    # None for a kernel launched outside a graph. A graph-launched kernel's
+    # correlation_id is the replay's one cudaGraphLaunch, so the range around
+    # that launch is a step-level label, not the op: it lands in launch_range,
+    # and range_op/range_layer stay None unless a capture-time graph node map
+    # names the node (docs/kernel_identity.md, "CUDA graphs").
+    graph_id: int | None = None
+    graph_node_id: int | None = None
+    launch_range: str | None = None
 
 
 class MemcpyEvent(_TraceEventBase):

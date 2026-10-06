@@ -65,7 +65,8 @@ static PyObject *py_start(PyObject *self, PyObject *args) {
 static PyObject *rec_to_dict(const gitm_record *r) {
     if (r->kind == GITM_REC_KERNEL) {
         return Py_BuildValue(
-            "{s:s, s:s, s:K, s:K, s:I, s:I, s:I, s:I, s:[iii], s:[iii], s:i, s:i, s:i}",
+            "{s:s, s:s, s:K, s:K, s:I, s:I, s:I, s:I, s:[iii], s:[iii], s:i, s:i, s:i,"
+            " s:I, s:K}",
             "kind", "kernel", "name", r->name,
             "start_ns", (unsigned long long)r->start_ns,
             "end_ns", (unsigned long long)r->end_ns,
@@ -75,7 +76,9 @@ static PyObject *rec_to_dict(const gitm_record *r) {
             "block", r->block[0], r->block[1], r->block[2],
             "static_shared_mem", r->static_shared_mem,
             "dynamic_shared_mem", r->dynamic_shared_mem,
-            "registers_per_thread", r->registers_per_thread);
+            "registers_per_thread", r->registers_per_thread,
+            "graph_id", r->graph_id,
+            "graph_node_id", (unsigned long long)r->graph_node_id);
     } else if (r->kind == GITM_REC_MEMCPY) {
         return Py_BuildValue(
             "{s:s, s:i, s:K, s:K, s:K, s:I, s:I, s:I, s:I}",

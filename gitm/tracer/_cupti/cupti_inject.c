@@ -93,12 +93,14 @@ static void file_sink(const gitm_record *r, void *user) {
                 ",\"start_ns\":%llu,\"end_ns\":%llu,\"device_id\":%u,\"context_id\":%u,"
                 "\"stream_id\":%u,\"correlation_id\":%u,\"grid\":[%d,%d,%d],"
                 "\"block\":[%d,%d,%d],\"static_shared_mem\":%d,"
-                "\"dynamic_shared_mem\":%d,\"registers_per_thread\":%d}\n",
+                "\"dynamic_shared_mem\":%d,\"registers_per_thread\":%d,"
+                "\"graph_id\":%u,\"graph_node_id\":%llu}\n",
                 (unsigned long long)r->start_ns, (unsigned long long)r->end_ns,
                 r->device_id, r->context_id, r->stream_id, r->correlation_id,
                 r->grid[0], r->grid[1], r->grid[2],
                 r->block[0], r->block[1], r->block[2],
-                r->static_shared_mem, r->dynamic_shared_mem, r->registers_per_thread);
+                r->static_shared_mem, r->dynamic_shared_mem, r->registers_per_thread,
+                r->graph_id, (unsigned long long)r->graph_node_id);
     } else if (r->kind == GITM_REC_MEMCPY) {
         fprintf(g_fp,
                 "{\"kind\":\"memcpy\",\"copy_kind\":%d,\"bytes\":%llu,"

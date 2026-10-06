@@ -109,6 +109,8 @@ static void ingest(CUpti_Activity *rec) {
             r.static_shared_mem = k->staticSharedMemory;
             r.dynamic_shared_mem = k->dynamicSharedMemory;
             r.registers_per_thread = k->registersPerThread;
+            r.graph_id = k->graphId;
+            r.graph_node_id = k->graphNodeId;
             break;
         }
         case CUPTI_ACTIVITY_KIND_MEMCPY: {

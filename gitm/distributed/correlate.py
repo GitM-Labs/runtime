@@ -26,6 +26,28 @@ Record contract, as emitted by the collector::
 A ``marker`` record is one fully-resolved push/pop range, with start and end
 already paired.
 
+CUDA graphs
+-----------
+The chain above names the op only for an eagerly launched kernel. A graph
+replay is one ``cudaGraphLaunch``, and every kernel it runs carries that one
+launch's ``correlation_id``, so the range enclosing the launch is whatever
+encloses the replay: a step, a layer group, or nothing. Taking it as the op
+would hand every kernel in the replay the same, wrong identity. A kernel with a
+nonzero ``graph_id`` therefore gets that range only as ``launch_range`` (a
+time-series label), and ``range_op``/``range_layer`` come from the graph node
+instead::
+
+    kernel      graph_node_id=N
+        |  same graph_node_id (following cloned_from to the captured node)
+    graph_node  {kind:"graph_node", graph_node_id:int, name:str,
+                 cloned_from:int | None}
+
+A ``graph_node`` record names the innermost NVTX range open on the capturing
+thread when the node was created, which is how Nsight Systems projects ranges
+onto replayed kernels. The collector does not emit these yet (it needs CUPTI's
+graph-node resource callbacks), so today a graph kernel's op is ``None`` and
+falls back to name classification, rather than silently taking the step's.
+
 Process scoping
 ---------------
 ``correlation_id`` is assigned by CUPTI per process, numbered from a low origin
@@ -75,8 +97,13 @@ def correlate_kernels_to_ranges(records: list[dict]) -> list[dict]:
     Returns every ``kind == "kernel"`` record as a shallow copy carrying
     ``range_op`` and ``range_layer``. Both are ``None`` where no match exists:
     no runtime record bears the kernel's ``correlation_id``, or no marker range
-    contains that runtime record. Input order is preserved. Runtime and marker
-    records are consumed to build the correlation index and are not returned.
+    contains that runtime record. Input order is preserved. Runtime, marker and
+    graph_node records are consumed to build the correlation index and are not
+    returned.
+
+    A kernel with a nonzero ``graph_id`` also carries ``launch_range``, the raw
+    name of the range around its graph launch, and takes ``range_op`` and
+    ``range_layer`` from its graph node only (module docstring, "CUDA graphs").
 
     Containment is evaluated on the runtime record's host window against the
     marker's host window, matched on ``thread_id`` — never on the kernel's own
@@ -91,6 +118,7 @@ def correlate_kernels_to_ranges(records: list[dict]) -> list[dict]:
     runtime_by_corr: dict[int, dict] = {}
     markers: list[dict] = []
     kernels: list[dict] = []
+    graph_nodes: dict[int, dict] = {}
 
     for r in records:
         kind = r.get("kind")
@@ -102,6 +130,10 @@ def correlate_kernels_to_ranges(records: list[dict]) -> list[dict]:
                 runtime_by_corr[cid] = r
         elif kind == "marker":
             markers.append(r)
+        elif kind == "graph_node":
+            nid = r.get("graph_node_id")
+            if nid is not None:
+                graph_nodes[nid] = r
 
     enclosing = _innermost_enclosing(markers, runtime_by_corr.values())
 
@@ -111,17 +143,43 @@ def correlate_kernels_to_ranges(records: list[dict]) -> list[dict]:
         enriched["range_op"] = None
         enriched["range_layer"] = None
 
+        launch_range = None
         rt = runtime_by_corr.get(k.get("correlation_id"))
         if rt is not None:
             m = enclosing.get(id(rt))
             if m is not None:
-                op, layer = parse_range_name(m["name"])
-                enriched["range_op"] = op
-                enriched["range_layer"] = layer
+                launch_range = m["name"]
+
+        if k.get("graph_id"):
+            enriched["launch_range"] = launch_range
+            name = _graph_node_range(graph_nodes, k.get("graph_node_id"))
+        else:
+            name = launch_range
+        if name:
+            enriched["range_op"], enriched["range_layer"] = parse_range_name(name)
 
         out.append(enriched)
 
     return out
+
+
+def _graph_node_range(graph_nodes: dict[int, dict], node_id: int | None) -> str | None:
+    """The range a graph node was captured under, following clones to the original.
+
+    Instantiating or cloning a graph gives its nodes new ids, and which one a
+    kernel record reports is not something to assume. Walking ``cloned_from``
+    resolves either. A chain that cycles or leaves the map resolves to ``None``.
+    """
+    seen: set[int] = set()
+    while node_id and node_id not in seen:
+        seen.add(node_id)
+        node = graph_nodes.get(node_id)
+        if node is None:
+            return None
+        if node.get("name"):
+            return node["name"]
+        node_id = node.get("cloned_from")
+    return None
 
 
 # Event phases for the sweep below. Ordering at equal timestamps is semantic, not

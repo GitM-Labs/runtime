@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -456,7 +457,12 @@ def _run_propose(args) -> int:
     from gitm.agents.policy import Policy, select_interventions
     from gitm.kernels.library import load_library
     from gitm.optimizer.experiment_specs import plan_arms, write_experiments
-    from gitm.optimizer.harness_results import CaptureError, fingerprint_of, read_capture
+    from gitm.optimizer.harness_results import (
+        CaptureError,
+        boolean_flags,
+        fingerprint_of,
+        read_capture,
+    )
     from gitm.optimizer.history import load_history
     from gitm.optimizer.preconditions import GateContext
     from gitm.optimizer.replay import _load_trace_jsonl
@@ -469,6 +475,16 @@ def _run_propose(args) -> int:
     if baseline.trace_path is None or not baseline.trace_path.exists():
         print(f"gitm propose: {Path(args.baseline).name} has no trace, so there is "
               "nothing to rank against. Capture it with tracing on.", file=sys.stderr)
+        return 2
+    if not baseline.launch_argv:
+        # Every arm is this command plus one lever. Without one there is nothing
+        # to run: an attached server started under a launcher (torchrun, a
+        # profiler) cannot be rebuilt faithfully, and a sweep of some other
+        # server layout would measure that instead of the lever.
+        print(f"gitm propose: {Path(args.baseline).name} has no command that "
+              "restarts its server as it ran (an attached server started under "
+              "a launcher such as torchrun?). Capture the baseline through "
+              "'gitm capture serve' instead.", file=sys.stderr)
         return 2
     if not baseline.load:
         # Every arm must carry the baseline's load shape or `gitm ingest` refuses
@@ -524,12 +540,17 @@ def _run_propose(args) -> int:
         top_n=args.top_n, ctx=ctx, history=history,
         gpu_sku=args.gpu_sku, fingerprint=fingerprint,
     )
-    arms, unreachable = plan_arms(baseline.serve_argv, ranked, max_arms=args.max_arms)
+    # Built from the command that starts the baseline, not from its flags: an
+    # arm is something the harness runs. For a launched capture the two are the
+    # same list; for an attached one the flags alone would start nothing.
+    base_argv = baseline.launch_argv
+    arms, unreachable = plan_arms(base_argv, ranked, max_arms=args.max_arms,
+                                  booleans=boolean_flags(library))
 
     measured = sum(1 for c in ranked if getattr(c, "delta_source", "") == "measured")
     out = Path(args.out) if args.out else Path(args.baseline) / "experiments.json"
     written = write_experiments(
-        out, baseline_argv=baseline.serve_argv, arms=arms, unreachable=unreachable,
+        out, baseline_argv=base_argv, arms=arms, unreachable=unreachable,
         served_model=baseline.served_model or "unknown", load=baseline.load,
         run_id=args.run_id, fingerprint=fingerprint, gpu_sku=args.gpu_sku,
         notes=(f"ranked against {baseline.trace_path.name} "
@@ -704,6 +725,20 @@ def _warn_degraded(summary: dict, run_dir: str | None) -> None:
     print(f"gitm: run degraded ({'; '.join(parts)}){where}", file=sys.stderr)
 
 
+def _started_as_gitm_command() -> bool:
+    """Whether this process is the ``gitm`` command, and so safe to spawn from.
+
+    A spawned vLLM worker re-imports ``__main__``. The ``gitm`` console script
+    and ``python -m gitm`` survive that; a caller that reached :func:`main` from
+    ``python -c``, a notebook or an unguarded script may not, and is left to the
+    vLLM factory's warning instead of being switched over.
+    """
+    spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    if spec is not None and spec.name in {"gitm", "gitm.__main__", "gitm.cli"}:
+        return True
+    return Path(sys.argv[0]).name == "gitm" if sys.argv and sys.argv[0] else False
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
 
@@ -732,8 +767,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "run":
         from gitm import optimize
+        from gitm.tracer import injection
 
         _apply_hft_run_flags(args)
+        # Here and not in the vLLM factory: this entry point is the `gitm`
+        # console script, which a spawned worker can re-import safely. An
+        # embedded caller's script may not be, so the factory only warns.
+        # setdefault, so an operator who chose a start method keeps it.
+        if injection.active_vendor() == "amd" and _started_as_gitm_command():
+            for key, value in injection.AMD_PROCESS_ENV.items():
+                os.environ.setdefault(key, value)
         # Asked here, before the loop starts any capture, so nobody answers a
         # prompt that arrived an hour into a 24h run.
         result = optimize(
