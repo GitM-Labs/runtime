@@ -264,21 +264,19 @@ def resolve_probe_world_size(*, workload: str, engine: Any | None = None) -> int
 def resolve_local_probe_world_size(global_world_size: int, available: int) -> int:
     """How many local ranks the AllReduce probe should launch.
 
-    Caps the global collective size to GPUs visible on this node. Optional
-    ``LOCAL_WORLD_SIZE`` / ``GITM_LOCAL_WORLD_SIZE`` (torchrun-style) further
-    constrains the local group when set.
+    Caps the global collective size to GPUs visible on this node. The explicit
+    ``GITM_LOCAL_WORLD_SIZE`` override can further constrain the local group.
+    Do not read torchrun's ``LOCAL_WORLD_SIZE``: it describes launched
+    processes, which can be 1 even when one process owns multiple TP GPUs.
     """
     if global_world_size < 1 or available < 1:
         return 0
     local = min(int(global_world_size), int(available))
-    for key in ("GITM_LOCAL_WORLD_SIZE", "LOCAL_WORLD_SIZE"):
-        raw = os.environ.get(key)
-        if raw is None or not str(raw).strip():
-            continue
+    raw = os.environ.get("GITM_LOCAL_WORLD_SIZE")
+    if raw is not None and str(raw).strip():
         n = _positive_int(raw)
         if n is not None:
             local = min(local, n)
-            break
     return max(0, local)
 
 

@@ -168,8 +168,15 @@ def test_resolve_local_probe_world_size_caps_to_visible():
     assert resolve_local_probe_world_size(8, 1) == 1
 
 
-def test_resolve_local_probe_world_size_honours_local_env(monkeypatch):
-    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+def test_resolve_local_probe_world_size_ignores_process_local_world_size(monkeypatch):
+    """One process may own multiple TP GPUs; torchrun's process count is not GPU count."""
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
+    monkeypatch.delenv("GITM_LOCAL_WORLD_SIZE", raising=False)
+    assert resolve_local_probe_world_size(2, 2) == 2
+
+
+def test_resolve_local_probe_world_size_honours_explicit_gitm_override(monkeypatch):
+    monkeypatch.setenv("GITM_LOCAL_WORLD_SIZE", "2")
     assert resolve_local_probe_world_size(8, 4) == 2
 
 
