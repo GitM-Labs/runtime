@@ -553,6 +553,10 @@ def _openfold_factory(cfg: LoopConfig) -> WorkloadRunner:
 ENGINE_WORKER_PREFIX = "EngineCore"
 
 
+def _warn_release(step: str, exc: Exception) -> None:
+    warnings.warn(f"engine release step {step!r} failed: {exc}", RuntimeWarning, stacklevel=3)
+
+
 def _shutdown_timeout() -> float:
     """Seconds to wait for workers before forcing them, from the environment.
 
@@ -666,9 +670,9 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
                               -> vLLM's "auto". Lets a serial A/B build each leg
                               directly in its dtype, one engine per process, so
                               each can use the full GITM_VLLM_GPU_MEM budget.
-        GITM_ENGINE_RELEASE_TIMEOUT_S  seconds an engine shutdown waits for its
+        GITM_SHUTDOWN_TIMEOUT_S  seconds an engine shutdown waits for its
                               EngineCore/TP worker processes to exit before
-                              killing the stragglers (default 60)
+                              killing the stragglers (default 30)
         GITM_VLLM_SYNTHETIC   "1" -> CPU-only decode stand-in instead of vLLM
                               (exercises the wire/registry path with no GPU or
                               vLLM; produces no GPU kernels)

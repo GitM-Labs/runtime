@@ -208,9 +208,15 @@ def apply_intervention(
     # Kept: whatever restore() would have needed is now garbage (for a restart,
     # the whole previous engine). Optional hook — only applicators holding
     # releasable state implement it.
+    # A release that fails (or warns under -W error) must not undo a keep the
+    # gate already made: the candidate is live and measured.
     commit = getattr(applicator, "commit", None)
     if callable(commit):
-        commit()
+        try:
+            commit()
+        except Exception as exc:
+            return ApplyResult(True, rolled_back=False, measured_delta=delta,
+                               error=f"kept; releasing the replaced engine failed: {exc}")
     return ApplyResult(True, rolled_back=False, measured_delta=delta)
 
 

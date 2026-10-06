@@ -14,8 +14,8 @@ every release path runs deterministically:
 
 Prints rocm-smi after each step: VRAM should never exceed one engine's share in
 serial mode, or two in parallel. Exits non-zero on any failed check or on a
-"still running ... killed" warning (a worker outlived shutdown — the race the
-fix guards against; it was handled, but you want to know it happened).
+"had to force vLLM engine workers down" warning (a worker outlived shutdown —
+it was handled, but you want to know it happened).
 
 Run as a FILE (not python -c / heredoc): the pod builds engines under spawn.
 """
@@ -52,24 +52,24 @@ def _gpus(label: str) -> None:
         subprocess.run([smi, "--query-gpu=index,memory.used", "--format=csv"])
 
 
-def _alive(p) -> bool:
+def _alive(pid: int) -> bool:
     import psutil
 
     try:
+        p = psutil.Process(pid)
         return p.is_running() and p.status() != psutil.STATUS_ZOMBIE
-    except psutil.NoSuchProcess:
+    except psutil.NoSuchProcess:  # exited between the listing and the check
         return False
 
 
 def _gone(engine, what: str) -> bool:
-    import psutil
-
     procs = sorted(getattr(engine, "gitm_worker_pids", None) or ())
-    alive = [pid for pid in procs if psutil.pid_exists(pid) and _alive(psutil.Process(pid))]
+    alive = [pid for pid in procs if _alive(pid)]
     ok = bool(procs) and not alive
     print(f"[{'PASS' if ok else 'FAIL'}] {what}: {len(procs)} processes tracked, alive={alive}")
     if not procs:
-        print("       (none tracked: psutil missing, or vLLM ran the engine in-process)")
+        print("       (none tracked: vLLM ran the engine in-process, or its workers "
+              "are not multiprocessing children)")
     return ok
 
 
@@ -118,7 +118,7 @@ def main() -> int:
 
     for w in caught:
         print(f"[WARN] {w.message}")
-    killed = [w for w in caught if "killed" in str(w.message)]
+    killed = [w for w in caught if "force vLLM engine workers down" in str(w.message)]
     if killed:
         print("[FAIL] a worker outlived shutdown and had to be killed (see WARN above)")
     ok = all(results) and not killed

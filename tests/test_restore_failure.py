@@ -392,3 +392,28 @@ def test_shutdown_does_not_repeat_a_working_gitm_shutdown_fn():
     with pytest.warns(RuntimeWarning):
         LiveEngineApplicator._shutdown(_Broken())
     assert calls == ["generic"]  # the fallback still runs when the hook fails
+
+
+def test_a_release_that_fails_on_keep_does_not_undo_the_keep():
+    """commit() raising (e.g. a release warning under -W error) must not turn a
+    candidate the gate kept into a crash of the A/B."""
+    class _App:
+        engine = _Engine(100.0)
+
+        def snapshot(self):
+            return {}
+
+        def apply(self, spec):
+            pass
+
+        def measure(self, spec):
+            return 0.5
+
+        def restore(self, snap):
+            raise AssertionError("a keep must not roll back")
+
+        def commit(self):
+            raise RuntimeWarning("engine release step 'shutdown' failed")
+
+    res = apply_intervention(_spec(), _App(), min_keep_delta=0.0)
+    assert res.kept and "releasing the replaced engine failed" in res.error
