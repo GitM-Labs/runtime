@@ -7,9 +7,10 @@ double-init: the workload will create its own process group later.
 Hard-fail: AllReduce timeout/hang or wrong reduced sum (whole buffer, all ranks).
 Soft-warn: busbw below 10% of the interconnect catalogue (never aborts on BW).
 
-The probe is scoped to the workload's participating world size (e.g. vLLM
-``tensor_parallel_size`` / ``GITM_VLLM_TP``). Workloads with ``world_size < 2``
-skip — unused GPUs on a multi-GPU box must not block a single-GPU run.
+The probe is scoped to the workload's participating world size: live engine
+``parallel_config`` via ``engine_config_value``, else the factory's final TP
+(``GITM_VLLM_TP`` then ``GITM_VLLM_EXTRA_JSON``). ``world_size < 2`` skips —
+unused GPUs on a multi-GPU box must not block a single-GPU run.
 
 Ranks are launched via ``python -m gitm.health.probe_worker`` (subprocess), not
 ``multiprocessing`` spawn, so embedded ``optimize()`` callers do not re-execute
@@ -174,29 +175,78 @@ def write_collective_health(out_dir: Path, report: HealthReport) -> Path:
     return path
 
 
+def _positive_int(val: Any) -> int | None:
+    if isinstance(val, bool) or val is None:
+        return None
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _factory_vllm_tensor_parallel_size() -> int | None:
+    """Match ``_vllm_decode_factory``'s final ``tensor_parallel_size``.
+
+    ``GITM_VLLM_TP`` is applied first, then ``GITM_VLLM_EXTRA_JSON`` overlays —
+    same order as the factory, so TP=2 only in EXTRA_JSON is not missed.
+    """
+    tp: int | None = None
+    raw_tp = os.environ.get("GITM_VLLM_TP")
+    if raw_tp is not None and str(raw_tp).strip():
+        tp = _positive_int(raw_tp)
+    raw_extra = os.environ.get("GITM_VLLM_EXTRA_JSON")
+    if raw_extra:
+        try:
+            extra = json.loads(raw_extra)
+        except json.JSONDecodeError:
+            extra = None
+        if isinstance(extra, dict) and "tensor_parallel_size" in extra:
+            overlay = _positive_int(extra.get("tensor_parallel_size"))
+            if overlay is not None:
+                tp = overlay
+    return tp
+
+
 def resolve_probe_world_size(*, workload: str, engine: Any | None = None) -> int:
     """Participating world size for the upcoming workload's collectives.
 
     Returns ``< 2`` when the workload has no multi-GPU collectives — the probe
     must skip so unused GPUs on a multi-GPU host cannot block a single-GPU run.
+
+    Resolution (first hit wins), aligned with planner/factory:
+
+    1. Live engine via :func:`engine_config_value` ``parallel_config.world_size``
+       (and ``tensor_parallel_size``), including ``engine.`` / ``llm_engine.`` /
+       ``vllm_config.`` layouts.
+    2. ``engine.gitm_llm_kwargs["tensor_parallel_size"]`` when present.
+    3. Factory-equivalent env merge: ``GITM_VLLM_TP`` then ``GITM_VLLM_EXTRA_JSON``.
+    4. Default ``1`` (skip probe).
     """
     if engine is not None:
+        from gitm.tracer.vllm_stats import engine_config_value
+
+        for section_field in (
+            ("parallel_config", "world_size"),
+            ("parallel_config", "tensor_parallel_size"),
+        ):
+            n = _positive_int(engine_config_value(engine, *section_field))
+            if n is not None:
+                return n
+        # Top-level / kwargs fallbacks for thin test doubles and pre-build handles.
         for attr in ("tensor_parallel_size", "tp_size"):
-            v = getattr(engine, attr, None)
-            if v is not None:
-                return max(1, int(v))
+            n = _positive_int(getattr(engine, attr, None))
+            if n is not None:
+                return n
         kwargs = getattr(engine, "gitm_llm_kwargs", None) or {}
-        if isinstance(kwargs, dict) and "tensor_parallel_size" in kwargs:
-            return max(1, int(kwargs["tensor_parallel_size"]))
+        if isinstance(kwargs, dict):
+            n = _positive_int(kwargs.get("tensor_parallel_size"))
+            if n is not None:
+                return n
 
     if workload in _COLLECTIVE_WORKLOADS or workload.startswith("vllm"):
-        tp = os.environ.get("GITM_VLLM_TP")
-        if tp is not None and str(tp).strip():
-            try:
-                return max(1, int(tp))
-            except ValueError:
-                return 1
-        return 1  # default vLLM path is TP=1
+        tp = _factory_vllm_tensor_parallel_size()
+        return tp if tp is not None else 1
 
     # HFT / edge / openfold / etc. do not drive NCCL/RCCL collectives here.
     return 1

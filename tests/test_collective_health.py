@@ -72,20 +72,61 @@ def test_write_collective_health_json(tmp_path: Path):
     assert '"skipped": true' in text
 
 
-def test_resolve_probe_world_size_skips_default_vllm():
+def test_resolve_probe_world_size_skips_default_vllm(monkeypatch):
+    monkeypatch.delenv("GITM_VLLM_TP", raising=False)
+    monkeypatch.delenv("GITM_VLLM_EXTRA_JSON", raising=False)
     assert resolve_probe_world_size(workload="vllm-decode") == 1
 
 
 def test_resolve_probe_world_size_honours_gitm_vllm_tp(monkeypatch):
+    monkeypatch.delenv("GITM_VLLM_EXTRA_JSON", raising=False)
     monkeypatch.setenv("GITM_VLLM_TP", "4")
     assert resolve_probe_world_size(workload="vllm-decode") == 4
 
 
-def test_resolve_probe_world_size_engine_tp():
+def test_resolve_probe_world_size_extra_json_tp(monkeypatch):
+    """Factory merges EXTRA_JSON after GITM_VLLM_TP — probe must see TP=2 there."""
+    monkeypatch.delenv("GITM_VLLM_TP", raising=False)
+    monkeypatch.setenv("GITM_VLLM_EXTRA_JSON", '{"tensor_parallel_size": 2}')
+    assert resolve_probe_world_size(workload="vllm-decode") == 2
+
+
+def test_resolve_probe_world_size_extra_json_overrides_tp_env(monkeypatch):
+    monkeypatch.setenv("GITM_VLLM_TP", "1")
+    monkeypatch.setenv("GITM_VLLM_EXTRA_JSON", '{"tensor_parallel_size": 2}')
+    assert resolve_probe_world_size(workload="vllm-decode") == 2
+
+
+def test_resolve_probe_world_size_engine_parallel_config():
+    """Embedded engines keep TP under parallel_config, not top-level attrs."""
+    from types import SimpleNamespace as NS
+
+    engine = NS(llm_engine=NS(vllm_config=NS(parallel_config=NS(world_size=2))))
+    assert resolve_probe_world_size(workload="vllm-decode", engine=engine) == 2
+
+
+def test_resolve_probe_world_size_engine_parallel_config_tp_field():
+    from types import SimpleNamespace as NS
+
+    engine = NS(engine=NS(parallel_config=NS(tensor_parallel_size=2)))
+    assert resolve_probe_world_size(workload="vllm-decode", engine=engine) == 2
+
+
+def test_resolve_probe_world_size_engine_top_level_tp():
     class _Eng:
         tensor_parallel_size = 2
 
     assert resolve_probe_world_size(workload="vllm-decode", engine=_Eng()) == 2
+
+
+def test_resolve_probe_world_size_engine_beats_env(monkeypatch):
+    """A live TP=2 engine must not be skipped because GITM_VLLM_TP is unset."""
+    from types import SimpleNamespace as NS
+
+    monkeypatch.delenv("GITM_VLLM_TP", raising=False)
+    monkeypatch.delenv("GITM_VLLM_EXTRA_JSON", raising=False)
+    engine = NS(vllm_config=NS(parallel_config=NS(world_size=2)))
+    assert resolve_probe_world_size(workload="vllm-decode", engine=engine) == 2
 
 
 def test_resolve_probe_world_size_non_collective_workload():

@@ -65,7 +65,7 @@ from gitm.optimizer.dr import attribute_dr
 from gitm.optimizer.history import load_history
 from gitm.optimizer.measure import measure_trace, measurement_claims, measurement_summary
 from gitm.optimizer.monitor import check_invariants, recoverable_by_op, residuals
-from gitm.optimizer.qualification import qualify
+from gitm.optimizer.qualification import QualificationResult, qualify
 from gitm.optimizer.report import Claim, build_provenance, write_report
 from gitm.optimizer.scheduler_attribution import scheduler_causes
 from gitm.optimizer.verification_export import (
