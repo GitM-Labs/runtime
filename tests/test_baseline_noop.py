@@ -221,3 +221,67 @@ def test_run_loop_skips_and_records_a_lever_the_recapture_rerank_finds_is_now_a_
     assert [n["name"] for n in noops] == ["seqs_512_from_sweep"]
     assert "max_num_seqs=512" in noops[0]["reason"]
     assert out["summary"]["n_baseline_noop"] == 1
+
+
+def test_a_noop_the_rerank_finds_is_recorded_even_when_the_deadline_ends_the_run_first(
+    tmp_path, monkeypatch,
+):
+    """Same two levers as above, but the budget runs out the moment the re-rank
+    returns, so the loop breaks before it would pop the duplicate. The re-rank
+    found it, so it must still be reported."""
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .conftest import make_kernel, make_trace
+    from .test_intra_run_rerank import _Runner
+
+    first = _spec("seqs_512", {"max_num_seqs": 512}, mean=0.08)
+    duplicate = _spec("seqs_512_from_sweep", {"max_num_seqs": 512}, mean=0.04)
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [make_kernel(f"k_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 80)
+                   for i in range(80)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    real_ns = loop.time.time_ns
+    clock = {"spent": False}
+    rankings: list[dict[str, str | None]] = []
+    real_select = loop.select_interventions
+
+    def select_then_expire(*a, **kw):
+        ranked = real_select(*a, **kw)
+        rankings.append({c.spec.name: c.baseline_noop for c in ranked})
+        if len(rankings) == 2:  # call 1 is Phase 3; call 2 is the re-rank
+            clock["spent"] = True
+        return ranked
+
+    applied: list[str] = []
+    real_apply = loop.apply_intervention
+
+    def recording_apply(spec, *a, **kw):
+        applied.append(spec.name)
+        return real_apply(spec, *a, **kw)
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "load_library", lambda workload=None: [first, duplicate])
+    monkeypatch.setattr(loop, "select_interventions", select_then_expire)
+    monkeypatch.setattr(loop, "apply_intervention", recording_apply)
+    monkeypatch.setattr(
+        loop.time, "time_ns", lambda: real_ns() + 10 ** 12 if clock["spent"] else real_ns())
+
+    out = run_loop(LoopConfig(engine=_FullEngine(), workload="vllm-decode", budget="30s",
+                              scratch=str(tmp_path), workload_runner=_Runner(),
+                              rerank="recapture"))
+
+    assert len(rankings) == 2
+    assert "max_num_seqs=512" in rankings[1]["seqs_512_from_sweep"]
+    assert applied == ["seqs_512"]
+    # The deadline fired right after the re-rank: Phase 4b never ran.
+    assert "exhausted by Phase 4" in json.dumps(out["summary"], default=str) + out["report_md"]
+
+    noops = json.loads((Path(out["run_dir"]) / "baseline_noop.json").read_text())
+    assert [n["name"] for n in noops] == ["seqs_512_from_sweep"]
+    assert "max_num_seqs=512" in noops[0]["reason"]
+    assert out["summary"]["n_baseline_noop"] == 1
