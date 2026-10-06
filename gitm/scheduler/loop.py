@@ -1146,9 +1146,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     while queue:
         c = queue.pop(0)
         if c.baseline_noop is not None:
-            # Phase 3's no-ops are already listed; one a re-rank caught is not.
-            if all(n.spec.name != c.spec.name for n in baseline_noops):
-                baseline_noops.append(c)
+            # Already in baseline_noops: recorded where it was found, by Phase 3
+            # or by the re-rank that caught it.
             continue
         if c.rejected_reason is not None:
             rejected.append(f"{c.spec.name} ({c.rejected_reason})")
@@ -1238,6 +1237,12 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                     fingerprint=qual.fingerprint,
                     current_values=current_knob_values(
                         engine_now, {k for s in remaining for k in s.knob_values}))
+                # Recorded now, not when the queue reaches them: the budget check
+                # below can end the run before that pop ever happens.
+                for x in queue:
+                    if x.baseline_noop is not None and all(
+                            n.spec.name != x.spec.name for n in baseline_noops):
+                        baseline_noops.append(x)
             now = [x.spec.name for x in queue]
             reranks.append({
                 "after": c.spec.name,
