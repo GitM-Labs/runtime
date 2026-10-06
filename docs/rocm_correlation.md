@@ -157,13 +157,18 @@ The default (op only) is unchanged.
    - AITER's `topksoftmax` router was filed as sampling.
    - MoE sort and quant kernels were charged to the expert GEMM.
    - `observed_op` now keeps a router kernel's own op inside an expert range, which
-     covers CUDA's `topk_softmax` as well.
+     covers CUDA's `topk_softmax` as well. **This changes NVIDIA numbers on existing MoE
+     captures:** router kernels inside expert ranges move from `moe_routed` to
+     `moe_router`, so `moe_routed`'s recoverable time drops by their share.
 6. **Causal attribution with mixed launch cardinalities.** `attribute` and
    `attribute_dr` truncated every op series to the shortest one. One op that runs once
-   per step (`lm_head`) cut every per-layer series to the step count, so Granger could
-   not fit and returned no hypotheses on any whole-model trace. Pairs are now aligned
-   only when their cardinalities match, since only then does position mean the same
-   layer/step slot.
+   per step (`lm_head`) cut every per-layer series to the step count, so on a short
+   window Granger could not fit and returned no hypotheses.
+   - Pairs are now aligned only between series of comparable cardinality
+     (`comparable`, min/max ≥ 0.9), each truncated to its own shorter length.
+   - The tolerance absorbs a window's partial edge steps and refused replays, which
+     make same-class series differ by a few launches.
+   - A per-step op is never aligned with a per-layer one.
 7. **Vendor classification is evidence-based.** It used to be "kfd present → AMD,
    else NVIDIA". It now ranks evidence: compute driver over PCI over device name over
    software. A split within the top tier is reported as a conflict, `GITM_VENDOR`
@@ -200,7 +205,8 @@ rendered as the collector records it, and is scored against launch truth:
 | AMD graphs, including blit nodes | 100% | 0 |
 | NVIDIA graphs with the planned node map | 100% | 0 |
 | NVIDIA graphs today | name-only | 0 |
-| AMD hazards: stamp not advancing, cross-kernel reorder, untracked exec | refused | 0 |
+| AMD hazards: stamp not advancing, inherited launch stamp, cross-kernel reorder, untracked exec | refused | 0 |
+| AMD capture without ranges | unnamed, reported as a problem | 0 |
 
 On the causal side, residuals, invariant violations, Granger and doubly-robust
 rankings, and recoverable time are all identical to ground truth in every exact mode,
@@ -221,15 +227,32 @@ Checks:
    ranges have `identity == "range_id"`. `stamp_containment_disagree == 0`, and
    `stamp_unresolved` comes only from ranges pushed before arming.
 2. **The stamp advances per dispatch inside `hipGraphLaunch`.** This is the one
-   behaviour 7.2.3 does not document. In a graph run, `graph_refused` must not contain
-   `duplicate_ordinal`. If it does, the request callback is not firing per dispatch on
-   the launching thread. Replays then degrade to `range_op = None`, never to a wrong
-   op. Upgrade to an sdk with the `HIP_GRAPH` domain.
-3. **Capture links.** Every `graph_exec` has a nonzero `capture_id`, and its `n_nodes`
-   equals the replay's dispatch-plus-copy count, i.e. no `ordinal_out_of_range`.
+   behaviour 7.2.3 does not document, and it can fail in two ways. Both degrade
+   replays to `range_op = None`, never to a wrong op:
+   - **Dispatches inherit the launch's stamp (the likelier failure).** No separate
+     request is made per dispatch, so each one inherits the `hipGraphLaunch` call's
+     stamp. Kernels then arrive with `graph_id` 0 and `range_id` equal to the launch
+     range's id. The `graph_launch` guard catches this, and it shows up as
+     `graph_refused["untracked_launch"]` close to the graph-kernel count.
+   - **Requests fire but the ordinal does not advance.** This shows up as
+     `duplicate_ordinal`.
+
+   In either case, upgrade to an sdk with the `HIP_GRAPH` domain.
+3. **Capture links and names.**
+   - Every `graph_exec` has a nonzero `capture_id`, and its `n_nodes` equals the
+     replay's dispatch-plus-copy count, i.e. no `ordinal_out_of_range`.
+   - `graph_node` names are mostly non-empty. `CorrelationReport.graph_unnamed` above
+     half of the graph kernels raises a problem: the ranges did not run during
+     capture. torch.compile can trace forward hooks away, and vLLM's
+     `--enable-layerwise-nvtx-tracing` should be checked separately.
 4. **Signatures.** `signature_*` refusals should be absent on single-stream vLLM
-   capture. If `signature_grid` appears on `hipExtModuleLaunchKernel` nodes, compare
-   the dispatch record's work-item grid against the call's `globalWorkSize`.
+   capture. Two suspects:
+   - **`signature_kernel_id` on `hipLaunchKernel` nodes.** It is not yet verified that
+     the code-object host-symbol callback's `kernel_id` shares an id space with the
+     dispatch record's `kernel_id`. If they differ, drop the `kernel_id` comparison for
+     host-function nodes and keep geometry.
+   - **`signature_grid` on `hipExtModuleLaunchKernel` nodes.** Compare the dispatch
+     record's work-item grid against the call's `globalWorkSize`.
 5. **Overhead.** Run e1 from `docs/mi355x_experiment_plan.md` with and without
    `GITM_TRACE_NVTX`. The HIP-API callback is filtered to 26 operations, and the stamp
    callback is a TLS read.

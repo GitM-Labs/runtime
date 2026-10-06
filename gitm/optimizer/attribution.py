@@ -17,6 +17,19 @@ import numpy as np
 from gitm.optimizer.monitor import Residuals
 from gitm.planner.graph import Graph
 
+#: Two series are the same launch cardinality — and so alignable by position —
+#: when the shorter is at least this fraction of the longer. Per-layer against
+#: per-step ops differ by the layer count (tens), so any value well above
+#: 1/n_layers separates them; 0.9 leaves room for a window's partial edge steps
+#: and refused replays.
+CARDINALITY_TOLERANCE = 0.9
+
+
+def comparable(n_a: int, n_b: int, tolerance: float = CARDINALITY_TOLERANCE) -> bool:
+    """True when series of these lengths can be aligned by position."""
+    lo, hi = sorted((n_a, n_b))
+    return hi > 0 and lo / hi >= tolerance
+
 
 @dataclass
 class Hypothesis:
@@ -80,15 +93,18 @@ def attribute(
     # series have the same launch cardinality: two per-layer ops put layer l of
     # step s at the same index, a per-layer op against lm_head (once a step)
     # does not. Truncating everything to the shortest series — the old
-    # behaviour — cut every per-layer series to the step count, which on a
-    # whole-model trace is too short for any lag model to fit, so attribution
-    # silently returned nothing. Pairs of unequal cardinality are skipped.
+    # behaviour — let one once-per-step op set the length of every per-layer
+    # pair, which on a short window is too few points for any lag model, so
+    # attribution silently returned nothing. Cardinality is matched with a
+    # tolerance (:func:`comparable`): a real window starts and ends mid-step,
+    # and a refused graph replay drops some of an op's kernels, so equal-class
+    # series routinely differ by a few launches.
     hypotheses: list[Hypothesis] = []
     for cause in ops:
         for effect in ops:
-            if cause == effect or len(series[cause]) != len(series[effect]):
+            if cause == effect or not comparable(len(series[cause]), len(series[effect])):
                 continue
-            n = len(series[cause])
+            n = min(len(series[cause]), len(series[effect]))
             arr = np.column_stack([np.asarray(series[effect][:n]), np.asarray(series[cause][:n])])
             try:
                 with warnings.catch_warnings():

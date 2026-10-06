@@ -135,7 +135,9 @@ def test_the_naive_decode_loses_the_cause(fx):
 
 @pytest.mark.parametrize("hazard", [dict(stamp_per_dispatch=False),
                                     dict(swap_replay_pair=(2, 3)),
-                                    dict(exec_untracked=True)])
+                                    dict(exec_untracked=True),
+                                    dict(stamp_inherits_launch=True),
+                                    dict(capture_unranged=True)])
 def test_a_refused_replay_never_invents_a_violation(fx, hazard):
     """Refusing identity loses evidence; it must not create any. Every
     violation a hazard-hit decode reports is one truth reports too."""
@@ -199,3 +201,54 @@ def test_static_attributes_come_from_the_graph_itself():
     attrs = idx.attributes(k)
     assert attrs["moe_phase"] == "expert" and attrs["replay"] == "graph"
     assert attrs["wave"] == "1" and attrs["layer_class"] == "override"
+
+
+def _window(events, t0, t1):
+    return [e for e in events if t0 <= e.start_ns <= t1]
+
+
+def test_attribution_survives_a_real_window_and_a_refused_replay(fx):
+    """A capture window opens and closes mid-step, and a refused replay drops
+    some ops' kernels but not others' — so series of one launch cardinality
+    differ in length by a few. Attribution must still pair them, and agree
+    with truth cut the same way."""
+    starts = sorted(e.start_ns for e in fx.trace.events)
+    t0, t1 = starts[len(starts) // 7], starts[(6 * len(starts)) // 7]
+    la = launches_from_fixture(fx)
+
+    def observed(records):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            events, report = decode_records_with_report(records)
+        trace = fx.trace.model_copy(update={"events": _window(events, t0, t1)})
+        return residuals(trace, fx.graph), report
+
+    truth = residuals(fx.trace.model_copy(update={"events": _window(fx.trace.events, t0, t1)}),
+                      fx.graph)
+    clean, _ = observed(emulate(la, EmulationConfig("amd", graphs=True)).records)
+    assert _ranking(attribute(clean, fx.graph)) == _ranking(attribute(truth, fx.graph))
+    assert _ranking(attribute_dr(clean, fx.graph)) == _ranking(attribute_dr(truth, fx.graph))
+
+    # Refuse one replay: mismatch one of its kernels' symbol.
+    records = emulate(la, EmulationConfig("amd", graphs=True)).records
+    victim = next(r for r in records if r.get("kind") == "kernel" and r.get("graph_id"))
+    victim["kernel_id"] ^= 1
+    refused, report = observed(records)
+    assert sum(report.graph_refused.values()) > 0
+    counts = {}
+    for k in refused.per_kernel:
+        counts[k.op] = counts.get(k.op, 0) + 1
+    assert len(set(counts.values())) > 1  # same-cardinality ops now differ in length
+    assert attribute(refused, fx.graph).hypotheses
+    assert attribute_dr(refused, fx.graph).hypotheses
+
+
+def test_once_per_step_ops_are_never_aligned_with_per_layer_ops(fx):
+    from gitm.optimizer.attribution import comparable
+
+    truth = observe(fx)
+    n_layer = sum(1 for k in truth.residuals.per_kernel if k.op == CAUSE)
+    n_step = sum(1 for k in truth.residuals.per_kernel if k.op == "lm_head")
+    assert not comparable(n_layer, n_step)
+    hyps = attribute(truth.residuals, fx.graph).hypotheses +         attribute_dr(truth.residuals, fx.graph).hypotheses
+    assert not any("lm_head" in (h.cause_op, h.effect_op) for h in hyps)

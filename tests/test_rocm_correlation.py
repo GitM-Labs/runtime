@@ -237,6 +237,18 @@ def test_a_graph_launch_the_stamp_missed_never_takes_the_launch_range():
     assert rep.graph_refused["untracked_launch"] == 1
 
 
+def test_the_guard_runs_before_the_stamped_join():
+    """A replayed dispatch that inherited the hipGraphLaunch call's stamp
+    carries the launch range's real marker id. Joining it would name every
+    replayed kernel after the range around the launch."""
+    recs = [_marker(1, "L0/qkv_proj", 0, 10_000), _rt(50, 100, 120, graph_launch=1, range_id=1),
+            _k(50, t=1000, range_id=1), _k(50, t=1020, range_id=1)]
+    out, _, rep = correlate_records(recs)
+    assert _ops(out) == [(None, None)] * 2
+    assert {o["launch_range"] for o in out} == {"L0/qkv_proj"}
+    assert rep.graph_refused["untracked_launch"] == 2 and not rep.identity["range_id"]
+
+
 def test_an_exec_built_without_capture_names_nothing():
     recs = [{"kind": "graph_exec", "graph_id": 2, "capture_id": 0}, _rt(50, 1, 2, graph_launch=1),
             *_gks()]

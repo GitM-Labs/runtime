@@ -193,6 +193,11 @@ def split_range_annotations(name: str) -> tuple[str, dict[str, str] | None]:
 _ATTR_TOKEN = re.compile(r"[A-Za-z0-9_.:+-]+")
 
 
+#: Share of graph kernels from unnamed nodes above which the capture, not the
+#: model, is the likelier explanation (CorrelationReport.graph_unnamed).
+UNNAMED_SHARE = 0.5
+
+
 @dataclass
 class CorrelationReport:
     """How each kernel got (or did not get) its identity, for one capture.
@@ -209,6 +214,11 @@ class CorrelationReport:
     graph_kernels: int = 0
     #: graph kernels refused, by reason.
     graph_refused: Counter = field(default_factory=Counter)
+    #: graph kernels whose node exists but was captured outside every range.
+    #: A few is normal (collectives, blits); most of them means the range
+    #: instrumentation did not run during capture — torch.compile can trace
+    #: forward hooks away — and every replay is anonymous without any refusal.
+    graph_unnamed: int = 0
     #: eager kernels where stamp and containment both resolved and disagreed.
     stamp_containment_disagree: int = 0
     #: kernels whose stamp named a range absent from the capture.
@@ -217,7 +227,7 @@ class CorrelationReport:
     memcpys_labelled: int = 0
 
     def merge(self, other: CorrelationReport) -> None:
-        for name in ("kernels", "graph_kernels", "stamp_containment_disagree",
+        for name in ("kernels", "graph_kernels", "graph_unnamed", "stamp_containment_disagree",
                      "stamp_unresolved", "memcpys", "memcpys_labelled"):
             setattr(self, name, getattr(self, name) + getattr(other, name))
         self.identity.update(other.identity)
@@ -230,6 +240,10 @@ class CorrelationReport:
             n = sum(self.graph_refused.values())
             out.append(f"{n} of {self.graph_kernels} graph-replayed kernel(s) refused "
                        f"node identity ({dict(self.graph_refused)})")
+        if self.graph_kernels and self.graph_unnamed >= UNNAMED_SHARE * self.graph_kernels:
+            out.append(f"{self.graph_unnamed} of {self.graph_kernels} graph-replayed kernel(s) "
+                       "ran from nodes captured outside every range — were ranges pushed "
+                       "during graph capture? (torch.compile can trace forward hooks away)")
         if self.stamp_containment_disagree:
             out.append(f"{self.stamp_containment_disagree} kernel(s): stamped range and "
                        "host-time containment disagree (stamp used)")
@@ -377,10 +391,13 @@ def correlate_records(records: list[dict]) -> tuple[list[dict], list[dict], Corr
                 report.graph_refused[reason] += 1
             else:
                 raw = _graph_node_range(graph_nodes, k.get("graph_node_id"))
-                if raw is None and _capture_node(graph_nodes, k.get("graph_node_id")) is None:
-                    # No node to name it. A node that exists but was captured
-                    # outside every range is not a loss: nothing named it then.
-                    report.graph_refused["no_node"] += 1
+                if raw is None:
+                    if _capture_node(graph_nodes, k.get("graph_node_id")) is None:
+                        report.graph_refused["no_node"] += 1
+                    else:
+                        # The node exists but was captured outside every range:
+                        # not a refusal, but counted (see graph_unnamed).
+                        report.graph_unnamed += 1
             # Node names arrive normalized from the decoder (pair_markers), so
             # only the annotation needs splitting here.
             name, attrs = split_range_annotations(raw) if raw else (None, None)

@@ -133,6 +133,12 @@ class EmulationConfig:
     swap_replay_pair: tuple[int, int] | None = None  # dispatch order differs from capture
     blit_memset_node: bool = False      # a captured hipMemsetAsync runs as a ROCclr blit
     exec_untracked: bool = False        # the instantiate was never seen
+    #: The likeliest 7.2.3 failure: no per-dispatch request inside a launch, so
+    #: each dispatch inherits the hipGraphLaunch call's stamp — the live launch
+    #: range's id — and carries no graph identity at all.
+    stamp_inherits_launch: bool = False
+    #: Capture without ranges (instrumentation traced away under compile).
+    capture_unranged: bool = False
     #: Range around each graph launch: what a naive decoder would take as every
     #: replayed kernel's op. A layer-op range here (vLLM piecewise graphs launch
     #: inside module ranges) is what makes that mistake expensive.
@@ -318,7 +324,7 @@ def emulate(launches: Sequence[TruthLaunch], cfg: EmulationConfig) -> Emulation:
     cupti_graph, cupti_base, cupti_clone = 7, 10_000, 20_000
     for k, kind in enumerate(node_kinds):
         la = template[k] if kind == "kernel" else None
-        rn = _range_name(cfg, la) if la is not None else None
+        rn = _range_name(cfg, la) if la is not None and not cfg.capture_unranged else None
         if rn:
             capture.push(main, rn)
         top = capture.top(main)
@@ -364,7 +370,9 @@ def emulate(launches: Sequence[TruthLaunch], cfg: EmulationConfig) -> Emulation:
         for ordinal, k in enumerate(dispatch):
             la = step[k]
             rec = kernel_rec(la, rt["correlation_id"])
-            if cfg.vendor == "amd":
+            if cfg.vendor == "amd" and cfg.stamp_inherits_launch:
+                rec["range_id"] = rt["range_id"]
+            elif cfg.vendor == "amd":
                 exec_seq = GRAPH_UNTRACKED if cfg.exec_untracked else exec_id
                 stamp_ord = ordinal if cfg.stamp_per_dispatch else 0
                 rec["graph_id"] = exec_seq
@@ -380,7 +388,9 @@ def emulate(launches: Sequence[TruthLaunch], cfg: EmulationConfig) -> Emulation:
                 name=names["memset"], start_ns=last.end_ns + 100, end_ns=last.end_ns + 400,
                 stream_id=0, device_id=0))
             rec = kernel_rec(blit, rt["correlation_id"], name=names["memset"])
-            if cfg.vendor == "amd":
+            if cfg.vendor == "amd" and cfg.stamp_inherits_launch:
+                rec["range_id"] = rt["range_id"]
+            elif cfg.vendor == "amd":
                 exec_seq = GRAPH_UNTRACKED if cfg.exec_untracked else exec_id
                 rec["graph_id"] = exec_seq
                 rec["graph_node_id"] = exec_node_id(

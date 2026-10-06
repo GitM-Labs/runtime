@@ -93,6 +93,12 @@ HAZARDS = [
     pytest.param(dict(swap_replay_pair=(2, 3)), "signature_",
                  id="replay-reordered-across-different-kernels"),
     pytest.param(dict(exec_untracked=True), "untracked_launch", id="instantiate-never-seen"),
+    # The likeliest 7.2.3 failure: no per-dispatch request inside the launch,
+    # so every dispatch inherits the hipGraphLaunch call's stamp — the id of
+    # the live launch range — and no graph identity. The graph_launch guard
+    # must run before the stamped join, or the launch range becomes the op.
+    pytest.param(dict(stamp_inherits_launch=True), "untracked_launch",
+                 id="dispatch-inherits-the-launch-stamp"),
 ]
 
 
@@ -166,3 +172,20 @@ def test_memcpys_label_every_step_on_both_vendors_in_graph_mode():
         copies = [e for e in events if e.kind == "memcpy"]
         assert copies and all(c.launch_range == "decode_step" for c in copies)
         assert report.memcpys_labelled == report.memcpys
+
+
+def test_a_capture_without_ranges_is_reported_not_silent():
+    """torch.compile can trace the instrumentation away during capture: every
+    node exists, none is named, nothing is refused — and without a report the
+    capture would look like a model with no identifiable ops."""
+    s, report, _ = _run(_launches("dense"), EmulationConfig("amd", graphs=True,
+                                                            capture_unranged=True))
+    assert s.wrong == 0 and not report.graph_refused
+    assert report.graph_unnamed == report.graph_kernels
+    assert any("captured outside every range" in p for p in report.problems())
+
+
+def test_a_few_unranged_nodes_are_normal():
+    _, report, _ = _run(_launches("side_stream"), EmulationConfig("amd", graphs=True))
+    assert 0 < report.graph_unnamed < report.graph_kernels / 2
+    assert report.problems() == []

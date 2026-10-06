@@ -123,22 +123,25 @@ def attribute_dr(residuals: Residuals, graph: Graph, *, band: float = _KT_BAND,
     ops = [op for op, v in series.items() if len(v) >= 4]
     if len(ops) < 2:
         return RankedHypotheses(hypotheses=[])
-    # Positional alignment is only meaningful between series of equal launch
-    # cardinality (see gitm.optimizer.attribution.attribute); truncating all of
-    # them to the shortest made a once-per-step op set the sample size for
-    # every per-layer pair.
+    # Positional alignment is only meaningful between series of comparable
+    # launch cardinality (gitm.optimizer.attribution.comparable); truncating
+    # all of them to the shortest made a once-per-step op set the sample size
+    # for every per-layer pair. Each pair is truncated to its own shorter
+    # length.
+    from gitm.optimizer.attribution import comparable
+
     effects: list[DREffect] = []
     for cause in ops:
-        n = len(series[cause])
-        pos = np.arange(n, dtype=float)
-        t = (np.abs(np.asarray(series[cause])) > band).astype(float)
-        n_t = int(t.sum())
-        if n_t < _MIN_GROUP or (n - n_t) < _MIN_GROUP:
-            continue  # too few anomalies to support a doubly-robust estimate
         for effect in ops:
-            if effect == cause or len(series[effect]) != n:
+            if effect == cause or not comparable(len(series[cause]), len(series[effect])):
                 continue
-            y = np.asarray(series[effect], dtype=float)
+            n = min(len(series[cause]), len(series[effect]))
+            pos = np.arange(n, dtype=float)
+            t = (np.abs(np.asarray(series[cause][:n])) > band).astype(float)
+            n_t = int(t.sum())
+            if n_t < _MIN_GROUP or (n - n_t) < _MIN_GROUP:
+                continue  # too few anomalies to support a doubly-robust estimate
+            y = np.asarray(series[effect][:n], dtype=float)
             ate, se = doubly_robust_ate(y, t, pos)
             z = ate / se if se not in (0.0, float("inf")) else 0.0
             effects.append(DREffect(cause, effect, ate, se, z, int(t.sum())))
