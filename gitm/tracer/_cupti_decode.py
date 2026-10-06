@@ -20,9 +20,12 @@ Dict contract (the shim emits exactly these shapes):
 
     graph_id/graph_node_id are 0 for a kernel launched outside a CUDA graph and
     are absent from captures taken before the collector emitted them; both
-    decode to None.
+    decode to None. The ROCm collector adds ``kernel_id`` (the code-object
+    symbol id) and, under GITM_TRACE_NVTX, ``range_id`` (the rocTX range open
+    at enqueue — see gitm.distributed.correlate, "Stamped ranges").
     memcpy  {kind:"memcpy", copy_kind:int, bytes, start_ns, end_ns, device_id,
-             context_id, stream_id, correlation_id}
+             context_id, stream_id, correlation_id[, range_id, graph_id,
+             graph_node_id]}
     sync    {kind:"sync", sync_type:int, start_ns, end_ns, device_id,
              context_id, stream_id, correlation_id}
 """
@@ -33,7 +36,7 @@ import re
 import warnings
 from typing import Literal
 
-from gitm.distributed.correlate import correlate_kernels_to_ranges
+from gitm.distributed.correlate import CorrelationReport, correlate_records, split_range_annotations
 from gitm.tracer.schema import KernelEvent, MemcpyEvent, SyncEvent, TraceEvent
 
 Endpoint = Literal["host", "device", "unified"]
@@ -114,6 +117,9 @@ def decode_kernel(d: dict) -> KernelEvent:
         graph_id=_opt_graph_id(d.get("graph_id")),
         graph_node_id=_opt_graph_id(d.get("graph_node_id")),
         launch_range=d.get("launch_range"),
+        range_attrs=d.get("range_attrs") or None,
+        identity=d.get("identity"),
+        kernel_id=_opt_graph_id(d.get("kernel_id")),
         pid=_opt_int(d.get("pid")),
     )
 
@@ -137,6 +143,9 @@ def decode_memcpy(d: dict) -> MemcpyEvent:
         bytes=int(d["bytes"]),
         src=src,
         dst=dst,
+        launch_range=d.get("launch_range"),
+        graph_id=_opt_graph_id(d.get("graph_id")),
+        pid=_opt_int(d.get("pid")),
     )
 
 
@@ -220,19 +229,41 @@ def pair_markers(records: list[dict]) -> list[dict]:
     ``{kind, name, start_ns, end_ns, thread_id}`` range that
     :mod:`gitm.distributed.correlate` documents as its input.
 
-    Non-marker records pass through untouched and in order. Unpaired halves are
+    Non-marker records pass through untouched and in order, ahead of the paired
+    ranges. Halves are paired in timestamp order (see below). Unpaired halves are
     dropped rather than repaired: a start without an end has no window, and
     inventing one — closing it at the capture's end, say — would produce a range
     that appears to contain every launch after it and would silently claim them
     all. A capture killed mid-step leaves exactly that, so this is the common
     case, not a corner one.
     """
-    starts: dict[tuple, dict] = {}
     out: list[dict] = []
+    halves: list[dict] = []
     for r in records:
-        if r.get("kind") != "marker":
+        kind = r.get("kind")
+        if kind == "graph_node" and r.get("name"):
+            # A capture-time node is named by the range open when it was
+            # created, in whatever form the emitter pushed it — vLLM's
+            # layerwise ranges are dict reprs. Normalize exactly as a marker's
+            # name is, keeping any annotation for correlation to split off.
+            name = r["name"]
+            base, sep, tail = ((name, "", "") if name.startswith("{")
+                               else name.partition("#"))
+            out.append({**r, "name": normalize_range_name(base) + sep + tail})
+        elif kind == "marker":
+            halves.append(r)
+        else:
             out.append(r)
-            continue
+
+    # Pair in time order, not arrival order. Halves reach the shard in the
+    # order buffers were flushed, which neither collector promises is the
+    # order they happened in; pairing by arrival dropped every range whose
+    # END was flushed ahead of its START. At one timestamp a START sorts first,
+    # so a point marker (both halves at one instant) still pairs.
+    halves.sort(key=lambda r: (int(r.get("timestamp_ns") or 0),
+                               r.get("marker_flags") == MARKER_END))
+    starts: dict[tuple, dict] = {}
+    for r in halves:
         # marker_id is unique per process, but pair within a thread anyway: an
         # id reused across threads would otherwise splice two ranges into one
         # spanning window.
@@ -241,12 +272,17 @@ def pair_markers(records: list[dict]) -> list[dict]:
             start = starts.pop(key, None)
             if start is None:
                 continue  # end without a start: nothing to bound
+            base, attrs = split_range_annotations(start.get("name") or "")
             out.append({
                 "kind": "marker",
-                "name": normalize_range_name(start.get("name") or ""),
+                "name": normalize_range_name(base),
+                "attrs": attrs,
                 "start_ns": int(start["timestamp_ns"]),
                 "end_ns": int(r["timestamp_ns"]),
                 "thread_id": r.get("thread_id"),
+                # The join key for stamped records (correlate.py, "Stamped
+                # ranges"): kernels the ROCm collector stamped carry this id.
+                "marker_id": r.get("marker_id"),
             })
         else:
             starts[key] = r
@@ -256,17 +292,25 @@ def pair_markers(records: list[dict]) -> list[dict]:
 def decode_records(records: list[dict]) -> list[TraceEvent]:
     """Decode a shim record batch, dropping unmodeled kinds, sorted by start.
 
-    Kernel dicts are first run through :func:`correlate_kernels_to_ranges` so
-    ``range_op``/``range_layer`` are populated whenever the capture carries
-    NVTX range instrumentation (``runtime``/``marker`` records) — a no-op
-    today since the shim doesn't emit those kinds yet, and harmless on any
-    trace that doesn't have them (``decode_kernel`` just sees ``None``).
-    ``runtime``/``marker`` records themselves are consumed by correlation and
-    never reach ``_DECODERS`` — GITM doesn't model them as events.
+    Kernel and memcpy dicts are first run through correlation
+    (:func:`gitm.distributed.correlate.correlate_records`) so ``range_op``/
+    ``range_layer`` are populated whenever the capture carries range
+    instrumentation (``runtime``/``marker`` records, ROCm range stamps, graph
+    node maps) — harmless on any trace that doesn't (``decode_kernel`` just sees
+    ``None``). Correlation records themselves are consumed and never reach
+    ``_DECODERS`` — GITM doesn't model them as events.
 
     Sorting by ``start_ns`` gives a stable timeline regardless of the order
     CUPTI flushed buffers (concurrent kernels on multiple streams interleave).
     """
+    return decode_records_with_report(records)[0]
+
+
+def decode_records_with_report(
+    records: list[dict],
+) -> tuple[list[TraceEvent], CorrelationReport]:
+    """:func:`decode_records`, plus how identity was recovered (or lost)."""
+    report = CorrelationReport()
     # Both marker IDs and launch correlation IDs are process-local. Partition
     # before pairing either; merging first silently borrows another rank's op.
     pids = {d.get("pid") for d in records}
@@ -274,18 +318,25 @@ def decode_records(records: list[dict]) -> list[TraceEvent]:
         by_pid: dict[int | None, list[dict]] = {}
         for d in records:
             by_pid.setdefault(d.get("pid"), []).append(d)
-        events = [e for group in by_pid.values() for e in decode_records(group)]
-        return sorted(events, key=lambda e: e.start_ns)
-    correlated = correlate_kernels_to_ranges(pair_markers(records))
-    enriched_kernels = iter(correlated)
-    events: list[TraceEvent] = []
+        events: list[TraceEvent] = []
+        for group in by_pid.values():
+            evs, rep = decode_records_with_report(group)
+            events.extend(evs)
+            report.merge(rep)
+        return sorted(events, key=lambda e: e.start_ns), report
+    kernels, copies, report = correlate_records(pair_markers(records))
+    enriched_kernels, enriched_copies = iter(kernels), iter(copies)
+    events = []
     for d in records:
-        if d.get("kind") == "kernel":
+        kind = d.get("kind")
+        if kind == "kernel":
             events.append(decode_kernel(next(enriched_kernels)))
+        elif kind == "memcpy":
+            events.append(decode_memcpy(next(enriched_copies)))
         elif (ev := decode_record(d)) is not None:
             events.append(ev)
     events.sort(key=lambda e: e.start_ns)
-    return events
+    return events, report
 
 
 def _opt_int(v) -> int | None:

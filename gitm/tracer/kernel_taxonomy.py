@@ -51,7 +51,10 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("collective", ("nccl", "all_reduce", "allreduce", "reduce_scatter", "reducescatter",
                     "all_gather", "allgather", "custom_ar", "cross_device", "one_shot",
                     "two_shot", "all_to_all", "alltoall", "dispatch_combine")),
-    ("moe", ("moe", "expert", "topk_softmax", "grouped_gemm", "group_gemm",
+    # "topksoftmax"/"moetopk": AITER's router kernels; the first has no
+    # underscore, so it slipped past "topk_softmax" into `sampling` below.
+    ("moe", ("moe", "expert", "topk_softmax", "topksoftmax", "moetopk", "grouped_gemm",
+             "group_gemm",
              "groupedgemm", "gather_scatter", "sort_tokens", "routing", "router")),
     # Speculative decoding: drafting scaffolding and rejection sampling.
     #
@@ -124,7 +127,14 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # a visible finding, whereas this silently inflated a bucket that gets
     # trusted. Its actual attention kernels are named for what they do, so they
     # are matched by name below.
-    ("attention", ("flash_fwd", "flash_attn", "flashattn", "fmha", "paged_attention",
+    # AMD: AITER's MLA decode and paged-attention asm kernels name neither
+    # "attention" nor any FlashAttention family (hsa/gfx950/{mla,pa}/*.csv);
+    # vLLM's Triton decode attention (`_fwd_grouped_kernel_stage1`) runs on
+    # both vendors. All of them sat in `other`.
+    ("attention", ("mla_dec", "mla_a16", "mla_a8", "mla_reduce", "mla_stage",
+                   "pa_a16w", "pa_a8w", "pa_bf16", "pa_fp8", "pa_decode",
+                   "_fwd_grouped_kernel_stage", "_fwd_kernel_stage",
+                   "flash_fwd", "flash_attn", "flashattn", "fmha", "paged_attention",
                    "paged_attn", "attention", "attn_score", "splitkv", "merge_attn",
                    "mha_fwd", "cutlass_mla", "flash_mla", "mla_sparse", "sparse_mla",
                    "indexer", "lightning_index", "batchprefill", "batchdecode",
@@ -138,7 +148,11 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # reported 3.6%. Worse, the family was *split*: the `..._splitK_...`
     # variants matched "splitk" and classified, so one kernel family landed in
     # two buckets by accident of naming.
-    ("gemm", ("gemm", "cutlass", "sgemm", "hgemm", "s16816", "s161616", "matmul",
+    # "cijk_" is Tensile's solution prefix (`Cijk_Alik_Bljk_BBS_BH_..._MT256x256x64`
+    # — C[i,j,k] = A x B in its index notation), which every hipBLASLt and
+    # rocBLAS GEMM on MI300/MI355 carries and which contains no "gemm": on AMD
+    # the whole dense-GEMM bucket landed in `other`, the AMD twin of nvjet.
+    ("gemm", ("gemm", "cijk_", "cutlass", "sgemm", "hgemm", "s16816", "s161616", "matmul",
               "cublas", "marlin", "machete", "scaled_mm", "wgrad", "tensorop",
               "gemv", "splitk", "nvjet", "xmma")),
     ("quant", ("quant", "dequant", "scaled_fp8", "per_token_group", "awq", "gptq",

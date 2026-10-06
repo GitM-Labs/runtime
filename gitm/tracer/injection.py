@@ -47,6 +47,10 @@ ENV_NVTX = "GITM_TRACE_NVTX"
 ENV_NVTX_INJECT = "NVTX_INJECTION64_PATH"
 ENV_SETTLE = "GITM_TRACE_SETTLE_S"
 
+#: Record kinds consumed by correlation rather than decoded as events, and
+#: exempt from the capture window (see read_shards).
+CORRELATION_KINDS = ("marker", "runtime", "graph_node", "graph_exec")
+
 LIB_NAME = "libgitm_inject.so"
 
 #: Process settings a traced vLLM run needs on AMD, beyond the collector hook.
@@ -144,15 +148,29 @@ def libcupti_path() -> Path | None:
 
 
 def detect_vendor() -> str:
-    """``"amd"`` on a ROCm box, else ``"nvidia"``.
+    """``"amd"`` or ``"nvidia"`` for this host — see :mod:`gitm.tracer.vendor`.
 
-    kfd topology is the ground truth for AMD GPUs and exists without any
-    library loaded; NVIDIA stays the default so a CPU-only dev box renders the
-    same env it always has.
+    ``GITM_VENDOR`` overrides. Otherwise the strongest evidence tier decides
+    (a loaded compute driver beats a PCI id beats a torch build). NVIDIA stays
+    the default when there is no evidence, so a CPU-only dev box renders the
+    same env it always has; a *conflict* (both vendors' drivers loaded) keeps
+    that default too but says so, because the env it renders loads one
+    vendor's collector and the other vendor's devices go untraced.
     """
-    from gitm.tracer import _rocm
+    from gitm.tracer import vendor as _vendor
 
-    return "amd" if _rocm.device_count() > 0 else "nvidia"
+    override = _vendor.env_vendor_override()
+    if override:
+        return override
+    c = _vendor.classify_host()
+    if c.conflict:
+        warnings.warn(
+            "GPU vendor is ambiguous on this host — rendering the NVIDIA trace env; "
+            "set GITM_VENDOR=amd|nvidia to choose.\n" + c.explain(),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return c.vendor or "nvidia"
 
 
 def run_env(
@@ -334,11 +352,13 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
     leaves a partial record, and losing the last kernel of a shard is a better
     outcome than failing the whole run.
     """
-    from gitm.tracer._cupti_decode import decode_records
+    from gitm.tracer._cupti_decode import decode_records_with_report
 
     records: list[dict] = []
     dropped_lines = 0
     collector_drops = 0
+    collectors: set[str] = set()
+    stamp_faults: dict[str, int] = {}
     for shard in shard_paths():
         try:
             text = shard.read_text(encoding="utf-8", errors="replace")
@@ -373,15 +393,24 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
             # They must NOT be windowed. A range that opens before the window
             # still encloses launches inside it, and pairing needs both halves;
             # dropping either end silently un-attributes everything it covered.
-            if rec.get("kind") in ("marker", "runtime"):
+            #
+            # Graph structure (graph_node, graph_exec) is the extreme case: it
+            # is written while the engine captures its graphs at startup, long
+            # before any window opens, and is the only thing that names a
+            # replayed kernel. Windowing it would leave every replay anonymous.
+            if rec.get("kind") in CORRELATION_KINDS:
                 records.append(rec)
                 continue
-            # In-band loss report from the ROCm collector (rocprofiler-sdk
-            # counts drops; CUPTI never told us). Not an event — surface it.
+            # In-band reports from the ROCm collector. Not events — surface them.
             if rec.get("kind") == "meta":
                 drops = rec.get("dropped_records")
                 if isinstance(drops, int):
                     collector_drops += drops
+                if rec.get("collector"):
+                    collectors.add(str(rec["collector"]))
+                for key in ("graph_stamp_overflow", "graph_untracked_launch"):
+                    if isinstance(rec.get(key), int):
+                        stamp_faults[key] = stamp_faults.get(key, 0) + rec[key]
                 continue
 
             ts = rec.get("start_ns")
@@ -409,11 +438,31 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
             RuntimeWarning,
             stacklevel=2,
         )
-    events = decode_records(records)
+    if len(collectors) > 1:
+        # Two collectors in one shard set is two runs in one directory: a
+        # stale shard from another box or build, merged as if it were this
+        # capture. Its kernels would be priced against this run's graph.
+        warnings.warn(
+            f"injected trace shards come from more than one collector "
+            f"({sorted(collectors)}); stale shards from another run are mixed in",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if stamp_faults:
+        warnings.warn(
+            f"injected trace coverage: the ROCm collector could not stamp graph "
+            f"identity on some replays ({stamp_faults}); those kernels keep "
+            "range_op=None and fall back to name classification",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    events, report = decode_records_with_report(records)
+    for problem in report.problems():
+        warnings.warn(f"injected trace identity: {problem}", RuntimeWarning, stacklevel=2)
     # Correlation records are consumed, not lost: decode_records folds them into
     # range_op/range_layer on the kernels. Counting them as dropped would report
     # millions of missing records on a correlated capture and read as data loss.
-    n_correlation = sum(1 for r in records if r.get("kind") in ("marker", "runtime"))
+    n_correlation = sum(1 for r in records if r.get("kind") in CORRELATION_KINDS)
     unmodeled = len(records) - n_correlation - len(events)
     if unmodeled > 0:
         warnings.warn(

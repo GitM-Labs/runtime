@@ -256,6 +256,25 @@ class Scenario:
     seed: int = 0
 
 
+@dataclass(frozen=True)
+class Launch:
+    """One kernel as the host issued it: the ground truth a collector records.
+
+    ``trace.events`` is sorted by device start, which is not the order the host
+    launched in once streams overlap, and carries the identity only as the
+    fixture *chose* to record it (a :class:`Misroute` changes it). This is the
+    unrecorded truth — what was launched, in what order, for which op and layer
+    — that :mod:`gitm.tracer.emulate` renders into each vendor's records.
+    """
+
+    step: int
+    op: str
+    layer: int | None
+    stream: int
+    #: Index into ``trace.events`` of the kernel this launch ran as.
+    event: int
+
+
 @dataclass
 class Fixture:
     scenario: Scenario
@@ -266,6 +285,8 @@ class Fixture:
     true_step_ns: list[int]
     #: Per-step wall time the trace shows.
     traced_step_ns: list[int]
+    #: Host launch order with true identity (see :class:`Launch`).
+    launches: list[Launch] = field(default_factory=list)
 
     @property
     def true_tpot_s(self) -> float:
@@ -394,7 +415,11 @@ def generate(scenario: Scenario) -> list[Fixture]:
         _schedule(true)
         _schedule(traced)
         misroutes = {d.from_op: d.to_op for d in scenario.observation if isinstance(d, Misroute)}
-        events = sorted((_event(i, misroutes) for i in traced), key=lambda e: e.start_ns)
+        order = sorted(range(len(traced)), key=lambda j: traced[j].start_ns)
+        events = [_event(traced[j], misroutes) for j in order]
+        position = {j: pos for pos, j in enumerate(order)}
+        launches = [Launch(step=i.step, op=i.op, layer=i.layer, stream=i.stream,
+                           event=position[j]) for j, i in enumerate(traced)]
         trace = Trace(
             workload_id="mechanism-fixture", fingerprint="synthetic",
             run_id=f"kv{point.kv_cache_len}-b{point.batch}", device_count=1, vendor="nvidia",
@@ -402,7 +427,7 @@ def generate(scenario: Scenario) -> list[Fixture]:
         )
         out.append(Fixture(scenario, point, graph, trace,
                            _step_spans(true, scenario.n_steps),
-                           _step_spans(traced, scenario.n_steps)))
+                           _step_spans(traced, scenario.n_steps), launches))
     return out
 
 

@@ -39,6 +39,8 @@ def attribute(
     residuals: Residuals,
     graph: Graph,
     max_lag: int = 2,
+    *,
+    stratify: tuple[str, ...] = (),
 ) -> RankedHypotheses:
     """Granger-causality on the residual subgraph.
 
@@ -49,7 +51,15 @@ def attribute(
       → predict_delta on captured trace (offline)
       → if Δ > threshold, attempt live (rollback-gated via gitm/optimizer/apply.py)
       → if not, drop or escalate
+
+    ``stratify`` splits each op's series by side-table attributes
+    (:mod:`gitm.tracer.kernel_attributes`; residuals must be computed
+    ``with_attributes``), so a cause or effect confined to one archetype or
+    wave is a series of its own instead of a fraction of the op's. Hypothesis
+    ops are then stratum labels (``"mlp_down[wave=0]"``). Default: op only.
     """
+    from gitm.tracer.kernel_attributes import stratum
+
     try:
         from statsmodels.tsa.stattools import (
             grangercausalitytests,  # type: ignore[import-not-found]
@@ -60,18 +70,25 @@ def attribute(
     # Group residuals by op into ordered time series (per layer-position step)
     series: dict[str, list[float]] = {}
     for kr in residuals.per_kernel:
-        series.setdefault(kr.op, []).append(kr.r_kt)
+        series.setdefault(stratum(kr.op, kr.attrs, stratify), []).append(kr.r_kt)
 
     ops = [op for op, vals in series.items() if len(vals) >= max_lag + 2]
     if len(ops) < 2:
         return RankedHypotheses(hypotheses=[])
 
-    n = min(len(series[op]) for op in ops)
+    # Series are aligned by position, which pairs like with like only when two
+    # series have the same launch cardinality: two per-layer ops put layer l of
+    # step s at the same index, a per-layer op against lm_head (once a step)
+    # does not. Truncating everything to the shortest series — the old
+    # behaviour — cut every per-layer series to the step count, which on a
+    # whole-model trace is too short for any lag model to fit, so attribution
+    # silently returned nothing. Pairs of unequal cardinality are skipped.
     hypotheses: list[Hypothesis] = []
     for cause in ops:
         for effect in ops:
-            if cause == effect:
+            if cause == effect or len(series[cause]) != len(series[effect]):
                 continue
+            n = len(series[cause])
             arr = np.column_stack([np.asarray(series[effect][:n]), np.asarray(series[cause][:n])])
             try:
                 with warnings.catch_warnings():

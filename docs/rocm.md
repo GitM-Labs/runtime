@@ -17,6 +17,9 @@ additive.
 | `cuptiGetTimestamp` (window clock) | `rocprofiler_get_timestamp` via ctypes | `injection.clock_now()` dispatches on the active vendor. Same-domain guarantee is load-bearing: a wrong clock silently windows out the whole trace. |
 | SYNCHRONIZATION records | — none | rocprofiler-sdk has no sync activity kind. AMD traces carry no `sync` events; consumers already tolerate absence. |
 | `registers_per_thread` | arch VGPR count | Taken from the code-object symbol; the AMD occupancy-limiting analog. |
+| `graphId`/`graphNodeId` on the kernel record | external-correlation **stamp** `(exec, ordinal)` from `hipGraphLaunch` callbacks | 7.2.3 has no graph id on a dispatch; built from the sdk's documented recipe. Validated per replay — see `docs/rocm_correlation.md`. |
+| capture-time node map (planned CUPTI NVTX/RESOURCE callbacks) | HIP-API callbacks during stream capture → `graph_node`, `EndCapture` + `Instantiate*` → `graph_exec` | Written unarmed (capture precedes any window). |
+| kernel → RUNTIME → range by host-time containment | kernel `range_id` **stamped at enqueue** with the innermost rocTX range on the launching thread | Exact join; containment kept as validator. |
 | dropped records: no signal | `drop_count` per buffer | The counter CUPTI never gave us. Emitted in-band as `{"kind":"meta","dropped_records":N}`; `read_shards` warns if non-zero, so a lossy AMD trace is *detectable* (the NVIDIA NVTX-lossiness question stays open). |
 
 Semantics normalized in the tool so downstream sees one schema:
@@ -28,6 +31,9 @@ Semantics normalized in the tool so downstream sees one schema:
   exactly as on NVIDIA.
 * **copy kinds** — mapped onto the CUPTI `CUpti_ActivityMemcpyKind` ints the
   decoder already speaks.
+
+Kernel identity (stamped ranges, HIP-graph projection, validation, attributes)
+is specified in `docs/rocm_correlation.md`, with its own hardware checklist.
 
 ## Bring-up on a fresh MI355X box (bare, no k8s)
 
@@ -97,10 +103,10 @@ draft rate the decode experiments measure.
 
 * `rocm_inject.c` is compiled against the installed rocprofiler-sdk headers;
   like `cupti_core.c`'s versioned-struct pins, a field rename in a future sdk
-  fails the build loudly rather than corrupting offsets silently. It has not
-  yet been compiled on the MI355X box — expect the first
-  `python -m gitm.tracer._rocm.build` to be the real review of the sdk's
-  current field spellings.
+  fails the build loudly rather than corrupting offsets silently.
+  `python scripts/check_rocm_collector.py --ref rocm-7.2.3` (or `--ref develop`)
+  compiles it against that release's real headers on any machine, ROCm or
+  not; both pass `-Wall -Wextra -Werror`. It has not yet run on the MI355X box.
 * In-process (non-injected) capture has no AMD backend; `capture()` degrades to
   a well-formed no-op outside injection. Injection is the only mode that sees a
   serving engine's children anyway, so this costs nothing for the experiments.

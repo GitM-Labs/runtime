@@ -51,6 +51,18 @@ class KernelEvent(_TraceEventBase):
     graph_id: int | None = None
     graph_node_id: int | None = None
     launch_range: str | None = None
+    # Annotations carried on the identifying range (``L3/moe_routed#wave=2``),
+    # split off before the name is parsed — see
+    # gitm.distributed.correlate.split_range_annotations and
+    # gitm.tracer.kernel_attributes, which indexes them for attribution.
+    range_attrs: dict[str, str] | None = None
+    # Which mechanism named this kernel: "range_id" (collector-stamped range,
+    # ROCm), "containment" (runtime record inside a host range), "graph_node"
+    # (capture-time projection). None when nothing did.
+    identity: Literal["range_id", "containment", "graph_node"] | None = None
+    # The collector's own symbol id (ROCm code-object kernel_id). Distinguishes
+    # kernels whose names collide after truncation; None on NVIDIA.
+    kernel_id: int | None = None
 
 
 class MemcpyEvent(_TraceEventBase):
@@ -58,6 +70,12 @@ class MemcpyEvent(_TraceEventBase):
     bytes: int
     src: Literal["host", "device", "unified"]
     dst: Literal["host", "device", "unified"]
+    # The range open around the copy's issue. vLLM's per-step input upload and
+    # sampled-token download run outside CUDA/HIP graphs, so this survives
+    # graph replay as a step-boundary label where kernel ranges do not.
+    launch_range: str | None = None
+    # Nonzero when the copy is a node of a graph replay.
+    graph_id: int | None = None
 
 
 class SyncEvent(_TraceEventBase):

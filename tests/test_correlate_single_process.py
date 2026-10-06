@@ -125,8 +125,11 @@ def test_a_push_and_pop_become_one_range():
     from gitm.tracer._cupti_decode import pair_markers
 
     got = pair_markers([_start(1, "L0/qkv_proj", 100), _end(1, 120)])
-    assert got == [{"kind": "marker", "name": "L0/qkv_proj",
-                    "start_ns": 100, "end_ns": 120, "thread_id": 7}]
+    # marker_id survives pairing: it is the join key for collector-stamped
+    # kernels (correlate.py, "Stamped ranges"). attrs is the split-off
+    # annotation, None when the name carries none.
+    assert got == [{"kind": "marker", "name": "L0/qkv_proj", "attrs": None,
+                    "start_ns": 100, "end_ns": 120, "thread_id": 7, "marker_id": 1}]
 
 
 def test_the_name_comes_from_the_start_half():
