@@ -48,7 +48,7 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
     # collective whose cost a MoE deployment exists to trade against, so it must
     # not disappear into a bucket labelled all-reduce.
     "moe_all_to_all": ("alltoall", "all_to_all", "_a2a", "dispatch_combine"),
-    "tp_all_reduce": ("nccl", "allreduce", "all_reduce", "custom_ar", "cross_device",
+    "tp_all_reduce": ("nccl", "rccl", "allreduce", "all_reduce", "custom_ar", "cross_device",
                       "one_shot", "two_shot", "reduce_scatter", "all_gather"),
 
     # ── gated DeltaNet / linear attention (hybrid checkpoints) ───────────────

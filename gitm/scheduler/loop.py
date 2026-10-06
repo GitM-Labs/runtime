@@ -41,7 +41,7 @@ from gitm.optimizer.dr import attribute_dr
 from gitm.optimizer.history import load_history
 from gitm.optimizer.measure import measure_trace, measurement_claims, measurement_summary
 from gitm.optimizer.monitor import check_invariants, residuals
-from gitm.optimizer.qualification import qualify
+from gitm.optimizer.qualification import QualificationResult, qualify
 from gitm.optimizer.report import Claim, build_provenance, write_report
 from gitm.optimizer.scheduler_attribution import scheduler_causes
 from gitm.optimizer.verification_export import (
@@ -170,6 +170,9 @@ class LoopConfig:
     # Optional explicit driver for the embedded/engine path. When unset, the
     # loop looks up ``workload`` in the workload registry (gitm.workloads).
     workload_runner: WorkloadRunner | None = None
+    #: Skip the pre-loop NCCL/RCCL AllReduce readiness probe. Also honour
+    #: ``GITM_SKIP_COLLECTIVE_HEALTH=1`` (same escape hatch as serve skip-preflight).
+    skip_collective_health: bool = False
 
 
 def _hf_config_from_engine(engine: Any) -> Any:
@@ -422,6 +425,34 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     run_dir = runs_dir(cfg.scratch) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     trace_path = traces_dir(cfg.scratch) / f"{run_id}.jsonl"
+
+    # Pre-loop collective readiness (NCCL / RCCL AllReduce). Standalone probe —
+    # accepts double-init when the workload later creates its own process group.
+    # Hard-fail on hang/wrong sum; soft-warn on low busbw. Skips cleanly on
+    # <2 GPUs / no torch so CPU CI stays green. See gitm.health.collective.
+    from gitm.health import run_collective_health, write_collective_health
+
+    health = run_collective_health(skip=cfg.skip_collective_health)
+    write_collective_health(run_dir, health)
+    if not health.ok:
+        diagnostic = (
+            "GPU collective health check failed before the Runtime loop: "
+            + (health.diagnostic() or "unknown collective failure")
+        )
+        return _no_data_result(
+            run_dir=run_dir,
+            run_id=run_id,
+            workload=workload,
+            qual=QualificationResult(
+                commit=False,
+                floor=0.0,
+                fingerprint="none:collective_health",
+                diagnostic=diagnostic,
+            ),
+            started_ns=started_ns,
+            trace_path=trace_path,
+            diagnostic=diagnostic,
+        )
 
     # Phase 1 — capture, fingerprint, predict graph
     # Resolve a workload runner: an explicit one wins, else the registry. The

@@ -21,6 +21,8 @@ from gitm.tracer.schema import Trace
 _COMM_PATTERNS: tuple[tuple[str, str], ...] = (
     ("nccl", "NCCL library prefix (any nccl* kernel)"),
     ("ncclkernel", "NCCL device kernel entry points"),
+    ("rccl", "RCCL library prefix (any rccl* kernel)"),
+    ("rcclkernel", "RCCL device kernel entry points"),
     ("allreduce", "AllReduce collective"),
     ("reducescatter", "ReduceScatter collective"),
     ("allgather", "AllGather collective"),
