@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import re
 import statistics
 import sys
@@ -275,6 +277,23 @@ def _noise(s: Sweep, pts: Sequence[str]) -> tuple[np.ndarray, int]:
     return np.sqrt(a2 + c2 * d**2), max(df, 1)
 
 
+def _positive(v) -> bool:
+    return isinstance(v, int | float) and not isinstance(v, bool) and math.isfinite(v) and v > 0
+
+
+def _strict_json(value):
+    """A copy that strict JSON can carry: non-finite floats become ``None``."""
+    if isinstance(value, Mapping):
+        return {k: _strict_json(v) for k, v in value.items()}
+    if isinstance(value, list | tuple | set | frozenset):
+        return [_strict_json(v) for v in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def _outside(ci: tuple[float, float], lo: float, hi: float) -> bool:
     return ci[1] < lo or ci[0] > hi
 
@@ -461,6 +480,8 @@ def _preemption_problem(prom: Path) -> str | None:
     pre = _prom_series(prom, _PREEMPTIONS)
     if len(pre) < 2:
         return f"preemption counter in {len(pre)} scrape(s); unverifiable"
+    if not all(math.isfinite(v) for v in pre):
+        return "preemption counter holds a non-finite value; unverifiable"
     if any(b < a for a, b in zip(pre, pre[1:], strict=False)):
         return "preemption counter went backwards (server restart)"
     if pre[-1] > pre[0]:
@@ -542,13 +563,23 @@ def _phase(run: Path, arm: str, phase: str, concurrency: int,
             problems.append("guidellm.json unreadable")
         else:
             p50, p95 = _itl_ms(g), _itl_ms(g, "p95")
-            if not (p50 and p95):
+            if p50 is None or p95 is None:
                 problems.append("ITL p50/p95 not found in guidellm.json")
+            elif not (_positive(p50) and _positive(p95)):
+                problems.append("ITL p50/p95 not finite and positive in guidellm.json")
             elif p95 / p50 > ITL_TAIL_MAX:
                 problems.append(f"ITL p95/p50 {p95 / p50:.1f} > {ITL_TAIL_MAX}")
-        running = _window_running(d)
-        if not running:
+        try:
+            running = _window_running(d)
+        except (OSError, ValueError, AttributeError):
+            # Cut off mid-write, like a trace: the load during the window is unknown.
+            running = None
+        if running is None:
+            problems.append("metrics_samples.jsonl unreadable")
+        elif not running:
             problems.append("no load metrics")
+        elif not all(math.isfinite(v) for v in running):
+            problems.append("running-requests series holds a non-finite value")
         elif statistics.median(running) < MIN_RUNNING_FRACTION * concurrency:
             problems.append(f"median running {statistics.median(running):.0f} < "
                             f"{MIN_RUNNING_FRACTION:.0%} of c={concurrency}")
@@ -586,6 +617,25 @@ def _kernel_diff(base: _Phase, cand: _Phase, top: int = 10) -> dict:
         out[p] = [{"kernel": n, "delta_us": v * 1e6, "only_in": "cand" if n not in b
                    else "base" if n not in c else None} for n, v in ranked]
     return out
+
+
+def _guard(base: Sweep, cand: Sweep, rep: Sweep) -> tuple[str, str] | None:
+    """Why ``decide()`` cannot run on these sweeps and what would fix it, or None.
+
+    ``decide()`` assumes positive finite times and a baseline that takes at least
+    three distinct values; without them it divides by zero or compares ``None``.
+    """
+    pts = [p for p in set(base) & set(cand) if base[p] and cand[p]]
+    for name, s in (("base1", base), ("cand", cand), ("base2", rep)):
+        bad = sorted(p for p in pts if not all(_positive(v) for v in s.get(p) or ()))
+        if bad:
+            return (f"a per-launch time in {name} at {', '.join(bad)} is not finite and "
+                    "positive", "rerun the affected window")
+    distinct = len({statistics.fmean(base[p]) for p in pts})
+    if len(pts) >= 3 and distinct < 3:
+        return (f"baseline shows {distinct} distinct mean(s) over {len(pts)} points; need 3",
+                "widen the sweep until the baseline shows 3 distinct durations")
+    return None
 
 
 def analyze(run: Path, *, n_layers: int, concurrency: int) -> dict:
@@ -632,19 +682,39 @@ def analyze(run: Path, *, n_layers: int, concurrency: int) -> dict:
     if base.anchors | rep.anchors and len(base.anchors | rep.anchors) > 1:
         failures.append("baseline anchor changed between base1 and base2")
 
+    # A control sample that is not a positive finite time is a corrupt
+    # measurement: its point leaves the control ratio before any statistic reads
+    # it, and the run-level gate fails.
+    invalid = {(p, arm) for arm, ph in (("base1", base), ("cand", cand))
+               for p, vals in ph.control.items() if not all(_positive(v) for v in vals)}
+    failures += [f"control op measurement invalid at {p} ({arm})" for p, arm in sorted(invalid)]
     cpts = sorted(p for p in set(base.control) & set(cand.control)
-                  if len(base.control[p]) >= 2 and len(cand.control[p]) >= 2)
+                  if len(base.control[p]) >= 2 and len(cand.control[p]) >= 2
+                  and p not in {q for q, _ in invalid})
     ctl = {p: statistics.fmean(cand.control[p]) / statistics.fmean(base.control[p])
            for p in cpts}
     cvb, cvc = _pooled_cv(base.control, cpts)[0], _pooled_cv(cand.control, cpts)[0]
     ctl_se = {p: (cvb**2 / len(base.control[p]) + cvc**2 / len(cand.control[p])) ** 0.5
               for p in cpts}
-    dec = decide(base.launch, cand.launch, base_repeat=rep.launch or None,
-                 control_ratio=ctl or None, control_se=ctl_se, gate_failures=failures,
-                 kernels_per_launch=(base.kernels_per_launch, cand.kernels_per_launch))
+    kpl = (base.kernels_per_launch, cand.kernels_per_launch)
+    if (guard := _guard(base.launch, cand.launch, rep.launch)) is not None:
+        dec = Decision("inconclusive", reasons=[*failures, f"decision rule not run: {guard[0]}"],
+                       points=sorted(p for p in set(base.launch) & set(cand.launch)
+                                     if base.launch[p] and cand.launch[p]),
+                       gates={"run": not failures})
+        _finish(dec).remedies.append(guard[1])
+    else:
+        dec = decide(base.launch, cand.launch, base_repeat=rep.launch or None,
+                     control_ratio=ctl or None, control_se=ctl_se, gate_failures=failures,
+                     kernels_per_launch=kpl)
     if grid_mismatch:
         dec.reasons.append(f"excluded {', '.join(grid_mismatch)}: modal grid differs across "
                            "phases or reps, so the decode batch is not matched")
+
+    try:
+        corroboration = _corroborate(run, dec, base.launch, n_layers)
+    except Exception as e:  # noqa: BLE001 - reported, never gating
+        corroboration = {"note": f"corroboration failed: {type(e).__name__}: {e}"}
 
     return {
         "decision": asdict(dec),
@@ -659,7 +729,7 @@ def analyze(run: Path, *, n_layers: int, concurrency: int) -> dict:
                              "cand": statistics.fmean(cand.launch[p]) * 1e6}
                          for p in dec.points},
         "kernel_diff": _kernel_diff(base, cand),
-        "off_arm_corroboration": _corroborate(run, dec, base.launch, n_layers),
+        "off_arm_corroboration": corroboration,
         "constants": {k: v for k, v in globals().items() if k.isupper()
                       and isinstance(v, int | float | str | tuple) and not isinstance(v, bool)},
     }
@@ -740,6 +810,17 @@ def sanity(base_url: str, out: Path, model: str) -> list[str]:
     return failures
 
 
+def _write_atomic(path: Path, text: str) -> None:
+    """Write beside ``path`` and rename into place, so a reader never sees half a file."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m gitm.optimizer.separation")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -751,7 +832,7 @@ def main(argv: list[str] | None = None) -> int:
     sa.add_argument("--out", required=True)
     an = sub.add_parser("analyze", help="Run the pre-registered decision on a run directory.")
     an.add_argument("run")
-    an.add_argument("--n-layers", type=int, default=61)
+    an.add_argument("--n-layers", type=int, default=None)
     an.add_argument("--concurrency", type=int, default=16)
     args = ap.parse_args(argv)
 
@@ -769,9 +850,20 @@ def main(argv: list[str] | None = None) -> int:
                          indent=2))
         return 0
 
-    report = analyze(Path(args.run), n_layers=args.n_layers, concurrency=args.concurrency)
-    out = Path(args.run) / "p1" / "decision.json"
-    out.write_text(json.dumps(report, indent=2, default=list))
+    run = Path(args.run)
+    if not (run / "p1" / "traced").is_dir():
+        print(f"no P1 run at {run}: expected {run}/p1/traced/{{base1,cand,base2}}; "
+              "pass the run root that p1_separation.sh wrote", file=sys.stderr)
+        return 2
+    report = analyze(run, n_layers=61 if args.n_layers is None else args.n_layers,
+                     concurrency=args.concurrency)
+    out = run / "p1" / "decision.json"
+    try:
+        _write_atomic(out, json.dumps(_strict_json(report), indent=2, default=list,
+                                      allow_nan=False))
+    except OSError as e:
+        print(f"cannot write {out}: {e}", file=sys.stderr)
+        return 2
     dec = report["decision"]
     print(f"outcome: {dec['outcome']}")
     if dec["k_ci"] is not None:
