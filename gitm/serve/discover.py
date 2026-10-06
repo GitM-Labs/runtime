@@ -91,6 +91,108 @@ def is_vllm_server(cmdline: list[str]) -> bool:
     return any(p.search(joined) for p in _VLLM_PATTERNS[1:])
 
 
+def vllm_argv_start(cmdline: list[str]) -> int | None:
+    """Index of the first *server* flag in a vLLM command line, or ``None``.
+
+    Everything before it is how the server was invoked — an interpreter, a
+    launcher and its own options, a console script, a module path, the ``serve``
+    subcommand, the positional model. Everything from it is what the server was
+    configured with, which is what a comparison between two arms comes down to.
+
+    Anchored on the vLLM entry point rather than on the first ``--``, because a
+    launcher brings its own options and they come first: under
+    ``torchrun --nproc-per-node 2 -m vllm.entrypoints.openai.api_server --model
+    m``, the first ``--`` belongs to torchrun. Copying that into a proposed arm
+    would hand the server a flag it has never heard of.
+
+    Uses the same patterns :func:`is_vllm_server` matches on, so what counts as
+    "the vLLM part of this command line" has one definition.
+    """
+    for i, token in enumerate(cmdline):
+        if not any(p.search(str(token)) for p in _VLLM_PATTERNS):
+            continue
+        for j in range(i + 1, len(cmdline)):
+            if str(cmdline[j]).startswith("--"):
+                return j
+        return None
+    return None
+
+
+_PYTHON = re.compile(r"(^|/)python[0-9.]*$")
+
+
+#: Interpreter options whose value is the next token: ``-X dev``, ``-W ignore``.
+#: Written joined (``-Xdev``) they are one token and need no special case.
+_PYTHON_VALUE_OPTIONS = frozenset({"-X", "-W"})
+
+
+def _interpreter_options(tokens: list[str]) -> list[str] | None:
+    """``tokens`` if they are all the interpreter's own options, else ``None``.
+
+    Single-dash options, with the separate value ``-X`` and ``-W`` take. Anything
+    else (a long option, a bare word that is not such a value) is not something
+    we can tell apart from a launcher, so it refuses rather than guesses.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if not tok.startswith("-") or tok.startswith("--"):
+            return None
+        if tok in _PYTHON_VALUE_OPTIONS:
+            if i + 1 >= len(tokens):
+                return None
+            out += [tok, tokens[i + 1]]
+            i += 2
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
+def vllm_launch_argv(cmdline: list[str]) -> list[str] | None:
+    """The command that would start this server again, or ``None``.
+
+    :func:`vllm_argv_start` gives the flags, which is what two arms are compared
+    on. A proposed arm needs more than that: it is a command the harness runs,
+    so it has to keep the entry point and the positional model.
+
+    The entry point is rewritten to a form that runs anywhere: a console script
+    at any path becomes ``vllm``, and a module becomes ``python -m <module>``.
+    That is only a faithful rewrite when nothing but a Python interpreter came
+    before the entry point. Its own single-dash options are kept for a module
+    launch; a console script run under options cannot be rewritten, since
+    ``vllm`` takes no interpreter options, and returns ``None``. Anything else in
+    front of it — ``torchrun --nproc-per-node 2``, ``nsys profile --`` — shaped
+    how the server ran, and dropping it would start a different layout from the
+    baseline and measure that instead. Those return ``None``: no command is
+    better than a command for some other server.
+    """
+    for i, token in enumerate(cmdline):
+        token = str(token)
+        console = bool(_VLLM_PATTERNS[0].search(token))
+        module = not console and any(p.search(token) for p in _VLLM_PATTERNS[1:])
+        if not (console or module):
+            continue
+        prefix = [str(a) for a in cmdline[:i]]
+        if module and prefix and prefix[-1] == "-m":
+            prefix = prefix[:-1]
+        if prefix and not _PYTHON.search(prefix[0]):
+            return None
+        options = _interpreter_options(prefix[1:])
+        if options is None:
+            return None
+        # The interpreter's own options (-O, -u, -X dev ...) change how the
+        # server runs, so an arm without them is not an A/B of this baseline. A
+        # module launch keeps them; `vllm` as a console script cannot take them,
+        # so a baseline that ran its script under options has no faithful command.
+        rest = [str(a) for a in cmdline[i + 1:]]
+        if console:
+            return None if options else ["vllm", *rest]
+        return ["python", *options, "-m", token, *rest]
+    return None
+
+
 def iter_pids(proc: Path = PROC) -> list[int]:
     try:
         return sorted(int(p.name) for p in proc.iterdir() if p.name.isdigit())

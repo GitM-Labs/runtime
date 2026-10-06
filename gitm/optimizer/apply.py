@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,33 @@ class ApplyResult:
     rolled_back: bool
     measured_delta: float | None
     error: str | None = None
+    #: The baseline could not be put back after this candidate, so whatever the
+    #: applicator mutates is in a state nothing measured. A caller holding more
+    #: candidates must stop: every A/B after this one would be taken against an
+    #: unknown baseline, or against no engine at all.
+    restore_failed: bool = False
+
+    @property
+    def kept(self) -> bool:
+        """Whether the gate kept this candidate. The one place that is decided.
+
+        Not ``not rolled_back``. A candidate whose restore failed was not rolled
+        back, but it was not kept either: every restore follows a rejection, so
+        the gate had already said no. Reading ``not rolled_back`` as kept turned a
+        candidate measured at -20% whose rollback then failed into a kept result,
+        which history counts as a win.
+        """
+        return not self.rolled_back and not self.restore_failed
+
+
+class RestoreFailed(RuntimeError):
+    """The baseline could not be restored, and the target is in an unknown state.
+
+    Raised by an applicator rather than letting the rebuild's own exception
+    escape, so :func:`apply_intervention` can tell "the candidate failed" (the
+    normal case, which it rolls back) from "the rollback failed" (which it cannot
+    do anything about and must not try twice).
+    """
 
 
 class Applicator(Protocol):
@@ -67,20 +95,61 @@ def apply_intervention(
 
     ``min_keep_delta`` is the regression threshold: a measured delta below it
     (e.g. a slowdown) is rolled back. With no measurement (``measure`` returns
-    ``None``) the change is kept — apply-only mode.
+    ``None``) the change is kept — apply-only mode. A spec carrying a
+    ``correctness_gate`` is additionally rolled back when that gate fails,
+    regardless of the measured delta.
 
     When an ``audit`` log is supplied, every live mutation and every rollback is
     recorded to the durable safety trail (best-effort — a broken audit sink never
     blocks the apply). Pass one only where the applicator mutates a real target;
     a dry-run leaves it ``None`` so the trail stays free of no-op entries.
     """
-    snapshot = applicator.snapshot()
+    # Step 1: snapshot. On a live engine this benchmarks the baseline, so it can
+    # fail the same ways a measurement can — and when it does, nothing has been
+    # applied yet. Returned as an error, not raised: one candidate whose baseline
+    # could not be taken must not end a run that has other candidates to try.
+    try:
+        snapshot = applicator.snapshot()
+    except Exception as exc:
+        return ApplyResult(False, rolled_back=False, measured_delta=None,
+                           error=f"snapshot failed, nothing applied: {exc}")
+
+    def _unrestored(applied: bool, delta: float | None, cause: str,
+                    exc: BaseException) -> ApplyResult:
+        """The result for a candidate whose rollback itself failed.
+
+        Returned, never raised. A restore that fails is a baseline rebuild that
+        could not get the memory back, and raising it here ended the whole run
+        with no report — losing every A/B already measured at exactly the point
+        the run most needed to write them down. ``rolled_back`` is False because
+        nothing was rolled back; saying otherwise would tell the reader the
+        baseline is in place.
+        """
+        _audit(audit, "restore_failed", spec, knobs=_knob_values(spec),
+               cause=f"{cause}; restore failed: {exc}")
+        return ApplyResult(applied, rolled_back=False, measured_delta=delta,
+                           error=f"{cause}; restore failed: {exc}",
+                           restore_failed=True)
+
+    def _rollback(applied: bool, delta: float | None, cause: str) -> ApplyResult | None:
+        """Restore the snapshot. ``None`` on success, else the unrestored result."""
+        try:
+            applicator.restore(snapshot)
+        except Exception as exc:
+            return _unrestored(applied, delta, cause, exc)
+        return None
 
     # Step 2: apply. A bad value (validation error) rolls straight back.
     try:
         applicator.apply(spec)
+    except RestoreFailed as exc:
+        # The applicator already tried to put the baseline back inside apply and
+        # could not. Calling restore() again would retry the same rebuild that
+        # just failed.
+        return _unrestored(False, None, "apply failed", exc)
     except Exception as exc:
-        applicator.restore(snapshot)
+        if (bad := _rollback(False, None, f"apply failed: {exc}")) is not None:
+            return bad
         _audit(audit, "revert", spec, cause=f"apply failed, restored: {exc}",
                knobs=_knob_values(spec))
         return ApplyResult(False, rolled_back=True, measured_delta=None,
@@ -91,15 +160,44 @@ def apply_intervention(
     try:
         delta = applicator.measure(spec)
     except Exception as exc:
-        applicator.restore(snapshot)
+        if (bad := _rollback(False, None, f"measure failed: {exc}")) is not None:
+            return bad
         _audit(audit, "revert", spec, cause=f"measure failed, restored: {exc}",
                knobs=_knob_values(spec))
         return ApplyResult(False, rolled_back=True, measured_delta=None,
                            error=f"measure failed, restored: {exc}")
 
+    # Step 3b: the spec's own correctness gate, before any keep decision. A
+    # faster candidate that fails it is restored with the reason, so the
+    # throughput number alone can never keep a change that alters output.
+    if spec.correctness_gate is not None:
+        # The gate is a benchmark against a live server: it can time out, lose
+        # the connection, or crash. Any of those is "not judged", and an
+        # unjudged change is restored exactly like a failed one — the same
+        # shape as the measure step above, so a crash mid-gate can never leave
+        # the candidate applied.
+        try:
+            why = spec.correctness_gate(spec)
+        except Exception as exc:
+            if (bad := _rollback(True, delta, f"correctness gate crashed: {exc}")) is not None:
+                return bad
+            _audit(audit, "revert", spec, knobs=_knob_values(spec),
+                   cause=f"correctness gate crashed, restored: {exc}")
+            return ApplyResult(True, rolled_back=True, measured_delta=delta,
+                               error=f"correctness gate crashed, restored: {exc}")
+        if why is not None:
+            if (bad := _rollback(True, delta, f"correctness gate failed: {why}")) is not None:
+                return bad
+            _audit(audit, "revert", spec, knobs=_knob_values(spec),
+                   cause=f"correctness gate failed: {why}")
+            return ApplyResult(True, rolled_back=True, measured_delta=delta,
+                               error=f"correctness gate failed: {why}, restored")
+
     # Step 4: keep-or-rollback on the regression threshold.
     if delta is not None and delta < min_keep_delta:
-        applicator.restore(snapshot)
+        cause = f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}"
+        if (bad := _rollback(True, delta, cause)) is not None:
+            return bad
         _audit(audit, "revert", spec, knobs=_knob_values(spec),
                cause=f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}")
         return ApplyResult(True, rolled_back=True, measured_delta=delta,
@@ -255,6 +353,145 @@ class StructuralKnobRequiresRestart(RuntimeError):
     """
 
 
+#: What vLLM gives an engine when nobody says otherwise. A restart candidate
+#: inherits the baseline's kwargs, so both engines ask for the same fraction.
+_DEFAULT_GPU_FRACTION = 0.9
+
+
+def gpu_fraction(engine: Any) -> float | None:
+    """The device fraction this engine was built to hold, or ``None`` if unknown.
+
+    Read off the kwargs it was built with rather than measured off the device.
+    Measuring would mean initialising CUDA in this process to ask, which on the
+    offline engine is a context the parent does not otherwise carry — and the
+    number we need is the one the *next* engine will ask for, which is this one
+    by construction: a restart candidate inherits the baseline's kwargs.
+
+    Two absences that are not the same. An engine with ``gitm_llm_kwargs`` and no
+    ``gpu_memory_utilization`` in them is one gitm built without an explicit cap,
+    so it holds vLLM's own default — which is the case the MI355X run was in.
+    An engine with no ``gitm_llm_kwargs`` at all is somebody else's handle, and
+    what it holds is genuinely unknown; guessing the default there would refuse
+    a restart on a number nobody supplied.
+    """
+    kwargs = getattr(engine, "gitm_llm_kwargs", None)
+    if kwargs is None:
+        return None
+    try:
+        return float(kwargs.get("gpu_memory_utilization", _DEFAULT_GPU_FRACTION))
+    except (TypeError, ValueError):
+        return _DEFAULT_GPU_FRACTION
+
+
+def parallel_restart_fits(
+    engine: Any, values: dict[str, Any] | None = None
+) -> tuple[bool, str]:
+    """Whether a candidate engine can be built while the baseline is still up.
+
+    Parallel mode holds both at once, so what matters is the *sum* of the two
+    fractions, not twice the baseline's. Those are usually the same number,
+    because a restart candidate inherits the baseline's kwargs — but not always:
+    ``gpu_memory_utilization_dynamic`` is a catalogue lever whose whole purpose
+    is to change this fraction, so a candidate carrying it asks for something
+    else. Doubling the baseline gets that case wrong in both directions: it
+    passes 0.45 beside a 0.9 candidate that needs 135%, and refuses 0.6 beside a
+    0.4 candidate that fits exactly.
+
+    The check stays arithmetic rather than a free-memory reading. Both numbers
+    are knowable from kwargs, so no device query and no CUDA context in a
+    process that does not otherwise carry one.
+
+    This is the failure that cost the MI355X run 27 of its 29 candidates. The
+    constraint was documented in ``workloads.py`` and enforced nowhere, so every
+    structural candidate built into a device the baseline had 90% of, and died.
+    """
+    baseline = gpu_fraction(engine)
+    if baseline is None:
+        # Not a handle gitm built, so nothing says what it holds. Refusing here
+        # would block a deployment that supplies its own restart_fn on a number
+        # it never gave us.
+        return True, "this engine does not say what fraction of the device it holds"
+
+    candidate = baseline
+    if values and "gpu_memory_utilization" in values:
+        try:
+            candidate = float(values["gpu_memory_utilization"])
+        except (TypeError, ValueError):
+            candidate = baseline
+
+    total = baseline + candidate
+    if total <= 1.0:
+        return True, (
+            f"baseline {baseline:.2f} + candidate {candidate:.2f} "
+            f"= {total:.2f} of the device")
+    same = "" if candidate == baseline else f" and the candidate asks for {candidate:.0%}"
+    return False, (
+        f"the baseline holds {baseline:.0%} of each device{same}, so building "
+        f"them side by side needs {total:.0%}. Use restart_mode='serial' to "
+        f"release the baseline first, or build with "
+        f"GITM_VLLM_GPU_MEM<={0.5:.2f} to leave room for both"
+    )
+
+
+def _largest_fitting_candidate(engine: Any) -> float:
+    """The biggest fraction a candidate can take and still fit beside this baseline.
+
+    Asked of :func:`parallel_restart_fits` rather than computed alongside it,
+    because the operator acts on this number and the check is what will judge
+    them. Deriving it separately put the two at odds in both directions:
+    rounding ``1 - 0.585`` to ``0.42`` offered a candidate the check then
+    refused at 1.005, and flooring it understated the room at 13 of the 49
+    two-decimal baselines — including 0.9, which is vLLM's own default, where
+    0.10 fits and the warning said 0.09.
+
+    Floor first, then ask whether one more hundredth is accepted. Two decimals
+    because that is the precision the warning prints at, and a limit the
+    operator cannot type is not a limit.
+    """
+    room = max(1.0 - (gpu_fraction(engine) or 0.0), 0.0)
+    limit = math.floor(room * 100) / 100
+    nxt = round(limit + 0.01, 2)
+    if parallel_restart_fits(engine, {"gpu_memory_utilization": nxt})[0]:
+        return nxt
+    return limit
+
+
+def resolve_restart_mode(
+    engine: Any, requested: str | None, baseline_restart_fn: Any = None
+) -> tuple[str, str]:
+    """``(mode, why)`` for this engine. ``requested`` wins when it is given.
+
+    Serial is the better default wherever it is available: it releases the
+    baseline before building the candidate, so the candidate gets the whole
+    device instead of whatever the baseline left. Parallel's only advantage is
+    not paying for a baseline rebuild, and it buys that by requiring both
+    engines resident — which at any realistic ``gpu_memory_utilization`` is
+    impossible. The default used to be parallel, and 93% of one run's candidates
+    died of it.
+
+    Parallel remains the fallback for a deployment that supplies no
+    ``baseline_restart_fn``, because there serial has nothing to restore with.
+
+    That callback is passed in rather than read off the engine, so the mode is
+    decided by the same one the apply path will use. Reading the engine
+    attribute here while the applicator held a constructor argument let the two
+    disagree, and both disagreements were bad: a caller supplying only the
+    argument got parallel despite having a rebuild available, and one supplying
+    only the attribute got serial and then failed every structural apply for
+    want of the argument.
+    """
+    if requested:
+        if requested not in {"parallel", "serial"}:
+            raise ValueError(
+                f"restart_mode must be 'parallel' or 'serial', got {requested!r}")
+        return requested, "set explicitly"
+    if (baseline_restart_fn or getattr(engine, "gitm_baseline_restart_fn", None)) is None:
+        return "parallel", (
+            "no baseline_restart_fn, so serial has nothing to rebuild the "
+            "baseline with")
+    return "serial", "the default: parallel needs both engines resident at once"
+
+
 class LiveEngineApplicator:
     """Apply a knob (or a joint set — see ``InterventionSpec.knobs``) to a live
     (vLLM) engine, gated by a real decode-throughput A/B.
@@ -292,7 +529,7 @@ class LiveEngineApplicator:
         throughput_fn: Callable[[Any], float],
         restart_fn: Callable[[Any, dict[str, Any]], Any] | None = None,
         baseline_restart_fn: Callable[[Any], Any] | None = None,
-        restart_mode: str = "parallel",
+        restart_mode: str | None = None,
         getter: Callable[[Any, str], Any] | None = None,
         setter: Callable[[Any, str, Any], None] | None = None,
         reps: int = 1,
@@ -300,10 +537,42 @@ class LiveEngineApplicator:
     ) -> None:
         self.engine = engine
         self._tps = throughput_fn
-        if restart_mode not in {"parallel", "serial"}:
-            raise ValueError(f"restart_mode must be 'parallel' or 'serial', got {restart_mode!r}")
+        # The engine's own hook is the fallback, so a caller handing over an
+        # engine gitm built need not re-pass what is already on it. One effective
+        # callback, and the mode is decided from that same one rather than from a
+        # second source that can disagree with it.
+        self._baseline_restart_fn = baseline_restart_fn or getattr(
+            engine, "gitm_baseline_restart_fn", None)
+        # None means "work it out from this engine", so the choice is made by one
+        # rule wherever an applicator is built. Defaulting the parameter to
+        # "parallel" put the trap one level below the loop: a direct caller got
+        # the mode that cannot build a candidate at any realistic memory cap.
+        restart_mode, _ = resolve_restart_mode(
+            engine, restart_mode, self._baseline_restart_fn)
+        self.restart_mode_warning: str | None = None
+        if restart_mode == "parallel" and restart_fn is not None:
+            # Against a candidate that inherits the baseline's fraction, since
+            # no real candidate is in hand yet. That covers most of the
+            # catalogue but not all of it, so this says what it actually
+            # checked: a lever that *lowers* gpu_memory_utilization can still
+            # fit, and is re-checked with its own value at the rebuild. Claiming
+            # structural candidates are impossible would have an operator
+            # dismiss a measurement that would have worked.
+            fits, _ = parallel_restart_fits(engine)
+            if not fits:
+                room = _largest_fitting_candidate(engine)
+                # Recorded, not raised: a run whose candidates are all
+                # hot-swappable never reaches a rebuild and should not be
+                # stopped here. The caller surfaces this so the operator learns
+                # it when the run starts rather than per dead candidate.
+                self.restart_mode_warning = (
+                    f"the baseline holds {gpu_fraction(engine):.0%} of each "
+                    f"device, so in restart_mode='parallel' only a candidate "
+                    f"that lowers gpu_memory_utilization to {room:.2f} or less "
+                    f"can be built beside it. Every other structural candidate "
+                    f"will be refused. Use restart_mode='serial' to release the "
+                    f"baseline first, or build with GITM_VLLM_GPU_MEM<=0.50")
         self._restart_fn = restart_fn
-        self._baseline_restart_fn = baseline_restart_fn
         self._restart_mode = restart_mode
         self._getter = getter or get_knob
         self._setter = setter or set_knob
@@ -383,17 +652,24 @@ class LiveEngineApplicator:
             self._prev = ("serial_restart", restore_baseline)
             try:
                 new_engine = self._restart_fn(old_engine, values)
-            except Exception:
-                self.engine = restore_baseline()
-                self._prev = None
+            except Exception as exc:
+                self._rebuild_baseline(restore_baseline, f"candidate build failed: {exc}")
                 raise
         else:
+            # Refuse a build that cannot fit rather than let it OOM. The failure
+            # is identical either way for this candidate, but an OOM traceback
+            # from inside vLLM says nothing about which mode caused it or what
+            # to do, and it repeats once per candidate for the whole run.
+            fits, why = parallel_restart_fits(old_engine, values)
+            if not fits:
+                raise StructuralKnobRequiresRestart(
+                    f"knob(s) {', '.join(values)} need an engine rebuild, and "
+                    f"restart_mode='parallel' cannot provide one: {why}")
             new_engine = self._restart_fn(old_engine, values)
         if new_engine is None:
             if self._restart_mode == "serial":
                 _, restore_baseline = self._prev
-                self.engine = restore_baseline()
-                self._prev = None
+                self._rebuild_baseline(restore_baseline, "restart_fn produced no engine")
             raise StructuralKnobRequiresRestart(
                 f"restart_fn produced no engine for knob(s) {', '.join(values)}"
             )
@@ -418,11 +694,32 @@ class LiveEngineApplicator:
         elif tag == "serial_restart":
             _, restore_baseline = self._prev
             self._shutdown(self.engine)  # drop the candidate engine we built
-            self.engine = restore_baseline()
-            self._activate(self.engine)
+            self._rebuild_baseline(restore_baseline, "rolling back the candidate")
+            return
         # Consume the restore record so a second restore() can't re-undo (or
         # re-shutdown the already-discarded candidate engine) a second time.
         self._prev = None
+
+    def _rebuild_baseline(self, restore_baseline: Callable[[], Any], cause: str) -> None:
+        """Build the baseline engine again after a serial restart, and make it live.
+
+        The record is consumed whether or not the rebuild works. A rebuild that
+        fails is almost always one that could not get the device memory back, and
+        trying it a second time from ``restore()`` fails the same way — that
+        second attempt, with nothing around it to catch it, is what used to end
+        the run without a report.
+
+        Activated as well as assigned. The workload runner drives whichever
+        engine was last activated, so a rebuilt baseline that is only assigned
+        here leaves the runner on the engine that was just shut down.
+        """
+        self._prev = None
+        try:
+            self.engine = restore_baseline()
+        except Exception as exc:
+            raise RestoreFailed(
+                f"could not rebuild the baseline engine ({cause}): {exc}") from exc
+        self._activate(self.engine)
 
     @staticmethod
     def _activate(engine: Any) -> None:

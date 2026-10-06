@@ -67,6 +67,21 @@ class SchedulerStatsSummary:
     # series on the same wall clock as vLLM's per-request timestamps and as
     # ``Trace.captured_at_ns`` — the join across the three views. 0 when unset.
     t0_wall_ns: int = 0
+    # In-flight requests, averaged over the samples that had any, and the most
+    # ever in flight at once. Raw observations: in-flight counts queued requests
+    # as well as decoding ones, so neither is a batch.
+    mean_unfinished: float | None = None
+    peak_unfinished: int | None = None
+    #: The decode-batch estimate: each busy sample's in-flight count bounded by
+    #: ``max_num_seqs`` *before* averaging, because the engine decodes at most
+    #: that many at once and the surplus is queue depth. Bounding the average
+    #: instead would be a different and wrong number — gitm submits every prompt
+    #: at once, so in-flight starts above capacity and drains through it, and
+    #: ``min(mean(x), cap)`` reads a window that straddled the cap as if it sat
+    #: at the cap throughout (64 and 2 in flight at a cap of 32 is a mean batch
+    #: of 17, not 32). ``None`` without a capacity to bound against.
+    mean_bounded_inflight: float | None = None
+    max_num_seqs: int | None = None
 
 
 # SLO defaults for goodput. Serving-shaped starting points, not tuned: a request
@@ -315,14 +330,43 @@ def _v1_scheduler_stats(scheduler: Any) -> dict[str, Any]:
     return out
 
 
+#: Where an engine object keeps vLLM's config, across versions and wrappers:
+#: on itself, on ``.engine`` or on ``.llm_engine`` (``LLM`` holds an
+#: ``LLMEngine``), and either directly or under ``vllm_config``.
+_CONFIG_ROOTS = ("", "engine.", "llm_engine.")
+_CONFIG_CONTAINERS = ("", "vllm_config.")
+
+
+def engine_config_value(engine: Any, section: str, field: str) -> Any:
+    """``<section>.<field>`` from wherever this engine keeps its vLLM config.
+
+    One list of places, read by everything that needs a config value. Two
+    lookups each kept their own list before, and they drifted: the scheduler
+    one learned ``engine.vllm_config`` and the world-size one did not, so a TP=1
+    run behind that layout was counted as the whole node and admitted levers that
+    need collectives it never runs.
+    """
+    return _first_attr(engine, *(f"{root}{container}{section}.{field}"
+                                 for root in _CONFIG_ROOTS
+                                 for container in _CONFIG_CONTAINERS))
+
+
 def _max_num_seqs(engine: Any) -> int | None:
-    val = _first_attr(
-        engine,
-        "scheduler_config.max_num_seqs",
-        "engine.scheduler_config.max_num_seqs",
-        "llm_engine.scheduler_config.max_num_seqs",
-        "vllm_config.scheduler_config.max_num_seqs",
-    )
+    """The most sequences this engine will decode at once, or ``None``.
+
+    The decode batch is bounded by this, so without it the in-flight count
+    cannot be turned into a batch and the graph falls back to ``batch=1``. That
+    is not hypothetical: the first full local run captured ``mean_unfinished``
+    of 243 and still priced its graph at 1, because none of the paths below
+    reached the value. Every residual in that run read ``+100%``.
+
+    The paths are tried in order and the first non-``None`` wins. The vLLM 0.30
+    one is ``llm_engine.vllm_config.scheduler_config`` — ``LLM`` holds the
+    engine, the engine holds the config, and the config holds the scheduler's.
+    Both halves of that chain were already listed separately and the two were
+    never joined, which is the whole of the bug.
+    """
+    val = engine_config_value(engine, "scheduler_config", "max_num_seqs")
     return int(val) if isinstance(val, int) and val > 0 else None
 
 
@@ -365,14 +409,6 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
         if usage is not None:
             sample.gpu_cache_usage = usage
             saw_any = True
-
-        # vLLM V1: fill running / waiting / cache from the scheduler's stat object
-        # where the VO deques weren't exposed (they read empty on V1)
-        for sch in schedulers:
-            for field_name, val in _v1_scheduler_stats(sch).items():
-                if getattr(sample, field_name) is None:
-                    setattr(sample, field_name, val)
-                    saw_any = True
 
         # vLLM V1: fill running / waiting / cache from the scheduler's stat object
         # where the VO deques weren't exposed (they read empty on V1)
@@ -486,7 +522,8 @@ class SchedulerStatsSampler:
         # Snapshot first: stop() joins with a timeout, so in the pathological case
         # where the daemon thread is still alive, summarize must iterate a stable
         # copy rather than a list being appended to concurrently.
-        return summarize(list(self.samples), t0_wall_ns=self._t0_wall_ns)
+        return summarize(list(self.samples), t0_wall_ns=self._t0_wall_ns,
+                         max_num_seqs=_max_num_seqs(self.engine))
 
     def to_records(self) -> list[dict[str, Any]]:
         """Samples as plain dicts, ready for JSONL alongside the kernel trace."""
@@ -494,14 +531,27 @@ class SchedulerStatsSampler:
 
 
 def summarize(
-    samples: list[SchedulerSample], *, t0_wall_ns: int = 0
+    samples: list[SchedulerSample], *, t0_wall_ns: int = 0, max_num_seqs: int | None = None
 ) -> SchedulerStatsSummary:
-    """Aggregate a sample series into the compact summary attribution consumes."""
+    """Aggregate a sample series into the compact summary attribution consumes.
+
+    The in-flight aggregates average only over the samples that had a request in
+    flight. The sampler deliberately takes a snapshot before the workload is
+    submitted and keeps going until the window closes, so a plain mean over
+    every sample is diluted by the idle head and tail — and what the predicted
+    graph needs is the concurrency *while decoding*, since a step with nothing
+    in flight is not a decode step at all.
+
+    ``mean_bounded_inflight`` bounds each of those samples by ``max_num_seqs``
+    before averaging rather than after; see the field for why the two differ and
+    which one is the batch.
+    """
     if not samples:
         return SchedulerStatsSummary(
             n_samples=0, duration_s=0.0, peak_queue_depth=None, mean_running=None,
             peak_running=None, mean_batch_occupancy=None, total_preemptions=None,
             peak_gpu_cache_usage=None, peak_swapped=None, t0_wall_ns=t0_wall_ns,
+            max_num_seqs=max_num_seqs,
         )
 
     def _vals(attr: str) -> list[float]:
@@ -513,6 +563,7 @@ def summarize(
     preempt = _vals("preemptions_cumulative")
     cache = _vals("gpu_cache_usage")
     swapped = _vals("num_swapped")
+    busy = [v for v in _vals("num_unfinished") if v >= 1]
     duration_s = max(samples[-1].t_ns - samples[0].t_ns, 0) / 1e9
 
     return SchedulerStatsSummary(
@@ -529,6 +580,13 @@ def summarize(
         peak_gpu_cache_usage=max(cache) if cache else None,
         peak_swapped=int(max(swapped)) if swapped else None,
         t0_wall_ns=t0_wall_ns,
+        mean_unfinished=(sum(busy) / len(busy)) if busy else None,
+        peak_unfinished=int(max(busy)) if busy else None,
+        mean_bounded_inflight=(
+            sum(min(v, max_num_seqs) for v in busy) / len(busy)
+            if busy and max_num_seqs else None
+        ),
+        max_num_seqs=max_num_seqs,
     )
 
 

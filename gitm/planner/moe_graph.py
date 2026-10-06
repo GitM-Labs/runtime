@@ -625,8 +625,32 @@ def is_sparse_moe_config(cfg: dict[str, Any]) -> bool:
     mixture.
     """
     routed = cfg.get("n_routed_experts") and cfg.get("num_experts_per_tok")
-    sparse_attn = cfg.get("index_topk") or cfg.get("compress_ratios")
-    return bool(routed and sparse_attn)
+    return bool(routed and has_active_indexer(cfg))
+
+
+def has_active_indexer(cfg: dict[str, Any]) -> bool:
+    """Whether the checkpoint's sparse-attention indexer actually binds.
+
+    Declaring ``index_topk`` is not the same as using it. Kimi K2.5 carries the
+    field and sets it to ``max_position_embeddings``, so ``min(kv_len, topk)``
+    can never bind and every layer is 'shared' — the catalogue entry spells this
+    out: *"the DSA indexer is the one piece Kimi does not have, and it is
+    switched off exactly, not approximately"*. What remains is dense MLA over
+    the full history, which is the ``glm_moe_dsa`` graph's shape, not this one.
+
+    Read structurally rather than by name so a checkpoint that disables the
+    indexer the same way is classified the same way, whatever it is called.
+    """
+    if cfg.get("compress_ratios"):
+        return True
+    topk = cfg.get("index_topk")
+    if not topk:
+        return False
+    ctx = cfg.get("max_position_embeddings")
+    try:
+        return not (ctx and int(topk) >= int(ctx))
+    except (TypeError, ValueError):
+        return True
 
 
 def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None) -> SparseMoEModelSpec:

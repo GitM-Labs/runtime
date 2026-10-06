@@ -124,12 +124,34 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
     pred = graph.nodes
 
     res = Residuals()
-    by_op_layer: dict[tuple[str, int], PredictedNode] = {}
+    # Every node of one (op, layer), in emission order. Usually one; more when a
+    # layer launches the same op more than once — the two expert GEMMs of an MoE
+    # layer are both ``moe_routed`` (one ``fused_moe_kernel`` per GEMM), GLM
+    # emits two ``moe_router`` nodes. Keeping only the first scored the down
+    # launch against the gate_up point, a systematic -50% ``check_invariants``
+    # reads as confirmation. An interval over the layer's nodes would hide a
+    # launch that is wrong for its own role but inside the span, so the k-th
+    # launch of the op in that layer (by start time) pairs with the k-th node,
+    # cycling across decode steps: a point residual against its own prediction.
+    by_op_layer: dict[tuple[str, int], list[PredictedNode]] = {}
     classes: dict[str, dict[tuple[float, float], PredictedNode]] = {}
     for pn in pred:
         if pn.layer is not None:
-            by_op_layer.setdefault((pn.op, pn.layer), pn)
+            by_op_layer.setdefault((pn.op, pn.layer), []).append(pn)
         classes.setdefault(pn.op, {}).setdefault(_class_key(pn), pn)
+
+    ordinal: dict[int, PredictedNode] = {}
+    seen: dict[tuple[str, int], int] = {}
+    for ok in sorted(obs, key=lambda k: k.start_ns):
+        op_k = observed_op(ok.name, ok.range_op)
+        if ok.range_layer is None or op_k is None:
+            continue
+        key = (op_k, ok.range_layer)
+        seq = by_op_layer.get(key)
+        if seq:
+            i = seen.get(key, 0)
+            seen[key] = i + 1
+            ordinal[id(ok)] = seq[i % len(seq)]
 
     for ok in obs:
         op = observed_op(ok.name, ok.range_op)
@@ -146,9 +168,7 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
             else None
         )
 
-        pn: PredictedNode | None = None
-        if ok.range_layer is not None:
-            pn = by_op_layer.get((op, ok.range_layer))
+        pn: PredictedNode | None = ordinal.get(id(ok))
         if pn is None and len(cls) == 1:
             pn = cls[0]
 
@@ -182,6 +202,48 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
 
     res.serialized_concurrency_fraction = _serialized_fraction(obs)
     return res
+
+
+def recoverable_by_op(res: Residuals) -> dict[str, float | None]:
+    """Per op: seconds observed above its predicted floor, or ``None`` if unjudgeable.
+
+    Each residual already pairs one kernel launch against the prediction for
+    *that* launch, so summing ``max(0, t_obs - t_pred)`` over an op's kernels
+    gives the time it spent above its floor across the window directly. That
+    matters: :mod:`gitm.optimizer.deviation_table` reaches the same quantity by
+    scaling a one-step floor by a step count, and it says plainly that nothing
+    can derive that count from a trace. Pairing per launch needs no step count
+    at all, which is what makes this usable from inside the loop.
+
+    ``None`` means *cannot be judged*, and is not the same as zero. An
+    interval-based residual (the op's layers disagree and this kernel's layer is
+    unknown — see :class:`KernelResidual.interval_based`) is measured against
+    whichever layer's prediction sits nearest the observation, so its gap is
+    biased toward zero by construction. Reading that as "at its floor" would
+    discard a lever aimed at a region that is genuinely over, so an op whose gap
+    comes out at zero while it still has interval-based kernels is reported as
+    unjudgeable instead. A positive gap from the point residuals alone is sound
+    either way — the interval kernels can only add to it — so it is reported as
+    the number.
+
+    An op with no kernels in the window simply does not appear. That is
+    deliberately *not* reported as zero: a kernel whose op the classifier could
+    not name is excluded from residuals altogether, so absence means "no
+    evidence here", not "ran at its floor".
+    """
+    point: dict[str, float] = {}
+    interval: dict[str, bool] = {}
+    for r in res.per_kernel:
+        if r.interval_based or r.t_obs_s is None or r.t_pred_s is None:
+            interval[r.op] = True
+            point.setdefault(r.op, 0.0)
+            continue
+        point[r.op] = point.get(r.op, 0.0) + max(0.0, r.t_obs_s - r.t_pred_s)
+
+    out: dict[str, float | None] = {}
+    for op, gap in point.items():
+        out[op] = gap if gap > 0 else (None if interval.get(op) else 0.0)
+    return out
 
 
 def _serialized_fraction(obs: list[KernelEvent]) -> float:

@@ -6,9 +6,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
+from gitm.kernels.library import parse_skips
 from gitm.scheduler import LoopConfig, run_loop
 
 
@@ -21,6 +22,8 @@ def optimize(
     scratch: str | None = None,
     workload_runner: Callable[[], dict[str, Any]] | None = None,
     use_history: bool | None = None,
+    rerank: str = "off",
+    skip_levers: str | Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Run the autonomous 24-hour optimization loop and return a report.
 
@@ -36,6 +39,17 @@ def optimize(
     caller cannot be blocked by a prompt it did not expect. ``gitm run`` puts
     the question to the operator and passes the answer down.
 
+    ``rerank`` decides what the run does with what it learns between one
+    candidate and the next. ``"off"`` keeps the opening order to the end;
+    ``"recapture"`` traces the workload again after each applied candidate and
+    re-ranks what is left against it.
+
+    ``skip_levers`` excludes levers from this run by name or knob, with shell
+    globs, as a list or a comma-separated string. Merged with the
+    ``GITM_SKIP_LEVERS`` environment variable. A lever can hang a model rather
+    than merely regress it, and until now the only way past one was to edit the
+    catalogue.
+
     ``workload_runner`` optionally supplies an explicit zero-arg callable that
     launches the workload's GPU work; it runs inside the capture window. When
     omitted, the loop resolves ``workload`` against the registry in
@@ -49,5 +63,7 @@ def optimize(
         scratch=scratch,
         workload_runner=workload_runner,
         use_history=use_history,
+        rerank=rerank,
+        skip_levers=parse_skips(skip_levers),
     )
     return run_loop(cfg)

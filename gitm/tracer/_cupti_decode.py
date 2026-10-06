@@ -15,7 +15,12 @@ Dict contract (the shim emits exactly these shapes):
 
     kernel  {kind:"kernel", name, start_ns, end_ns, device_id, context_id,
              stream_id, correlation_id, grid:[x,y,z], block:[x,y,z],
-             static_shared_mem, dynamic_shared_mem, registers_per_thread}
+             static_shared_mem, dynamic_shared_mem, registers_per_thread,
+             graph_id, graph_node_id}
+
+    graph_id/graph_node_id are 0 for a kernel launched outside a CUDA graph and
+    are absent from captures taken before the collector emitted them; both
+    decode to None.
     memcpy  {kind:"memcpy", copy_kind:int, bytes, start_ns, end_ns, device_id,
              context_id, stream_id, correlation_id}
     sync    {kind:"sync", sync_type:int, start_ns, end_ns, device_id,
@@ -106,6 +111,9 @@ def decode_kernel(d: dict) -> KernelEvent:
         registers_per_thread=int(d.get("registers_per_thread", 0)),
         range_op=d.get("range_op"),
         range_layer=_opt_int(d.get("range_layer")),
+        graph_id=_opt_graph_id(d.get("graph_id")),
+        graph_node_id=_opt_graph_id(d.get("graph_node_id")),
+        launch_range=d.get("launch_range"),
         pid=_opt_int(d.get("pid")),
     )
 
@@ -282,3 +290,9 @@ def decode_records(records: list[dict]) -> list[TraceEvent]:
 
 def _opt_int(v) -> int | None:
     return None if v is None else int(v)
+
+
+def _opt_graph_id(v) -> int | None:
+    # CUPTI reports 0 for "not launched from a graph", and 0 is never a valid
+    # graph or node id, so it decodes to the same None as a missing field.
+    return None if v is None or int(v) == 0 else int(v)

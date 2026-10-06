@@ -142,6 +142,39 @@ Versatility comes from the `KnobSource`, **not** a `{workload: knobs}` table:
   `Knob` with the bottleneck classes it targets (`Knob.classes`), and only knobs
   with no tag fall back to the vLLM-flavoured keyword heuristic on the name.
 
+### Registered hypotheses
+
+`HypothesisProposer` (`gitm/agents/hypotheses.py`) is a third candidate source
+behind the same seam. Where the other proposers attach a flat, unproven delta
+band, it emits interventions whose effect was *derived from the planner* for a
+named workload and written down in `docs/hypotheses/` before anything runs.
+
+- It takes a `Workload` (catalogue spec, `HardwareSpec`, batch, sharding, and
+  the engine's current `serving` config) and a `noise_floor`.
+- Before emitting, each hypothesis checks its own applicability (model, engine
+  config, architecture) and its predicted mean step effect against the noise
+  floor. Every hypothesis it does not emit lands in `skipped` with the reason.
+- The emitted spec's `expected_delta_*` is the effect on the **covered ops**,
+  because `predict_delta` multiplies it by the trace's coverage of
+  `applies_to_kernels`. The step-level prediction a verdict is judged against
+  is in the hypothesis's `Prediction` and its doc.
+- A hypothesis that can change model output (`requires_correctness_gate`) is
+  emitted only when the proposer has a `correctness_gate`, and the emitted
+  spec carries it (`InterventionSpec.correctness_gate`, runtime-only).
+  `apply_intervention` runs it after measure and before keep with any
+  applicator, so a faster but wrong candidate is rolled back. The keep gate
+  otherwise sees throughput alone.
+- The emitted `applies_to_kernels` is the hypothesis's `kernel_scope`, kernel
+  substrings narrower than its planner op where the taxonomy rule is wider
+  than the mechanism.
+- A hypothesis may target a knob the catalogue also carries (H-002 targets
+  `kv_cache_dtype`). The name prefix `hypothesis:<id>:` says which source
+  produced the candidate. Weight and topology changes are registered with
+  `proposable=False`: their arithmetic is tested, and they are run by hand.
+
+It is not wired into the Phase 4b chain yet. That needs the loop to know its
+catalogue model name and serving config, which `PlannerContext` does not carry.
+
 ## Fallback table
 
 The static `_RULES` table — one small, fixed `(knob, value, rationale)` per

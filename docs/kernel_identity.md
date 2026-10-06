@@ -160,3 +160,103 @@ carry instead of always `None`.
    attach mechanism.
 
 Starting with (1) now.
+
+## CUDA graphs: the launch-enclosing range is not the op
+
+*Added 2026-10-05, branch `tracer/graph-node-identity`.*
+
+Everything above assumes a kernel's launch is its own API call. Under CUDA graphs
+it isn't. A replay is one `cudaGraphLaunch`, and every kernel in it carries that
+launch's `correlation_id`. So `kernel → runtime → enclosing range` gives every kernel
+in the replay the same range: whatever was open around the launch. That might be a
+step, a layer group, or nothing. Production vLLM runs piecewise or full graphs by
+default. Only `--enforce-eager` captures avoid this.
+
+Before this branch, the collector dropped CUPTI's `graphId` and `graphNodeId`. So
+nothing downstream could tell a replayed kernel from an eager one. If a layer or op
+range happened to be open around the launch, every kernel in the piece took that op
+and layer. `observed_op` prefers a known `range_op` over the name guess, so the
+wrong identity won. That is a silent mis-attribution, not a gap.
+
+### What this branch does
+
+- **Collector** (`cupti_core.{h,c}`, `cupti_shim.c`, `cupti_inject.c`): copies
+  `graphId` and `graphNodeId` off `CUpti_ActivityKernel9` into both emitters. Both
+  are 0 for an eager launch. *Not compiled on a CUDA box yet.*
+- **Schema** (`KernelEvent`): adds `graph_id`, `graph_node_id` and `launch_range`.
+  All are optional, so old traces decode unchanged, and 0 decodes to `None`.
+- **Correlation** (`correlate_kernels_to_ranges`): for a kernel with a nonzero
+  `graph_id`:
+  - The launch-enclosing range goes to `launch_range`. That is a step or time-series
+    label, which is what it actually is.
+  - `range_op` and `range_layer` come only from a `graph_node` record:
+    ```
+    graph_node {kind:"graph_node", graph_node_id, name, cloned_from}
+    ```
+    `cloned_from` is followed back to the captured node.
+  - With no node map, the op is `None` and falls back to name classification.
+    It no longer silently takes the step's range.
+
+### The Nsight approach, next on the collector
+
+Nsight Systems projects NVTX ranges onto replayed kernels by recording, at graph
+*capture*, which range was open when each node was created. Graph nodes are created
+during stream capture, so the forward pass does run under its ranges once. The
+collector can do the same with standard CUPTI. No vLLM patch is needed.
+
+1. Subscribe `CUPTI_CB_DOMAIN_NVTX`. Push and pop callbacks are synchronous, so the
+   collector can keep a per-thread stack of open range names. The activity
+   `MARKER` records arrive later in buffers, which is too late for this.
+2. Subscribe `CUPTI_CB_DOMAIN_RESOURCE`:
+   - On `CUPTI_CBID_RESOURCE_GRAPHNODE_CREATED`, read the node id and emit
+     `graph_node{id, name=top of this thread's stack}`.
+   - On `..._GRAPHNODE_CLONED` (instantiate or clone), emit
+     `graph_node{id=clone, cloned_from=original}`.
+3. `injection.merge` must pass `graph_node` records through without windowing them,
+   the same way it does `marker`/`runtime`. Capture happens at engine start, long
+   before the trace window opens. This was left out of this branch to stay clear
+   of #159.
+
+Verify on hardware before relying on it:
+
+- Does `Kernel9.graphNodeId` name the captured node or the instantiated clone?
+  The join handles either, but the clone callback must actually fire.
+- Do the vLLM NVTX ranges fire during capture under `torch.compile`?
+  `instrument_model`'s forward hooks may be traced away inside compiled regions.
+  vLLM's `--enable-layerwise-nvtx-tracing` should be checked separately.
+- What is the overhead of the NVTX callback domain on top of `GITM_TRACE_NVTX`'s
+  existing cost?
+
+### Attributes beyond `L{layer}/{op}`: a side table, not a longer name
+
+Heterogeneous models need more than an op and a layer to classify a kernel.
+DeepSeek-V4 has two examples:
+
+- **KV cache.** Only layers 2, 8, 14 and 20 compress and cache. The rest read a
+  source layer's cache, at different compress ratios. See
+  `docs/deepseek-v4.1-flash/DESIGN-NOTE.md`.
+- **Expert-parallel waves.** These run dispatch, expert GEMM and combine
+  concurrently across waves.
+
+Don't encode these into the range name that `parse_range_name` parses. Join them in
+Python as a map keyed by what correlation already recovers:
+
+| key | attributes | source | when |
+|---|---|---|---|
+| `range_layer` | archetype, KV source layer, compress ratio, reads-from | planner catalogue | static: this is next |
+| `(range_layer, range_op)` | MoE phase (dispatch / expert / combine) | op vocabulary | static |
+| range instance | wave index, expert group | NVTX payload (`nvtxEventAttributes_t.payload` and category, read through CUPTI `MARKER_DATA`) | dynamic: later |
+| kernel | `stream_id`, overlap with other streams, `graph_node_id`, grid/block | the kernel record | already captured |
+
+Wave identity is dynamic, so it can't come from the layer. The standard carrier is
+the NVTX payload and category, not the name string. Until something pushes it,
+stream id plus time overlap is the lead for separating concurrent waves.
+
+### Memcpy and step boundaries
+
+A memcpy's `correlation_id` links it to its own API call, not to an NVTX range.
+It reaches a range the same way a kernel does: by host-time containment on the
+same thread. vLLM's per-step H2D input preparation and D2H sampled-token copy run
+outside the graph. That makes them likely step boundaries that survive graph
+replay when kernel ranges don't. This is a candidate time-series label alongside
+`launch_range`, still to be measured.

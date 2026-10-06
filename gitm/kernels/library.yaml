@@ -8,18 +8,17 @@
 #
 # applies_to_kernels scopes each vLLM entry to the canonical per-decode-step op
 # vocabulary predict_graph()/classify_op() share — NOT raw kernel-name
-# substrings, which drift across backends/vendors/torch.compile. Whole-step
-# levers use &all_ops; empty means 0 coverage (not 100%) for levers the
-# decode-only predicted graph can't represent (prefill-side, orchestration).
-# Non-vLLM entries (edge/HFT) keep their own vocabulary via substring fallback.
-_decode_step_ops: &all_ops
-  - qkv_proj
-  - attn_score_value
-  - attn_out_proj
-  - mlp_gate_up
-  - mlp_down
-  - lm_head
-
+# substrings, which drift across backends/vendors/torch.compile.
+#
+# A lever that acts on the whole step — batch shape, admission order, graph
+# capture, sharding degree — sets whole_step: true instead. It used to list the
+# dense model's six ops, which made every one of those levers score zero
+# coverage on a sparse-MoE checkpoint, where the knob applies just as much and
+# none of those op names occur.
+#
+# Empty means 0 coverage (not 100%) for levers the decode-only predicted graph
+# can't represent (prefill-side, orchestration). Non-vLLM entries (edge/HFT)
+# keep their own vocabulary via substring fallback.
 # Shared multiplier ladder for sweeping relative levers — same as
 # autoresearch's _GRID_MULTIPLIERS, one canonical convention.
 _relative_sweep: &sweep_grid [0.5, 2.0, 4.0]
@@ -70,7 +69,7 @@ interventions:
     knob: max_num_batched_tokens
     value: 8192  # offline/predict-only fallback when there's no live engine to scale
     value_multiplier_grid: *sweep_grid  # right value depends on model/GPU/workload
-    applies_to_kernels: *all_ops  # batch-shape lever: touches every op's batch dim
+    whole_step: true  # batch-shape lever: touches every op's batch dim
     expected_delta_mean: 0.05
     expected_delta_lo: 0.01
     expected_delta_hi: 0.10
@@ -90,7 +89,7 @@ interventions:
     knob: max_num_seqs
     value: 256  # offline/predict-only fallback when there's no live engine to scale
     value_multiplier_grid: *sweep_grid
-    applies_to_kernels: *all_ops  # concurrency lever: touches every op's batch dim
+    whole_step: true  # concurrency lever: touches every op's batch dim
     expected_delta_mean: 0.04
     expected_delta_lo: 0.00
     expected_delta_hi: 0.09
@@ -133,7 +132,7 @@ interventions:
     # invalid here, so a gentler one, clamped below 1.0.
     value_multiplier_grid: [0.95, 1.03, 1.10]
     value_max: 0.97
-    applies_to_kernels: *all_ops  # raises the batch-slot ceiling for every op
+    whole_step: true  # raises the batch-slot ceiling for every op
     expected_delta_mean: 0.04
     expected_delta_lo: 0.01
     expected_delta_hi: 0.08
@@ -189,7 +188,7 @@ interventions:
       idle/launch-bound gaps between decode steps.
     knob: async_scheduling
     value: true
-    applies_to_kernels: *all_ops  # closes idle gaps around every op's launch
+    whole_step: true  # closes idle gaps around every op's launch
     expected_delta_mean: 0.02
     expected_delta_lo: -0.02
     expected_delta_hi: 0.05
@@ -207,7 +206,7 @@ interventions:
     summary: Chunk prefill so it overlaps with decode instead of stalling it.
     knob: enable_chunked_prefill
     value: true
-    applies_to_kernels: *all_ops  # changes the prefill/decode mix every step runs
+    whole_step: true  # changes the prefill/decode mix every step runs
     expected_delta_mean: 0.08
     expected_delta_lo: 0.02
     expected_delta_hi: 0.15
@@ -242,7 +241,7 @@ interventions:
     summary: Enable 5-token n-gram speculative decoding to cut decode steps.
     knob: num_speculative_tokens
     value: 5
-    applies_to_kernels: *all_ops  # changes the whole per-step decode cadence
+    whole_step: true  # changes the whole per-step decode cadence
     expected_delta_mean: 0.12
     expected_delta_lo: -0.05
     expected_delta_hi: 0.30
@@ -261,7 +260,7 @@ interventions:
     summary: Switch the scheduler to priority policy for mixed-SLO traffic.
     knob: scheduling_policy
     value: priority
-    applies_to_kernels: *all_ops  # admission order changes every step's batch
+    whole_step: true  # admission order changes every step's batch
     expected_delta_mean: 0.03
     expected_delta_lo: -0.02
     expected_delta_hi: 0.08
@@ -280,6 +279,9 @@ interventions:
     knob: VLLM_ATTENTION_BACKEND
     value: FLASHINFER
     applies_to_kernels: [attn_score_value]  # attention kernel swap only
+    # A different attention kernel for the same work: if the attention already
+    # runs at its roofline floor there is no slack for a faster kernel to take.
+    recovers_kernel_time: true
     expected_delta_mean: 0.07
     expected_delta_lo: -0.03
     expected_delta_hi: 0.15
@@ -298,8 +300,11 @@ interventions:
     summary: Fall back to NCCL all-reduce when custom all-reduce stalls comm overlap.
     knob: disable_custom_all_reduce
     value: true
-    # Comm-path change, not one of the modeled per-op decode kernels — honest 0.
-    applies_to_kernels: []
+    # The custom all-reduce and NCCL kernels it swaps between both classify to
+    # tp_all_reduce (deviation._OP_RULES), which the sharded graphs price. An empty
+    # scope made this score exactly 0 on every trace, so it could never rank into
+    # a run; on a single-GPU trace there are no such kernels and it still scores 0.
+    applies_to_kernels: [tp_all_reduce]
     expected_delta_mean: 0.02
     expected_delta_lo: -0.04
     expected_delta_hi: 0.08
@@ -318,7 +323,7 @@ interventions:
     summary: Reshape to TP=2 to fit larger batches / longer context per replica.
     knob: tensor_parallel_size
     value: 2
-    applies_to_kernels: *all_ops  # every layer's op gets sharded
+    whole_step: true  # every layer's op gets sharded
     expected_delta_mean: 0.00
     expected_delta_lo: -0.15
     expected_delta_hi: 0.20
@@ -358,7 +363,7 @@ interventions:
     summary: Disable enforce_eager so CUDA graphs capture and replay the decode step.
     knob: enforce_eager
     value: false
-    applies_to_kernels: *all_ops  # graph capture wraps the whole decode step
+    whole_step: true  # graph capture wraps the whole decode step
     expected_delta_mean: 0.09
     expected_delta_lo: 0.02
     expected_delta_hi: 0.18
@@ -378,7 +383,7 @@ interventions:
     knob: max_seq_len_to_capture
     value: 8192  # offline/predict-only fallback when there's no live engine to scale
     value_multiplier_grid: *sweep_grid
-    applies_to_kernels: *all_ops  # extends graph-capture scope for the whole step
+    whole_step: true  # extends graph-capture scope for the whole step
     expected_delta_mean: 0.04
     expected_delta_lo: -0.02
     expected_delta_hi: 0.10
@@ -397,7 +402,7 @@ interventions:
     summary: Split layers across 2 pipeline stages to fit a model that won't shard on TP alone.
     knob: pipeline_parallel_size
     value: 2
-    applies_to_kernels: *all_ops  # every layer's op is split across stages
+    whole_step: true  # every layer's op is split across stages
     expected_delta_mean: -0.02
     expected_delta_lo: -0.20
     expected_delta_hi: 0.15
@@ -446,7 +451,13 @@ interventions:
     summary: Select the DeepGEMM fused-MoE backend for the fp8 expert GEMMs.
     knob: moe_backend
     value: deep_gemm
-    applies_to_kernels: [mlp_gate_up, mlp_down]  # the routed-expert GEMMs
+    # The routed-expert GEMMs: fused_moe_kernel and the grouped-GEMM kernels
+    # classify to moe_routed, never to the dense mlp_* ops, so a dense-op scope
+    # covered nothing on a real MoE trace.
+    applies_to_kernels: [moe_routed]
+    # A different kernel for the same expert GEMMs, so its gain is the slack
+    # between the observed GEMM time and its floor.
+    recovers_kernel_time: true
     expected_delta_mean: 0.05
     expected_delta_lo: -0.05
     expected_delta_hi: 0.20
@@ -474,7 +485,7 @@ interventions:
     summary: Shard whole experts across ranks (EP) instead of slicing each one (TP).
     knob: enable_expert_parallel
     value: true
-    applies_to_kernels: [mlp_gate_up, mlp_down]  # MoE layers only, per vLLM docs
+    applies_to_kernels: [moe_routed]  # MoE layers only, per vLLM docs
     expected_delta_mean: 0.00
     expected_delta_lo: -0.20
     expected_delta_hi: 0.25
@@ -501,7 +512,13 @@ interventions:
     summary: Rebalance expert placement across ranks to cut routing-induced stragglers.
     knob: enable_eplb
     value: true
-    applies_to_kernels: [mlp_gate_up, mlp_down]  # expert load is the FFN path
+    applies_to_kernels: [moe_routed]  # expert load is the routed-expert GEMMs
+    # Deliberately NOT recovers_kernel_time, though "cut stragglers" reads like
+    # it. A straggler rank runs *more* expert GEMMs, not slower ones, so each of
+    # its kernels can sit exactly at its floor while the step waits on that rank.
+    # The per-op roofline gap cannot see a distribution problem; rank skew is
+    # measured separately (importers/node_rollup.py, busy_fraction max - min),
+    # and that is the signal this lever should one day be gated on.
     expected_delta_mean: 0.03
     expected_delta_lo: -0.02
     expected_delta_hi: 0.15
@@ -525,7 +542,7 @@ interventions:
     summary: Overlap two micro-batches so collectives hide behind compute.
     knob: enable_dbo
     value: true
-    applies_to_kernels: *all_ops  # overlap reshapes the whole step's execution
+    whole_step: true  # overlap reshapes the whole step's execution
     expected_delta_mean: 0.04
     expected_delta_lo: -0.03
     expected_delta_hi: 0.12

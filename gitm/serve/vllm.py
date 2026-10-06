@@ -635,7 +635,11 @@ def add_serve_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
                          "on RUNTIME/DRIVER/MARKER collection (records them). Both "
                          "halves are required and neither errors alone: ranges nobody "
                          "collects and collection with no ranges each produce a clean "
-                         "trace with range_op null on every kernel. Costs throughput — "
+                         "trace with range_op null on every kernel. Under CUDA graphs "
+                         "(no --enforce-eager), replayed kernels also keep range_op "
+                         "null and carry the range around their graph launch as "
+                         "launch_range instead, until the collector records which "
+                         "range each graph node was captured under. Costs throughput — "
                          "capture the same workload with and without to quantify it.")
     ap.add_argument("--keep-server", action="store_true",
                     help="leave the server up after capture — the handoff into "
@@ -675,12 +679,22 @@ def apply_tracing_env(env, trace_path, *, nvtx: bool, no_trace: bool) -> None:
     """
     from gitm.tracer import injection
 
+    # The process settings are not part of what distinguishes the arms, so both
+    # get them. Starting the traced arm's workers with spawn and the untraced
+    # arm's with fork would make the overhead comparison measure the start
+    # method as well as the collector. setdefault, so a start method the
+    # operator exported is kept rather than silently replaced.
+    process = injection.AMD_PROCESS_ENV if injection.detect_vendor() == "amd" else {}
+    for key, value in process.items():
+        env.setdefault(key, value)
+
     if no_trace:
         for var in (injection.ENV_LIB, injection.ENV_ROCP, injection.ENV_OUT,
                     injection.ENV_NVTX, injection.ENV_NVTX_INJECT):
             env.pop(var, None)
         return
-    env.update(injection.run_env(trace_path, nvtx=nvtx))
+    env.update({k: v for k, v in injection.run_env(trace_path, nvtx=nvtx).items()
+                if k not in process})
 
 
 def launch_and_capture(args, serve_argv: list[str] | None = None):

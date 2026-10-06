@@ -39,8 +39,9 @@ from __future__ import annotations
 
 import random
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from gitm.agents.policy import Policy, select_interventions
 from gitm.kernels.library import load_library
@@ -52,12 +53,23 @@ from gitm.optimizer.bound_classes import (
     IDLE_STALL,
     MEMORY_BOUND,
 )
-from gitm.optimizer.deviation import classify_op
+from gitm.optimizer.degradation import (
+    AFFECTS_RANKING,
+    APPROXIMATE,
+    AR_CATALOG,
+    AR_EMPTY,
+    AR_PROPOSER,
+    AR_TARGET,
+    Degradation,
+    DegradationLog,
+)
+from gitm.optimizer.deviation import observed_op
 from gitm.optimizer.monitor import Residuals, _serialized_fraction
 from gitm.optimizer.vllm_knobs import KNOB_PREREQUISITES
 from gitm.tracer.schema import Trace
 
 if TYPE_CHECKING:
+    from gitm.optimizer.history import History
     from gitm.optimizer.preconditions import GateContext
 
 #: The module's public surface: the bottleneck vocabulary, the ``KnobSource`` and
@@ -74,7 +86,10 @@ __all__ = [
     "largest_residual",
     "Knob",
     "KnobSource",
+    "KnobSurface",
     "VLLMKnobSource",
+    "resolve_engine_arg_knobs",
+    "resolve_knobs_from",
     "Proposer",
     "TableProposer",
     "GenerativeProposer",
@@ -196,11 +211,13 @@ def _op_present(trace: Trace, op: str) -> bool:
     """True if some kernel in the trace classifies to ``op``.
 
     The op label is synthetic (from the predicted graph), never a literal
-    substring of a real kernel name, so classify by identity like
-    ``residuals()`` does — otherwise an untargeted proposal would get tagged
-    anyway and rank as worthless (zero ``predict_delta`` coverage).
+    substring of a real kernel name, so classify by identity exactly as
+    ``residuals()`` does — NVTX range first, then the name. The target comes out
+    of ``residuals()``, so checking it by name alone dropped every target whose
+    kernels only an NVTX range identifies (the bare projection GEMMs), and the
+    search went out unaimed.
     """
-    return any(classify_op(k.name) == op for k in trace.kernels())
+    return any(observed_op(k.name, k.range_op) == op for k in trace.kernels())
 
 
 # --- candidate table --------------------------------------------------------
@@ -240,6 +257,9 @@ class AutoresearchResult:
     ab_result: EngineABResult | None = None
     baseline_config: dict | None = None
     candidate_config: dict | None = None
+    #: The A/B-affecting degradations this candidate was measured under (the
+    #: run's, and those recorded during its own apply), when a log was passed.
+    degradations: list[Degradation] = field(default_factory=list)
 
 
 @dataclass
@@ -249,6 +269,13 @@ class AutoresearchRun:
     bottleneck_class: str
     results: list[AutoresearchResult] = field(default_factory=list)
     target: ResidualTarget | None = None  # the largest-residual op the search aimed at
+    #: Where the search fell back — a frozen catalog, the static table standing
+    #: in for the generative proposer, an unscoped search, nothing to propose, or
+    #: the pass not running at all. Empty means it searched what it meant to.
+    degradations: list[Degradation] = field(default_factory=list)
+    #: Ranked candidates the pass never reached because the engine was lost
+    #: part-way. Counted here because only the pass knows what it had ranked.
+    n_untried: int = 0
 
 
 #: The honest, unproven delta band every candidate carries until the measured A/B
@@ -663,26 +690,104 @@ def _knobs_from_engine_args(
     return knobs
 
 
-def _engine_arg_knobs(*, gpu_count: int | None = None) -> list[Knob]:
-    """Enumerate real vLLM EngineArgs, or fall back to the frozen catalog.
+@dataclass(frozen=True)
+class KnobSurface:
+    """The knobs a search runs over, and where they came from.
+
+    ``degradation`` is ``None`` only when the knobs are the installed engine's
+    own. Anything else is a fallback, and which one matters: vLLM being absent
+    (an offline box, where the frozen catalog is the intended surface) is not the
+    same event as vLLM being present and its introspection breaking (version
+    drift, where the frozen catalog may name fields this vLLM no longer has).
+    """
+
+    knobs: tuple[Knob, ...]
+    source: str
+    degradation: Degradation | None = None
+
+
+def _engine_arg_field_names(engine_args_cls: object) -> set[str] | None:
+    """Field names an ``EngineArgs``-like class accepts, by the cheapest reading
+    that still works when full introspection does not. ``None`` if none does."""
+    import dataclasses
+    import inspect
+
+    try:
+        return {f.name for f in dataclasses.fields(engine_args_cls)}  # type: ignore[arg-type]
+    except Exception:
+        pass
+    try:
+        params = inspect.signature(engine_args_cls).parameters  # type: ignore[arg-type]
+        return {n for n in params if n != "self"}
+    except Exception:
+        return None
+
+
+def _frozen_for(engine_args_cls: object, why: str) -> KnobSurface:
+    """The frozen catalog, cut down to what the installed ``EngineArgs`` accepts.
+
+    The contingency for "vLLM is here but introspection broke": the frozen list
+    was written against some vLLM, not necessarily this one, and a knob this
+    version dropped is an engine build that can only fail — a wasted restart A/B
+    reported as a loss. When not even the field names can be read, the whole
+    catalog is used and the entry says so.
+    """
+    names = _engine_arg_field_names(engine_args_cls)
+    if names is None:
+        knobs = tuple(_FALLBACK_KNOBS)
+        used = f"frozen catalog, all {len(knobs)} knobs (EngineArgs fields unreadable too)"
+    else:
+        knobs = tuple(k for k in _FALLBACK_KNOBS if k.name in names)
+        dropped = sorted(k.name for k in _FALLBACK_KNOBS if k.name not in names)
+        used = (f"frozen catalog cut to the installed EngineArgs, {len(knobs)} knobs"
+                + (f" (dropped: {', '.join(dropped)})" if dropped else ""))
+    return KnobSurface(knobs, "frozen:introspection-failed", Degradation(
+        AR_CATALOG, used=used, reason=why, severity=APPROXIMATE,
+        affects=(AFFECTS_RANKING,)))
+
+
+def resolve_engine_arg_knobs(*, gpu_count: int | None = None) -> KnobSurface:
+    """Enumerate real vLLM EngineArgs, or say exactly why the surface is frozen.
 
     Best-effort introspection: when vLLM is importable, each tunable, scalar,
     single-GPU-applicable field is a candidate knob, with its valid domain (enum
     ``choices``, type) read from the field's CLI argument (:func:`_argparse_domains`)
     so the search only proposes values that can actually apply. Non-performance
     fields (:data:`_NON_TUNABLE_HINTS`), list-valued args, and (on a 1-GPU box)
-    multi-GPU topology knobs (:data:`_MULTI_GPU_HINTS`) are skipped. When vLLM
-    isn't importable (no GPU stack / air-gapped), the frozen catalog keeps the
-    generative path working offline.
+    multi-GPU topology knobs (:data:`_MULTI_GPU_HINTS`) are skipped.
+
+    Three fallbacks, kept apart because they call for different things:
+
+    * vLLM not importable — the frozen catalog, the intended offline surface.
+    * introspection raised, or produced nothing — the frozen catalog cut to the
+      fields this ``EngineArgs`` actually has (:func:`_frozen_for`).
     """
     try:
         from vllm import EngineArgs  # type: ignore
-    except Exception:
-        return list(_FALLBACK_KNOBS)
+    except Exception as exc:
+        return KnobSurface(tuple(_FALLBACK_KNOBS), "frozen:vllm-absent", Degradation(
+            AR_CATALOG, used=f"frozen catalog ({len(_FALLBACK_KNOBS)} knobs)",
+            reason=f"vLLM not importable: {type(exc).__name__}: {exc}",
+            severity=APPROXIMATE, affects=(AFFECTS_RANKING,)))
+    return resolve_knobs_from(EngineArgs, gpu_count=gpu_count)
+
+
+def resolve_knobs_from(engine_args_cls: object, *, gpu_count: int | None = None) -> KnobSurface:
+    """:func:`resolve_engine_arg_knobs` for a given ``EngineArgs``-like class —
+    split out so the drift contingency is testable without vLLM installed."""
     try:
-        return _knobs_from_engine_args(EngineArgs, gpu_count=gpu_count) or list(_FALLBACK_KNOBS)
-    except Exception:
-        return list(_FALLBACK_KNOBS)
+        knobs = _knobs_from_engine_args(engine_args_cls, gpu_count=gpu_count)
+    except Exception as exc:
+        return _frozen_for(engine_args_cls, f"EngineArgs introspection raised "
+                                            f"{type(exc).__name__}: {exc}")
+    if not knobs:
+        return _frozen_for(engine_args_cls, "EngineArgs introspection found no tunable knobs")
+    return KnobSurface(tuple(knobs), "engineargs")
+
+
+def _engine_arg_knobs(*, gpu_count: int | None = None) -> list[Knob]:
+    """The knob list alone. See :func:`resolve_engine_arg_knobs` for its source."""
+    return list(resolve_engine_arg_knobs(gpu_count=gpu_count).knobs)
 
 
 class KnobSource(Protocol):
@@ -691,6 +796,9 @@ class KnobSource(Protocol):
     vLLM's is :class:`VLLMKnobSource` (introspect ``EngineArgs``). Another workload
     plugs in by yielding its own ``Knob`` list; there is deliberately no
     ``{workload: knobs}`` table — versatility comes from the source, not a map.
+
+    A source may also define ``degradations() -> list[Degradation]`` to say it
+    fell back; proposers forward it, and :func:`autoresearch` puts it on the run.
     """
 
     def knobs(self) -> list[Knob]: ...
@@ -709,9 +817,16 @@ class VLLMKnobSource:
 
     def __init__(self, *, gpu_count: int | None = None) -> None:
         self._gpu_count = gpu_count
+        self.surface: KnobSurface | None = None
 
     def knobs(self) -> list[Knob]:
-        return _engine_arg_knobs(gpu_count=self._gpu_count)
+        self.surface = resolve_engine_arg_knobs(gpu_count=self._gpu_count)
+        return list(self.surface.knobs)
+
+    def degradations(self) -> list[Degradation]:
+        if self.surface is None or self.surface.degradation is None:
+            return []
+        return [self.surface.degradation]
 
 
 @dataclass(frozen=True)
@@ -755,6 +870,11 @@ class _ProposerBase:
             else {s.knob for s in load_library()}
         )
         self._searchable_cache: list[Knob] | None = None
+
+    def degradations(self) -> list[Degradation]:
+        """What the knob source fell back to, if it can say (see :class:`KnobSource`)."""
+        report = getattr(self._source, "degradations", None)
+        return list(report()) if callable(report) else []
 
     def _searchable(self) -> list[Knob]:
         """Knobs worth searching: outside the catalog and with a non-empty grid.
@@ -970,12 +1090,37 @@ class FallbackProposer:
     def __init__(self, primary: Proposer, secondary: Proposer) -> None:
         self._primary = primary
         self._secondary = secondary
+        self._fell_back: Degradation | None = None
 
     def propose(
         self, bottleneck_class: str, *, target_op: str | None = None
     ) -> list[InterventionSpec]:
         specs = self._primary.propose(bottleneck_class, target_op=target_op)
-        return specs or self._secondary.propose(bottleneck_class, target_op=target_op)
+        self._fell_back = None
+        if specs:
+            return specs
+        # Which source a candidate came from is part of what it is: a lever from
+        # the reviewed table and one generated from the engine surface carry
+        # different priors, and "the generator found nothing" is itself a finding.
+        self._fell_back = Degradation(
+            AR_PROPOSER,
+            used=type(self._secondary).__name__,
+            reason=(f"{type(self._primary).__name__} proposed nothing for "
+                    f"{bottleneck_class!r}"),
+            severity=APPROXIMATE,
+            affects=(AFFECTS_RANKING,),
+        )
+        return self._secondary.propose(bottleneck_class, target_op=target_op)
+
+    def degradations(self) -> list[Degradation]:
+        out: list[Degradation] = []
+        for p in (self._primary, self._secondary):
+            report = getattr(p, "degradations", None)
+            if callable(report):
+                out.extend(report())
+        if self._fell_back is not None:
+            out.append(self._fell_back)
+        return out
 
 
 class StochasticProposer(_ProposerBase):
@@ -1054,7 +1199,13 @@ class StochasticProposer(_ProposerBase):
         return out
 
 
-def autoresearch_v0(
+def autoresearch_v0(trace: Trace, bottleneck_class: str, **kw: Any) -> list[AutoresearchResult]:
+    """The results of one pass. See :func:`_autoresearch_pass`, which also says
+    how many ranked candidates were left untried."""
+    return _autoresearch_pass(trace, bottleneck_class, **kw)[0]
+
+
+def _autoresearch_pass(
     trace: Trace,
     bottleneck_class: str,
     *,
@@ -1065,7 +1216,11 @@ def autoresearch_v0(
     proposer: Proposer | None = None,
     ctx: GateContext | None = None,
     reject: Callable[[InterventionSpec], str | None] | None = None,
-) -> list[AutoresearchResult]:
+    history: History | None = None,
+    gpu_sku: str | None = None,
+    fingerprint: str | None = None,
+    degradations: DegradationLog | None = None,
+) -> tuple[list[AutoresearchResult], int]:
     """Propose → gate → (apply + measure + rollback) for one bottleneck class.
 
     Proposals are ranked and pre-filtered by :func:`select_interventions` (the
@@ -1095,20 +1250,45 @@ def autoresearch_v0(
     else:
         proposals = proposer.propose(bottleneck_class, target_op=target_op)
     if not proposals:
-        return []
+        return [], 0
 
+    # ``history``/``gpu_sku``/``fingerprint`` are what the catalog is ranked
+    # with. Autoresearch results are exported to the same verification.json the
+    # history reader aggregates, under stable candidate names, so without them a
+    # candidate measured at -30% on this box last run ranked from its flat
+    # unproven prior again, every run.
     ranked = select_interventions(
-        trace, proposals, policy or Policy(), top_n=len(proposals), ctx=ctx
+        trace, proposals, policy or Policy(), top_n=len(proposals), ctx=ctx,
+        history=history, gpu_sku=gpu_sku, fingerprint=fingerprint,
     )
     aimed_at = target.op if target is not None else None
 
     results: list[AutoresearchResult] = []
+    n_untried = 0
+    # Set once a restore fails. The pass keeps walking the ranking, but only to
+    # record what the gate had already rejected — that verdict needs no engine,
+    # and dropping it would leave those candidates in neither the rejected count
+    # nor the untried one. Every survivor after that point is counted untried.
+    lost = False
     for c in ranked:
         # Gate rejection wins; else the caller's veto (e.g. a live structural knob
         # with no restart hook) can reject before we touch the engine. Rejected
         # candidates are recorded but never applied; survivors go through the
         # rollback-gated apply. Both land in one result shape.
         reason = c.rejected_reason
+        # Autoresearch applies every survivor, not a top-N, so the ranking alone
+        # cannot stop a known loser: sorted last, it still ran. A candidate this
+        # box already measured at no gain is a result in hand, not an experiment,
+        # and re-running it spends an A/B (often a restart) to learn it again.
+        # Checked before the lost-engine exit below: like the gate, it is a
+        # verdict from the record, and needs no engine to reach.
+        if reason is None and c.delta_source == "measured" and c.predicted_delta <= 0:
+            reason = f"history: measured {c.predicted_delta:+.1%} on this box; not re-run"
+        if lost and reason is None:
+            n_untried += 1
+            continue
+        # The caller's veto can read the engine (a prerequisite, a restart hook),
+        # so it is only asked while there is one.
         if reason is None and reject is not None:
             reason = reject(c.spec)
         pre_cfg: dict | None = None
@@ -1116,7 +1296,10 @@ def autoresearch_v0(
         if reason is None:
             eng = getattr(applicator, "engine", None)
             pre_cfg = dict(getattr(eng, "gitm_llm_kwargs", None) or {}) if eng else None
-            applied = apply_intervention(c.spec, applicator, min_keep_delta=min_keep_delta)
+            # Scoped, so a fallback the probe records during this A/B is charged
+            # to this candidate and not to the ones measured before or after it.
+            with degradations.scope(c.spec.name) if degradations is not None else nullcontext():
+                applied = apply_intervention(c.spec, applicator, min_keep_delta=min_keep_delta)
             ab = (
                 getattr(applicator, "last_result", None)
                 if applied.measured_delta is not None
@@ -1142,9 +1325,16 @@ def autoresearch_v0(
                 ab_result=ab,
                 baseline_config=pre_cfg,
                 candidate_config=post_cfg,
+                degradations=(degradations.measured_under(c.spec.name)
+                              if degradations is not None and applied is not None else []),
             )
         )
-    return results
+        if applied is not None and applied.restore_failed:
+            # The baseline is gone, so every candidate after this one would be
+            # measured against nothing. The caller reads the flag off this
+            # result and records why the pass ended early.
+            lost = True
+    return results, n_untried
 
 
 def autoresearch(
@@ -1157,6 +1347,10 @@ def autoresearch(
     proposer: Proposer | None = None,
     ctx: GateContext | None = None,
     reject: Callable[[InterventionSpec], str | None] | None = None,
+    history: History | None = None,
+    gpu_sku: str | None = None,
+    fingerprint: str | None = None,
+    degradations: DegradationLog | None = None,
 ) -> AutoresearchRun:
     """Classify the trace's bottleneck, then run the full propose→gate→apply pass.
 
@@ -1169,7 +1363,8 @@ def autoresearch(
     from the real EngineArgs surface rather than a frozen list. ``ctx`` forwards
     the precondition gate context (same applicability gate as the catalog);
     ``reject`` is an optional per-candidate veto (the loop's structural-knob
-    guard). See :func:`autoresearch_v0`.
+    guard). ``history``/``gpu_sku``/``fingerprint`` rank candidates from what they
+    measured before, exactly as the catalog is ranked. See :func:`autoresearch_v0`.
 
     When ``residuals`` (from :func:`gitm.optimizer.monitor.residuals`) are passed,
     the bottleneck class weighs the roofline-predicted memory-bound fraction too,
@@ -1178,10 +1373,7 @@ def autoresearch(
     """
     bottleneck_class = classify_bottleneck(trace, residuals)
     target = largest_residual(residuals) if residuals is not None else None
-    return AutoresearchRun(
-        bottleneck_class=bottleneck_class,
-        target=target,
-        results=autoresearch_v0(
+    results, n_untried = _autoresearch_pass(
             trace,
             bottleneck_class,
             applicator=applicator,
@@ -1191,5 +1383,48 @@ def autoresearch(
             proposer=proposer,
             ctx=ctx,
             reject=reject,
-        ),
+            history=history,
+            gpu_sku=gpu_sku,
+            fingerprint=fingerprint,
+            degradations=degradations,
     )
+    return AutoresearchRun(
+        bottleneck_class=bottleneck_class,
+        target=target,
+        results=results,
+        degradations=_search_degradations(trace, bottleneck_class, target, proposer, results),
+        n_untried=n_untried,
+    )
+
+
+def _search_degradations(
+    trace: Trace,
+    bottleneck_class: str,
+    target: ResidualTarget | None,
+    proposer: Proposer | None,
+    results: list[AutoresearchResult],
+) -> list[Degradation]:
+    """Every way this pass searched something other than what it meant to.
+
+    Each of these used to be indistinguishable from a clean pass in
+    ``autoresearch.json``: an unscoped search still records the target it
+    missed, and an empty result list looks the same whether nothing was
+    proposed or the pass never ran.
+    """
+    out: list[Degradation] = []
+    report = getattr(proposer, "degradations", None)
+    if callable(report):
+        out.extend(report())
+    if target is not None and not _op_present(trace, target.op):
+        out.append(Degradation(
+            AR_TARGET, used="unscoped search over the whole trace",
+            reason=(f"largest-residual op {target.op!r} matches no kernel in the trace, "
+                    "so candidates could not be scoped to it"),
+            severity=APPROXIMATE, affects=(AFFECTS_RANKING,)))
+    if not results:
+        source = type(proposer).__name__ if proposer is not None else "the static table"
+        out.append(Degradation(
+            AR_EMPTY, used="no autoresearch candidates",
+            reason=f"{source} proposed nothing for {bottleneck_class!r}",
+            severity=APPROXIMATE, affects=(AFFECTS_RANKING,)))
+    return out

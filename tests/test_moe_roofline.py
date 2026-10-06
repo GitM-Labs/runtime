@@ -28,8 +28,22 @@ H100 = HardwareSpec(
 )
 
 
+#: Position of each FFN GEMM within a layer's pair. An MoE layer names both of
+#: them ``moe_routed`` (what the expert kernels classify to), so the role is read
+#: from the order the graph emits them in, not from the name.
+_FFN_ROLE = {"mlp_gate_up": 0, "mlp_down": 1}
+
+
+def _ffn_pairs(g):
+    """``[(gate_up, down), ...]`` per layer, whatever each layer names them."""
+    ffn = [n for n in g.nodes if n.op in ("mlp_gate_up", "mlp_down", "moe_routed")]
+    return list(zip(ffn[0::2], ffn[1::2], strict=True))
+
+
 def _node(model, batch, op, hw=H100):
     g = predict_graph(model, hw, BatchConfig(batch=batch))
+    if op in _FFN_ROLE:
+        return _ffn_pairs(g)[0][_FFN_ROLE[op]].prediction
     return next(n for n in g.nodes if n.op == op).prediction
 
 
@@ -125,13 +139,22 @@ def test_moe_does_not_disturb_non_ffn_ops():
         assert (d.flops, d.bytes) == (m.flops, m.bytes), f"{op} should be untouched"
 
 
-def test_graph_node_vocabulary_is_unchanged_for_moe():
-    """No new op names — library.yaml/classify_op key off this vocabulary."""
+def test_moe_layers_name_their_expert_gemms_what_the_kernels_classify_to():
+    """An MoE layer's two expert GEMMs are ``moe_routed``, the op ``classify_op``
+    files ``fused_moe_kernel`` under. They used to keep the dense ``mlp_*`` names
+    "so the vocabulary stayed unchanged" — but no expert kernel classifies to
+    those, so the expert time landed unmodeled and both nodes went unobserved.
+    Every other op, and every op of a dense model, is unchanged."""
+    from gitm.optimizer.deviation import classify_op
+
     dense_ops = {n.op for n in predict_graph(ModelSpec(n_layers=2)).nodes}
     moe_ops = {n.op for n in predict_graph(
         ModelSpec(n_layers=2, num_experts=64, experts_per_token=4, moe_intermediate=512)
     ).nodes}
-    assert moe_ops == dense_ops
+    assert moe_ops == (dense_ops - {"mlp_gate_up", "mlp_down"}) | {"moe_routed"}
+    assert classify_op("fused_moe_kernel") == "moe_routed"
+    assert dense_ops == {"qkv_proj", "attn_score_value", "attn_out_proj",
+                         "mlp_gate_up", "mlp_down", "lm_head"}
 
 
 # --- graph: the MoE property that matters -------------------------------------
@@ -258,8 +281,11 @@ def test_dense_layers_are_priced_as_dense_in_the_graph():
     m = ModelSpec(hidden=2048, n_layers=4, intermediate=768, num_experts=256,
                   experts_per_token=8, moe_intermediate=768, first_dense_layers=2)
     g = predict_graph(m, H100, BatchConfig(batch=16))
-    gate_ups = [n for n in g.nodes if n.op == "mlp_gate_up"]
+    gate_ups = [gu for gu, _down in _ffn_pairs(g)]
     assert len(gate_ups) == 4
+    # Dense blocks keep the dense names; the MoE blocks' GEMMs are expert GEMMs.
+    assert [n.op for n in gate_ups] == ["mlp_gate_up", "mlp_gate_up",
+                                        "moe_routed", "moe_routed"]
     dense_bytes = gate_ups[0].prediction.bytes   # layer 0 -> dense
     moe_bytes = gate_ups[2].prediction.bytes     # layer 2 -> MoE
     assert dense_bytes != moe_bytes
@@ -433,9 +459,46 @@ def test_batch_config_from_stats_uses_observed_concurrency():
     class Sched:
         n_samples = 12
         mean_running = 15.6
+        mean_bounded_inflight = 64.0  # ignored: the running count is the batch
+        max_num_seqs = 256
 
-    cfg = _batch_config_from_stats(Sched())
+    cfg, source = _batch_config_from_stats(Sched())
     assert cfg is not None and cfg.batch == 16  # rounded
+    assert source == "running"
+
+
+def test_batch_config_falls_back_to_in_flight_requests():
+    """The offline engine keeps its scheduler in another process, so the running
+    count is unreachable and the in-flight count is all there is."""
+    from gitm.scheduler.loop import _batch_config_from_stats
+
+    class Sched:
+        n_samples = 12
+        mean_running = None
+        mean_bounded_inflight = 31.4
+        max_num_seqs = 256
+
+    cfg, source = _batch_config_from_stats(Sched())
+    assert cfg is not None and cfg.batch == 31
+    assert source == "unfinished"
+
+
+def test_batch_config_takes_the_bound_already_applied_per_sample():
+    """The bounding is per sample, in ``summarize``. This reads the bounded field
+    and does not re-apply a cap to an average, which would be the wrong number
+    (see test_each_sample_is_bounded_before_averaging_not_after)."""
+    from gitm.scheduler.loop import _batch_config_from_stats
+
+    class Sched:
+        n_samples = 12
+        mean_running = None
+        mean_unfinished = 400.0        # raw, unbounded — must not be used
+        mean_bounded_inflight = 17.0
+        max_num_seqs = 32
+
+    cfg, source = _batch_config_from_stats(Sched())
+    assert cfg is not None and cfg.batch == 17
+    assert source == "unfinished"
 
 
 def test_batch_config_falls_back_when_no_samples():
@@ -446,14 +509,29 @@ def test_batch_config_falls_back_when_no_samples():
     class NoSamples:
         n_samples = 0
         mean_running = 8.0
+        mean_bounded_inflight = 8.0
+        max_num_seqs = 256
 
     class NoRunning:
         n_samples = 5
         mean_running = None
+        mean_bounded_inflight = None
+        max_num_seqs = 256
 
-    assert _batch_config_from_stats(None) is None
-    assert _batch_config_from_stats(NoSamples()) is None
-    assert _batch_config_from_stats(NoRunning()) is None
+    class NoCapacity:
+        """An in-flight count with nothing to bound it stays unused: unbounded it
+        is queue depth plus batch, which on a drain workload is neither.
+        ``summarize`` leaves the bounded field None in that case."""
+        n_samples = 5
+        mean_running = None
+        mean_unfinished = 400.0
+        mean_bounded_inflight = None
+        max_num_seqs = None
+
+    assert _batch_config_from_stats(None) == (None, None)
+    assert _batch_config_from_stats(NoSamples()) == (None, None)
+    assert _batch_config_from_stats(NoRunning()) == (None, None)
+    assert _batch_config_from_stats(NoCapacity()) == (None, None)
 
 
 def test_wrong_batch_badly_misprices_expert_traffic():
@@ -479,3 +557,28 @@ def test_total_prediction_is_finite_and_positive_across_shapes():
             assert g.total_pred_s > 0
             assert all(n.prediction.t_pred_s >= 0 for n in g.nodes)
             assert all(n.prediction.bytes > 0 for n in g.nodes)
+
+
+def test_a_graph_carries_the_batch_it_was_priced_with_defaults_included():
+    """``predicted_graph.json`` reports the batch by reading it off the graph, so
+    the graph has to hold the effective config and not just what was passed in.
+    Every ``predict_*`` entry point does ``batch = batch or BatchConfig()`` and
+    stores the result; rebuilding that fallback at the artifact would be a second
+    copy of it, free to drift from the one that did the pricing."""
+    from gitm.planner.graph import predict_graph
+    from gitm.planner.moe_graph import predict_moe_graph
+    from gitm.planner.roofline import BatchConfig, ShardingConfig
+
+    defaulted = predict_graph(model=ModelSpec(), hw=H100, batch=None)
+    assert defaulted.batch.batch == 1          # the documented default
+    assert defaulted.batch.kv_cache_len == 128
+
+    given = predict_graph(model=ModelSpec(), hw=H100, batch=BatchConfig(batch=17))
+    assert given.batch.batch == 17
+
+    # Same invariant on the MoE path, which is the one the cluster run took.
+    from gitm.planner.moe_graph import spec_from_hf_config
+    from tests.test_moe_graph import V4_BASE_CONFIG
+    moe = predict_moe_graph(spec_from_hf_config(V4_BASE_CONFIG), H100, None, ShardingConfig())
+    assert moe.batch.batch == 1
+    assert moe.batch.kv_cache_len == 128

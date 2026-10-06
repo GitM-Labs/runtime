@@ -1,0 +1,165 @@
+# deepseek-ai/DeepSeek-V4.1-Flash — DeepseekV41ForCausalLM (model_type deepseek_v41,
+# text_config nested): compressed sparse attention + MoE + engram n-gram tables.
+# Source: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/config.json
+# Read from config.json, inference/{config.json,model.py,engram.py,vision.py},
+# model.safetensors.index.json and the safetensors headers of shards 00017 and
+# 00048 at that revision — no traces.
+#
+# Family note: `sparse_moe` is the DeepSeek-V4 graph and carries the backbone
+# field for field. It cannot express what is new in V4.1: the engram tables
+# (203.07 GB, 39.8% of the checkpoint), cross-layer KV sharing (4 source layers
+# own a cache, the rest read it), candidate pre-filtering, the DSpark draft
+# blocks' own expert count, or the ViT. This is the closest honest fit and its
+# predictions are wrong in known directions, listed under unmodelled. See
+# docs/deepseek-v4.1-flash/DESIGN-NOTE.md for the ledger.
+
+name: deepseek-ai/DeepSeek-V4.1-Flash
+family: sparse_moe
+description: >
+  40 layers, hidden 5120, 384 routed experts top-6 plus one shared expert on
+  every layer, one 512-wide KV head. Layers 0-1 window only, 2-19 ratio 2,
+  20-39 ratio 1, but only layers 2, 8, 14 and 20 own a compressed cache and
+  index keys; the rest read their source's. Engram n-gram tables on layers 1
+  and 14. Three DSpark draft blocks (128 experts top-3, window only). Routed
+  experts fp4 (e2m1, e8m0 scale per 32), attention, shared expert and engram
+  fp8 e4m3 with e8m0 32x32 block scales; compressor, router, embedding and
+  lm_head bf16. 510.29 GB on disk. Native context 1,048,576. Vision tower out of scope for a text decode step.
+
+spec:
+  hidden: 5120
+  n_layers: 40
+  vocab: 129280
+
+  # Attention. head_dim 512 already includes the 64 RoPE dims in code
+  # (nope = head_dim - rope); wq_b is [32768, 1280] = 64 heads x 512 in the
+  # header. o_lora_rank 1024 is per group: wo_a is [8192, 4096] = 8 groups x
+  # 1024. Reading either the other way moves q_b/kv_a by 12.5% or wo_a/wo_b 8x.
+  n_heads: 64
+  num_kv_heads: 1
+  head_dim: 512
+  qk_rope_head_dim: 64
+  q_lora_rank: 1280
+  o_lora_rank: 1024
+  o_groups: 8
+
+  # Mixture of experts. Every layer is MoE and every layer carries gate.bias,
+  # so there is no hash-routed prefix (num_hash_layers 0, unlike V4 Pro's 3).
+  # Routed experts are I8-packed fp4 in the header.
+  n_routed_experts: 384
+  n_shared_experts: 1
+  num_experts_per_tok: 6
+  moe_intermediate_size: 2304
+  num_hash_layers: 0
+
+  # Compressed sparse attention. All 43 ratios are kept: 40 layers plus the
+  # three DSpark blocks, which the code builds as layers 40-42 and asserts
+  # window-only (model.py:1034). A ratio of 1 is not "uncompressed" — it is a
+  # per-token latent attended sparsely at top-512.
+  index_n_heads: 32
+  index_head_dim: 128
+  index_topk: 512
+  sliding_window: 128
+  compress_ratios: [
+    0, 0, 2, 2, 2, 2, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    0, 0, 0,
+  ]
+
+  # Multi-token prediction: three DSpark draft blocks.
+  num_nextn_predict_layers: 3
+
+  # mHC, as on V4 Pro: 4 residual streams, 20 Sinkhorn iterations, two mixing
+  # blocks per layer.
+  hc_width: 4
+  hc_sinkhorn_iters: 20
+  hc_blocks_per_layer: 2
+
+  # Empty on purpose. config.json's dspark_target_layer_ids [37, 38, 39] are
+  # hidden-state taps that feed the draft block (model.py:1265), not layers with
+  # extra weights — 37-39 carry the same 2,334 tensors as any plain layer. The
+  # planner's dspark field prices a low-rank update the code does not run.
+  dspark_layer_ids: []
+  dspark_markov_rank: 0
+
+  weight_dtype: fp8
+  expert_dtype: fp4                 # quantization_config.expert_dtype, nested
+  kv_dtype: fp8                     # vLLM recipe --kv-cache-dtype fp8, not the checkpoint
+  act_dtype: bf16
+
+provenance:
+  verified:
+    - claim: every spec value is read from config.json text_config
+      detail: >
+        hidden_size 5120, num_hidden_layers 40, num_attention_heads 64,
+        num_key_value_heads 1, head_dim 512, qk_rope_head_dim 64, q_lora_rank
+        1280, o_lora_rank 1024, o_groups 8, vocab_size 129280,
+        n_routed_experts 384, n_shared_experts 1, num_experts_per_tok 6,
+        moe_intermediate_size 2304, index_n_heads 32, index_head_dim 128,
+        index_topk 512, sliding_window 128, num_nextn_predict_layers 3,
+        hc_mult 4, hc_sinkhorn_iters 20, compress_ratios (43 entries).
+        quantization_config.quant_method fp8, quantization_config.expert_dtype
+        fp4. No num_hash_layers key.
+    - claim: shapes and dtypes are read from real shard headers
+      detail: >
+        Shard 00017 (layer 14): wq_b F8_E4M3 [32768, 1280], wkv F8_E4M3
+        [512, 5120], wo_a F8_E4M3 [8192, 4096], wo_b F8_E4M3 [5120, 8192],
+        shared_experts F8_E4M3, routed experts I8 [2304, 2560] + F8_E8M0
+        [2304, 160] scales, gate.weight BF16, compressor BF16, indexer wq_b
+        F8_E4M3 [4096, 1280], weights_proj and wk BF16, hc fns F32. Its tensors
+        sum to the shard's 7,405,694,680 B exactly. Shard 00048 (layer 14
+        engram): embed F8_E4M3 [384016682, 256] + F8_E8M0 [384016682, 8], wkv
+        F8_E4M3 [25600, 6144].
+    - claim: a shape ledger closes on total_size with zero residual
+      detail: >
+        Header dtypes for layer 14 and inferred dtypes elsewhere sum to
+        510,286,023,000 B, the index total_size. Tensor counts close too:
+        93,415 layers.*, 2,401 mtp.*, 259 vision.*, 4 aligner.*, 6 top-level,
+        96,085 in all. Ledger in the design note, section 2.
+    - claim: model_weight_bytes on this entry, and why it is far off
+      detail: >
+        316,399,407,824 B against 510,286,023,000 B (-38.0%). Most of the gap
+        is the engram tables (203.07 GB), which the family has no term for. Do
+        not read the remainder as validation; its itemised errors are in
+        unmodelled.
+
+  estimated:
+    - field: kv_dtype
+      value: fp8
+      detail: >
+        From the vLLM recipe flag, an engine assumption. The reference code
+        fp8-quantizes the window KV (model.py:707) but fp4-quantizes compressed
+        KV with e4m3 scales per 16 (line 760) and index keys with e8m0 scales
+        per 32 (line 546).
+    - field: dspark_layer_ids
+      value: "[]"
+      detail: >
+        See the spec comment. dspark_markov_rank 256 in config.json is the
+        Markov head width (model.py:1117), not a per-layer rank, so it is not
+        carried into this field.
+
+  open:
+    - question: engram placement, GPU type and layout
+      detail: >
+        The vLLM recipe (vLLM 0.30.0+) offers engram CPU offload
+        (`--engram-config '{"cpu_offload":true}'`) and TP4, TP2 or DEP8
+        layouts. Which one a deployment runs is UNVERIFIED; it moves per-GPU weights
+        between 41.6 GB and 257.0 GB.
+
+  unmodelled:
+    - Engram tables and their projections, 203.07 GB (39.8% of bytes). This is
+      most of the -38.0% in model_weight_bytes.
+    - Cross-layer KV and indexer sharing. kv_bytes_per_token charges every
+      ratio-1 and ratio-2 layer its own cache and index keys, 22,276.5 B per
+      token, against 1,600 B for the four real sources at fp8 (13.9x).
+    - Two-level candidate selection (source layer 20, 2048 blocks of 8) that
+      layers 24, 28, 32 and 36 score inside.
+    - DSpark blocks have 128 experts top-3, a main_proj and a Markov head. The
+      planner gives them the backbone's 384 experts, 14.44 GB too much.
+    - The 32-layer ViT and aligner (0.97 GB) and the vision routing bias bias_vl.
+      A text decode step never enters the ViT.
+    - Shared expert, router, embedding and lm_head dtypes (fp8, bf16, bf16,
+      bf16). SparseMoEModelSpec has no per-op override to express them.
+    - The fp8 scale rate. This checkpoint uses 32x32 blocks with 1-byte e8m0
+      scales; the planner's fp8 rate assumes 128x128 fp32 scales.

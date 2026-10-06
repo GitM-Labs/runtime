@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 
 import pytest
 
@@ -95,6 +96,56 @@ def test_run_env_nvidia_shape_is_unchanged(tmp_path):
     env = injection.run_env(tmp_path / "t.jsonl", vendor="nvidia")
     assert injection.ENV_LIB in env
     assert injection.ENV_ROCP not in env
+
+
+def test_run_env_amd_starts_vllm_workers_with_spawn(tmp_path):
+    """A forked EngineCore on ROCm keeps the parent's HIP runtime but not the
+    rocprofiler tool, so it records nothing (P1-1). Spawn reloads the tool."""
+    env = injection.run_env(tmp_path / "t.jsonl", vendor="amd")
+    assert env["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+
+
+def test_run_env_nvidia_leaves_the_start_method_alone(tmp_path):
+    env = injection.run_env(tmp_path / "t.jsonl", vendor="nvidia")
+    assert "VLLM_WORKER_MULTIPROC_METHOD" not in env
+
+
+def _factory_env(monkeypatch, vendor):
+    """What the vLLM factory leaves in the environment before importing vLLM.
+
+    vLLM is blocked from importing, so the factory stops right after the point
+    under test instead of building an engine.
+    """
+    import sys
+
+    from gitm import workloads
+
+    monkeypatch.delenv("GITM_VLLM_SYNTHETIC", raising=False)
+    monkeypatch.setattr(injection, "active_vendor", lambda: vendor)
+    monkeypatch.setitem(sys.modules, "vllm", None)
+    with pytest.raises(ImportError):
+        workloads._vllm_decode_factory(None)
+    return os.environ
+
+
+def test_vllm_factory_never_switches_an_embedded_caller_to_spawn(monkeypatch):
+    """Spawn re-imports __main__ in every worker. A script that exists as a file
+    can still start the workload at top level, and each worker would start it
+    again, so the factory cannot tell spawn is safe. It warns instead."""
+    monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    with pytest.warns(RuntimeWarning, match="fork"):
+        env = _factory_env(monkeypatch, "amd")
+    assert "VLLM_WORKER_MULTIPROC_METHOD" not in env
+
+
+def test_vllm_factory_keeps_an_explicit_start_method(monkeypatch):
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "fork")
+    assert _factory_env(monkeypatch, "amd")["VLLM_WORKER_MULTIPROC_METHOD"] == "fork"
+
+
+def test_vllm_factory_leaves_the_start_method_alone_on_nvidia(monkeypatch):
+    monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    assert "VLLM_WORKER_MULTIPROC_METHOD" not in _factory_env(monkeypatch, "nvidia")
 
 
 # --------------------------------------------------------------------------- #
@@ -383,3 +434,53 @@ def test_a_truncated_final_line_is_still_reported(tmp_path, monkeypatch):
         _w.simplefilter("always")
         injection.read_shards()
     assert any("malformed or incomplete" in str(c.message) for c in caught)
+
+
+
+def _cli_run_env(monkeypatch, vendor, argv0="/venv/bin/gitm"):
+    """The environment `gitm run` hands the loop, without running the loop.
+
+    ``argv0`` is how the process was started: the ``gitm`` console script by
+    default, which is the entry point that may choose spawn.
+    """
+    import sys
+
+    import gitm
+    from gitm.cli import main
+
+    monkeypatch.setattr(sys, "argv", [argv0])
+
+    seen: dict[str, str | None] = {}
+
+    def fake_optimize(**kw):
+        seen["method"] = os.environ.get("VLLM_WORKER_MULTIPROC_METHOD")
+        return {"summary": {"status": "ok"}, "report_md": "", "run_dir": None}
+
+    monkeypatch.setattr(injection, "active_vendor", lambda: vendor)
+    monkeypatch.setattr(gitm, "optimize", fake_optimize)
+    assert main(["run", "--workload", "vllm-decode", "--no-history"]) == 0
+    return seen["method"]
+
+
+def test_gitm_run_starts_workers_with_spawn_on_amd(monkeypatch):
+    """The gitm command is a console script a spawned worker can re-import, so
+    this is the entry point that can choose spawn for the operator."""
+    monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    assert _cli_run_env(monkeypatch, "amd") == "spawn"
+
+
+def test_gitm_run_keeps_an_explicit_start_method(monkeypatch):
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "fork")
+    assert _cli_run_env(monkeypatch, "amd") == "fork"
+
+
+def test_main_called_from_another_entry_point_does_not_choose_spawn(monkeypatch):
+    """python -c, a notebook or an unguarded script can reach main() too, and a
+    spawned worker re-importing them can fail or re-run their work."""
+    monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    assert _cli_run_env(monkeypatch, "amd", argv0="-c") is None
+
+
+def test_gitm_run_leaves_the_start_method_alone_on_nvidia(monkeypatch):
+    monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    assert _cli_run_env(monkeypatch, "nvidia") is None

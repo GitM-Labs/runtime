@@ -63,13 +63,22 @@ _PEAKS: dict[str, tuple[float, float]] = {
 #
 _QUANT_PEAKS: dict[str, dict[str, float]] = {
     # Blackwell Ultra: 15 PFLOPS dense fp4, with fp8/bf16 carried over from B200.
-    "GB300": {"fp8": 4500e12, "fp4": 15000e12},
-    "B300": {"fp8": 4500e12, "fp4": 15000e12},
-    "GB200": {"fp8": 4500e12, "fp4": 9000e12},
-    "B200": {"fp8": 4500e12, "fp4": 9000e12},
-    # Hopper has fp8 tensor cores; it has no fp4 path (MXFP4 runs dequantised
-    # through Marlin, which is why an fp4 checkpoint traced on H100/H200 prices
-    # against fp8 and still shows a compute-bound expert GEMM).
+    # fp32 is the CUDA-core rate: HGX B200 and HGX B300 both list 600 TFLOPS
+    # FP32 across eight GPUs (NVIDIA HGX datasheets; Lenovo Press LP2226), and
+    # GB200/GB300 are the same silicon per GPU. Without it an fp32 router on
+    # B200 priced at A100's 19.5 TF/s and the K2.6 case's planner run carried
+    # 0.54 ms of router compute that the hardware does not impose. Unlike a
+    # missing fp8/fp4 peak this fallback is NOT flagged, so every Blackwell
+    # entry carries the figure rather than one.
+    "GB300": {"fp8": 4500e12, "fp4": 15000e12, "fp32": 75e12},
+    "B300": {"fp8": 4500e12, "fp4": 15000e12, "fp32": 75e12},
+    "GB200": {"fp8": 4500e12, "fp4": 9000e12, "fp32": 75e12},
+    "B200": {"fp8": 4500e12, "fp4": 9000e12, "fp32": 75e12},
+    # Hopper has fp8 tensor cores and no fp4 path. An fp4 checkpoint does not
+    # therefore price against fp8: vLLM runs it through Marlin, which dequantises
+    # in registers and multiplies in bf16, so ``resolve_execution`` sends it to
+    # the fp16/bf16 peak. The fp8 figure is only the ladder fallback for a SKU
+    # whose arch is unknown.
     #
     # ``fp32`` is the *vector* (non-tensor-core) rate, and it is here because
     # mixed-precision checkpoints run a genuinely fp32 op: the MoE router casts
@@ -101,6 +110,55 @@ _INTERCONNECT: dict[str, float] = {
     "A100": 600e9,  # NVLink 3
     "MI355X": 1075e9,  # xGMI / Infinity Fabric, 7 links, aggregate bidirectional
 }
+
+
+# Tensor-core generation per SKU substring, same first-match ordering as
+# ``_PEAKS``. It decides what a quantised checkpoint *executes* as, which the
+# peak tables alone cannot: Hopper has fp8 tensor cores and no fp4 or
+# microscaling path, so an NVFP4 or MXFP4 expert runs through Marlin at bf16
+# (see ``roofline.resolve_execution``); CDNA4 has MX fp4/fp8 but no NVFP4.
+_ARCH: dict[str, str] = {
+    "GB300": "blackwell",
+    "B300": "blackwell",
+    "GB200": "blackwell",
+    "B200": "blackwell",
+    "H100": "hopper",
+    "H200": "hopper",
+    "MI355X": "cdna4",
+    "A100": "ampere",
+    "L40": "ada",
+    "L4": "ada",
+    "T4": "turing",
+    "V100": "volta",
+}
+
+# HBM per GPU (bytes), for deployment fit. Vendor figures: H200 SXM 141 GB, H100
+# SXM 80 GB, HGX B200 1,440 GB / 8, HGX B300 2.3 TB / 8, GB200 NVL72 13.4 TB / 72,
+# GB300 NVL72 20.7 TB / 72, MI355X 288 GB.
+_MEMORY: dict[str, float] = {
+    "GB300": 288e9,
+    "B300": 288e9,
+    "GB200": 186e9,
+    "B200": 180e9,
+    "H100": 80e9,
+    "H200": 141e9,
+    "MI355X": 288e9,
+    "A100-SXM": 80e9,
+    "A100": 40e9,
+    "L40": 48e9,
+    "L4": 24e9,
+    "T4": 16e9,
+    "V100": 32e9,
+}
+
+
+def _first_match(table: dict[str, Any], sku: str | None, default: Any) -> Any:
+    if not sku:
+        return default
+    for key, value in table.items():
+        if key.lower() in sku.lower():
+            return value
+    return default
 
 
 def quant_peaks_for_sku(sku: str | None) -> dict[str, float]:
@@ -159,6 +217,54 @@ def _query_nvml() -> tuple[str | None, int | None]:
         return None, None
 
 
+def _query_torch() -> tuple[str | None, int | None]:
+    """(device name, count) through torch, which speaks both vendors.
+
+    The fallback for :func:`_query_nvml`, which is pynvml and therefore NVIDIA
+    only. On ROCm, ``torch.cuda`` *is* the ROCm API and reports the AMD device —
+    ``"AMD Instinct MI355X"`` — which ``peak_for_sku`` matches on substring, so
+    the peaks already in the table become reachable without a second lookup
+    path.
+
+    Without this an 8x MI355X run resolved no SKU, fell through to
+    ``HardwareSpec()`` (A100-SXM4-80GB), and priced every roofline floor against
+    the wrong silicon while reporting that it had done so.
+
+    ``device_count`` is read before ``get_device_name`` so a box with the
+    runtime but no visible device returns ``(None, 0)`` instead of raising.
+    """
+    try:
+        import torch
+
+        n = int(torch.cuda.device_count())
+        if n <= 0:
+            return None, 0
+        return str(torch.cuda.get_device_name(0)), n
+    except Exception:
+        return None, None
+
+
+def _engine_world_size(engine: Any) -> int | None:
+    """Ranks in this run, or ``None``.
+
+    Not the box's device count: ``num_gpus`` feeds ``has_collective``, which
+    gates levers declaring ``requires_collective``, and a TP=1 job on an
+    eight-GPU node has no collectives to speak of. Telling it otherwise admits
+    candidates whose whole premise is a collective that will never run — and on
+    a cluster that insists on full-node allocation, TP=1 on eight GPUs is a
+    normal thing to be doing.
+
+    Duck-typed across vLLM version drift, like every other engine read here.
+    """
+    if engine is None:
+        return None
+    # The same list of places the scheduler lookup reads, not a copy of it.
+    from gitm.tracer.vllm_stats import engine_config_value
+
+    val = engine_config_value(engine, "parallel_config", "world_size")
+    return int(val) if isinstance(val, int) and not isinstance(val, bool) and val > 0 else None
+
+
 def peak_for_sku(sku: str | None) -> HardwarePeak | None:
     """Look up dense peaks for a SKU string (substring match), else None."""
     if not sku:
@@ -198,6 +304,8 @@ def hardware_spec_for(peak: HardwarePeak | None) -> HardwareSpec:
         peak_flops_fp32_per_s=quant.get("fp32", HardwareSpec.peak_flops_fp32_per_s),
         peak_mem_bw_bytes_per_s=peak.peak_bw_bytes_s,
         interconnect_bw_bytes_per_s=interconnect_bw_for_sku(peak.name),
+        arch=_first_match(_ARCH, peak.name, ""),
+        memory_bytes=_first_match(_MEMORY, peak.name, 0.0),
     )
 
 
@@ -242,13 +350,36 @@ def build_planner_context(
 
     ``GITM_GPU_SKU`` overrides NVML (useful in CI / on a box without pynvml).
     """
-    env_sku = os.environ.get("GITM_GPU_SKU")
+    # Empty is unset. `GITM_GPU_SKU=` in a manifest or an exported-but-unset
+    # shell variable arrives as "", which is not None — so every `is None` test
+    # below would read it as an answer, skip detection, and leave the SKU to the
+    # A100 default on a box NVML could have identified.
+    env_sku = (os.environ.get("GITM_GPU_SKU") or "").strip() or None
+    # Settle the count first, from what is already in hand. What gates a
+    # collective lever is whether *this run* has collectives, not what the box
+    # holds — so an explicit count, then the engine's world size, before any
+    # device is asked anything. Deciding this up front is also what keeps the
+    # probes below from running for a value already known: with GITM_GPU_SKU
+    # set and a live engine, nothing needs to be discovered at all.
+    world = num_gpus or _engine_world_size(engine)
+
     # Only touch NVML if something it provides is actually missing.
     nvml_name = nvml_count = None
-    if env_sku is None or num_gpus is None:
+    if env_sku is None or world is None:
         nvml_name, nvml_count = _query_nvml()
-    sku = env_sku or nvml_name
-    n = num_gpus or nvml_count or 1
+
+    # NVML answers for NVIDIA alone, so ask torch where it did not — and only
+    # for something still missing. The probe is not free: `get_device_name`
+    # initialises a CUDA/HIP context, which is a side effect the planner should
+    # not have when it already knows both answers.
+    need_sku = env_sku is None and nvml_name is None
+    need_count = world is None and nvml_count is None
+    torch_name = torch_count = None
+    if need_sku or need_count:
+        torch_name, torch_count = _query_torch()
+
+    sku = env_sku or nvml_name or torch_name
+    n = world or nvml_count or torch_count or 1
     peak = peak_for_sku(sku)
     dtype = _engine_dtype(engine)
     kv_len = _engine_kv_len(engine)

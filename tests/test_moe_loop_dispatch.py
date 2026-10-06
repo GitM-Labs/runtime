@@ -74,3 +74,50 @@ def test_object_quantization_config_is_flattened_to_a_dict():
     # spec_from_hf_config expects a dict, so the boundary must normalise it.
     hf = SimpleNamespace(**{**_V4, "quantization_config": SimpleNamespace(quant_method="fp8")})
     assert _hf_config_dict(hf)["quantization_config"] == {"quant_method": "fp8"}
+
+
+# ── family dispatch shared with the registry ─────────────────────────────────
+# The loop used to test ``is_sparse_moe_config`` alone. GLM-5.2 carries
+# ``index_topk`` + ``n_routed_experts`` exactly as V4 does, so it matched and the
+# live loop priced a GLM run with the V4 graph — the collision
+# ``registry.detect_family`` orders its checks to avoid.
+
+
+def test_glm_engine_routes_to_the_glm_graph_not_the_v4_one():
+    from gitm.planner.glm_graph import GlmMoeDsaModelSpec
+    from gitm.scheduler.loop import _execution_graph_family
+    from tests.test_glm_graph import GLM_CONFIG
+
+    assert is_sparse_moe_config(GLM_CONFIG)  # the structural test *would* claim it
+    graph, family = _execution_graph_family(_engine(**GLM_CONFIG), HardwareSpec(),
+                                            BatchConfig(batch=8))
+    assert family == "glm_moe_dsa"
+    assert isinstance(graph.model, GlmMoeDsaModelSpec)
+    assert not isinstance(graph.model, SparseMoEModelSpec)
+    assert graph.total_pred_s > 0
+
+
+def test_glm_engine_with_no_scheduler_samples_still_predicts():
+    """The loop passes ``batch=None`` when nothing was sampled (CPU box, dry run)."""
+    from gitm.scheduler.loop import _execution_graph_family
+    from tests.test_glm_graph import GLM_CONFIG
+
+    graph, family = _execution_graph_family(_engine(**GLM_CONFIG), HardwareSpec(), None)
+    assert family == "glm_moe_dsa" and graph.total_pred_s > 0
+
+
+def test_hybrid_engine_routes_to_the_hybrid_graph():
+    from gitm.scheduler.loop import _execution_graph_family
+    from tests.test_moe_graph import QWEN36
+
+    graph, family = _execution_graph_family(_engine(**QWEN36), HardwareSpec(),
+                                            BatchConfig(batch=4))
+    assert family == "hybrid"
+    assert any(n.op == "linattn_recurrent" for n in graph.nodes)
+
+
+def test_v4_still_reports_the_sparse_moe_family():
+    from gitm.scheduler.loop import _execution_graph_family
+
+    _, family = _execution_graph_family(_engine(**_V4), HardwareSpec(), BatchConfig(batch=8))
+    assert family == "sparse_moe"
