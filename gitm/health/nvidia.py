@@ -6,12 +6,11 @@ import os
 
 
 def device_count() -> int:
-    """Visible CUDA devices, honouring ``CUDA_VISIBLE_DEVICES``."""
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if cvd is not None and cvd.strip():
-        parts = [p.strip() for p in cvd.split(",") if p.strip()]
-        if parts:
-            return len(parts)
+    """Usable CUDA devices for the collective probe.
+
+    Honours ``CUDA_VISIBLE_DEVICES`` only when torch can actually see CUDA —
+    an env list alone must not trigger a multi-proc NCCL spawn on a CPU box.
+    """
     try:
         import torch
 

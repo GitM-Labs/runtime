@@ -274,6 +274,11 @@ def run_torch_nccl_allreduce(
                 p.terminate()
             for p in alive:
                 p.join(timeout=5)
+            still = [p for p in procs if p.is_alive()]
+            for p in still:
+                p.kill()
+            for p in still:
+                p.join(timeout=5)
             raise TimeoutError(
                 f"collective AllReduce timed out after {timeout:.0f}s "
                 f"(world_size={world_size})"

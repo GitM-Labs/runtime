@@ -20,18 +20,25 @@ def _visible_from_env() -> int | None:
 
 
 def device_count() -> int:
-    """Visible HIP/ROCm devices."""
-    env_n = _visible_from_env()
-    if env_n is not None:
-        return env_n
+    """Usable HIP/ROCm devices for the collective probe.
+
+    Env visibility vars alone are not enough — torch must report devices, or a
+    CPU/CI box with ``HIP_VISIBLE_DEVICES=0,1`` would hard-fail the probe.
+    """
     try:
         import torch
 
         if not torch.cuda.is_available():
             return 0
-        return int(torch.cuda.device_count())
+        n = int(torch.cuda.device_count())
     except Exception:
         return 0
+    # Cap by explicit visibility masks when set (torch already applies them for
+    # count; keep env helper for SKU/docs symmetry and future non-torch paths).
+    env_n = _visible_from_env()
+    if env_n is not None:
+        return min(n, env_n)
+    return n
 
 
 def detect_sku() -> str | None:
