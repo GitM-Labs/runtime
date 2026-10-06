@@ -4,22 +4,31 @@ Standalone NCCL (NVIDIA) / RCCL (AMD) AllReduce probe that runs *before*
 ``factory(cfg)`` so a broken fabric fails fast with diagnostics. Accepts
 double-init: the workload will create its own process group later.
 
-Hard-fail: AllReduce timeout/hang or wrong reduced sum.
+Hard-fail: AllReduce timeout/hang or wrong reduced sum (whole buffer, all ranks).
 Soft-warn: busbw below 10% of the interconnect catalogue (never aborts on BW).
 
-Skip (pass) when fewer than 2 GPUs are visible or torch/CUDA/HIP is unavailable,
-so CPU CI stays green. Escape hatch: ``GITM_SKIP_COLLECTIVE_HEALTH=1``.
+The probe is scoped to the workload's participating world size (e.g. vLLM
+``tensor_parallel_size`` / ``GITM_VLLM_TP``). Workloads with ``world_size < 2``
+skip — unused GPUs on a multi-GPU box must not block a single-GPU run.
 
-GPU-live smoke (multi-GPU box)::
+Ranks are launched via ``python -m gitm.health.probe_worker`` (subprocess), not
+``multiprocessing`` spawn, so embedded ``optimize()`` callers do not re-execute
+their ``__main__`` module in every child.
 
-    python -c "from gitm.health import run_collective_health; \\
-        r = run_collective_health(); print(r.to_dict())"
+Escape hatch: ``GITM_SKIP_COLLECTIVE_HEALTH=1``.
+
+GPU-live smoke (multi-GPU box, TP>=2)::
+
+    GITM_VLLM_TP=2 python -c "from gitm.health import run_collective_health; \\
+        print(run_collective_health(world_size=2).to_dict())"
 """
 
 from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
@@ -37,6 +46,9 @@ _DEFAULT_TIMEOUT_S = 60.0
 
 _ATOL = 1e-3
 _RTOL = 1e-5
+
+# Workloads that may use NCCL/RCCL collectives when world_size >= 2.
+_COLLECTIVE_WORKLOADS = frozenset({"vllm-decode"})
 
 
 @dataclass
@@ -162,6 +174,34 @@ def write_collective_health(out_dir: Path, report: HealthReport) -> Path:
     return path
 
 
+def resolve_probe_world_size(*, workload: str, engine: Any | None = None) -> int:
+    """Participating world size for the upcoming workload's collectives.
+
+    Returns ``< 2`` when the workload has no multi-GPU collectives — the probe
+    must skip so unused GPUs on a multi-GPU host cannot block a single-GPU run.
+    """
+    if engine is not None:
+        for attr in ("tensor_parallel_size", "tp_size"):
+            v = getattr(engine, attr, None)
+            if v is not None:
+                return max(1, int(v))
+        kwargs = getattr(engine, "gitm_llm_kwargs", None) or {}
+        if isinstance(kwargs, dict) and "tensor_parallel_size" in kwargs:
+            return max(1, int(kwargs["tensor_parallel_size"]))
+
+    if workload in _COLLECTIVE_WORKLOADS or workload.startswith("vllm"):
+        tp = os.environ.get("GITM_VLLM_TP")
+        if tp is not None and str(tp).strip():
+            try:
+                return max(1, int(tp))
+            except ValueError:
+                return 1
+        return 1  # default vLLM path is TP=1
+
+    # HFT / edge / openfold / etc. do not drive NCCL/RCCL collectives here.
+    return 1
+
+
 def _timeout_s() -> float:
     raw = os.environ.get("GITM_COLLECTIVE_HEALTH_TIMEOUT_S")
     if raw is None or not raw.strip():
@@ -195,43 +235,26 @@ def _skipped_report(vendor: str, world_size: int, reason: str) -> HealthReport:
     )
 
 
-def _worker(
-    rank: int,
-    world_size: int,
-    nbytes: int,
-    init_method: str,
-    result_path: str,
-) -> None:
-    """One rank of the multi-proc AllReduce probe (spawned entry point)."""
-    import torch
-    import torch.distributed as dist
-
-    torch.cuda.set_device(rank)
-    dist.init_process_group(
-        backend="nccl",
-        init_method=init_method,
-        rank=rank,
-        world_size=world_size,
-    )
-    try:
-        n_elem = nbytes // 4
-        buf = torch.ones(n_elem, device=f"cuda:{rank}", dtype=torch.float32)
-        dist.barrier()
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        dist.all_reduce(buf, op=dist.ReduceOp.SUM)
-        torch.cuda.synchronize()
-        elapsed_s = time.perf_counter() - t0
-        if rank == 0:
-            payload = {
-                "elapsed_s": elapsed_s,
-                "observed_sum": float(buf[0].item()),
-                "expected_sum": expected_allreduce_sum(world_size),
-                "nbytes": nbytes,
-            }
-            Path(result_path).write_text(json.dumps(payload))
-    finally:
-        dist.destroy_process_group()
+def _stop_procs(procs: list[subprocess.Popen[Any]]) -> None:
+    """Terminate then kill any still-alive children."""
+    alive = [p for p in procs if p.poll() is None]
+    for p in alive:
+        p.terminate()
+    deadline = time.monotonic() + 5.0
+    for p in alive:
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            p.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            pass
+    still = [p for p in procs if p.poll() is None]
+    for p in still:
+        p.kill()
+    for p in still:
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def run_torch_nccl_allreduce(
@@ -240,12 +263,11 @@ def run_torch_nccl_allreduce(
     nbytes: int = _DEFAULT_NBYTES,
     timeout_s: float | None = None,
 ) -> dict[str, Any]:
-    """Spawn ``world_size`` ranks, AllReduce ones, return metrics from rank 0.
+    """Launch ``world_size`` probe_worker subprocesses; return rank-0 metrics.
 
-    Raises ``TimeoutError`` / ``RuntimeError`` on failure.
+    Uses ``python -m gitm.health.probe_worker`` so the caller's ``__main__`` is
+    never re-imported. Raises ``TimeoutError`` / ``RuntimeError`` on failure.
     """
-    import torch.multiprocessing as mp
-
     if world_size < 2:
         raise ValueError("world_size must be >= 2 for collective probe")
 
@@ -254,42 +276,63 @@ def run_torch_nccl_allreduce(
         init_file = os.path.join(tmp, "pg")
         result_path = os.path.join(tmp, "result.json")
         init_method = f"file://{init_file}"
-        ctx = mp.get_context("spawn")
-        procs = [
-            ctx.Process(
-                target=_worker,
-                args=(rank, world_size, nbytes, init_method, result_path),
-            )
-            for rank in range(world_size)
-        ]
-        for p in procs:
-            p.start()
-        deadline = time.monotonic() + timeout
-        for p in procs:
-            remaining = max(0.1, deadline - time.monotonic())
-            p.join(timeout=remaining)
-        alive = [p for p in procs if p.is_alive()]
-        if alive:
-            for p in alive:
-                p.terminate()
-            for p in alive:
-                p.join(timeout=5)
-            still = [p for p in procs if p.is_alive()]
-            for p in still:
-                p.kill()
-            for p in still:
-                p.join(timeout=5)
-            raise TimeoutError(
-                f"collective AllReduce timed out after {timeout:.0f}s "
-                f"(world_size={world_size})"
-            )
-        bad = [p for p in procs if p.exitcode not in (0, None)]
-        if bad:
-            codes = {p.pid: p.exitcode for p in bad}
-            raise RuntimeError(f"collective AllReduce worker(s) failed: {codes}")
-        if not Path(result_path).is_file():
-            raise RuntimeError("collective AllReduce produced no result from rank 0")
-        return json.loads(Path(result_path).read_text())
+        procs: list[subprocess.Popen[Any]] = []
+        try:
+            for rank in range(world_size):
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "gitm.health.probe_worker",
+                    "--rank",
+                    str(rank),
+                    "--world-size",
+                    str(world_size),
+                    "--nbytes",
+                    str(nbytes),
+                    "--init-method",
+                    init_method,
+                    "--result-path",
+                    result_path,
+                    "--atol",
+                    str(_ATOL),
+                    "--rtol",
+                    str(_RTOL),
+                ]
+                procs.append(
+                    subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                )
+            deadline = time.monotonic() + timeout
+            for p in procs:
+                remaining = max(0.1, deadline - time.monotonic())
+                try:
+                    p.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    pass
+            if any(p.poll() is None for p in procs):
+                _stop_procs(procs)
+                raise TimeoutError(
+                    f"collective AllReduce timed out after {timeout:.0f}s "
+                    f"(world_size={world_size})"
+                )
+            bad = [p for p in procs if p.returncode not in (0,)]
+            if bad:
+                snippets = []
+                for p in bad:
+                    err = (p.stderr.read() if p.stderr else "") or ""
+                    snippets.append(f"pid={p.pid} rc={p.returncode}: {err.strip()[:200]}")
+                raise RuntimeError(
+                    "collective AllReduce worker(s) failed: " + "; ".join(snippets)
+                )
+            if not Path(result_path).is_file():
+                raise RuntimeError("collective AllReduce produced no result from rank 0")
+            return json.loads(Path(result_path).read_text())
+        finally:
+            _stop_procs(procs)
 
 
 def _build_probed_report(
@@ -303,19 +346,29 @@ def _build_probed_report(
 
     expected = float(metrics["expected_sum"])
     observed = float(metrics["observed_sum"])
+    observed_min = float(metrics.get("observed_min", observed))
+    observed_max = float(metrics.get("observed_max", observed))
+    all_ranks_ok = bool(metrics.get("all_ranks_ok", True))
     nbytes = int(metrics["nbytes"])
     elapsed_s = float(metrics["elapsed_s"])
     algbw, busbw = algbw_busbw_gbs(nbytes, elapsed_s, world_size)
     catalogue = interconnect_bw_for_sku(sku)
 
     checks: list[Check] = []
-    if numerical_ok(observed, expected):
+    values_ok = (
+        all_ranks_ok
+        and numerical_ok(observed, expected)
+        and numerical_ok(observed_min, expected)
+        and numerical_ok(observed_max, expected)
+    )
+    if values_ok:
         checks.append(
             Check(
                 "collective_allreduce",
                 "pass",
-                f"AllReduce ok: observed={observed:.6g} expected={expected:.6g} "
-                f"in {elapsed_s * 1000:.2f} ms",
+                f"AllReduce ok: observed={observed:.6g} "
+                f"(min={observed_min:.6g} max={observed_max:.6g}) "
+                f"expected={expected:.6g} in {elapsed_s * 1000:.2f} ms",
             )
         )
     else:
@@ -324,7 +377,8 @@ def _build_probed_report(
                 "collective_allreduce",
                 "fail",
                 f"AllReduce numerical mismatch: observed={observed:.6g} "
-                f"expected={expected:.6g}",
+                f"(min={observed_min:.6g} max={observed_max:.6g}) "
+                f"expected={expected:.6g} all_ranks_ok={all_ranks_ok}",
             )
         )
     checks.append(soft_bw_check(busbw, catalogue))
@@ -350,12 +404,22 @@ def run_collective_health(
     *,
     timeout_s: float | None = None,
     skip: bool = False,
+    world_size: int | None = None,
 ) -> HealthReport:
-    """Dispatch vendor probe; return a report (never raises for soft skips)."""
+    """Dispatch vendor probe for ``world_size`` participating ranks.
+
+    ``world_size`` should be the workload's collective size (e.g. TP). When
+    omitted, falls back to all visible devices (legacy); callers should pass
+    :func:`resolve_probe_world_size` instead.
+    """
     if skip or _env_skip():
         from gitm.tracer.injection import detect_vendor
 
-        return _skipped_report(detect_vendor(), 0, "GITM_SKIP_COLLECTIVE_HEALTH or skip=True")
+        return _skipped_report(
+            detect_vendor(),
+            world_size or 0,
+            "GITM_SKIP_COLLECTIVE_HEALTH or skip=True",
+        )
 
     from gitm.tracer.injection import detect_vendor
 
@@ -365,9 +429,31 @@ def run_collective_health(
     else:
         import gitm.health.nvidia as backend
 
-    world_size = backend.device_count()
+    available = backend.device_count()
+    if world_size is None:
+        world_size = available
+    world_size = int(world_size)
+
     if world_size < 2:
-        return _skipped_report(vendor, world_size, "need >=2 GPUs for collective probe")
+        return _skipped_report(
+            vendor,
+            world_size,
+            "workload has no multi-GPU collectives",
+        )
+    if available < world_size:
+        return HealthReport(
+            vendor=vendor,
+            world_size=world_size,
+            sku=backend.detect_sku(),
+            checks=[
+                Check(
+                    "collective_allreduce",
+                    "fail",
+                    f"need {world_size} GPUs for workload collectives, "
+                    f"only {available} visible",
+                )
+            ],
+        )
 
     sku = backend.detect_sku()
     try:

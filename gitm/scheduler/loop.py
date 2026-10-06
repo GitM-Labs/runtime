@@ -793,11 +793,19 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
 
     # Pre-loop collective readiness (NCCL / RCCL AllReduce). Standalone probe —
     # accepts double-init when the workload later creates its own process group.
-    # Hard-fail on hang/wrong sum; soft-warn on low busbw. Skips cleanly on
-    # <2 GPUs / no torch so CPU CI stays green. See gitm.health.collective.
-    from gitm.health import run_collective_health, write_collective_health
+    # Scoped to the workload's participating world size (e.g. TP) so unused GPUs
+    # on a multi-GPU host cannot block a single-GPU run. Hard-fail on hang/wrong
+    # sum; soft-warn on low busbw. See gitm.health.collective.
+    from gitm.health import (
+        resolve_probe_world_size,
+        run_collective_health,
+        write_collective_health,
+    )
 
-    health = run_collective_health(skip=cfg.skip_collective_health)
+    probe_ws = resolve_probe_world_size(workload=workload, engine=cfg.engine)
+    health = run_collective_health(
+        skip=cfg.skip_collective_health, world_size=probe_ws
+    )
     write_collective_health(run_dir, health)
     if not health.ok:
         diagnostic = (
