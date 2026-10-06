@@ -503,6 +503,86 @@ def test_run_loop_vetoes_library_lever_with_unmet_prerequisite(tmp_path, monkeyp
     # enable_dbo is its own prerequisite flag, so it is not vetoed for lacking itself.
     assert "enable_dbo (prerequisite" not in report
 
+
+class _ParallelCfg:
+    def __init__(self, *, enable_expert_parallel: bool, enable_eplb: bool):
+        self.enable_expert_parallel = enable_expert_parallel
+        self.enable_eplb = enable_eplb
+
+
+class _ExpertParallelEngine(_FullEngine):
+    """_FullEngine whose MoE flags only a restart can change. Each flag on adds
+    throughput, so the A/B keeps whichever lever turns one on."""
+
+    def __init__(self, *, enable_expert_parallel: bool = False, enable_eplb: bool = False):
+        super().__init__()
+        self.parallel_config = _ParallelCfg(
+            enable_expert_parallel=enable_expert_parallel, enable_eplb=enable_eplb)
+        self.gitm_throughput_fn = lambda e: (
+            64.0 + 8.0 * e.parallel_config.enable_expert_parallel
+            + 4.0 * e.parallel_config.enable_eplb)
+
+    def _restart(self, old_engine, knob_values):
+        pc = old_engine.parallel_config
+        return _ExpertParallelEngine(
+            enable_expert_parallel=bool(
+                knob_values.get("enable_expert_parallel", pc.enable_expert_parallel)),
+            enable_eplb=bool(knob_values.get("enable_eplb", pc.enable_eplb)))
+
+
+def test_run_loop_prerequisite_reads_the_engine_a_kept_restart_left(tmp_path, monkeypatch):
+    """cfg.engine has expert parallel off. The first lever turns it on through a
+    restart that is kept, so enable_eplb's prerequisite holds only on the engine
+    the applicator now holds. A check that read cfg.engine would veto it."""
+    from contextlib import contextmanager
+
+    import gitm.scheduler.loop as loop
+    from gitm.kernels.spec import Applicability, SafetyGate
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .conftest import make_kernel, make_trace
+
+    def lever(name, knob, mean):
+        return InterventionSpec(
+            name=name, summary=f"set {knob}", knob=knob, value=True,
+            expected_delta_mean=mean, expected_delta_lo=0.0, expected_delta_hi=0.2,
+            source="test", applies_to_kernels=["paged_attention"],
+            applicability=Applicability(workloads=["vllm-decode"]),
+            safety=SafetyGate(tier="moderate"))
+
+    ep = lever("ep_on", "enable_expert_parallel", 0.08)
+    eplb = lever("eplb_on", "enable_eplb", 0.04)
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [make_kernel(f"paged_attention_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 80)
+                   for i in range(80)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    applied: list[str] = []
+    real_apply = loop.apply_intervention
+
+    def recording_apply(spec, *a, **kw):
+        applied.append(spec.name)
+        return real_apply(spec, *a, **kw)
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "load_library", lambda workload=None: [ep, eplb])
+    monkeypatch.setattr(loop, "apply_intervention", recording_apply)
+
+    engine = _ExpertParallelEngine()
+    out = run_loop(LoopConfig(engine=engine, workload="vllm-decode", budget="24h",
+                              scratch=str(tmp_path)))
+
+    report = out["report_md"]
+    assert applied == ["ep_on", "eplb_on"]
+    assert "eplb_on (prerequisite" not in report
+    # The restart behind ep_on was kept, and cfg.engine itself never changed.
+    assert report.count("via restart") >= 1
+    assert engine.parallel_config.enable_expert_parallel is False
+
+
 def test_report_kernel_time_residual_uses_weighted_total_and_clamps():
     from gitm.optimizer.monitor import KernelResidual, Residuals
     from gitm.scheduler.loop import _agg_kt_residual
