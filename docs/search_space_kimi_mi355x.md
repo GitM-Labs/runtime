@@ -102,8 +102,15 @@ Source: artifact `funnel`. Joint configs are feasible ones: the product over kno
 (the `joint_configs` function in the script).
 
 > **PROVISIONAL — ranking stage.** The "after ranking" row (5 ranked candidates) is
-> based on the predicted-graph stand-in, not a measured trace. The rejection stages
-> above it do not depend on the trace.
+> based on the predicted-graph stand-in, not a measured trace.
+>
+> **PROVISIONAL — safety stage.** The "after applicability + safety" row (25
+> survivors) also depends on the trace: the safety half uses the `Policy` built from
+> `qualify(trace)`, and `qualify()` commits here only on the stand-in. Under the
+> other qualification outcome, 22 survivors remain (see
+> [Rejection, ranking and dedup](#rejection-ranking-and-dedup)). Only validity,
+> prerequisites, hardware, mutual dependency, deployment, and applicability on its
+> own are independent of the trace.
 
 | Stage | Candidates | Knobs | Bits | Joint configs (feasible / unconstrained) |
 |---|---:|---:|---:|---|
@@ -113,7 +120,7 @@ Source: artifact `funnel`. Joint configs are feasible ones: the product over kno
 | after hardware | 27 | 19 | 23 | 8,388,608 |
 | after mutual dependency | 27 | 19 | 23 | 8,388,608 |
 | after deployment | 27 | 19 | 23 | 8,388,608 |
-| after applicability + safety | 25 | 17 | 21 | 2,097,152 |
+| after applicability + safety **(PROVISIONAL: safety depends on `qualify()`)** | 25 | 17 | 21 | 2,097,152 |
 | after ranking **(PROVISIONAL: predicted-graph stand-in)** | 5 | 4 | 5 | 24 |
 
 What each stage removes:
@@ -175,6 +182,18 @@ substring rule matches the flag against itself (artifact
 
 These are three separate numbers drawn from different pools. They are **not
 additive**.
+
+> **PROVISIONAL — rejection totals.** The 11 rejected and 25 survivors include the
+> safety check, which uses the `Policy` built from `qualify(trace)`. On the stand-in
+> `qualify()` commits, giving `Policy(require_qualification_commit=True,
+> skip_high_risk=False)`. If it does not commit on a measured trace, the policy is
+> `Policy(require_qualification_commit=False, skip_high_risk=True)`. Three more
+> candidates are then rejected: `speculative_decode_ngram_5`, `quantization_awq` and
+> `distributed_executor_ray`, all `high_risk` with `requires_qualification_commit:
+> true`. That gives **22 survivors and 14 rejected**
+> (`sensitivity.other_qualification_value.gate_rejected_after_deployment_stage`).
+> Only validity, prerequisites, hardware, mutual dependency, deployment, and
+> applicability on its own are independent of the trace; safety is not.
 
 - **Rejected before ranking: 11** of the 36 raw candidates (36 − 25).
 - **Cut by ranking: 20** of the 25 gate survivors (25 − 5).
