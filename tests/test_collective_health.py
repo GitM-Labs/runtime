@@ -14,6 +14,7 @@ from gitm.health.collective import (
     algbw_busbw_gbs,
     expected_allreduce_sum,
     numerical_ok,
+    resolve_local_probe_world_size,
     resolve_probe_world_size,
     run_collective_health,
     run_torch_nccl_allreduce,
@@ -161,16 +162,66 @@ def test_run_collective_health_skips_when_workload_tp1(monkeypatch):
     assert "no multi-GPU collectives" in report.checks[0].detail
 
 
-def test_run_collective_health_fail_insufficient_gpus(monkeypatch):
+def test_resolve_local_probe_world_size_caps_to_visible():
+    assert resolve_local_probe_world_size(8, 4) == 4
+    assert resolve_local_probe_world_size(2, 8) == 2
+    assert resolve_local_probe_world_size(8, 1) == 1
+
+
+def test_resolve_local_probe_world_size_honours_local_env(monkeypatch):
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    assert resolve_local_probe_world_size(8, 4) == 2
+
+
+def test_multi_node_global_ws_probes_local_gpus_only(monkeypatch):
+    """world_size=8 on a 4-GPU node must probe 4 locally — not fail as missing remotes."""
+    monkeypatch.delenv("GITM_SKIP_COLLECTIVE_HEALTH", raising=False)
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising=False)
+    monkeypatch.delenv("GITM_LOCAL_WORLD_SIZE", raising=False)
+    monkeypatch.setattr("gitm.tracer.injection.detect_vendor", lambda: "nvidia")
+    import gitm.health.nvidia as nvidia_mod
+
+    monkeypatch.setattr(nvidia_mod, "device_count", lambda: 4)
+    monkeypatch.setattr(nvidia_mod, "detect_sku", lambda: "H100")
+
+    seen: dict = {}
+
+    def _fake_allreduce(ws, **_k):
+        seen["world_size"] = ws
+        return {
+            "elapsed_s": 0.01,
+            "observed_sum": float(ws),
+            "observed_min": float(ws),
+            "observed_max": float(ws),
+            "expected_sum": float(ws),
+            "all_ranks_ok": True,
+            "nbytes": 4 * 1024 * 1024,
+        }
+
+    monkeypatch.setattr(
+        "gitm.health.collective.run_torch_nccl_allreduce", _fake_allreduce
+    )
+    report = run_collective_health(world_size=8)
+    assert report.ok
+    assert not report.skipped
+    assert seen["world_size"] == 4
+    assert report.world_size == 4
+    assert report.global_world_size == 8
+    assert "local_probe=4" in report.checks[0].detail
+    assert "global_world_size=8" in report.checks[0].detail
+
+
+def test_multi_node_single_local_gpu_skips_not_fails(monkeypatch):
     monkeypatch.delenv("GITM_SKIP_COLLECTIVE_HEALTH", raising=False)
     monkeypatch.setattr("gitm.tracer.injection.detect_vendor", lambda: "nvidia")
     import gitm.health.nvidia as nvidia_mod
 
-    monkeypatch.setattr(nvidia_mod, "device_count", lambda: 2)
+    monkeypatch.setattr(nvidia_mod, "device_count", lambda: 1)
     monkeypatch.setattr(nvidia_mod, "detect_sku", lambda: "H100")
-    report = run_collective_health(world_size=4)
-    assert not report.ok
-    assert "only 2 visible" in report.diagnostic()
+    report = run_collective_health(world_size=8)
+    assert report.ok and report.skipped
+    assert report.global_world_size == 8
+    assert "local GPU" in report.checks[0].detail
 
 
 def test_run_collective_health_fail_on_timeout(monkeypatch):

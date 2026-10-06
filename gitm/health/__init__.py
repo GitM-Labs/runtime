@@ -3,6 +3,7 @@
 from gitm.health.collective import (
     Check,
     HealthReport,
+    resolve_local_probe_world_size,
     resolve_probe_world_size,
     run_collective_health,
     write_collective_health,
@@ -11,6 +12,7 @@ from gitm.health.collective import (
 __all__ = [
     "Check",
     "HealthReport",
+    "resolve_local_probe_world_size",
     "resolve_probe_world_size",
     "run_collective_health",
     "write_collective_health",

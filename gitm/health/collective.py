@@ -7,9 +7,11 @@ double-init: the workload will create its own process group later.
 Hard-fail: AllReduce timeout/hang or wrong reduced sum (whole buffer, all ranks).
 Soft-warn: busbw below 10% of the interconnect catalogue (never aborts on BW).
 
-The probe is scoped to the workload's participating world size: live engine
-``parallel_config`` via ``engine_config_value``, else the factory's final TP
-(``GITM_VLLM_TP`` then ``GITM_VLLM_EXTRA_JSON``). ``world_size < 2`` skips —
+Global collective size comes from the live engine ``parallel_config`` (via
+``engine_config_value``) or the factory's final TP (``GITM_VLLM_TP`` then
+``GITM_VLLM_EXTRA_JSON``). The probe itself only launches workers for *local*
+visible GPUs (``min(global, local)``), so multi-node ``world_size=8`` on a
+4-GPU node does not fail as “missing” remote ranks. Global ``< 2`` skips —
 unused GPUs on a multi-GPU box must not block a single-GPU run.
 
 Ranks are launched via ``python -m gitm.health.probe_worker`` (subprocess), not
@@ -67,7 +69,8 @@ class HealthReport:
 
     vendor: str
     checks: list[Check] = field(default_factory=list)
-    world_size: int = 0
+    world_size: int = 0  # local ranks actually probed (or intended skip size)
+    global_world_size: int | None = None  # workload-wide size when multi-node
     dtype: str | None = None
     nbytes: int | None = None
     elapsed_ms: float | None = None
@@ -96,6 +99,7 @@ class HealthReport:
             "ok": self.ok,
             "skipped": self.skipped,
             "world_size": self.world_size,
+            "global_world_size": self.global_world_size,
             "dtype": self.dtype,
             "nbytes": self.nbytes,
             "elapsed_ms": self.elapsed_ms,
@@ -209,10 +213,15 @@ def _factory_vllm_tensor_parallel_size() -> int | None:
 
 
 def resolve_probe_world_size(*, workload: str, engine: Any | None = None) -> int:
-    """Participating world size for the upcoming workload's collectives.
+    """Global participating world size for the upcoming workload's collectives.
 
-    Returns ``< 2`` when the workload has no multi-GPU collectives — the probe
-    must skip so unused GPUs on a multi-GPU host cannot block a single-GPU run.
+    This is the workload-wide size (may span nodes). Returns ``< 2`` when there
+    are no multi-GPU collectives — the probe must skip so unused GPUs on a
+    multi-GPU host cannot block a single-GPU run.
+
+    The *local* probe size is derived separately via
+    :func:`resolve_local_probe_world_size` so remote ranks are never treated as
+    missing local GPUs.
 
     Resolution (first hit wins), aligned with planner/factory:
 
@@ -252,6 +261,27 @@ def resolve_probe_world_size(*, workload: str, engine: Any | None = None) -> int
     return 1
 
 
+def resolve_local_probe_world_size(global_world_size: int, available: int) -> int:
+    """How many local ranks the AllReduce probe should launch.
+
+    Caps the global collective size to GPUs visible on this node. Optional
+    ``LOCAL_WORLD_SIZE`` / ``GITM_LOCAL_WORLD_SIZE`` (torchrun-style) further
+    constrains the local group when set.
+    """
+    if global_world_size < 1 or available < 1:
+        return 0
+    local = min(int(global_world_size), int(available))
+    for key in ("GITM_LOCAL_WORLD_SIZE", "LOCAL_WORLD_SIZE"):
+        raw = os.environ.get(key)
+        if raw is None or not str(raw).strip():
+            continue
+        n = _positive_int(raw)
+        if n is not None:
+            local = min(local, n)
+            break
+    return max(0, local)
+
+
 def _timeout_s() -> float:
     raw = os.environ.get("GITM_COLLECTIVE_HEALTH_TIMEOUT_S")
     if raw is None or not raw.strip():
@@ -270,10 +300,17 @@ def _env_skip() -> bool:
     )
 
 
-def _skipped_report(vendor: str, world_size: int, reason: str) -> HealthReport:
+def _skipped_report(
+    vendor: str,
+    world_size: int,
+    reason: str,
+    *,
+    global_world_size: int | None = None,
+) -> HealthReport:
     return HealthReport(
         vendor=vendor,
         world_size=world_size,
+        global_world_size=global_world_size,
         skipped=True,
         checks=[
             Check(
@@ -391,6 +428,7 @@ def _build_probed_report(
     world_size: int,
     sku: str | None,
     metrics: dict[str, Any],
+    global_world_size: int | None = None,
 ) -> HealthReport:
     from gitm.planner.context import interconnect_bw_for_sku
 
@@ -403,6 +441,10 @@ def _build_probed_report(
     elapsed_s = float(metrics["elapsed_s"])
     algbw, busbw = algbw_busbw_gbs(nbytes, elapsed_s, world_size)
     catalogue = interconnect_bw_for_sku(sku)
+
+    scope = ""
+    if global_world_size is not None and global_world_size != world_size:
+        scope = f" local_probe={world_size} global_world_size={global_world_size}"
 
     checks: list[Check] = []
     values_ok = (
@@ -418,7 +460,7 @@ def _build_probed_report(
                 "pass",
                 f"AllReduce ok: observed={observed:.6g} "
                 f"(min={observed_min:.6g} max={observed_max:.6g}) "
-                f"expected={expected:.6g} in {elapsed_s * 1000:.2f} ms",
+                f"expected={expected:.6g} in {elapsed_s * 1000:.2f} ms{scope}",
             )
         )
     else:
@@ -428,7 +470,7 @@ def _build_probed_report(
                 "fail",
                 f"AllReduce numerical mismatch: observed={observed:.6g} "
                 f"(min={observed_min:.6g} max={observed_max:.6g}) "
-                f"expected={expected:.6g} all_ranks_ok={all_ranks_ok}",
+                f"expected={expected:.6g} all_ranks_ok={all_ranks_ok}{scope}",
             )
         )
     checks.append(soft_bw_check(busbw, catalogue))
@@ -437,6 +479,7 @@ def _build_probed_report(
         vendor=vendor,
         checks=checks,
         world_size=world_size,
+        global_world_size=global_world_size,
         dtype="float32",
         nbytes=nbytes,
         elapsed_ms=elapsed_s * 1000.0,
@@ -456,11 +499,11 @@ def run_collective_health(
     skip: bool = False,
     world_size: int | None = None,
 ) -> HealthReport:
-    """Dispatch vendor probe for ``world_size`` participating ranks.
+    """Dispatch a *local* AllReduce probe for the workload's collectives.
 
-    ``world_size`` should be the workload's collective size (e.g. TP). When
-    omitted, falls back to all visible devices (legacy); callers should pass
-    :func:`resolve_probe_world_size` instead.
+    ``world_size`` is the workload-global collective size (may span nodes).
+    Only locally visible GPUs are probed — remote ranks are never treated as
+    missing devices. Callers should pass :func:`resolve_probe_world_size`.
     """
     if skip or _env_skip():
         from gitm.tracer.injection import detect_vendor
@@ -469,6 +512,7 @@ def run_collective_health(
             detect_vendor(),
             world_size or 0,
             "GITM_SKIP_COLLECTIVE_HEALTH or skip=True",
+            global_world_size=world_size,
         )
 
     from gitm.tracer.injection import detect_vendor
@@ -482,45 +526,44 @@ def run_collective_health(
     available = backend.device_count()
     if world_size is None:
         world_size = available
-    world_size = int(world_size)
+    global_ws = int(world_size)
 
-    if world_size < 2:
+    if global_ws < 2:
         return _skipped_report(
             vendor,
-            world_size,
+            global_ws,
             "workload has no multi-GPU collectives",
+            global_world_size=global_ws,
         )
-    if available < world_size:
-        return HealthReport(
-            vendor=vendor,
-            world_size=world_size,
-            sku=backend.detect_sku(),
-            checks=[
-                Check(
-                    "collective_allreduce",
-                    "fail",
-                    f"need {world_size} GPUs for workload collectives, "
-                    f"only {available} visible",
-                )
-            ],
+
+    local_ws = resolve_local_probe_world_size(global_ws, available)
+    if local_ws < 2:
+        return _skipped_report(
+            vendor,
+            local_ws,
+            f"global_world_size={global_ws} but only {available} local GPU(s); "
+            "local collective probe needs >=2",
+            global_world_size=global_ws,
         )
 
     sku = backend.detect_sku()
     try:
         metrics = run_torch_nccl_allreduce(
-            world_size, timeout_s=timeout_s if timeout_s is not None else _timeout_s()
+            local_ws, timeout_s=timeout_s if timeout_s is not None else _timeout_s()
         )
     except TimeoutError as exc:
         return HealthReport(
             vendor=vendor,
-            world_size=world_size,
+            world_size=local_ws,
+            global_world_size=global_ws,
             sku=sku,
             checks=[Check("collective_allreduce", "fail", str(exc))],
         )
     except Exception as exc:
         return HealthReport(
             vendor=vendor,
-            world_size=world_size,
+            world_size=local_ws,
+            global_world_size=global_ws,
             sku=sku,
             checks=[
                 Check(
@@ -531,5 +574,9 @@ def run_collective_health(
             ],
         )
     return _build_probed_report(
-        vendor=vendor, world_size=world_size, sku=sku, metrics=metrics
+        vendor=vendor,
+        world_size=local_ws,
+        sku=sku,
+        metrics=metrics,
+        global_world_size=global_ws,
     )
