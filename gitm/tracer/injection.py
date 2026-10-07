@@ -47,8 +47,7 @@ ENV_NVTX = "GITM_TRACE_NVTX"
 ENV_NVTX_INJECT = "NVTX_INJECTION64_PATH"
 ENV_SETTLE = "GITM_TRACE_SETTLE_S"
 
-#: Record kinds consumed by correlation rather than decoded as events, and
-#: exempt from the capture window (see read_shards).
+#: Consumed by correlation, not decoded as events, and never windowed.
 CORRELATION_KINDS = ("marker", "runtime", "graph_node", "graph_exec")
 
 LIB_NAME = "libgitm_inject.so"
@@ -148,15 +147,9 @@ def libcupti_path() -> Path | None:
 
 
 def detect_vendor() -> str:
-    """``"amd"`` or ``"nvidia"`` for this host — see :mod:`gitm.tracer.vendor`.
-
-    ``GITM_VENDOR`` overrides. Otherwise the strongest evidence tier decides
-    (a loaded compute driver beats a PCI id beats a torch build). NVIDIA stays
-    the default when there is no evidence, so a CPU-only dev box renders the
-    same env it always has; a *conflict* (both vendors' drivers loaded) keeps
-    that default too but says so, because the env it renders loads one
-    vendor's collector and the other vendor's devices go untraced.
-    """
+    """``"amd"`` or ``"nvidia"`` (:mod:`gitm.tracer.vendor`); ``GITM_VENDOR``
+    overrides. No evidence or a conflict keeps the NVIDIA default — the latter
+    with a warning."""
     from gitm.tracer import vendor as _vendor
 
     override = _vendor.env_vendor_override()
@@ -393,15 +386,11 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
             # They must NOT be windowed. A range that opens before the window
             # still encloses launches inside it, and pairing needs both halves;
             # dropping either end silently un-attributes everything it covered.
-            #
-            # Graph structure (graph_node, graph_exec) is the extreme case: it
-            # is written while the engine captures its graphs at startup, long
-            # before any window opens, and is the only thing that names a
-            # replayed kernel. Windowing it would leave every replay anonymous.
+            # Graph structure is written at engine start, before any window.
             if rec.get("kind") in CORRELATION_KINDS:
                 records.append(rec)
                 continue
-            # In-band reports from the ROCm collector. Not events — surface them.
+            # In-band reports from the ROCm collector.
             if rec.get("kind") == "meta":
                 drops = rec.get("dropped_records")
                 if isinstance(drops, int):
@@ -439,9 +428,6 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
             stacklevel=2,
         )
     if len(collectors) > 1:
-        # Two collectors in one shard set is two runs in one directory: a
-        # stale shard from another box or build, merged as if it were this
-        # capture. Its kernels would be priced against this run's graph.
         warnings.warn(
             f"injected trace shards come from more than one collector "
             f"({sorted(collectors)}); stale shards from another run are mixed in",

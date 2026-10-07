@@ -1,10 +1,4 @@
-"""Which vendor a host and a trace belong to — evidence, tiers, conflicts.
-
-Every probe here reads a fake filesystem tree or a stub module, so the tests
-pin the decision rule itself: the strongest evidence tier decides, a split
-inside it is reported rather than resolved, and a CPU-only box keeps the
-NVIDIA default it always had.
-"""
+"""Vendor evidence: the strongest tier decides, a split inside it is a conflict."""
 
 from __future__ import annotations
 
@@ -66,8 +60,7 @@ def test_the_nvidia_kernel_driver_is_nvidia_driver_evidence(tmp_path):
 
 
 def test_an_apu_beside_an_nvidia_card_is_decided_by_the_driver_tier(tmp_path):
-    """The workstation case: both vendors on the PCI bus. Only one compute
-    driver is loaded, and that — not the bus — says what a run can trace."""
+    """The workstation case: both vendors on the PCI bus."""
     root = _tree(tmp_path, nvidia_driver=True,
                  pci=[("0x1002", "0x030000"), ("0x10de", "0x030000")])
     c = V.classify_host(root=root, modules=NO_MODULES)
@@ -95,8 +88,6 @@ def test_mi_series_accelerators_count_under_either_gpu_class(tmp_path):
 
 
 def test_a_torch_build_is_only_software_evidence(tmp_path):
-    """A ROCm container on an NVIDIA host carries torch.version.hip with no AMD
-    device behind it; the driver tier must outrank it."""
     torch = types.SimpleNamespace(version=types.SimpleNamespace(hip="7.2.53211", cuda=None))
     alone = V.classify_host(root=_tree(tmp_path / "a"), modules={"torch": torch})
     assert alone.vendor == "amd" and alone.decided_by == "software"
@@ -179,8 +170,6 @@ def test_rccl_keeps_ncclDevKernel_so_it_is_no_evidence_either_way():
 
 
 def test_a_mixed_dialect_trace_is_not_an_answer():
-    """Stale shards from another run, merged into this one: 3 vs 2 is not a
-    majority worth trusting."""
     recs = ([{"kind": "kernel", "name": "Cijk_A"}] * 3
             + [{"kind": "kernel", "name": "nvjet_sm90_x"}] * 2)
     assert V.classify_trace(recs).vendor is None

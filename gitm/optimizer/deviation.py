@@ -100,10 +100,7 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
     # needle below claims it as an expert GEMM, which puts routing cost — cheap,
     # and bound by something else entirely — inside the entry whose weight
     # traffic dominates the step.
-    # AMD: AITER's router is `topksoftmax_*` (no underscore — it misses the
-    # CUDA needle and fell to the coarse sampling bucket) and its fused top-k
-    # entry point `moeTopK`, which the bare "moe" needle below would file as an
-    # expert GEMM.
+    # AMD: AITER's `topksoftmax_*` and `moeTopK`.
     "moe_router": ("moe_align", "topk_softmax", "topksoftmax", "moetopk", "grouped_topk",
                    "topkgating", "gating", "router",
                    "routing", "sinkhorn", "expert_bias"),
@@ -117,9 +114,7 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
     # dispatch.
     "moe_combine": ("moe_sum", "finalize_moe", "unpermute", "scatter_add",
                     "index_add", "moe_combine"),
-    # AMD sorts tokens into expert-major order with AITER's `*_moe_sort_kernel`
-    # and CK's `MoeSortingKernel`; both contain "moe" and were charged to the
-    # expert GEMM.
+    # AMD: AITER's `*_moe_sort_kernel`, CK's `MoeSortingKernel`.
     "moe_permute": ("permute", "expert_sort", "shuffle_rows", "gather_rows", "moe_sort",
                     "moesorting"),
     "moe_routed": ("moe", "expert", "grouped_gemm", "group_gemm", "groupedgemm"),
@@ -134,13 +129,8 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
     # H200, FLASHINFER on the B200 in the same vLLM build), so a rule set that
     # covers only one of them silently loses the whole attention path on the
     # other machine.
-    # AMD attention carries none of the CUDA needles: AITER's MLA decode asm
-    # kernels (`mla_dec_stage1_*`, `mla_a16w16_*`, `mla_a8w8_*`) and paged
-    # attention (`PA_A16W8_*`, `pa_bf16_*`) — kernel tables in AITER's
-    # hsa/gfx950/{mla,pa}/*.csv. On Kimi K2.5 / MI355X, an MLA model, every
-    # attention kernel went unmodeled without them. vLLM's Triton decode
-    # attention (`_fwd_grouped_kernel_stage1`, `_fwd_kernel_stage2`) runs on
-    # both vendors and was missing too.
+    # AMD: AITER MLA decode and paged-attention asm kernels (hsa/gfx950/{mla,pa});
+    # both vendors: vLLM's Triton decode attention (`_fwd_*kernel_stage*`).
     "attn_score_value": ("mla_dec", "mla_a16", "mla_a8", "mla_reduce", "mla_stage",
                          "pa_a16w", "pa_a8w", "pa_bf16", "pa_fp8", "pa_decode",
                          "_fwd_grouped_kernel_stage", "_fwd_kernel_stage",
@@ -196,10 +186,8 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
 }
 
 
-#: Needles tested before :data:`_OP_RULES`: kernels whose op is defined after
-#: the MoE block but whose names carry its bare "moe" needle. AITER quantizes
-#: expert-major activations with `moe_smooth_per_token_scaled_quant_kernel`,
-#: which is activation quantization, not an expert GEMM.
+#: Tested before :data:`_OP_RULES`, whose "moe" needle would claim AITER's
+#: `moe_smooth_per_token_scaled_quant_kernel` as an expert GEMM.
 _EARLY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("act_quant", ("smooth_per_token_scaled_quant", "moe_smooth")),
 )
@@ -229,10 +217,7 @@ def observed_op(name: str, range_op: str | None = None) -> str | None:
     guessed = classify_op(name)
     if range_op not in _OP_RULES:
         return guessed or range_op
-    # The router is on the list for the same reason: vLLM launches top-k
-    # routing inside the experts module's forward, so its kernels sit inside
-    # the ``moe_routed`` range, and the MoE graph prices routing as its own
-    # ``moe_router`` node.
+    # Routing runs inside the experts module's range but has its own node.
     if guessed in ("act_quant", "rms_norm", "moe_router", "moe_permute", "moe_combine",
                    "tp_all_reduce", "moe_all_to_all"):
         return guessed

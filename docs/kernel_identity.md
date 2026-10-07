@@ -263,20 +263,9 @@ replay when kernel ranges don't. This is a candidate time-series label alongside
 
 ## Status after the ROCm port (2026-10-06)
 
-`docs/rocm_correlation.md` carries every requirement above to AMD and lands
-the shared pieces for both vendors:
-
-* the capture-time node map exists on ROCm (validated per replay), and
-  `read_shards` now passes `graph_node`/`graph_exec` through unwindowed (step 3
-  of "The Nsight approach");
-* the attribute side table is implemented (`gitm.tracer.kernel_attributes`),
-  with range annotations (`L3/moe_routed#wave=2`) as the vendor-neutral
-  dynamic carrier — rocTX has no payload, so NVTX's payload is not the common
-  denominator;
-* memcpys carry `launch_range` on both vendors.
-
-The CUPTI capture-time collector is still to do. When it lands it should emit
-the same optional signature fields on `graph_node` (`node_kind`, `grid`,
-`block`) so replay validation protects it too; `gitm.tracer.emulate` renders it
-(`cupti_node_map=True`) and the parity tests already show it reaches exact
-identity.
+See `docs/rocm_correlation.md`. Landed for both vendors: unwindowed
+`graph_node`/`graph_exec` in `read_shards`, the attribute side table
+(`gitm.tracer.kernel_attributes`, with `#k=v` range annotations as the
+dynamic carrier), and memcpy `launch_range`. Still to do: the CUPTI
+capture-time collector. It should emit the same optional node signature fields
+(`node_kind`, `grid`, `block`) so replay validation covers it too.

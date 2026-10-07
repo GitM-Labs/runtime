@@ -1,38 +1,21 @@
 """Render one ground-truth execution as each vendor's collector would record it.
 
-Kernel identity is decided by records no test box can produce: CUPTI's
-RUNTIME/MARKER activity, rocprofiler-sdk's external-correlation stamps, the
-capture-time graph-node map. Unit tests that hand-write those dicts check the
-decoder against the decoder's own assumptions. This module instead starts from
-what *happened* — which kernels the host launched, in which order, on which
+Tests that hand-write collector dicts check the decoder against its own
+assumptions. This starts from what *happened* — launches in host order, on which
 thread, under which ranges, captured into which graph, replayed how — and
-derives the records from the documented semantics of each collector:
+derives the records from each collector's semantics:
 
-* **CUPTI** (``cupti_core.c``): a kernel record carries the ``correlationId`` of
-  its launch API call; the RUNTIME record carries the host window and thread;
-  NVTX ranges arrive as MARKER start/end halves. A graph replay is one
-  ``cudaGraphLaunch`` — every kernel in it carries that one id — plus
-  ``graphId``/``graphNodeId`` of the *instantiated* node. The capture-time node
-  map (``graph_node`` records) is the planned Nsight-style collector; it is
-  rendered only when ``cupti_node_map`` asks for it, so tests can measure both
-  today's NVIDIA behaviour and the planned one.
-* **rocprofiler-sdk** (``rocm_inject.c``): every dispatch, copy and HIP API
-  record is stamped, at enqueue on the issuing thread, with the innermost rocTX
-  range open *on that thread at that instant* — or, inside ``hipGraphLaunch``,
-  with ``(exec, ordinal)`` in dispatch order. Captured launches become
-  ``graph_node`` records with the range open at capture time and a signature;
-  instantiation links capture to executable.
+* CUPTI: a kernel carries its launch API's ``correlation_id``; runtime records
+  carry the host window and thread; NVTX ranges arrive as marker halves. A graph
+  replay is one launch whose kernels report ``graphId``/instantiated
+  ``graphNodeId``; the capture-time node map is rendered only with
+  ``cupti_node_map`` (the planned collector).
+* rocprofiler-sdk (``rocm_inject.c``): records are stamped at enqueue with the
+  innermost range on the issuing thread, or inside a graph launch with
+  ``(exec, ordinal)``; captured launches become signed ``graph_node`` records.
 
-Ground truth stays separate from the records (:attr:`Emulation.truth`) and is
-keyed by device start, so the scorer never reads an identity the decoder could
-have written. Every hazard the decoder claims to handle has a switch here —
-helper-thread launches, an async device clock offset, replays dispatched in a
-different order than captured, ROCclr blit nodes, a stamp that does not advance
-per dispatch, launches of an executable never seen instantiated — so the claim
-is tested against an execution that exhibits it, not against a record shaped
-to pass.
-
-Pure Python; nothing here needs a GPU.
+Truth is kept apart from the records (:attr:`Emulation.truth`), and every hazard
+the decoder claims to handle has a switch in :class:`EmulationConfig`.
 """
 
 from __future__ import annotations
@@ -43,23 +26,13 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
-from gitm.distributed.correlate import (
-    GRAPH_UNTRACKED,
-    capture_node_id,
-    exec_node_id,
-)
+from gitm.distributed.correlate import GRAPH_UNTRACKED, capture_node_id, exec_node_id
 from gitm.tracer.schema import KernelEvent
 
 Vendor = Literal["nvidia", "amd"]
 
-#: Opaque, real-dialect kernel names: what each vendor's libraries call the
-#: kernel, which by design says nothing about the op that launched it. A
-#: GEMM's name cannot tell qkv_proj from mlp_down on either vendor — the point
-#: of correlation — while attention and collectives are recognisable by name.
-#: Sources: hipBLASLt/Tensile solution naming (``Cijk_<layout>_<types>_MT..``),
-#: AITER's paged-attention kernels, RCCL (which keeps NCCL's device-kernel
-#: names), ROCclr's blit kernels; cuBLAS's nvjet JIT family, FlashAttention-2's
-#: split-KV kernel, NCCL.
+#: Real-dialect kernel names that say nothing about the launching op: a GEMM's
+#: name can't tell qkv_proj from mlp_down on either vendor.
 DIALECT: dict[str, dict[str, str]] = {
     "amd": {
         "gemm": "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT128x128x64_MI16x16x1_SN_"
@@ -75,6 +48,7 @@ DIALECT: dict[str, dict[str, str]] = {
         "memset": "memset_kernel",
     },
 }
+MAIN, HELPER = 1001, 1002
 
 
 def kernel_class(op: str | None, name: str) -> str:
@@ -87,8 +61,6 @@ def kernel_class(op: str | None, name: str) -> str:
 
 @dataclass(frozen=True)
 class TruthLaunch:
-    """What the host launched: identity, order and the device interval it ran."""
-
     step: int
     op: str | None
     layer: int | None
@@ -97,7 +69,6 @@ class TruthLaunch:
 
     @property
     def range_name(self) -> str | None:
-        """The range the model's instrumentation pushes around this launch."""
         if self.op is None:
             return None
         return f"L{self.layer}/{self.op}" if self.layer is not None else self.op
@@ -106,43 +77,24 @@ class TruthLaunch:
 @dataclass(frozen=True)
 class EmulationConfig:
     vendor: Vendor
-    #: Replay every step from one captured graph (vLLM's default) instead of
-    #: launching eagerly (``--enforce-eager``).
     graphs: bool = False
-    #: Emit the CUPTI capture-time node map (the planned NVTX/RESOURCE
-    #: callback collector). Ignored for AMD, whose collector always emits it.
     cupti_node_map: bool = False
-    #: Per-step H2D input upload and D2H sampled-token download, issued
-    #: outside any graph under the step range.
     step_copies: bool = True
-    #: Annotations appended to an op's range name (``#k=v,...``).
     annotate: dict[str, dict[str, str]] = field(default_factory=dict)
-    #: Per-launch annotations (dynamic: e.g. an expert-parallel wave index);
-    #: merged over ``annotate``.
     annotate_launch: Callable[[TruthLaunch], dict[str, str] | None] | None = None
-    #: Ops whose launch API is called from a second host thread (eager only):
-    #: their ranges are pushed on that thread too.
     helper_thread_ops: frozenset[str] = frozenset()
-    #: Device clock offset vs host clock. Any comparison of a kernel's device
-    #: window against a host range would break under a large offset.
     device_offset_ns: int = 0
     api_ns: int = 2_000
     gap_ns: int = 500
-    #: AMD graph hazards.
-    stamp_per_dispatch: bool = True     # False: every replay dispatch gets ordinal 0
-    swap_replay_pair: tuple[int, int] | None = None  # dispatch order differs from capture
-    blit_memset_node: bool = False      # a captured hipMemsetAsync runs as a ROCclr blit
-    exec_untracked: bool = False        # the instantiate was never seen
-    #: The likeliest 7.2.3 failure: no per-dispatch request inside a launch, so
-    #: each dispatch inherits the hipGraphLaunch call's stamp — the live launch
-    #: range's id — and carries no graph identity at all.
-    stamp_inherits_launch: bool = False
-    #: Capture without ranges (instrumentation traced away under compile).
-    capture_unranged: bool = False
-    #: Range around each graph launch: what a naive decoder would take as every
-    #: replayed kernel's op. A layer-op range here (vLLM piecewise graphs launch
-    #: inside module ranges) is what makes that mistake expensive.
+    #: range open around each graph launch — what a naive decoder takes as the op
     graph_launch_range: str = "decode_step"
+    # AMD graph hazards
+    stamp_per_dispatch: bool = True     # False: every dispatch gets ordinal 0
+    stamp_inherits_launch: bool = False  # dispatches inherit the launch call's range stamp
+    swap_replay_pair: tuple[int, int] | None = None
+    blit_memset_node: bool = False
+    exec_untracked: bool = False
+    capture_unranged: bool = False
     pid: int = 4242
     seed: int = 0
 
@@ -150,23 +102,17 @@ class EmulationConfig:
 @dataclass
 class Emulation:
     records: list[dict]
-    #: (device start_ns as recorded, stream) -> (true op, true layer, name).
-    #: Start alone is not a key: a side-stream kernel can start in the same
-    #: nanosecond as the compute kernel it overlaps.
+    #: (device start_ns, stream) -> (true op, true layer, name)
     truth: dict[tuple[int, int], tuple[str | None, int | None, str]]
     config: EmulationConfig
 
 
 def launches_from_fixture(fx) -> list[TruthLaunch]:
-    """Ground-truth launches from a :class:`~gitm.optimizer.mechanism_fixtures.Fixture`."""
     from gitm.optimizer.mechanism_fixtures import SIDE_OP
 
-    out = []
-    for la in fx.launches:
-        op = None if la.op == SIDE_OP else la.op
-        out.append(TruthLaunch(la.step, op, la.layer if op else None, la.stream,
-                               fx.trace.events[la.event]))
-    return out
+    return [TruthLaunch(la.step, None if la.op == SIDE_OP else la.op,
+                        None if la.op == SIDE_OP else la.layer, la.stream,
+                        fx.trace.events[la.event]) for la in fx.launches]
 
 
 def _kernel_id(name: str) -> int:
@@ -174,263 +120,208 @@ def _kernel_id(name: str) -> int:
 
 
 def _geometry(op: str | None, cls: str) -> tuple[list[int], list[int]]:
-    """Launch geometry by op: same GEMM kernel, different shapes per projection."""
+    """Same GEMM kernel, a different shape per projection."""
     h = int.from_bytes(hashlib.sha1(f"{op}/{cls}".encode()).digest()[:2], "big")
     return [8 + h % 504, 1, 1], [256, 1, 1]
 
 
 class _Host:
-    """Host timeline: per-thread range stacks, API records, marker halves."""
+    """Host timeline: per-thread range stacks, API and marker records."""
 
-    def __init__(self, cfg: EmulationConfig, armed: bool = True):
-        self.cfg = cfg
-        self.t = 1_000_000_000
-        self.corr = 0
-        self.marker_seq = 0
+    def __init__(self, cfg: EmulationConfig, records: list[dict], armed: bool = True):
+        self.cfg, self.records, self.armed = cfg, records, armed
+        self.t = 1_000_000_000 if armed else 10_000_000
+        self.corr = self.marker_seq = 0
         self.stacks: dict[int, list[tuple[int, str]]] = {}
-        self.records: list[dict] = []
-        self.armed = armed
 
-    def tick(self, ns: int) -> int:
-        self.t += ns
-        return self.t
+    def _emit(self, rec: dict) -> dict:
+        if self.armed:
+            self.records.append(rec)
+        return rec
 
     def push(self, thread: int, name: str) -> None:
         self.marker_seq += 1
-        mid = self.marker_seq
-        self.stacks.setdefault(thread, []).append((mid, name))
-        if self.armed:
-            self.records.append({"kind": "marker", "name": name, "timestamp_ns": self.tick(10),
-                                 "marker_id": mid, "marker_flags": 0, "thread_id": thread})
-        else:
-            self.tick(10)
+        self.stacks.setdefault(thread, []).append((self.marker_seq, name))
+        self.t += 10
+        self._emit({"kind": "marker", "name": name, "timestamp_ns": self.t,
+                    "marker_id": self.marker_seq, "marker_flags": 0, "thread_id": thread})
 
     def pop(self, thread: int) -> None:
         mid, _ = self.stacks[thread].pop()
-        if self.armed:
-            self.records.append({"kind": "marker", "name": None, "timestamp_ns": self.tick(10),
-                                 "marker_id": mid, "marker_flags": 1, "thread_id": thread})
-        else:
-            self.tick(10)
+        self.t += 10
+        self._emit({"kind": "marker", "name": None, "timestamp_ns": self.t,
+                    "marker_id": mid, "marker_flags": 1, "thread_id": thread})
 
     def top(self, thread: int) -> tuple[int, str] | None:
         s = self.stacks.get(thread)
         return s[-1] if s else None
 
     def api(self, thread: int, *, graph_launch: bool = False) -> dict:
-        """A launch-API call: returns its runtime record (emitted when armed)."""
         self.corr += 1
-        start = self.tick(self.cfg.gap_ns)
-        end = self.tick(self.cfg.api_ns)
-        top = self.top(thread)
-        rec = {"kind": "runtime", "start_ns": start, "end_ns": end,
+        self.t += self.cfg.gap_ns
+        start, self.t = self.t, self.t + self.cfg.api_ns
+        rec = {"kind": "runtime", "start_ns": start, "end_ns": self.t,
                "correlation_id": self.corr, "thread_id": thread}
         if self.cfg.vendor == "amd":
-            rec["range_id"] = top[0] if top else 0
-            rec["graph_launch"] = int(graph_launch)
-        if self.armed:
-            self.records.append(rec)
-        return rec
+            top = self.top(thread)
+            rec.update(range_id=top[0] if top else 0, graph_launch=int(graph_launch))
+        return self._emit(rec)
 
 
-def _range_name(cfg: EmulationConfig, la: TruthLaunch) -> str | None:
-    base = la.range_name
+def _range_name(cfg: EmulationConfig, la: TruthLaunch | None) -> str | None:
+    base = la.range_name if la is not None else None
     if base is None:
         return None
-    attrs = dict(cfg.annotate.get(la.op or "", {}))
-    if cfg.annotate_launch is not None:
-        attrs.update(cfg.annotate_launch(la) or {})
-    if attrs:
-        return base + "#" + ",".join(f"{k}={v}" for k, v in attrs.items())
-    return base
+    attrs = {**cfg.annotate.get(la.op or "", {}),
+             **((cfg.annotate_launch(la) or {}) if cfg.annotate_launch else {})}
+    return base + "#" + ",".join(f"{k}={v}" for k, v in attrs.items()) if attrs else base
 
 
 def emulate(launches: Sequence[TruthLaunch], cfg: EmulationConfig) -> Emulation:
     """Render ``launches`` (host emission order) as ``cfg.vendor``'s collector would."""
+    amd = cfg.vendor == "amd"
     names = DIALECT[cfg.vendor]
-    host = _Host(cfg)
-    records = host.records
+    records: list[dict] = []
     truth: dict[tuple[int, int], tuple[str | None, int | None, str]] = {}
-    main, helper = 1001, 1002
+    host = _Host(cfg, records)
     off = cfg.device_offset_ns
 
-    def kernel_rec(la: TruthLaunch, corr: int, *, name: str | None = None) -> dict:
+    def kernel_rec(la: TruthLaunch, corr: int) -> dict:
         cls = kernel_class(la.op, la.event.name)
-        nm = name or names[cls]
+        nm = names["memset"] if la.event.name == names["memset"] else names[cls]
         grid, block = _geometry(la.op, cls)
         rec = {"kind": "kernel", "name": nm, "start_ns": la.event.start_ns + off,
                "end_ns": la.event.end_ns + off, "device_id": 0, "context_id": 0,
-               "stream_id": la.stream, "correlation_id": corr, "grid": grid,
-               "block": block, "static_shared_mem": 0, "dynamic_shared_mem": 0,
-               "registers_per_thread": 64}
-        if cfg.vendor == "amd":
+               "stream_id": la.stream, "correlation_id": corr, "grid": grid, "block": block}
+        if amd:
             rec["kernel_id"] = _kernel_id(nm)
         key = (rec["start_ns"], rec["stream_id"])
         assert key not in truth, f"two launches share device start and stream: {key}"
         truth[key] = (la.op, la.layer, nm)
         return rec
 
-    def copy_rec(corr: int, kind: int, t: int, *, thread_top: tuple | None) -> dict:
+    def copy(kind: int, t: int) -> None:
+        rt = host.api(MAIN)
         rec = {"kind": "memcpy", "copy_kind": kind, "bytes": 4096, "start_ns": t + off,
                "end_ns": t + off + 800, "device_id": 0, "context_id": 0, "stream_id": 0,
-               "correlation_id": corr}
-        if cfg.vendor == "amd":
-            rec["range_id"] = thread_top[0] if thread_top else 0
-        return rec
+               "correlation_id": rt["correlation_id"]}
+        if amd:
+            rec["range_id"] = rt["range_id"]
+        records.append(rec)
 
     steps: dict[int, list[TruthLaunch]] = {}
     for la in launches:
         steps.setdefault(la.step, []).append(la)
+    if cfg.graphs:
+        _capture(cfg, records, sorted(steps.items())[0][1], names)
 
-    if not cfg.graphs:
-        for _s, step in sorted(steps.items()):
-            host.push(main, "decode_step")
-            first, last = step[0].event, step[-1].event
-            if cfg.step_copies:
-                rt = host.api(main)
-                records.append(copy_rec(rt["correlation_id"], 1, first.start_ns - 2_000,
-                                        thread_top=host.top(main)))
+    for _s, step in sorted(steps.items()):
+        host.push(MAIN, "decode_step")
+        if cfg.step_copies:
+            copy(1, step[0].event.start_ns - 2_000)
+        if not cfg.graphs:
             for la in step:
-                thread = helper if la.op in cfg.helper_thread_ops else main
+                thread = HELPER if la.op in cfg.helper_thread_ops else MAIN
                 rn = _range_name(cfg, la)
                 if rn:
                     host.push(thread, rn)
-                top = host.top(thread)
                 rt = host.api(thread)
-                k = kernel_rec(la, rt["correlation_id"])
-                if cfg.vendor == "amd":
-                    k["range_id"] = top[0] if top else 0
-                records.append(k)
+                rec = kernel_rec(la, rt["correlation_id"])
+                if amd:
+                    rec["range_id"] = rt["range_id"]
+                records.append(rec)
                 if rn:
                     host.pop(thread)
-            if cfg.step_copies:
-                rt = host.api(main)
-                records.append(copy_rec(rt["correlation_id"], 2, last.end_ns + 500,
-                                        thread_top=host.top(main)))
-            host.pop(main)
-        return _finish(records, truth, cfg)
+        else:
+            wrap = cfg.graph_launch_range != "decode_step"
+            if wrap:
+                host.push(MAIN, cfg.graph_launch_range)
+            rt = host.api(MAIN, graph_launch=True)
+            if wrap:
+                host.pop(MAIN)
+            order = list(step)
+            if cfg.swap_replay_pair:
+                i, j = cfg.swap_replay_pair
+                order[i], order[j] = order[j], order[i]
+            if cfg.blit_memset_node:
+                end = step[-1].event.end_ns
+                order.append(TruthLaunch(step[-1].step, None, None, 0, KernelEvent(
+                    name=names["memset"], start_ns=end + 100, end_ns=end + 400,
+                    stream_id=0, device_id=0)))
+            for ordinal, la in enumerate(order):
+                rec = kernel_rec(la, rt["correlation_id"])
+                # CUPTI reports the node the kernel was captured as (by template
+                # position), under its instantiated clone id.
+                node = step.index(la) if la in step else len(step)
+                records.append(_replay_stamp(cfg, rec, ordinal, node, rt))
+        if cfg.step_copies:
+            copy(2, step[-1].event.end_ns + 500)
+        host.pop(MAIN)
 
-    # ── graph mode ──────────────────────────────────────────────────────────
-    template = sorted(steps.items())[0][1]
-    node_kinds = ["kernel"] * len(template)
-    if cfg.blit_memset_node:
-        node_kinds.append("memset")
+    if amd:
+        records.insert(0, {"kind": "meta", "collector": "rocprofiler-sdk", "sdk_version": "1.1.0",
+                           "identity": 1, "agents": [{"ordinal": 0, "name": "gfx950",
+                                                      "product": "AMD Instinct MI355X"}]})
+    for r in records:
+        r["pid"] = cfg.pid
+    random.Random(cfg.seed).shuffle(records)  # shards promise no record order
+    return Emulation(records, truth, cfg)
 
-    # Capture: at engine start, before any window arms — markers and API
-    # records of this phase never reach the shard; structural records do.
-    capture = _Host(cfg, armed=False)
-    capture.t = 10_000_000
-    capture_id, exec_id = 1, 1
-    cupti_graph, cupti_base, cupti_clone = 7, 10_000, 20_000
-    for k, kind in enumerate(node_kinds):
+
+_CUPTI_GRAPH, _CUPTI_NODE, _CUPTI_CLONE = 7, 10_000, 20_000
+_EXEC, _CAPTURE = 1, 1
+
+
+def _replay_stamp(cfg: EmulationConfig, rec: dict, ordinal: int, node: int, rt: dict) -> dict:
+    if cfg.vendor != "amd":
+        rec.update(graph_id=_CUPTI_GRAPH, graph_node_id=_CUPTI_CLONE + node)
+    elif cfg.stamp_inherits_launch:
+        rec["range_id"] = rt["range_id"]
+    else:
+        exec_seq = GRAPH_UNTRACKED if cfg.exec_untracked else _EXEC
+        rec.update(graph_id=exec_seq, range_id=0, graph_node_id=exec_node_id(
+            exec_seq, ordinal if cfg.stamp_per_dispatch else 0))
+    return rec
+
+
+def _capture(cfg: EmulationConfig, records: list[dict], template: list[TruthLaunch],
+             names: dict[str, str]) -> None:
+    """Graph capture at engine start: only structural records reach the shard."""
+    host = _Host(cfg, records, armed=False)
+    kinds = ["kernel"] * len(template) + (["memset"] if cfg.blit_memset_node else [])
+    for k, kind in enumerate(kinds):
         la = template[k] if kind == "kernel" else None
-        rn = _range_name(cfg, la) if la is not None and not cfg.capture_unranged else None
+        rn = None if cfg.capture_unranged else _range_name(cfg, la)
         if rn:
-            capture.push(main, rn)
-        top = capture.top(main)
+            host.push(MAIN, rn)
+        top = host.top(MAIN)
+        name = top[1] if top else ""
         if cfg.vendor == "amd":
-            node = {"kind": "graph_node", "graph_node_id": capture_node_id(capture_id, k),
-                    "capture_id": capture_id, "node_kind": kind,
-                    "name": top[1] if top else ""}
-            if kind == "kernel":
+            node = {"kind": "graph_node", "graph_node_id": capture_node_id(_CAPTURE, k),
+                    "capture_id": _CAPTURE, "node_kind": kind, "name": name, "kernel_id": 0}
+            if la is not None:
                 cls = kernel_class(la.op, la.event.name)
                 node["kernel_id"] = _kernel_id(names[cls])
                 node["grid"], node["block"] = _geometry(la.op, cls)
-            else:
-                node["kernel_id"] = 0
             records.append(node)
         elif cfg.cupti_node_map:
-            records.append({"kind": "graph_node", "graph_node_id": cupti_base + k,
-                            "name": top[1] if top else "", "cloned_from": None})
-            records.append({"kind": "graph_node", "graph_node_id": cupti_clone + k,
-                            "name": "", "cloned_from": cupti_base + k})
+            records += [{"kind": "graph_node", "graph_node_id": _CUPTI_NODE + k, "name": name},
+                        {"kind": "graph_node", "graph_node_id": _CUPTI_CLONE + k,
+                         "cloned_from": _CUPTI_NODE + k}]
         if rn:
-            capture.pop(main)
+            host.pop(MAIN)
     if cfg.vendor == "amd" and not cfg.exec_untracked:
-        records.append({"kind": "graph_exec", "graph_id": exec_id, "capture_id": capture_id,
-                        "n_nodes": len(node_kinds)})
-
-    for _s, step in sorted(steps.items()):
-        host.push(main, "decode_step")
-        if cfg.step_copies:
-            rt = host.api(main)
-            records.append(copy_rec(rt["correlation_id"], 1, step[0].event.start_ns - 2_000,
-                                    thread_top=host.top(main)))
-        if cfg.graph_launch_range != "decode_step":
-            host.push(main, cfg.graph_launch_range)
-        rt = host.api(main, graph_launch=True)
-        if cfg.graph_launch_range != "decode_step":
-            host.pop(main)
-        # Dispatch order: capture order, unless the replay is forked and the
-        # runtime reorders it; the ordinal stamp follows dispatch order.
-        dispatch = list(range(len(step)))
-        if cfg.swap_replay_pair:
-            i, j = cfg.swap_replay_pair
-            dispatch[i], dispatch[j] = dispatch[j], dispatch[i]
-        for ordinal, k in enumerate(dispatch):
-            la = step[k]
-            rec = kernel_rec(la, rt["correlation_id"])
-            if cfg.vendor == "amd" and cfg.stamp_inherits_launch:
-                rec["range_id"] = rt["range_id"]
-            elif cfg.vendor == "amd":
-                exec_seq = GRAPH_UNTRACKED if cfg.exec_untracked else exec_id
-                stamp_ord = ordinal if cfg.stamp_per_dispatch else 0
-                rec["graph_id"] = exec_seq
-                rec["graph_node_id"] = exec_node_id(exec_seq, stamp_ord)
-                rec["range_id"] = 0
-            else:
-                rec["graph_id"] = cupti_graph
-                rec["graph_node_id"] = cupti_clone + k
-            records.append(rec)
-        if cfg.blit_memset_node:
-            last = step[-1].event
-            blit = TruthLaunch(step[-1].step, None, None, 0, KernelEvent(
-                name=names["memset"], start_ns=last.end_ns + 100, end_ns=last.end_ns + 400,
-                stream_id=0, device_id=0))
-            rec = kernel_rec(blit, rt["correlation_id"], name=names["memset"])
-            if cfg.vendor == "amd" and cfg.stamp_inherits_launch:
-                rec["range_id"] = rt["range_id"]
-            elif cfg.vendor == "amd":
-                exec_seq = GRAPH_UNTRACKED if cfg.exec_untracked else exec_id
-                rec["graph_id"] = exec_seq
-                rec["graph_node_id"] = exec_node_id(
-                    exec_seq, len(step) if cfg.stamp_per_dispatch else 0)
-                rec["range_id"] = 0
-            else:
-                rec["graph_id"] = cupti_graph
-                rec["graph_node_id"] = cupti_clone + len(step)
-            records.append(rec)
-        if cfg.step_copies:
-            rt2 = host.api(main)
-            records.append(copy_rec(rt2["correlation_id"], 2, step[-1].event.end_ns + 500,
-                                    thread_top=host.top(main)))
-        host.pop(main)
-    return _finish(records, truth, cfg)
-
-
-def _finish(records, truth, cfg) -> Emulation:
-    if cfg.vendor == "amd":
-        records.insert(0, {"kind": "meta", "collector": "rocprofiler-sdk",
-                           "sdk_version": "1.1.0", "identity": 1,
-                           "agents": [{"ordinal": 0, "name": "gfx950",
-                                       "product": "AMD Instinct MI355X"}]})
-    for r in records:
-        r["pid"] = cfg.pid
-    # Shards interleave buffers in no promised order; the decoder must not care.
-    random.Random(cfg.seed).shuffle(records)
-    return Emulation(records, truth, cfg)
+        records.append({"kind": "graph_exec", "graph_id": _EXEC, "capture_id": _CAPTURE,
+                        "n_nodes": len(kinds)})
 
 
 @dataclass
 class IdentityScore:
-    """Per-kernel identity against ground truth, on what downstream consumes."""
-
     n: int = 0
     correct: int = 0
-    #: resolved to a *different* op or layer than the one launched — the
-    #: silent failure; must be zero for any mechanism worth shipping.
+    #: named as a different op or layer than launched — must be zero
     wrong: int = 0
-    #: resolved to nothing where truth had an op (falls back to the name).
+    #: unnamed where truth had an op (falls back to the kernel name)
     missing: int = 0
     wrong_examples: list[tuple] = field(default_factory=list)
 
@@ -441,13 +332,7 @@ class IdentityScore:
 
 def score(events, truth: dict[tuple[int, int], tuple[str | None, int | None, str]]
           ) -> IdentityScore:
-    """Compare decoded kernels to the launch truth.
-
-    Identity is judged as the monitor consumes it — ``observed_op(name,
-    range_op)`` and ``range_layer`` — so a step-level range that downstream
-    already ignores is not penalised, and a wrong op that downstream would
-    trust is.
-    """
+    """Judge identity as downstream consumes it: ``observed_op`` and ``range_layer``."""
     from gitm.optimizer.deviation import classify_op, observed_op
 
     out = IdentityScore()

@@ -32,8 +32,7 @@ Semantics normalized in the tool so downstream sees one schema:
 * **copy kinds** — mapped onto the CUPTI `CUpti_ActivityMemcpyKind` ints the
   decoder already speaks.
 
-Kernel identity (stamped ranges, HIP-graph projection, validation, attributes)
-is specified in `docs/rocm_correlation.md`, with its own hardware checklist.
+Kernel identity on AMD: `docs/rocm_correlation.md`.
 
 ## Bring-up on a fresh MI355X box (bare, no k8s)
 

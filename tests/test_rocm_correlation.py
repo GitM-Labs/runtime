@@ -1,10 +1,4 @@
-"""ROCm identity: collector-stamped ranges and validated HIP-graph projection.
-
-Contract in gitm/distributed/correlate.py ("Stamped ranges", "HIP graphs").
-Each test pins one rule with hand-written records; the end-to-end accuracy of
-the rules together is measured against emulated executions in
-tests/test_identity_accuracy.py.
-"""
+"""ROCm identity rules, one per test: stamped ranges and validated HIP-graph projection."""
 
 from __future__ import annotations
 
@@ -55,8 +49,6 @@ def test_a_stamp_names_the_kernel_without_any_runtime_record():
 
 
 def test_a_stamp_survives_a_launch_from_another_thread():
-    """Containment matches on thread_id; a helper-thread launch whose range was
-    pushed on that same helper thread is what the stamp records."""
     recs = [_marker(5, "L0/qkv_proj", 0, 100, thread=2), _rt(1, 10, 20, thread=2),
             _k(1, range_id=5)]
     assert _ops(correlate_records(recs)[0]) == [("qkv_proj", 0)]
@@ -74,8 +66,6 @@ def test_stamp_wins_over_containment_and_the_disagreement_is_counted():
 
 
 def test_an_unresolved_stamp_falls_back_to_containment():
-    """Range pushed before the window armed: its id reached the kernel but its
-    START half never reached the shard."""
     recs = [_marker(7, "L2/qkv_proj", 0, 100), _rt(1, 10, 20), _k(1, range_id=99)]
     out, _, rep = correlate_records(recs)
     assert _ops(out) == [("qkv_proj", 2)] and out[0]["identity"] == "containment"
@@ -83,8 +73,6 @@ def test_an_unresolved_stamp_falls_back_to_containment():
 
 
 def test_an_end_only_range_names_nothing():
-    """pair_markers drops an END without its START; the stamp then resolves to
-    nothing rather than to the next range that happens to enclose it."""
     halves = [{"kind": "marker", "marker_id": 5, "marker_flags": 1, "timestamp_ns": 90,
                "thread_id": 1, "name": None},
               _rt(1, 10, 20), _k(1, range_id=5)]
@@ -163,8 +151,6 @@ def test_replayed_kernels_take_the_range_their_node_was_captured_under():
 
 
 def test_capture_node_names_are_normalized_like_markers():
-    """vLLM's layerwise ranges arrive as dict reprs; a capture node named by one
-    must resolve exactly as a marker of that name does."""
     vllm = "{'Module': 'model.layers.7.mlp.down_proj', 'shape': [1, 7168]}"
     recs = [_node(1, 0, vllm, kernel_id=9, grid=[8, 1, 1], block=[256, 1, 1]),
             {"kind": "graph_exec", "graph_id": 3, "capture_id": 1, "n_nodes": 1},
@@ -215,8 +201,6 @@ def test_a_memset_node_replayed_as_an_ordinary_kernel_means_the_ordinals_shifted
 
 
 def test_module_launch_nodes_validate_on_geometry_alone():
-    """hipModuleLaunchKernel nodes carry kernel_id 0 (no symbol map exists for
-    a hipFunction_t); geometry is still compared."""
     recs = _graph()
     for r in recs[:3]:
         r["kernel_id"] = 0
@@ -227,8 +211,6 @@ def test_module_launch_nodes_validate_on_geometry_alone():
 
 
 def test_a_graph_launch_the_stamp_missed_never_takes_the_launch_range():
-    """The kernel arrived unstamped, but its launch record is a hipGraphLaunch:
-    taking the range around it as the op is the bug #160 fixed on NVIDIA."""
     recs = [_marker(1, "L0/qkv_proj", 0, 10_000), _rt(50, 100, 120, graph_launch=1),
             _k(50, t=1000, range_id=0)]
     out, _, rep = correlate_records(recs)
@@ -238,9 +220,6 @@ def test_a_graph_launch_the_stamp_missed_never_takes_the_launch_range():
 
 
 def test_the_guard_runs_before_the_stamped_join():
-    """A replayed dispatch that inherited the hipGraphLaunch call's stamp
-    carries the launch range's real marker id. Joining it would name every
-    replayed kernel after the range around the launch."""
     recs = [_marker(1, "L0/qkv_proj", 0, 10_000), _rt(50, 100, 120, graph_launch=1, range_id=1),
             _k(50, t=1000, range_id=1), _k(50, t=1020, range_id=1)]
     out, _, rep = correlate_records(recs)
@@ -273,8 +252,6 @@ def test_reinstantiation_gets_a_new_exec_and_both_resolve():
 
 
 def test_cupti_replays_without_signatures_are_not_refused():
-    """The CUPTI collector's nodes carry no signature; validating on fields a
-    record never had would refuse every NVIDIA replay."""
     recs = [{"kind": "graph_node", "graph_node_id": 41, "name": "L0/qkv_proj"},
             _rt(9, 1, 2), _k(9, graph_id=3, graph_node_id=41)]
     out, _, rep = correlate_records(recs)
@@ -308,8 +285,7 @@ def test_decoded_memcpy_events_carry_the_label():
 
 
 def test_read_shards_keeps_pre_arm_graph_structure(tmp_path, monkeypatch):
-    """Graph nodes are written at engine start, before any window. A windowed
-    reader would drop them and leave every replay anonymous."""
+    """Graph nodes are written at engine start, before any window."""
     out = tmp_path / "trace.jsonl"
     monkeypatch.setenv(injection.ENV_OUT, str(out))
     early = [*_graph()]

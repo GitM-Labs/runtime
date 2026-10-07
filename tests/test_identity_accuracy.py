@@ -1,16 +1,9 @@
-"""Kernel identity accuracy against ground truth, per vendor, mode and hazard.
+"""Identity accuracy against launch truth, per vendor, mode and hazard.
 
-Each case starts from a mechanism fixture — what the host launched, in order,
-for which op and layer — renders it as one vendor's collector would record it
-(gitm.tracer.emulate), runs the records through the real decoder, and scores
-every decoded kernel against the launch truth.
-
-Two numbers per case: accuracy, and **wrong** — kernels named as a different op
-or layer than the one launched. Wrong must be zero everywhere: a missing
-identity falls back to the name and is visible in the coverage report; a wrong
-one is trusted downstream and silently mis-prices the op. Where a mechanism
-cannot name a kernel (NVIDIA graph replay before the capture-time node map
-lands), the requirement is that it says nothing, not something false.
+Fixture executions are rendered as each collector records them
+(gitm.tracer.emulate) and decoded by the real pipeline. ``wrong`` — named as
+a different op or layer than launched — must be zero everywhere; a missing
+identity is visible, a wrong one is trusted downstream.
 """
 
 from __future__ import annotations
@@ -77,8 +70,6 @@ def test_amd_graph_identity_comes_from_the_capture_projection():
 
 @pytest.mark.parametrize("scenario", list(SCENARIOS))
 def test_nvidia_graphs_today_say_nothing_rather_than_something_wrong(scenario):
-    """No capture-time node map yet: replayed GEMMs cannot be named, and must
-    not borrow the step's range. Only name-identifiable kernels resolve."""
     s, report, _ = _run(_launches(scenario), EmulationConfig("nvidia", graphs=True))
     assert s.wrong == 0
     # A layer is needed for every per-layer op, and no name carries one, so
@@ -116,11 +107,7 @@ def test_amd_graph_hazards_refuse_instead_of_guessing(kw, reason):
 
 
 def test_known_limit_reordering_two_identical_nodes_is_undetectable():
-    """Validation compares a replayed kernel with its node's signature (symbol,
-    geometry, kind). Two nodes with the same signature — the same projection in
-    two layers — cannot be told apart if the runtime swaps them. A single-stream
-    capture (vLLM's) replays in capture order, so this needs a forked capture
-    and a reordering runtime; it is pinned here so the limit is a known one."""
+    """Validation compares a replayed kernel with its node's signature (symbol, geometry, kind)."""
     launches = _launches("dense")
     step0 = [i for i, la in enumerate(launches) if la.step == 0]
     same = [i for i in step0 if launches[i].op == "qkv_proj"][:2]
@@ -131,8 +118,6 @@ def test_known_limit_reordering_two_identical_nodes_is_undetectable():
 
 
 def test_the_old_graph_behaviour_is_what_these_tests_exist_to_catch():
-    """Strip graph identity (the collector before #160) and decode: every
-    replayed kernel takes the launch's range as its op."""
     launches = _launches("dense")
     em = emulate(launches, EmulationConfig("amd", graphs=True, graph_launch_range="L0/qkv_proj"))
     old = [{k: v for k, v in r.items() if k not in ("graph_id", "graph_node_id", "graph_launch")}
@@ -152,8 +137,6 @@ def test_shard_record_order_does_not_matter(seed):
 
 
 def test_ranks_with_colliding_ids_are_scored_independently():
-    """Two ranks issue identical launch sequences, so correlation ids, marker
-    ids and graph node ids collide across processes; decoding must partition."""
     launches = _launches("dense")
     a = emulate(launches, EmulationConfig("amd", graphs=True, pid=100))
     b = emulate(launches, EmulationConfig("amd", pid=200, device_offset_ns=7))
@@ -175,9 +158,6 @@ def test_memcpys_label_every_step_on_both_vendors_in_graph_mode():
 
 
 def test_a_capture_without_ranges_is_reported_not_silent():
-    """torch.compile can trace the instrumentation away during capture: every
-    node exists, none is named, nothing is refused — and without a report the
-    capture would look like a model with no identifiable ops."""
     s, report, _ = _run(_launches("dense"), EmulationConfig("amd", graphs=True,
                                                             capture_unranged=True))
     assert s.wrong == 0 and not report.graph_refused

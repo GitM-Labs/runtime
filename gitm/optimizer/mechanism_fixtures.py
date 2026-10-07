@@ -258,21 +258,15 @@ class Scenario:
 
 @dataclass(frozen=True)
 class Launch:
-    """One kernel as the host issued it: the ground truth a collector records.
-
-    ``trace.events`` is sorted by device start, which is not the order the host
-    launched in once streams overlap, and carries the identity only as the
-    fixture *chose* to record it (a :class:`Misroute` changes it). This is the
-    unrecorded truth — what was launched, in what order, for which op and layer
-    — that :mod:`gitm.tracer.emulate` renders into each vendor's records.
-    """
+    """One kernel as the host issued it, with its true identity — unlike
+    ``trace.events``, which is in device order and may be misrouted. Rendered
+    into collector records by :mod:`gitm.tracer.emulate`."""
 
     step: int
     op: str
     layer: int | None
     stream: int
-    #: Index into ``trace.events`` of the kernel this launch ran as.
-    event: int
+    event: int  # index into trace.events
 
 
 @dataclass
@@ -285,7 +279,6 @@ class Fixture:
     true_step_ns: list[int]
     #: Per-step wall time the trace shows.
     traced_step_ns: list[int]
-    #: Host launch order with true identity (see :class:`Launch`).
     launches: list[Launch] = field(default_factory=list)
 
     @property

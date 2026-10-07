@@ -1,22 +1,8 @@
-"""AMD kernel names must land in the right bucket and op, as NVIDIA's do.
+"""AMD kernel names land in the right bucket and op.
 
-Both rule sets were written against CUDA captures. On MI355X the dominant
-GEMMs (Tensile/hipBLASLt ``Cijk_``), every AITER MLA decode and paged-attention
-kernel, and AITER's MoE router went to ``other`` or to the wrong op — the
-router to sampling, MoE sort/quant kernels to the expert GEMM.
-
-Every name below is a real symbol, from the source that ships it:
-
-* Tensile/hipBLASLt solution names: ``Cijk_<A layout>_<B layout>_<types>_MT...``
-  (hipBLASLt library logic YAMLs; rocBLAS uses the same Tensile naming).
-* vLLM ``csrc/rocm/skinny_gemms.cu`` (``wvSplitK*``, ``LLGemm1_kernel``) and
-  ``csrc/rocm/attention.cu`` (``paged_attention_ll4mi_*``).
-* AITER kernel tables ``hsa/gfx950/<family>/*.csv`` (``knl_name`` column) and
-  ``csrc/kernels/*.cu`` (``__global__`` symbols).
-* Composable Kernel / ck_tile mangled entry points, ROCclr blit kernels, RCCL.
-
-``classify_op`` deliberately returns None for a bare GEMM on either vendor —
-its op comes from correlation, never the name.
+Real symbols from Tensile/hipBLASLt (``Cijk_``), vLLM ``csrc/rocm``, AITER
+(``hsa/gfx950/*/*.csv`` and ``csrc/kernels``), CK/ck_tile, ROCclr and RCCL.
+A bare GEMM's op stays None: it comes from correlation, never the name.
 """
 
 from __future__ import annotations
@@ -82,9 +68,6 @@ def test_no_amd_kernel_in_the_corpus_lands_in_other():
                                   "_ZN5aiter19topksoftmax_4x128x4E",
                                   "fused_mx_quant_moe_sort_kernel"])
 def test_moe_side_kernels_inside_an_expert_range_keep_their_own_op(name):
-    """Inside ``L3/moe_routed`` these must not be charged to the expert GEMM:
-    observed_op keeps the name's own op for quant, router and permute work,
-    each of which the MoE graph prices as its own node."""
     assert observed_op(name, "moe_routed") == classify_op(name) != "moe_routed"
 
 

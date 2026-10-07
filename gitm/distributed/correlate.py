@@ -44,56 +44,19 @@ instead::
 
 A ``graph_node`` record names the innermost NVTX range open on the capturing
 thread when the node was created, which is how Nsight Systems projects ranges
-onto replayed kernels. The CUPTI collector does not emit these yet (it needs
-CUPTI's graph-node resource callbacks), so there a graph kernel's op is ``None``
-and falls back to name classification, rather than silently taking the step's.
+onto replayed kernels. The CUPTI collector does not emit these yet, so there a
+graph kernel's op is ``None`` and falls back to name classification.
 
-Stamped ranges (ROCm)
----------------------
-The ROCm collector (``rocm_inject.c``) does better than containment for eager
-launches. rocprofiler-sdk's external-correlation request service asks the tool,
-synchronously on the enqueuing thread, for a value to stamp on every dispatch,
-copy and HIP API record; the tool answers with the id of the innermost rocTX
-range open on that thread. Those records arrive with ``range_id``, and the
-paired marker carries the same ``marker_id``::
-
-    kernel   range_id=R                     (stamped at enqueue, launching thread)
-        |  same id
-    marker   {kind:"marker", marker_id:R, name, start_ns, end_ns, thread_id}
-
-No clock comparison and no thread matching is involved, so neither the async
-end-time hazard nor a launch issued from a helper thread can misplace it. When
-both joins are available they are compared, and a disagreement is counted in
-the :class:`CorrelationReport` rather than resolved silently; the stamp wins,
-because it is the one taken at the moment of the launch. A stamp whose marker
-is not in the capture (pushed before the window armed) falls back to
-containment, which usually fails for the same reason and leaves ``None``.
-
-HIP graphs (ROCm)
------------------
-ROCm 7.2 has no graph-node id on a dispatch record. The collector builds one
-from the documented recipe (rocprofiler-sdk ``callback_tracing.h``, HIP graph
-domain): it tracks ``hipGraphLaunch`` ENTER/EXIT per thread and stamps each
-dispatch or copy enqueued inside it with ``(exec, ordinal)``. The capture side
-records, for every launch made while a thread is stream-capturing, a
-``graph_node`` carrying the range open at that moment, its position in the
-capture, and a signature; ``hipStreamEndCapture`` + ``hipGraphInstantiate*``
-link the capture to the executable graph::
-
-    kernel      graph_id=E, graph_node_id=node_id(E, k)
-        |  graph_exec {kind:"graph_exec", graph_id:E, capture_id:C, n_nodes:N}
-    graph_node  {graph_node_id: capture_node_id(C, k), name, node_kind,
-                 kernel_id, grid, block}
-
-Position is only an identity if replay order equals capture order, which holds
-for a single-stream capture and is not promised for a forked one. So the join
-is *validated*, per replay (kernels sharing one launch ``correlation_id``):
-ordinals must be distinct and within ``n_nodes``, and each kernel must match
-its node's signature — the same symbol (``kernel_id``) and launch geometry for
-a kernel node; a ROCclr blit (``__amd_rocclr_*``) or a copy record for a
-memcpy/memset node, since ROCm executes those as blit kernels or SDMA copies.
-One mismatch refuses the whole replay — an ordinal shift misplaces everything
-after it — and the refusal is counted, never guessed past.
+ROCm (docs/rocm_correlation.md)
+-------------------------------
+Eager kernels arrive with ``range_id``, the rocTX range open on the launching
+thread at enqueue, and join the marker with that ``marker_id`` directly;
+containment is the fallback and a cross-check. Replayed kernels arrive with
+``graph_id``/``graph_node_id`` = ``(exec, ordinal)``; a ``graph_exec`` record
+links the exec to the capture whose ``graph_node`` records carry the ranges.
+Position is only an identity if the replay runs in capture order, so each
+replay is validated (distinct ordinals, within ``n_nodes``, each record
+matching its node's signature) and refused whole on any mismatch.
 
 Process scoping
 ---------------
@@ -117,129 +80,91 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 from gitm.distributed.topology import Rank, Topology, topology_from_records
 
 _RANGE_NAME_RE = re.compile(r"^L(\d+)/(.+)$")
+_ATTR_TOKEN = re.compile(r"[A-Za-z0-9_.:+-]+")
 
 #: Keys added to every record returned by :func:`correlate_by_rank`.
 RANK_KEYS = ("pid", "local_rank")
 
-# ── ROCm graph-node id layout ───────────────────────────────────────────────
-#
-# Mirrors GITM_NODE_* in rocm_inject.c. Ids are nonzero by construction: 0 means
-# "not a graph launch" throughout this codebase (CUPTI's convention, and
-# ``_opt_graph_id`` decodes it to None), so the zero-based replay ordinal is
-# stored as ordinal + 1. The capture flag keeps capture-side and replay-side ids
-# disjoint, so one ``graph_nodes`` map can hold both.
+# ROCm node-id layout, mirrored by GITM_NODE_* in rocm_inject.c. Ordinals are
+# stored +1 so no id is 0 ("not a graph"); the flag keeps capture ids apart.
 NODE_ORDINAL_BITS = 32
 NODE_SEQ_BITS = 31
 NODE_CAPTURE_FLAG = 1 << 63
 _ORD_MASK = (1 << NODE_ORDINAL_BITS) - 1
 _SEQ_MASK = (1 << NODE_SEQ_BITS) - 1
-
-#: ``graph_id`` for a replayed kernel whose executable the collector never saw
-#: instantiated (or whose stamp did not fire): still a replay, so never given
-#: its launch's range as an op, but no node can be named. Mirrors
-#: GITM_EXEC_UNTRACKED in rocm_inject.c.
+#: graph_id of a replay whose exec was never seen instantiated.
 GRAPH_UNTRACKED = _SEQ_MASK
-
-#: Prefix of ROCclr's blit kernels (``__amd_rocclr_copyBuffer``,
-#: ``__amd_rocclr_fillBufferAligned``, ...): how ROCm executes a captured
-#: memcpy/memset node when it does not go to an SDMA engine.
+#: ROCm runs captured memcpy/memset nodes as these blit kernels (or SDMA copies).
 ROCCLR_BLIT_PREFIX = "__amd_rocclr_"
+#: Share of unnamed graph kernels at which the capture itself is suspect.
+UNNAMED_SHARE = 0.5
 
 
 def exec_node_id(exec_seq: int, ordinal: int) -> int:
-    """Replay-side node id for zero-based ``ordinal`` of executable ``exec_seq``."""
     return ((exec_seq & _SEQ_MASK) << NODE_ORDINAL_BITS) | ((ordinal + 1) & _ORD_MASK)
 
 
 def capture_node_id(capture_seq: int, ordinal: int) -> int:
-    """Capture-side node id for zero-based ``ordinal`` of capture ``capture_seq``."""
     return NODE_CAPTURE_FLAG | exec_node_id(capture_seq, ordinal)
 
 
 def node_ordinal(node_id: int) -> int:
-    """Zero-based ordinal of either kind of node id."""
     return (node_id & _ORD_MASK) - 1
 
 
 def split_range_annotations(name: str) -> tuple[str, dict[str, str] | None]:
-    """``"L3/moe_routed#phase=expert,wave=2"`` -> ``("L3/moe_routed", {...})``.
+    """``"L3/moe_routed#wave=2"`` -> ``("L3/moe_routed", {"wave": "2"})``.
 
-    The attribute channel for ranges. NVTX has a typed payload for this; rocTX
-    has none (``roctxRangePushA`` takes one string), so the vendor-neutral
-    carrier is a suffix on the name — and it must come off *before*
-    :func:`parse_range_name` and op resolution see the name, or
-    ``moe_routed#wave=2`` becomes an op no rule knows. Everything from the first
-    ``#`` is the annotation; pairs that do not parse are dropped, and an
-    annotation with no valid pair yields ``None``. vLLM's dict-repr range names
-    (``{...}``) are never split: their contents are not ours.
+    rocTX has no payload, so attributes ride on the name and must come off
+    before it is parsed. Malformed pairs are dropped; vLLM's ``{...}`` names
+    are never split.
     """
     if not name or name.startswith("{") or "#" not in name:
         return name, None
     base, _, tail = name.partition("#")
-    attrs: dict[str, str] = {}
+    attrs = {}
     for part in tail.split(","):
-        k, eq, v = part.partition("=")
-        k, v = k.strip(), v.strip()
-        if eq and k and v and _ATTR_TOKEN.fullmatch(k) and _ATTR_TOKEN.fullmatch(v):
+        k, eq, v = (s.strip() for s in part.partition("="))
+        if eq and _ATTR_TOKEN.fullmatch(k) and _ATTR_TOKEN.fullmatch(v):
             attrs[k] = v
     return base, attrs or None
 
 
-_ATTR_TOKEN = re.compile(r"[A-Za-z0-9_.:+-]+")
-
-
-#: Share of graph kernels from unnamed nodes above which the capture, not the
-#: model, is the likelier explanation (CorrelationReport.graph_unnamed).
-UNNAMED_SHARE = 0.5
-
-
 @dataclass
 class CorrelationReport:
-    """How each kernel got (or did not get) its identity, for one capture.
-
-    The point of counting is that every failure mode here is otherwise silent:
-    a refused replay, a stamp whose range never reached the capture, and a stamp
-    that disagrees with containment all produce well-formed records.
-    """
+    """How identity was recovered or lost; every failure here is otherwise silent."""
 
     kernels: int = 0
-    #: kernels by the mechanism that named them: "range_id" | "containment" |
-    #: "graph_node" | "none".
+    #: kernels by mechanism: "range_id" | "containment" | "graph_node" | "none"
     identity: Counter = field(default_factory=Counter)
     graph_kernels: int = 0
-    #: graph kernels refused, by reason.
     graph_refused: Counter = field(default_factory=Counter)
-    #: graph kernels whose node exists but was captured outside every range.
-    #: A few is normal (collectives, blits); most of them means the range
-    #: instrumentation did not run during capture — torch.compile can trace
-    #: forward hooks away — and every replay is anonymous without any refusal.
+    #: replayed kernels whose node was captured outside every range
     graph_unnamed: int = 0
-    #: eager kernels where stamp and containment both resolved and disagreed.
     stamp_containment_disagree: int = 0
-    #: kernels whose stamp named a range absent from the capture.
     stamp_unresolved: int = 0
     memcpys: int = 0
     memcpys_labelled: int = 0
 
     def merge(self, other: CorrelationReport) -> None:
-        for name in ("kernels", "graph_kernels", "graph_unnamed", "stamp_containment_disagree",
-                     "stamp_unresolved", "memcpys", "memcpys_labelled"):
-            setattr(self, name, getattr(self, name) + getattr(other, name))
-        self.identity.update(other.identity)
-        self.graph_refused.update(other.graph_refused)
+        for f in fields(self):
+            mine = getattr(self, f.name)
+            if isinstance(mine, Counter):
+                mine.update(getattr(other, f.name))
+            else:
+                setattr(self, f.name, mine + getattr(other, f.name))
 
     def problems(self) -> list[str]:
-        """Findings worth a warning: each one means identity was lost or doubted."""
         out = []
         if self.graph_refused:
-            n = sum(self.graph_refused.values())
-            out.append(f"{n} of {self.graph_kernels} graph-replayed kernel(s) refused "
-                       f"node identity ({dict(self.graph_refused)})")
+            out.append(f"{sum(self.graph_refused.values())} of {self.graph_kernels} "
+                       f"graph-replayed kernel(s) refused node identity "
+                       f"({dict(self.graph_refused)})")
         if self.graph_kernels and self.graph_unnamed >= UNNAMED_SHARE * self.graph_kernels:
             out.append(f"{self.graph_unnamed} of {self.graph_kernels} graph-replayed kernel(s) "
                        "ran from nodes captured outside every range — were ranges pushed "
@@ -291,161 +216,131 @@ def correlate_kernels_to_ranges(records: list[dict]) -> list[dict]:
 
 
 def correlate_records(records: list[dict]) -> tuple[list[dict], list[dict], CorrelationReport]:
-    """Kernels and memcpys of a **single process**, enriched, plus a report.
+    """Kernels and memcpys of one process, enriched, plus a :class:`CorrelationReport`.
 
-    Kernels come back as in :func:`correlate_kernels_to_ranges`, additionally
-    carrying ``range_attrs`` (the range's annotations) and ``identity`` (which
-    mechanism named it — see :class:`CorrelationReport`). Memcpys come back with
-    ``launch_range``: the range around the copy's issue, a step-boundary label
-    that survives graph replay because vLLM's per-step host<->device copies run
-    outside the graph. Input order is preserved within each list.
+    Kernels additionally carry ``range_attrs`` and ``identity``; memcpys carry
+    ``launch_range``, a step label that survives graph replay.
     """
     runtime_by_corr: dict[int, dict] = {}
     markers: list[dict] = []
-    markers_by_id: dict[int, dict] = {}
     kernels: list[dict] = []
     memcpys: list[dict] = []
     graph_nodes: dict[int, dict] = {}
-    graph_execs: list[dict] = []
-
+    n_nodes: dict[int, int] = {}
     for r in records:
         kind = r.get("kind")
         if kind == "kernel":
             kernels.append(r)
         elif kind == "memcpy":
             memcpys.append(r)
-        elif kind == "runtime":
-            cid = r.get("correlation_id")
-            if cid is not None:
-                runtime_by_corr[cid] = r
+        elif kind == "runtime" and r.get("correlation_id") is not None:
+            runtime_by_corr[r["correlation_id"]] = r
         elif kind == "marker":
             markers.append(r)
-            mid = r.get("marker_id")
-            if mid:
-                markers_by_id[mid] = r
-        elif kind == "graph_node":
-            nid = r.get("graph_node_id")
-            if nid is not None:
-                graph_nodes[nid] = r
-        elif kind == "graph_exec":
-            graph_execs.append(r)
-
-    # Replay-side node ids resolve to their capture node through the exec's
-    # capture link — the ROCm form of an instantiated clone.
-    n_nodes: dict[int, int] = {}
-    for ex in graph_execs:
-        gid, cap, n = ex.get("graph_id"), ex.get("capture_id"), ex.get("n_nodes")
-        if not gid or not isinstance(n, int):
-            continue
-        n_nodes[gid] = n
-        if cap:
-            for i in range(n):
+        elif kind == "graph_node" and r.get("graph_node_id") is not None:
+            graph_nodes[r["graph_node_id"]] = r
+        elif kind == "graph_exec" and r.get("graph_id") and isinstance(r.get("n_nodes"), int):
+            gid, cap = r["graph_id"], r.get("capture_id")
+            n_nodes[gid] = r["n_nodes"]
+            # ROCm's form of an instantiated clone: exec node k -> capture node k.
+            for i in range(r["n_nodes"] if cap else 0):
                 graph_nodes.setdefault(exec_node_id(gid, i), {
-                    "graph_node_id": exec_node_id(gid, i),
-                    "cloned_from": capture_node_id(cap, i)})
+                    "graph_node_id": exec_node_id(gid, i), "cloned_from": capture_node_id(cap, i)})
 
+    markers_by_id = {m["marker_id"]: m for m in markers if m.get("marker_id")}
     enclosing = _innermost_enclosing(markers, runtime_by_corr.values())
+    refused = _refused_replays(kernels, memcpys, graph_nodes, n_nodes)
     report = CorrelationReport()
 
-    def stamped(rec: dict) -> dict | None:
-        rid = rec.get("range_id")
+    def stamped(rec: dict | None) -> dict | None:
+        rid = rec.get("range_id") if rec else None
         if not rid:
             return None
         m = markers_by_id.get(rid)
-        if m is None:
-            report.stamp_unresolved += 1
+        report.stamp_unresolved += m is None
         return m
 
     def contained(rec: dict) -> dict | None:
         rt = runtime_by_corr.get(rec.get("correlation_id"))
         return enclosing.get(id(rt)) if rt is not None else None
 
-    refused = _refused_replays(kernels, memcpys, graph_nodes, n_nodes)
-
     out: list[dict] = []
     for k in kernels:
-        enriched = dict(k)
-        if not k.get("graph_id"):
-            rt = runtime_by_corr.get(k.get("correlation_id"))
-            if rt is not None and rt.get("graph_launch"):
-                # Launched by a graph replay the stamp did not mark: the
-                # replay's range is not this kernel's op (module docstring).
-                enriched["graph_id"] = GRAPH_UNTRACKED
-                enriched["graph_node_id"] = None
-                k = enriched
-        enriched["range_op"] = None
-        enriched["range_layer"] = None
-        enriched["range_attrs"] = None
-        enriched["identity"] = None
+        k = dict(k)
+        rt = runtime_by_corr.get(k.get("correlation_id"))
+        if not k.get("graph_id") and rt is not None and rt.get("graph_launch"):
+            # A replay the ordinal stamp missed: still never takes the launch range.
+            k["graph_id"], k["graph_node_id"] = GRAPH_UNTRACKED, None
+        k.update(range_op=None, range_layer=None, range_attrs=None, identity=None)
         report.kernels += 1
 
         if k.get("graph_id"):
             report.graph_kernels += 1
-            rt = runtime_by_corr.get(k.get("correlation_id"))
-            launch = (stamped(rt) if rt is not None else None) or contained(k)
-            enriched["launch_range"] = launch["name"] if launch else None
-            reason = ("untracked_launch" if k["graph_id"] == GRAPH_UNTRACKED else
-                      refused.get((k.get("graph_id"), k.get("correlation_id"))))
-            raw = None
-            if reason is not None:
+            launch = stamped(rt) or contained(k)
+            k["launch_range"] = launch["name"] if launch else None
+            reason = ("untracked_launch" if k["graph_id"] == GRAPH_UNTRACKED
+                      else refused.get((k["graph_id"], k.get("correlation_id"))))
+            named = None
+            if reason:
                 report.graph_refused[reason] += 1
             else:
-                raw = _graph_node_range(graph_nodes, k.get("graph_node_id"))
-                if raw is None:
-                    if _capture_node(graph_nodes, k.get("graph_node_id")) is None:
-                        report.graph_refused["no_node"] += 1
-                    else:
-                        # The node exists but was captured outside every range:
-                        # not a refusal, but counted (see graph_unnamed).
-                        report.graph_unnamed += 1
-            # Node names arrive normalized from the decoder (pair_markers), so
-            # only the annotation needs splitting here.
-            name, attrs = split_range_annotations(raw) if raw else (None, None)
-            source = "graph_node" if name else None
+                chain = _node_chain(graph_nodes, k.get("graph_node_id"))
+                named = next((n for n in chain if n.get("name")), None)
+                if not chain:
+                    report.graph_refused["no_node"] += 1
+                elif named is None:
+                    report.graph_unnamed += 1
+            name = named["name"] if reason is None and named else None
+            attrs = named.get("attrs") if name else None
+            source = "graph_node"
         else:
             by_stamp, by_host = stamped(k), contained(k)
-            if by_stamp is not None and by_host is not None and by_stamp is not by_host \
-                    and by_stamp["name"] != by_host["name"]:
+            if by_stamp and by_host and by_stamp["name"] != by_host["name"]:
                 report.stamp_containment_disagree += 1
             chosen = by_stamp or by_host
             name = chosen["name"] if chosen else None
             attrs = chosen.get("attrs") if chosen else None
-            source = ("range_id" if by_stamp is not None else
-                      "containment" if by_host is not None else None)
+            source = "range_id" if by_stamp else "containment"
 
         if name:
-            enriched["range_op"], enriched["range_layer"] = parse_range_name(name)
-            enriched["range_attrs"] = attrs
-            enriched["identity"] = source
-        report.identity[enriched["identity"] or "none"] += 1
-        out.append(enriched)
+            k["range_op"], k["range_layer"] = parse_range_name(name)
+            k["range_attrs"], k["identity"] = attrs, source
+        report.identity[k["identity"] or "none"] += 1
+        out.append(k)
 
-    out_copies: list[dict] = []
+    copies = []
     for c in memcpys:
-        enriched = dict(c)
-        report.memcpys += 1
         m = stamped(c) or contained(c)
-        enriched["launch_range"] = m["name"] if m else None
+        copies.append({**c, "launch_range": m["name"] if m else None})
+        report.memcpys += 1
         report.memcpys_labelled += m is not None
-        out_copies.append(enriched)
+    return out, copies, report
 
-    return out, out_copies, report
+
+def _node_chain(graph_nodes: dict[int, dict], node_id: int | None) -> list[dict]:
+    """Nodes from ``node_id`` along ``cloned_from``; empty if it leaves the map or cycles."""
+    chain: list[dict] = []
+    seen: set[int] = set()
+    while node_id:
+        node = graph_nodes.get(node_id)
+        if node is None or node_id in seen:
+            return []
+        seen.add(node_id)
+        chain.append(node)
+        node_id = node.get("cloned_from")
+    return chain
 
 
 def _signature_mismatch(rec: dict, node: dict) -> str | None:
-    """Why ``rec`` cannot be the replay of capture ``node``, or None if it can.
-
-    Only fields both sides carry are compared: the CUPTI collector's nodes carry
-    none of them, and a check that fails on missing data would refuse every
-    NVIDIA replay for want of a field it never had.
-    """
+    """Why ``rec`` can't be a replay of ``node``. Fields absent on either side
+    (all of them, for CUPTI nodes) are not compared."""
     kind = node.get("node_kind")
-    is_blit = rec.get("kind") == "memcpy" or str(rec.get("name") or "").startswith(
-        ROCCLR_BLIT_PREFIX)
+    is_copy = rec.get("kind") == "memcpy"
     if kind in ("memcpy", "memset"):
-        return None if is_blit else "copy_node_ran_kernel"
+        blit = is_copy or str(rec.get("name") or "").startswith(ROCCLR_BLIT_PREFIX)
+        return None if blit else "copy_node_ran_kernel"
     if kind == "kernel":
-        if rec.get("kind") == "memcpy":
+        if is_copy:
             return "kernel_node_ran_copy"
         nk, rk = node.get("kernel_id"), rec.get("kernel_id")
         if nk and rk and nk != rk:
@@ -457,27 +352,11 @@ def _signature_mismatch(rec: dict, node: dict) -> str | None:
     return None
 
 
-def _capture_node(graph_nodes: dict[int, dict], node_id: int | None) -> dict | None:
-    """The node at the end of the clone chain (the one with the signature)."""
-    seen: set[int] = set()
-    node = None
-    while node_id and node_id not in seen:
-        seen.add(node_id)
-        node = graph_nodes.get(node_id)
-        if node is None or not node.get("cloned_from"):
-            return node
-        node_id = node["cloned_from"]
-    return None
-
-
 def _refused_replays(kernels, memcpys, graph_nodes, n_nodes) -> dict[tuple, str]:
     """``{(graph_id, correlation_id): reason}`` for replays whose node join fails.
 
-    A replay is the set of graph records sharing one launch's correlation id.
-    Checks, in order: a node id seen twice in one replay (the per-dispatch stamp
-    did not advance — the hazard of an experimental service on an older
-    runtime); an ordinal past the executable's node count; a record that does
-    not match its node's signature.
+    One mismatch refuses the whole replay: an ordinal shift misplaces everything
+    after it.
     """
     replays: dict[tuple, list[dict]] = {}
     for r in (*kernels, *memcpys):
@@ -485,40 +364,19 @@ def _refused_replays(kernels, memcpys, graph_nodes, n_nodes) -> dict[tuple, str]
             replays.setdefault((r["graph_id"], r.get("correlation_id")), []).append(r)
     out: dict[tuple, str] = {}
     for key, recs in replays.items():
-        ids = [r.get("graph_node_id") for r in recs if r.get("graph_node_id")]
+        ids = [r["graph_node_id"] for r in recs if r.get("graph_node_id")]
         if len(ids) != len(set(ids)):
             out[key] = "duplicate_ordinal"
-            continue
-        n = n_nodes.get(key[0])
-        if n is not None and any(node_ordinal(i) >= n for i in ids):
+        elif key[0] in n_nodes and any(node_ordinal(i) >= n_nodes[key[0]] for i in ids):
             out[key] = "ordinal_out_of_range"
-            continue
-        for r in recs:
-            node = _capture_node(graph_nodes, r.get("graph_node_id"))
-            why = _signature_mismatch(r, node) if node is not None else None
-            if why:
-                out[key] = f"signature_{why}"
-                break
+        else:
+            for r in recs:
+                chain = _node_chain(graph_nodes, r.get("graph_node_id"))
+                why = _signature_mismatch(r, chain[-1]) if chain else None
+                if why:
+                    out[key] = f"signature_{why}"
+                    break
     return out
-
-
-def _graph_node_range(graph_nodes: dict[int, dict], node_id: int | None) -> str | None:
-    """The range a graph node was captured under, following clones to the original.
-
-    Instantiating or cloning a graph gives its nodes new ids, and which one a
-    kernel record reports is not something to assume. Walking ``cloned_from``
-    resolves either. A chain that cycles or leaves the map resolves to ``None``.
-    """
-    seen: set[int] = set()
-    while node_id and node_id not in seen:
-        seen.add(node_id)
-        node = graph_nodes.get(node_id)
-        if node is None:
-            return None
-        if node.get("name"):
-            return node["name"]
-        node_id = node.get("cloned_from")
-    return None
 
 
 # Event phases for the sweep below. Ordering at equal timestamps is semantic, not

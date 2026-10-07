@@ -51,8 +51,7 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("collective", ("nccl", "all_reduce", "allreduce", "reduce_scatter", "reducescatter",
                     "all_gather", "allgather", "custom_ar", "cross_device", "one_shot",
                     "two_shot", "all_to_all", "alltoall", "dispatch_combine")),
-    # "topksoftmax"/"moetopk": AITER's router kernels; the first has no
-    # underscore, so it slipped past "topk_softmax" into `sampling` below.
+    # AMD: AITER's router kernels (`topksoftmax_*`, `moeTopK`).
     ("moe", ("moe", "expert", "topk_softmax", "topksoftmax", "moetopk", "grouped_gemm",
              "group_gemm",
              "groupedgemm", "gather_scatter", "sort_tokens", "routing", "router")),
@@ -127,10 +126,8 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # a visible finding, whereas this silently inflated a bucket that gets
     # trusted. Its actual attention kernels are named for what they do, so they
     # are matched by name below.
-    # AMD: AITER's MLA decode and paged-attention asm kernels name neither
-    # "attention" nor any FlashAttention family (hsa/gfx950/{mla,pa}/*.csv);
-    # vLLM's Triton decode attention (`_fwd_grouped_kernel_stage1`) runs on
-    # both vendors. All of them sat in `other`.
+    # AMD: AITER MLA decode / paged-attention asm kernels; both vendors: vLLM's
+    # Triton decode attention.
     ("attention", ("mla_dec", "mla_a16", "mla_a8", "mla_reduce", "mla_stage",
                    "pa_a16w", "pa_a8w", "pa_bf16", "pa_fp8", "pa_decode",
                    "_fwd_grouped_kernel_stage", "_fwd_kernel_stage",
@@ -148,10 +145,7 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # reported 3.6%. Worse, the family was *split*: the `..._splitK_...`
     # variants matched "splitk" and classified, so one kernel family landed in
     # two buckets by accident of naming.
-    # "cijk_" is Tensile's solution prefix (`Cijk_Alik_Bljk_BBS_BH_..._MT256x256x64`
-    # — C[i,j,k] = A x B in its index notation), which every hipBLASLt and
-    # rocBLAS GEMM on MI300/MI355 carries and which contains no "gemm": on AMD
-    # the whole dense-GEMM bucket landed in `other`, the AMD twin of nvjet.
+    # "cijk_": Tensile's prefix on every hipBLASLt/rocBLAS GEMM — the AMD nvjet.
     ("gemm", ("gemm", "cijk_", "cutlass", "sgemm", "hgemm", "s16816", "s161616", "matmul",
               "cublas", "marlin", "machete", "scaled_mm", "wgrad", "tensorop",
               "gemv", "splitk", "nvjet", "xmma")),

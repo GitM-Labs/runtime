@@ -20,9 +20,7 @@ Dict contract (the shim emits exactly these shapes):
 
     graph_id/graph_node_id are 0 for a kernel launched outside a CUDA graph and
     are absent from captures taken before the collector emitted them; both
-    decode to None. The ROCm collector adds ``kernel_id`` (the code-object
-    symbol id) and, under GITM_TRACE_NVTX, ``range_id`` (the rocTX range open
-    at enqueue — see gitm.distributed.correlate, "Stamped ranges").
+    decode to None. The ROCm collector adds ``kernel_id`` and ``range_id``.
     memcpy  {kind:"memcpy", copy_kind:int, bytes, start_ns, end_ns, device_id,
              context_id, stream_id, correlation_id[, range_id, graph_id,
              graph_node_id]}
@@ -229,8 +227,8 @@ def pair_markers(records: list[dict]) -> list[dict]:
     ``{kind, name, start_ns, end_ns, thread_id}`` range that
     :mod:`gitm.distributed.correlate` documents as its input.
 
-    Non-marker records pass through untouched and in order, ahead of the paired
-    ranges. Halves are paired in timestamp order (see below). Unpaired halves are
+    Non-marker records pass through in order, ahead of the paired ranges;
+    graph_node names are normalized like marker names. Unpaired halves are
     dropped rather than repaired: a start without an end has no window, and
     inventing one — closing it at the capture's end, say — would produce a range
     that appears to contain every launch after it and would silently claim them
@@ -242,24 +240,16 @@ def pair_markers(records: list[dict]) -> list[dict]:
     for r in records:
         kind = r.get("kind")
         if kind == "graph_node" and r.get("name"):
-            # A capture-time node is named by the range open when it was
-            # created, in whatever form the emitter pushed it — vLLM's
-            # layerwise ranges are dict reprs. Normalize exactly as a marker's
-            # name is, keeping any annotation for correlation to split off.
-            name = r["name"]
-            base, sep, tail = ((name, "", "") if name.startswith("{")
-                               else name.partition("#"))
-            out.append({**r, "name": normalize_range_name(base) + sep + tail})
+            # Named by whatever range was open at capture: normalize like a marker.
+            base, attrs = split_range_annotations(r["name"])
+            out.append({**r, "name": normalize_range_name(base), "attrs": attrs})
         elif kind == "marker":
             halves.append(r)
         else:
             out.append(r)
 
-    # Pair in time order, not arrival order. Halves reach the shard in the
-    # order buffers were flushed, which neither collector promises is the
-    # order they happened in; pairing by arrival dropped every range whose
-    # END was flushed ahead of its START. At one timestamp a START sorts first,
-    # so a point marker (both halves at one instant) still pairs.
+    # Pair in time order: neither collector promises buffers flush in order.
+    # START sorts first at equal timestamps so point markers still pair.
     halves.sort(key=lambda r: (int(r.get("timestamp_ns") or 0),
                                r.get("marker_flags") == MARKER_END))
     starts: dict[tuple, dict] = {}
@@ -280,8 +270,6 @@ def pair_markers(records: list[dict]) -> list[dict]:
                 "start_ns": int(start["timestamp_ns"]),
                 "end_ns": int(r["timestamp_ns"]),
                 "thread_id": r.get("thread_id"),
-                # The join key for stamped records (correlate.py, "Stamped
-                # ranges"): kernels the ROCm collector stamped carry this id.
                 "marker_id": r.get("marker_id"),
             })
         else:
@@ -292,13 +280,9 @@ def pair_markers(records: list[dict]) -> list[dict]:
 def decode_records(records: list[dict]) -> list[TraceEvent]:
     """Decode a shim record batch, dropping unmodeled kinds, sorted by start.
 
-    Kernel and memcpy dicts are first run through correlation
-    (:func:`gitm.distributed.correlate.correlate_records`) so ``range_op``/
-    ``range_layer`` are populated whenever the capture carries range
-    instrumentation (``runtime``/``marker`` records, ROCm range stamps, graph
-    node maps) — harmless on any trace that doesn't (``decode_kernel`` just sees
-    ``None``). Correlation records themselves are consumed and never reach
-    ``_DECODERS`` — GITM doesn't model them as events.
+    Kernel and memcpy dicts are first run through
+    :func:`gitm.distributed.correlate.correlate_records`, which consumes the
+    correlation records; on a trace without them identity just stays ``None``.
 
     Sorting by ``start_ns`` gives a stable timeline regardless of the order
     CUPTI flushed buffers (concurrent kernels on multiple streams interleave).

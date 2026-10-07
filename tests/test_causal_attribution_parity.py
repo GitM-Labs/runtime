@@ -1,21 +1,8 @@
-"""Correlation changes the causal answer, and the ROCm port gives the same answer.
+"""A known cause must survive decode identically to ground truth, on both vendors.
 
-A fixture with a known cause — a slowdown injected into one op at chosen
-layers — is observed three ways:
-
-* **truth**: the fixture's own trace, where every kernel carries the identity
-  it was launched with (``mechanism_fixtures.observe``);
-* **decoded**: the same execution rendered as a vendor's collector records it
-  and decoded by the real pipeline (gitm.tracer.emulate);
-* **naive**: decoded the way the collector worked before graph identity
-  existed — a replayed kernel takes the range around its launch.
-
-The requirement is not that decoded identity looks plausible but that every
-downstream causal product — residuals, invariant violations, Granger and
-doubly-robust rankings, recoverable time — is *identical* to truth on every
-mechanism that claims exact identity, on both vendors; that the injected
-cause is among the violations; and that the naive decode loses it. The last
-is what proves the test can fail.
+truth = the fixture's own trace; decoded = the same execution through each
+collector's records and the real decoder; naive = the pre-graph-identity
+decode, which proves the comparison can fail.
 """
 
 from __future__ import annotations
@@ -78,9 +65,6 @@ EXACT = [
 
 
 def test_truth_finds_the_injected_cause(fx):
-    """Not necessarily at every slowed layer — multi-basis confirmation keeps
-    only the anomalies it can corroborate — but only at slowed layers. Truth's
-    own finding is then the reference every decode must reproduce."""
     found = _cause_found(observe(fx))
     assert found and found <= SLOW_LAYERS
 
@@ -116,11 +100,7 @@ def test_attribution_is_not_vacuous(fx):
 
 
 def test_the_naive_decode_loses_the_cause(fx):
-    """Before graph identity, every replayed kernel took the range around its
-    launch. With the launch inside an op range, every kernel of the step is
-    filed as that one op: the mixture's median sits inside the band, so the
-    monitor reports nothing, and the only op attribution can name is the wrong
-    one."""
+    """Before graph identity, every replayed kernel took the range around its launch."""
     em = emulate(launches_from_fixture(fx),
                  EmulationConfig("amd", graphs=True, graph_launch_range="L0/qkv_proj"))
     old = [{k: v for k, v in r.items() if k not in ("graph_id", "graph_node_id", "graph_launch")}
@@ -139,8 +119,7 @@ def test_the_naive_decode_loses_the_cause(fx):
                                     dict(stamp_inherits_launch=True),
                                     dict(capture_unranged=True)])
 def test_a_refused_replay_never_invents_a_violation(fx, hazard):
-    """Refusing identity loses evidence; it must not create any. Every
-    violation a hazard-hit decode reports is one truth reports too."""
+    """Refusing identity loses evidence; it must not create any."""
     truth = {(v.invariant, v.node_op, v.layer) for v in observe(fx).violations}
     got = _observe(fx, emulate(launches_from_fixture(fx),
                                EmulationConfig("amd", graphs=True,
@@ -150,8 +129,6 @@ def test_a_refused_replay_never_invents_a_violation(fx, hazard):
 
 
 def test_nvidia_graphs_today_miss_the_cause_but_invent_nothing(fx):
-    """The gap the capture-time node map closes, measured: the per-layer cause
-    is invisible, and nothing false is reported in its place."""
     truth = {(v.invariant, v.node_op, v.layer) for v in observe(fx).violations}
     got = _observe(fx, emulate(launches_from_fixture(fx),
                                EmulationConfig("nvidia", graphs=True)).records)
@@ -160,10 +137,6 @@ def test_nvidia_graphs_today_miss_the_cause_but_invent_nothing(fx):
 
 
 def test_stratifying_by_a_range_annotation_localises_the_cause():
-    """Expert-parallel waves are dynamic — they cannot come from the layer — so
-    they ride on the range as an annotation. A slowdown confined to wave 0 is a
-    quarter of mlp_down's launches: op-level attribution can only say
-    "mlp_down"; stratified by wave it says which wave, and only that one."""
     slow = frozenset(layer for layer in range(32) if layer % 4 == 0)
     fx = generate(Scenario(n_steps=6, noise_cv=0.03, seed=1,
                            mechanisms=(RegionSlowdown(0.6, ops={CAUSE}, layers=slow),)))[0]
@@ -208,10 +181,6 @@ def _window(events, t0, t1):
 
 
 def test_attribution_survives_a_real_window_and_a_refused_replay(fx):
-    """A capture window opens and closes mid-step, and a refused replay drops
-    some ops' kernels but not others' — so series of one launch cardinality
-    differ in length by a few. Attribution must still pair them, and agree
-    with truth cut the same way."""
     starts = sorted(e.start_ns for e in fx.trace.events)
     t0, t1 = starts[len(starts) // 7], starts[(6 * len(starts)) // 7]
     la = launches_from_fixture(fx)

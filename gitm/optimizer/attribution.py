@@ -17,18 +17,25 @@ import numpy as np
 from gitm.optimizer.monitor import Residuals
 from gitm.planner.graph import Graph
 
-#: Two series are the same launch cardinality — and so alignable by position —
-#: when the shorter is at least this fraction of the longer. Per-layer against
-#: per-step ops differ by the layer count (tens), so any value well above
-#: 1/n_layers separates them; 0.9 leaves room for a window's partial edge steps
-#: and refused replays.
+#: Series are aligned by position, which only pairs like with like at the same
+#: launch cardinality: two per-layer ops yes, a per-layer op and lm_head (once a
+#: step) no. The tolerance absorbs a window's partial edge steps and refused
+#: replays; truncating every series to the shortest — the old behaviour — let a
+#: once-per-step op starve every per-layer pair.
 CARDINALITY_TOLERANCE = 0.9
 
 
 def comparable(n_a: int, n_b: int, tolerance: float = CARDINALITY_TOLERANCE) -> bool:
-    """True when series of these lengths can be aligned by position."""
     lo, hi = sorted((n_a, n_b))
     return hi > 0 and lo / hi >= tolerance
+
+
+def aligned_pairs(series: dict[str, list[float]], ops: list[str]):
+    """``(cause, effect, n)`` for every comparable ordered pair, n = shorter length."""
+    for cause in ops:
+        for effect in ops:
+            if cause != effect and comparable(len(series[cause]), len(series[effect])):
+                yield cause, effect, min(len(series[cause]), len(series[effect]))
 
 
 @dataclass
@@ -65,13 +72,10 @@ def attribute(
       → if Δ > threshold, attempt live (rollback-gated via gitm/optimizer/apply.py)
       → if not, drop or escalate
 
-    ``stratify`` splits each op's series by side-table attributes
-    (:mod:`gitm.tracer.kernel_attributes`; residuals must be computed
-    ``with_attributes``), so a cause or effect confined to one archetype or
-    wave is a series of its own instead of a fraction of the op's. Hypothesis
-    ops are then stratum labels (``"mlp_down[wave=0]"``). Default: op only.
+    ``stratify`` splits each op's series by side-table attributes (residuals
+    computed ``with_attributes``); hypothesis ops are then stratum labels.
     """
-    from gitm.tracer.kernel_attributes import stratum
+    from gitm.optimizer.monitor import residual_series
 
     try:
         from statsmodels.tsa.stattools import (
@@ -81,43 +85,27 @@ def attribute(
         return RankedHypotheses(hypotheses=[])
 
     # Group residuals by op into ordered time series (per layer-position step)
-    series: dict[str, list[float]] = {}
-    for kr in residuals.per_kernel:
-        series.setdefault(stratum(kr.op, kr.attrs, stratify), []).append(kr.r_kt)
+    series = residual_series(residuals, stratify)
 
     ops = [op for op, vals in series.items() if len(vals) >= max_lag + 2]
     if len(ops) < 2:
         return RankedHypotheses(hypotheses=[])
 
-    # Series are aligned by position, which pairs like with like only when two
-    # series have the same launch cardinality: two per-layer ops put layer l of
-    # step s at the same index, a per-layer op against lm_head (once a step)
-    # does not. Truncating everything to the shortest series — the old
-    # behaviour — let one once-per-step op set the length of every per-layer
-    # pair, which on a short window is too few points for any lag model, so
-    # attribution silently returned nothing. Cardinality is matched with a
-    # tolerance (:func:`comparable`): a real window starts and ends mid-step,
-    # and a refused graph replay drops some of an op's kernels, so equal-class
-    # series routinely differ by a few launches.
     hypotheses: list[Hypothesis] = []
-    for cause in ops:
-        for effect in ops:
-            if cause == effect or not comparable(len(series[cause]), len(series[effect])):
-                continue
-            n = min(len(series[cause]), len(series[effect]))
-            arr = np.column_stack([np.asarray(series[effect][:n]), np.asarray(series[cause][:n])])
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")  # deprecated-arg + convergence chatter
-                    result = grangercausalitytests(arr, maxlag=max_lag, verbose=False)
-                pvals = [result[lag][0]["ssr_ftest"][1] for lag in range(1, max_lag + 1)]
-                p = float(min(pvals))
-            except Exception:
-                continue
-            direction = "+ slower" if np.mean(series[cause]) > 0 else "- faster"
-            hypotheses.append(
-                Hypothesis(cause_op=cause, effect_op=effect, p_value=p, direction=direction)
-            )
+    for cause, effect, n in aligned_pairs(series, ops):
+        arr = np.column_stack([np.asarray(series[effect][:n]), np.asarray(series[cause][:n])])
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # deprecated-arg + convergence chatter
+                result = grangercausalitytests(arr, maxlag=max_lag, verbose=False)
+            pvals = [result[lag][0]["ssr_ftest"][1] for lag in range(1, max_lag + 1)]
+            p = float(min(pvals))
+        except Exception:
+            continue
+        direction = "+ slower" if np.mean(series[cause]) > 0 else "- faster"
+        hypotheses.append(
+            Hypothesis(cause_op=cause, effect_op=effect, p_value=p, direction=direction)
+        )
 
     hypotheses.sort(key=lambda h: h.p_value)
     return RankedHypotheses(hypotheses=hypotheses)
