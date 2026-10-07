@@ -270,9 +270,6 @@ class LoopConfig:
     # Optional explicit driver for the embedded/engine path. When unset, the
     # loop looks up ``workload`` in the workload registry (gitm.workloads).
     workload_runner: WorkloadRunner | None = None
-    #: Skip the pre-loop NCCL/RCCL AllReduce readiness probe. Also honour
-    #: ``GITM_SKIP_COLLECTIVE_HEALTH=1`` (same escape hatch as serve skip-preflight).
-    skip_collective_health: bool = False
 
 
 def _hf_config_from_engine(engine: Any) -> Any:
@@ -791,26 +788,18 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     run_dir.mkdir(parents=True, exist_ok=True)
     trace_path = traces_dir(cfg.scratch) / f"{run_id}.jsonl"
 
-    # Pre-loop collective readiness (NCCL / RCCL AllReduce). Standalone probe —
-    # accepts double-init when the workload later creates its own process group.
-    # Scoped to the workload's participating world size (e.g. TP) so unused GPUs
-    # on a multi-GPU host cannot block a single-GPU run. Hard-fail on hang/wrong
-    # sum; soft-warn on low busbw. See gitm.health.collective.
-    from gitm.health import (
-        resolve_probe_world_size,
-        run_collective_health,
-        write_collective_health,
-    )
+    # Verify that every visible GPU can participate in NCCL (NVIDIA) or RCCL
+    # (AMD) before building the workload.
+    from gitm.health import run_collective_health
 
-    probe_ws = resolve_probe_world_size(workload=workload, engine=cfg.engine)
-    health = run_collective_health(
-        skip=cfg.skip_collective_health, world_size=probe_ws
+    health = run_collective_health()
+    (run_dir / "collective_health.json").write_text(
+        json.dumps(health.to_dict(), indent=2)
     )
-    write_collective_health(run_dir, health)
     if not health.ok:
         diagnostic = (
             "GPU collective health check failed before the Runtime loop: "
-            + (health.diagnostic() or "unknown collective failure")
+            + health.detail
         )
         return _no_data_result(
             run_dir=run_dir,

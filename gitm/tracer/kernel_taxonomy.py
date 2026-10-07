@@ -48,7 +48,7 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # on NVLink). Without it the generic "reduce" needle files it as elementwise and
     # the collective cost disappears into the noise — which is the one cost a TP run
     # exists to measure.
-    ("collective", ("nccl", "rccl", "all_reduce", "allreduce", "reduce_scatter", "reducescatter",
+    ("collective", ("nccl", "all_reduce", "allreduce", "reduce_scatter", "reducescatter",
                     "all_gather", "allgather", "custom_ar", "cross_device", "one_shot",
                     "two_shot", "all_to_all", "alltoall", "dispatch_combine")),
     ("moe", ("moe", "expert", "topk_softmax", "grouped_gemm", "group_gemm",
