@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 from gitm.health.collective import HealthResult, detect_gpus, run_collective_health
 
 
@@ -94,6 +96,21 @@ def test_timeout_kills_torchrun_process_group(monkeypatch):
 
     assert not result.ok
     assert "timed out" in result.detail
+    killpg.assert_called_once()
+    proc.wait.assert_called_once()
+
+
+def test_keyboard_interrupt_kills_torchrun_process_group(monkeypatch):
+    proc = Mock(pid=123, returncode=None)
+    proc.communicate.side_effect = KeyboardInterrupt()
+    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda: ("nvidia", 2))
+    monkeypatch.setattr("gitm.health.collective.subprocess.Popen", lambda *a, **k: proc)
+    killpg = Mock()
+    monkeypatch.setattr("gitm.health.collective.os.killpg", killpg)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_collective_health(timeout_s=1)
+
     killpg.assert_called_once()
     proc.wait.assert_called_once()
 

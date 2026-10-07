@@ -65,11 +65,23 @@ def run_collective_health(timeout_s: float = 60.0) -> HealthResult:
             text=True,
             start_new_session=True,
         )
+        timed_out = False
         try:
             _, stderr = proc.communicate(timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait()
+            timed_out = True
+            stderr = None
+        finally:
+            # start_new_session=True puts torchrun outside the terminal PG, so
+            # Ctrl+C / timeout must kill the group explicitly or workers linger.
+            if proc.returncode is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
+
+        if timed_out:
             return HealthResult(vendor, count, "fail", f"AllReduce timed out after {timeout_s:g}s")
 
         if proc.returncode:
