@@ -129,6 +129,32 @@ def test_an_mi350x_is_named_but_not_priced_as_an_mi355x(kfd):
     assert ctx.peak_for_sku(name) is None
 
 
+@pytest.mark.parametrize(
+    ("device", "gfx_version", "expected"),
+    [
+        (0x74A1, 90402, "AMD Instinct MI300X"),
+        (0x74A5, 90402, "AMD Instinct MI325X"),
+        (0x740F, 90010, "AMD Instinct MI210"),
+    ],
+)
+def test_older_instinct_parts_get_the_name_torch_gives(kfd, device, gfx_version, expected):
+    """Unlisted, an MI300X was "AMD gfx942 device id 29857": a different history
+    key from the one the marketing name gives."""
+    props = _gpu_properties(device).replace(
+        "gfx_target_version 90500", f"gfx_target_version {gfx_version}"
+    )
+    _node(kfd, 1, 1001, props)
+
+    assert ctx._query_amd() == (expected, 1)
+
+
+def test_ids_whose_name_depends_on_the_revision_are_not_named(kfd):
+    """libdrm: 74A2 is MI308X at revision 00 and MI300X at A1, and kfd does not
+    say which. A guess would file one part under the other's name."""
+    for device in (0x74A2, 0x74B6):
+        assert device not in ctx._AMD_DEVICE_NAMES
+
+
 def test_only_mi355x_names_reach_the_mi355x_entry():
     """The catalogue has MI355X and no other gfx950 part, so every other name
     in the table must miss rather than borrow MI355X's peaks."""

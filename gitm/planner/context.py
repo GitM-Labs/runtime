@@ -272,13 +272,31 @@ _KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
 
 _AMD_PCI_VENDOR = 0x1002
 
-#: PCI device id -> name, spelled as libdrm's ``data/amdgpu.ids`` spells it.
-#: ROCm's thunk (libhsakmt) names devices from that file, so these are the names
-#: ROCm itself reports. MI350X and MI355X are both gfx950, so
-#: ``gfx_target_version`` cannot tell them apart; the device id can. MI350P is
-#: gfx950 too, with half the CUs and HBM. The PCI ID database (pci-ids.ucw.cz,
-#: vendor 1002) lists the same 75A0/75A3/75A8; the VF ids are in libdrm only.
+#: PCI device id -> name, spelled as libdrm's ``data/amdgpu.ids`` spells it
+#: (mesa/drm at b97cbde1). ROCm's thunk (libhsakmt) names devices from that
+#: file, so these are the names ROCm itself reports, and a part needs one so
+#: that its SKU, which keys the run history, does not depend on which probe
+#: answered. MI350X and MI355X are both gfx950, so ``gfx_target_version``
+#: cannot tell them apart; the device id can. MI350P is gfx950 too, with half
+#: the CUs and HBM. The PCI ID database (pci-ids.ucw.cz, vendor 1002) lists
+#: every id below except 0x7410 and the gfx950 VFs.
+#:
+#: Names only: nothing here is a ``_PEAKS`` entry. Left out on purpose: 0x74A2
+#: and 0x74B6, which libdrm names MI308X at revision 00 and MI300X at A1 (kfd
+#: does not expose the revision), and the "HF" ids 0x74A8, 0x74A9 and 0x74BD.
 _AMD_DEVICE_NAMES: dict[int, str] = {
+    # gfx90a (CDNA2)
+    0x7408: "AMD Instinct MI250X",
+    0x740C: "AMD Instinct MI250X / MI250",
+    0x740F: "AMD Instinct MI210",
+    0x7410: "AMD Instinct MI210 VF",
+    # gfx942 (CDNA3)
+    0x74A0: "AMD Instinct MI300A",
+    0x74A1: "AMD Instinct MI300X",
+    0x74A5: "AMD Instinct MI325X",
+    0x74B5: "AMD Instinct MI300X VF",
+    0x74B9: "AMD Instinct MI325X VF",
+    # gfx950 (CDNA4)
     0x75A0: "AMD Instinct MI350X",
     0x75A3: "AMD Instinct MI355X",
     0x75A8: "AMD Instinct MI350P",
