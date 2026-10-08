@@ -223,3 +223,17 @@ def test_once_per_step_ops_are_never_aligned_with_per_layer_ops(fx):
     assert not comparable(n_layer, n_step)
     hyps = attribute(truth.residuals, fx.graph).hypotheses +         attribute_dr(truth.residuals, fx.graph).hypotheses
     assert not any("lm_head" in (h.cause_op, h.effect_op) for h in hyps)
+
+
+def test_granger_works_with_the_statsmodels_015_signature(fx, monkeypatch):
+    """statsmodels 0.15 removed ``verbose=``; passing it made every pair raise
+    and attribution return nothing, silently."""
+    import statsmodels.tsa.stattools as st
+
+    real = st.grangercausalitytests
+
+    def granger_015(x, maxlag, addconst=True):
+        return real(x, maxlag, addconst)
+
+    monkeypatch.setattr(st, "grangercausalitytests", granger_015)
+    assert attribute(observe(fx).residuals, fx.graph).hypotheses

@@ -129,3 +129,26 @@ def test_compiles_against_rocprofiler_sdk_headers(tmp_path):
         pytest.skip("no C compiler")
     r = check.compile_rocm(pathlib.Path(inc), tmp_path)
     assert r.returncode == 0, r.stderr[-4000:]
+
+
+def test_launches_outside_the_capture_take_no_ordinal():
+    """A launch on a stream the capture never reached is not a node; counting
+    it shifts every later ordinal onto the wrong node."""
+    body = _between("static void capture_node(", "\n}\n")
+    assert "set_has(tls_capture.streams" in body
+    assert body.index("set_has(tls_capture.streams") < body.index("emit_graph_node(")
+    cb = _between("static void hip_api_cb(", "\n}\n")
+    for op in ("hipEventRecord", "hipStreamWaitEvent"):  # forks join through events
+        assert f"ROCPROFILER_HIP_RUNTIME_API_ID_{op}" in cb
+    assert "tls_capture.untrusted ? 0 : tls_capture.seq" in cb
+
+
+def test_destroyed_and_updated_graphs_drop_their_labels():
+    cb = _between("static void hip_api_cb(", "\n}\n")
+    assert "umap_remove(&g_graphs" in cb and "umap_remove(&g_execs" in cb
+    update = cb[cb.index("hipGraphExecUpdate:"):]
+    assert "link_exec(" in update[:300]
+    filt = _between("k_hip_ops[] = {", "};")
+    for op in ("hipGraphDestroy", "hipGraphExecDestroy", "hipGraphExecUpdate",
+               "hipEventRecord", "hipEventRecordWithFlags", "hipStreamWaitEvent"):
+        assert f"ROCPROFILER_HIP_RUNTIME_API_ID_{op}," in filt

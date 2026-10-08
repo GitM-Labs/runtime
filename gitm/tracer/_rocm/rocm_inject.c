@@ -170,7 +170,7 @@ typedef struct {
 } umap;
 
 static umap g_hostfn; /* host stub address -> kernel_id */
-static umap g_graphs; /* hipGraph_t -> (capture seq, node count) */
+static umap g_graphs; /* hipGraph_t -> (capture seq, node count); seq 0 = untrusted */
 static umap g_execs;  /* hipGraphExec_t -> exec seq */
 
 static size_t umap_bucket(uint64_t key) {
@@ -190,6 +190,23 @@ static void umap_put(umap *m, uint64_t key, uint64_t a, uint64_t b) {
     if (!n) return;
     *n = (umap_node){key, a, b, m->buckets[i]};
     m->buckets[i] = n;
+}
+
+static void umap_del(umap *m, uint64_t key) {
+    for (umap_node **pp = &m->buckets[umap_bucket(key)]; *pp; pp = &(*pp)->next) {
+        if ((*pp)->key == key) {
+            umap_node *dead = *pp;
+            *pp = dead->next;
+            free(dead);
+            return;
+        }
+    }
+}
+
+static void umap_remove(umap *m, uint64_t key) {
+    pthread_mutex_lock(&g_lock);
+    umap_del(m, key);
+    pthread_mutex_unlock(&g_lock);
 }
 
 static const umap_node *umap_get(const umap *m, uint64_t key) {
@@ -384,10 +401,31 @@ static __thread struct {
     int depth;
 } tls_ranges;
 
+/* A capture covers its origin stream plus every stream that waits on an event
+ * recorded inside it (how forks join). Launches on any other stream are not
+ * nodes and must not take an ordinal. Past the set sizes the capture is marked
+ * untrusted: its replays are left unnamed rather than guessed. */
+#define CAPTURE_STREAMS_MAX 32
+#define CAPTURE_EVENTS_MAX 128
 static __thread struct {
-    int active;
+    int active, untrusted;
     uint64_t seq, n;
+    uint64_t streams[CAPTURE_STREAMS_MAX];
+    uint64_t events[CAPTURE_EVENTS_MAX];
+    int n_streams, n_events;
 } tls_capture;
+
+static int set_has(const uint64_t *set, int n, uint64_t v) {
+    for (int i = 0; i < n; i++)
+        if (set[i] == v) return 1;
+    return 0;
+}
+
+static void set_add(uint64_t *set, int *n, int cap, uint64_t v) {
+    if (set_has(set, *n, v)) return;
+    if (*n < cap) set[(*n)++] = v;
+    else tls_capture.untrusted = 1;
+}
 
 static __thread struct {
     uint64_t exec[GRAPH_STACK_MAX], ordinal[GRAPH_STACK_MAX];
@@ -479,99 +517,132 @@ static void emit_graph_exec(uint64_t exec_seq, uint64_t capture_seq,
 
 /* ---- HIP API callbacks: capture and graph launches ---------------------- */
 
-/* A host-stub launch: kernel_id via the host-symbol map, geometry in blocks. */
-static void node_hostfn(const void *fn, rocprofiler_dim3_t g, rocprofiler_dim3_t b) {
-    uint64_t kid = 0;
-    umap_lookup(&g_hostfn, (uint64_t)(uintptr_t)fn, &kid, NULL);
-    dims_t grid = {g.x, g.y, g.z}, block = {b.x, b.y, b.z};
-    emit_graph_node("kernel", kid, &grid, &block);
-}
-
 static uint32_t div0(uint32_t a, uint32_t b) { return b ? a / b : 0; }
 
+static uint64_t hostfn_kid(const void *fn) {
+    uint64_t kid = 0;
+    umap_lookup(&g_hostfn, (uint64_t)(uintptr_t)fn, &kid, NULL);
+    return kid;
+}
+
+#define DIM3(d) ((dims_t){(d).x, (d).y, (d).z})
+
+/* One captured launch/copy/memset -> one graph node, if its stream belongs to
+ * the capture. Geometry in blocks, the unit dispatch records are normalized to. */
 static void capture_node(rocprofiler_tracing_operation_t op,
                          const rocprofiler_hip_api_args_t *a) {
+    const char *kind = "kernel";
+    hipStream_t stream = NULL;
+    uint64_t kid = 0;
+    dims_t g = {0, 0, 0}, b = {0, 0, 0};
+    int dims = 1;
     switch (op) {
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipLaunchKernel:
-            node_hostfn(a->hipLaunchKernel.function_address,
-                        a->hipLaunchKernel.numBlocks, a->hipLaunchKernel.dimBlocks);
-            return;
+            stream = a->hipLaunchKernel.stream;
+            kid = hostfn_kid(a->hipLaunchKernel.function_address);
+            g = DIM3(a->hipLaunchKernel.numBlocks);
+            b = DIM3(a->hipLaunchKernel.dimBlocks);
+            break;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipLaunchKernel_spt:
-            node_hostfn(a->hipLaunchKernel_spt.function_address,
-                        a->hipLaunchKernel_spt.numBlocks,
-                        a->hipLaunchKernel_spt.dimBlocks);
-            return;
+            stream = a->hipLaunchKernel_spt.stream;
+            kid = hostfn_kid(a->hipLaunchKernel_spt.function_address);
+            g = DIM3(a->hipLaunchKernel_spt.numBlocks);
+            b = DIM3(a->hipLaunchKernel_spt.dimBlocks);
+            break;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipExtLaunchKernel:
-            node_hostfn(a->hipExtLaunchKernel.function_address,
-                        a->hipExtLaunchKernel.numBlocks,
-                        a->hipExtLaunchKernel.dimBlocks);
-            return;
+            stream = a->hipExtLaunchKernel.stream;
+            kid = hostfn_kid(a->hipExtLaunchKernel.function_address);
+            g = DIM3(a->hipExtLaunchKernel.numBlocks);
+            b = DIM3(a->hipExtLaunchKernel.dimBlocks);
+            break;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipLaunchCooperativeKernel:
-            node_hostfn(a->hipLaunchCooperativeKernel.func,
-                        a->hipLaunchCooperativeKernel.gridDim,
-                        a->hipLaunchCooperativeKernel.blockDimX);
-            return;
+            stream = a->hipLaunchCooperativeKernel.stream;
+            kid = hostfn_kid(a->hipLaunchCooperativeKernel.func);
+            g = DIM3(a->hipLaunchCooperativeKernel.gridDim);
+            b = DIM3(a->hipLaunchCooperativeKernel.blockDimX);
+            break;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipLaunchKernelExC: {
             const hipLaunchConfig_t *c = a->hipLaunchKernelExC.config;
-            uint64_t kid = 0;
-            umap_lookup(&g_hostfn, (uint64_t)(uintptr_t)a->hipLaunchKernelExC.fPtr,
-                        &kid, NULL);
-            dims_t g = {0, 0, 0}, b = {0, 0, 0};
-            if (c) {
-                g = (dims_t){c->gridDim.x, c->gridDim.y, c->gridDim.z};
-                b = (dims_t){c->blockDim.x, c->blockDim.y, c->blockDim.z};
-            }
-            emit_graph_node("kernel", kid, c ? &g : NULL, c ? &b : NULL);
-            return;
+            if (!c) return; /* no stream to attribute it to */
+            stream = c->stream;
+            kid = hostfn_kid(a->hipLaunchKernelExC.fPtr);
+            g = DIM3(c->gridDim);
+            b = DIM3(c->blockDim);
+            break;
         }
         /* hipFunction_t launches (Triton, hipBLASLt, AITER asm) have no
          * kernel_id mapping; they validate on geometry alone. */
-        case ROCPROFILER_HIP_RUNTIME_API_ID_hipModuleLaunchKernel: {
-            dims_t g = {a->hipModuleLaunchKernel.gridDimX, a->hipModuleLaunchKernel.gridDimY,
-                        a->hipModuleLaunchKernel.gridDimZ};
-            dims_t b = {a->hipModuleLaunchKernel.blockDimX, a->hipModuleLaunchKernel.blockDimY,
-                        a->hipModuleLaunchKernel.blockDimZ};
-            emit_graph_node("kernel", 0, &g, &b);
-            return;
-        }
-        case ROCPROFILER_HIP_RUNTIME_API_ID_hipExtModuleLaunchKernel: {
+        case ROCPROFILER_HIP_RUNTIME_API_ID_hipModuleLaunchKernel:
+            stream = a->hipModuleLaunchKernel.stream;
+            g = (dims_t){a->hipModuleLaunchKernel.gridDimX, a->hipModuleLaunchKernel.gridDimY,
+                         a->hipModuleLaunchKernel.gridDimZ};
+            b = (dims_t){a->hipModuleLaunchKernel.blockDimX, a->hipModuleLaunchKernel.blockDimY,
+                         a->hipModuleLaunchKernel.blockDimZ};
+            break;
+        case ROCPROFILER_HIP_RUNTIME_API_ID_hipExtModuleLaunchKernel:
             /* global size is in work-items, like the dispatch record */
-            dims_t b = {a->hipExtModuleLaunchKernel.localWorkSizeX,
-                        a->hipExtModuleLaunchKernel.localWorkSizeY,
-                        a->hipExtModuleLaunchKernel.localWorkSizeZ};
-            dims_t g = {div0(a->hipExtModuleLaunchKernel.globalWorkSizeX, b.x),
-                        div0(a->hipExtModuleLaunchKernel.globalWorkSizeY, b.y),
-                        div0(a->hipExtModuleLaunchKernel.globalWorkSizeZ, b.z)};
-            emit_graph_node("kernel", 0, &g, &b);
-            return;
-        }
+            stream = a->hipExtModuleLaunchKernel.stream;
+            b = (dims_t){a->hipExtModuleLaunchKernel.localWorkSizeX,
+                         a->hipExtModuleLaunchKernel.localWorkSizeY,
+                         a->hipExtModuleLaunchKernel.localWorkSizeZ};
+            g = (dims_t){div0(a->hipExtModuleLaunchKernel.globalWorkSizeX, b.x),
+                         div0(a->hipExtModuleLaunchKernel.globalWorkSizeY, b.y),
+                         div0(a->hipExtModuleLaunchKernel.globalWorkSizeZ, b.z)};
+            break;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpyAsync:
+            kind = "memcpy", dims = 0, stream = a->hipMemcpyAsync.stream;
+            break;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpyDtoDAsync:
+            kind = "memcpy", dims = 0, stream = a->hipMemcpyDtoDAsync.stream;
+            break;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpyDtoHAsync:
+            kind = "memcpy", dims = 0, stream = a->hipMemcpyDtoHAsync.stream;
+            break;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpyHtoDAsync:
+            kind = "memcpy", dims = 0, stream = a->hipMemcpyHtoDAsync.stream;
+            break;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpy2DAsync:
+            kind = "memcpy", dims = 0, stream = a->hipMemcpy2DAsync.stream;
+            break;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipMemcpyPeerAsync:
-            emit_graph_node("memcpy", 0, NULL, NULL);
-            return;
+            kind = "memcpy", dims = 0, stream = a->hipMemcpyPeerAsync.stream;
+            break;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipMemsetAsync:
+            kind = "memset", dims = 0, stream = a->hipMemsetAsync.stream;
+            break;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipMemsetD8Async:
+            kind = "memset", dims = 0, stream = a->hipMemsetD8Async.stream;
+            break;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipMemsetD16Async:
+            kind = "memset", dims = 0, stream = a->hipMemsetD16Async.stream;
+            break;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipMemsetD32Async:
+            kind = "memset", dims = 0, stream = a->hipMemsetD32Async.stream;
+            break;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipMemset2DAsync:
-            emit_graph_node("memset", 0, NULL, NULL);
-            return;
+            kind = "memset", dims = 0, stream = a->hipMemset2DAsync.stream;
+            break;
         default:
             return;
     }
+    if (!set_has(tls_capture.streams, tls_capture.n_streams, (uint64_t)(uintptr_t)stream))
+        return; /* another stream: not a node of this capture */
+    emit_graph_node(kind, kid, dims ? &g : NULL, dims ? &b : NULL);
+}
+
+/* Bind an executable to a fresh exec seq and the capture its graph came from
+ * (instantiate, or hipGraphExecUpdate swapping in another graph). */
+static void link_exec(hipGraphExec_t exec, hipGraph_t graph) {
+    if (!exec) return;
+    uint64_t exec_seq = atomic_fetch_add(&g_exec_seq, 1) + 1;
+    uint64_t cap = 0, n = 0;
+    int captured = umap_lookup(&g_graphs, (uint64_t)(uintptr_t)graph, &cap, &n) && cap;
+    umap_store(&g_execs, (uint64_t)(uintptr_t)exec, exec_seq, 0);
+    emit_graph_exec(exec_seq, cap, n, captured);
 }
 
 static void link_instantiate(hipGraphExec_t *pexec, hipGraph_t graph) {
-    if (!pexec || !*pexec) return;
-    uint64_t exec_seq = atomic_fetch_add(&g_exec_seq, 1) + 1;
-    uint64_t cap = 0, n = 0;
-    int captured = umap_lookup(&g_graphs, (uint64_t)(uintptr_t)graph, &cap, &n);
-    umap_store(&g_execs, (uint64_t)(uintptr_t)*pexec, exec_seq, 0);
-    emit_graph_exec(exec_seq, cap, n, captured);
+    if (pexec) link_exec(*pexec, graph);
 }
 
 static void hip_api_cb(rocprofiler_callback_tracing_record_t record) {
@@ -606,19 +677,59 @@ static void hip_api_cb(rocprofiler_callback_tracing_record_t record) {
             return;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamBeginCapture:
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamBeginCaptureToGraph:
-            /* per-thread, not per-stream: forked side streams are captured too */
             if (ok && !tls_capture.active) {
+                hipStream_t origin = op == ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamBeginCapture
+                                         ? a->hipStreamBeginCapture.stream
+                                         : a->hipStreamBeginCaptureToGraph.stream;
                 tls_capture.active = 1;
+                tls_capture.untrusted = 0;
                 tls_capture.seq = atomic_fetch_add(&g_capture_seq, 1) + 1;
                 tls_capture.n = 0;
+                tls_capture.n_streams = tls_capture.n_events = 0;
+                set_add(tls_capture.streams, &tls_capture.n_streams, CAPTURE_STREAMS_MAX,
+                        (uint64_t)(uintptr_t)origin);
             }
+            return;
+        case ROCPROFILER_HIP_RUNTIME_API_ID_hipEventRecord:
+        case ROCPROFILER_HIP_RUNTIME_API_ID_hipEventRecordWithFlags: {
+            hipStream_t st = op == ROCPROFILER_HIP_RUNTIME_API_ID_hipEventRecord
+                                 ? a->hipEventRecord.stream
+                                 : a->hipEventRecordWithFlags.stream;
+            hipEvent_t ev = op == ROCPROFILER_HIP_RUNTIME_API_ID_hipEventRecord
+                                ? a->hipEventRecord.event
+                                : a->hipEventRecordWithFlags.event;
+            if (ok && tls_capture.active &&
+                set_has(tls_capture.streams, tls_capture.n_streams, (uint64_t)(uintptr_t)st))
+                set_add(tls_capture.events, &tls_capture.n_events, CAPTURE_EVENTS_MAX,
+                        (uint64_t)(uintptr_t)ev);
+            return;
+        }
+        case ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamWaitEvent:
+            /* a stream waiting on a captured event joins the capture (a fork) */
+            if (ok && tls_capture.active &&
+                set_has(tls_capture.events, tls_capture.n_events,
+                        (uint64_t)(uintptr_t)a->hipStreamWaitEvent.event))
+                set_add(tls_capture.streams, &tls_capture.n_streams, CAPTURE_STREAMS_MAX,
+                        (uint64_t)(uintptr_t)a->hipStreamWaitEvent.stream);
             return;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamEndCapture:
             if (tls_capture.active && ok && a->hipStreamEndCapture.pGraph &&
                 *a->hipStreamEndCapture.pGraph)
+                /* an untrusted capture is stored as seq 0: never projected */
                 umap_store(&g_graphs, (uint64_t)(uintptr_t)*a->hipStreamEndCapture.pGraph,
-                           tls_capture.seq, tls_capture.n);
+                           tls_capture.untrusted ? 0 : tls_capture.seq, tls_capture.n);
             tls_capture.active = 0;
+            return;
+        case ROCPROFILER_HIP_RUNTIME_API_ID_hipGraphDestroy:
+            /* a reused pointer must not inherit this capture */
+            if (ok) umap_remove(&g_graphs, (uint64_t)(uintptr_t)a->hipGraphDestroy.graph);
+            return;
+        case ROCPROFILER_HIP_RUNTIME_API_ID_hipGraphExecDestroy:
+            if (ok) umap_remove(&g_execs, (uint64_t)(uintptr_t)a->hipGraphExecDestroy.graphExec);
+            return;
+        case ROCPROFILER_HIP_RUNTIME_API_ID_hipGraphExecUpdate:
+            /* the executable now runs another graph's nodes: new exec seq */
+            if (ok) link_exec(a->hipGraphExecUpdate.hGraphExec, a->hipGraphExecUpdate.hGraph);
             return;
         case ROCPROFILER_HIP_RUNTIME_API_ID_hipGraphInstantiate:
             if (ok) link_instantiate(a->hipGraphInstantiate.pGraphExec,
@@ -641,6 +752,12 @@ static const rocprofiler_tracing_operation_t k_hip_ops[] = {
     ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamBeginCapture,
     ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamBeginCaptureToGraph,
     ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamEndCapture,
+    ROCPROFILER_HIP_RUNTIME_API_ID_hipEventRecord,
+    ROCPROFILER_HIP_RUNTIME_API_ID_hipEventRecordWithFlags,
+    ROCPROFILER_HIP_RUNTIME_API_ID_hipStreamWaitEvent,
+    ROCPROFILER_HIP_RUNTIME_API_ID_hipGraphDestroy,
+    ROCPROFILER_HIP_RUNTIME_API_ID_hipGraphExecDestroy,
+    ROCPROFILER_HIP_RUNTIME_API_ID_hipGraphExecUpdate,
     ROCPROFILER_HIP_RUNTIME_API_ID_hipGraphInstantiate,
     ROCPROFILER_HIP_RUNTIME_API_ID_hipGraphInstantiateWithFlags,
     ROCPROFILER_HIP_RUNTIME_API_ID_hipGraphInstantiateWithParams,

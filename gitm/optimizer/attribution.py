@@ -9,6 +9,8 @@ A doubly-robust estimator runs alongside Granger (see gitm/optimizer/dr.py).
 
 from __future__ import annotations
 
+import contextlib
+import io
 import warnings
 from dataclasses import dataclass
 
@@ -95,9 +97,12 @@ def attribute(
     for cause, effect, n in aligned_pairs(series, ops):
         arr = np.column_stack([np.asarray(series[effect][:n]), np.asarray(series[cause][:n])])
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")  # deprecated-arg + convergence chatter
-                result = grangercausalitytests(arr, maxlag=max_lag, verbose=False)
+            # No `verbose=`: statsmodels 0.15 removed it, and passing it raised a
+            # TypeError on every pair that the except below swallowed, so Granger
+            # silently returned nothing. 0.14 prints without it, hence the redirect.
+            with warnings.catch_warnings(), contextlib.redirect_stdout(io.StringIO()):
+                warnings.simplefilter("ignore")  # convergence chatter
+                result = grangercausalitytests(arr, maxlag=max_lag)
             pvals = [result[lag][0]["ssr_ftest"][1] for lag in range(1, max_lag + 1)]
             p = float(min(pvals))
         except Exception:

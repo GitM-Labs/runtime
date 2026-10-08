@@ -342,3 +342,16 @@ def test_cupti_node_records_sharing_an_id_merge_and_the_captured_name_wins():
             {"kind": "graph_node", "graph_node_id": 900, "name": "decode_step"},
             _rt(9, 1, 2), _k(9, graph_id=3, graph_node_id=900)]
     assert _ops(correlate_records(recs)[0]) == [("mlp_down", 3)]
+
+
+def test_a_replay_straddling_the_window_is_validated_whole(tmp_path, monkeypatch):
+    """Every dispatch got ordinal 0 (the stamp did not advance). A window that
+    keeps only the last kernel would hide the duplicates and trust node 0's
+    label; read_shards must validate before windowing."""
+    monkeypatch.setenv(injection.ENV_OUT, str(tmp_path / "trace.jsonl"))
+    ks = [_gk(2, 0, t=1000 + 20 * i, kernel_id=100, grid=[8, 1, 1]) for i in range(3)]
+    (tmp_path / "trace.jsonl.9").write_text(
+        "\n".join(json.dumps(r) for r in [*_graph(), *ks]) + "\n")
+    with pytest.warns(RuntimeWarning, match="duplicate_ordinal"):
+        events = injection.read_shards(start_ns=1035, end_ns=2000)
+    assert [(e.start_ns, e.range_op) for e in events] == [(1040, None)]

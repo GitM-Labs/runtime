@@ -10,6 +10,7 @@
 
 #include <cuda_runtime.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -228,12 +229,29 @@ const char *gitm_node_kind_name(int kind) {
 
 static CUpti_SubscriberHandle g_sub;
 static int g_subscribed = 0;
+/* Bumped on every node_map_start. Pops that happen while callbacks are off
+ * are never seen, so a thread's stack from an earlier session would name the
+ * next session's nodes; a thread resets the first time it is seen in a new one. */
+static atomic_uint g_session = 0;
 
 static __thread struct {
     char *names[RANGE_STACK_MAX];
     int depth;
     int instantiating;
+    unsigned session;
 } tls_nvtx;
+
+static void tls_sync(void) {
+    unsigned now = atomic_load(&g_session);
+    if (tls_nvtx.session == now) return;
+    for (int d = 0; d < tls_nvtx.depth && d < RANGE_STACK_MAX; d++) {
+        free(tls_nvtx.names[d]);
+        tls_nvtx.names[d] = NULL;
+    }
+    tls_nvtx.depth = 0;
+    tls_nvtx.instantiating = 0;
+    tls_nvtx.session = now;
+}
 
 static void nvtx_push(const char *msg) {
     int d = tls_nvtx.depth++;
@@ -306,6 +324,7 @@ static const CUpti_CallbackId DRIVER_INSTANTIATE[] = {
 static void CUPTIAPI on_callback(void *user, CUpti_CallbackDomain dom, CUpti_CallbackId cbid,
                                  const void *cbdata) {
     (void)user;
+    tls_sync();
     if (dom == CUPTI_CB_DOMAIN_NVTX) {
         const void *params = ((const CUpti_NvtxData *)cbdata)->functionParams;
         switch (cbid) {
@@ -360,6 +379,7 @@ static void CUPTIAPI on_callback(void *user, CUpti_CallbackDomain dom, CUpti_Cal
 static void node_map_start(void) {
     if (g_subscribed || cuptiSubscribe(&g_sub, on_callback, NULL) != CUPTI_SUCCESS) return;
     g_subscribed = 1;
+    atomic_fetch_add(&g_session, 1);
     cuptiEnableDomain(1, g_sub, CUPTI_CB_DOMAIN_NVTX);
     cuptiEnableCallback(1, g_sub, CUPTI_CB_DOMAIN_RESOURCE, CUPTI_CBID_RESOURCE_GRAPHNODE_CREATED);
     cuptiEnableCallback(1, g_sub, CUPTI_CB_DOMAIN_RESOURCE, CUPTI_CBID_RESOURCE_GRAPHNODE_CLONED);

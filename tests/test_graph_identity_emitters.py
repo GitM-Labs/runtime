@@ -188,3 +188,12 @@ def test_replayed_kernels_take_their_capture_range_end_to_end(monkeypatch):
     replayed = [e for e in events if e.kind == "kernel" and e.graph_id is not None]
     assert replayed and all((k.range_op, k.range_layer) == ("mlp_down", 4) for k in replayed)
     assert {k.launch_range for k in replayed} == {"decode_step"}
+
+
+def test_a_new_session_starts_with_an_empty_range_stack():
+    """Pops while callbacks are off are never seen; without a reset a range from
+    an earlier session would name the next session's nodes."""
+    cb = _CORE[_CORE.index("static void CUPTIAPI on_callback"):]
+    assert cb.index("tls_sync();") < cb.index("CUPTI_CB_DOMAIN_NVTX")
+    start = _CORE[_CORE.index("static void node_map_start"):]
+    assert "atomic_fetch_add(&g_session, 1);" in start[:start.index("\n}\n")]

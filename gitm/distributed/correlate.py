@@ -247,6 +247,9 @@ def correlate_records(records: list[dict]) -> tuple[list[dict], list[dict], Corr
         elif kind == "marker":
             markers.append(r)
         elif kind == "graph_node" and r.get("graph_node_id") is not None:
+            # Several records can describe one node (created, then linked as
+            # a copy). Empty fields mean "not known here", never "cleared", so
+            # they never overwrite: an unnamed copy must not erase a name.
             prior = graph_nodes.get(r["graph_node_id"], {})
             graph_nodes[r["graph_node_id"]] = {
                 **prior, **{k: v for k, v in r.items() if v not in (None, "", 0)}}

@@ -405,13 +405,11 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
                         stamp_faults[key] = stamp_faults.get(key, 0) + rec[key]
                 continue
 
-            ts = rec.get("start_ns")
-            if not isinstance(ts, int):
+            # The window is applied after decoding, not here: a graph replay that
+            # straddles it must be validated whole, or the duplicates or ordinal
+            # shift that would refuse it fall outside and the rest is trusted.
+            if not isinstance(rec.get("start_ns"), int):
                 dropped_lines += 1
-                continue
-            if start_ns is not None and ts < start_ns:
-                continue
-            if end_ns is not None and ts > end_ns:
                 continue
             records.append(rec)
 
@@ -453,14 +451,17 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
             RuntimeWarning,
             stacklevel=2,
         )
-    events, report = decode_records_with_report(records)
+    decoded, report = decode_records_with_report(records)
     for problem in report.problems():
         warnings.warn(f"injected trace identity: {problem}", RuntimeWarning, stacklevel=2)
+    events = [e for e in decoded
+              if (start_ns is None or e.start_ns >= start_ns)
+              and (end_ns is None or e.start_ns <= end_ns)]
     # Correlation records are consumed, not lost: decode_records folds them into
     # range_op/range_layer on the kernels. Counting them as dropped would report
     # millions of missing records on a correlated capture and read as data loss.
     n_correlation = sum(1 for r in records if r.get("kind") in CORRELATION_KINDS)
-    unmodeled = len(records) - n_correlation - len(events)
+    unmodeled = len(records) - n_correlation - len(decoded)
     if unmodeled > 0:
         warnings.warn(
             f"injected trace coverage: dropped {unmodeled} unmodeled activity record(s)",
