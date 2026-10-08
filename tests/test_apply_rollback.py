@@ -427,6 +427,7 @@ def test_a_timed_out_gate_blocks_the_next_candidate_until_it_exits():
     release.set()
     for t in list(apply_mod._timed_out_gates):
         t.join(5)
+    assert blocked.restore_failed, "the loops stop only on restore_failed"
     after = apply_intervention(_spec(), DictApplicator(cfg, measure_fn=lambda s: +0.1))
     assert after.kept and cfg == {"block_size": 16}
 

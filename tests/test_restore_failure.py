@@ -339,6 +339,44 @@ def test_autoresearch_counts_what_it_never_reached(monkeypatch):
     assert len(run.results) == 4
 
 
+def test_a_gate_still_running_stops_the_pass_like_a_failed_restore(monkeypatch):
+    """A refusal that reads as an ordinary apply failure let the pass spend
+    every remaining candidate on it."""
+    import threading
+
+    import gitm.agents.autoresearch as ar
+    from gitm.agents.policy import RankedCandidate
+    from gitm.optimizer.apply import DictApplicator
+
+    specs = [_spec(f"knob_{i}", 1) for i in range(3)]
+    monkeypatch.setattr(ar, "select_interventions", lambda *a, **kw: [
+        RankedCandidate(spec=s, predicted_delta=0.05) for s in specs])
+
+    class _Proposer:
+        def propose(self, cls, target_op=None):
+            return specs
+
+    release = threading.Event()
+    hung = _spec().model_copy(update={"correctness_gate": lambda _s: release.wait(10),
+                                      "safety": _spec().safety.model_copy(
+                                          update={"correctness_gate_timeout_s": 0.2})})
+    try:
+        assert "timed out" in apply_intervention(
+            hung, DictApplicator({"block_size": 8}, measure_fn=lambda s: 0.1)).error
+        run = ar.autoresearch(_trace(), applicator=object(), proposer=_Proposer())
+    finally:
+        release.set()
+        for t in threading.enumerate():
+            if t.name.startswith("correctness-gate"):
+                t.join(5)
+
+    assert len(run.results) == 1
+    first = run.results[0].apply_result
+    assert first.restore_failed and not first.applied
+    assert "still running" in first.error
+    assert run.n_untried == 2
+
+
 def test_phase4_still_records_what_the_gate_rejected(tmp_path, monkeypatch):
     """Breaking on a lost engine dropped the gate's rejections queued behind it:
     they reached neither n_rejected nor n_untried."""

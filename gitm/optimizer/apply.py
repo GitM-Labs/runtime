@@ -51,7 +51,9 @@ class ApplyResult:
     #: The baseline could not be put back after this candidate, so whatever the
     #: applicator mutates is in a state nothing measured. A caller holding more
     #: candidates must stop: every A/B after this one would be taken against an
-    #: unknown baseline, or against no engine at all.
+    #: unknown baseline, or against no engine at all. Also set, with nothing
+    #: applied, when a gate that timed out or was interrupted is still running
+    #: against the target.
     restore_failed: bool = False
 
     @property
@@ -116,11 +118,14 @@ def apply_intervention(
                                  "is runtime-only and is lost when a spec is saved); "
                                  "nothing applied")
     if running := _gates_still_running():
+        # Not a failed restore, but the same stop: the target is under load no
+        # A/B measured, so every candidate after this one would be judged on it.
         return ApplyResult(False, rolled_back=False, measured_delta=None,
                            error=f"a correctness gate that timed out or was interrupted is "
-                                 f"still running against the "
-                                 f"target ({', '.join(running)}); nothing applied until it "
-                                 f"exits, since an A/B measured beside it would carry its load")
+                                 f"still running against the target ({', '.join(running)}); "
+                                 f"nothing applied, and no candidate can be measured until "
+                                 f"it exits, since an A/B beside it would carry its load",
+                           restore_failed=True)
 
     # Step 1: snapshot. On a live engine this benchmarks the baseline, so it can
     # fail the same ways a measurement can — and when it does, nothing has been
