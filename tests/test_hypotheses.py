@@ -462,7 +462,9 @@ def test_a_saved_and_reloaded_h002_spec_is_refused_not_applied_ungated():
 
 
 def test_h002_gate_deadline_covers_its_own_gate_budget():
-    # docs/hypotheses/H-002-mla-kv-fp8.md budgets ~1.5 h for both arms' GSM8K +
-    # needle; the default 30 min would cut off every real H-002 gate.
+    # docs/hypotheses/H-002-mla-kv-fp8.md (Budget) gives about 1.5 h for GSM8K +
+    # needle across 2 arms, so one arm is about 45 min. The H-002 registration
+    # in gitm/agents/hypotheses.py and the doc's gate section both give 2x that.
+    per_arm_s = 90 * 60 / 2
     spec = _prop(_k25()).propose("memory_bound")[0]
-    assert spec.safety.correctness_gate_timeout_s >= 45 * 60
+    assert spec.safety.correctness_gate_timeout_s >= 2 * per_arm_s
