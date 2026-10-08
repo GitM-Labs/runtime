@@ -273,6 +273,8 @@ def test_a_failed_restore_is_not_kept():
     assert not lost.kept
     assert ApplyResult(True, rolled_back=False, measured_delta=0.1).kept
     assert not ApplyResult(True, rolled_back=True, measured_delta=-0.1).kept
+    assert not ApplyResult(False, rolled_back=False, measured_delta=None,
+                           error="snapshot failed, nothing applied").kept
 
 
 def test_the_export_does_not_record_a_failed_restore_as_kept():

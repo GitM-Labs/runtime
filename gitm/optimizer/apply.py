@@ -64,9 +64,10 @@ class ApplyResult:
         back, but it was not kept either: every restore follows a rejection, so
         the gate had already said no. Reading ``not rolled_back`` as kept turned a
         candidate measured at -20% whose rollback then failed into a kept result,
-        which history counts as a win.
+        which history counts as a win. Nor is a candidate that was never applied
+        (refused, or its snapshot failed) kept.
         """
-        return not self.rolled_back and not self.restore_failed
+        return self.applied and not self.rolled_back and not self.restore_failed
 
 
 class RestoreFailed(RuntimeError):

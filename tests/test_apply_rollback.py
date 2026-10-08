@@ -302,7 +302,7 @@ def test_a_spec_that_needs_a_gate_but_carries_none_is_not_applied():
     cfg = {"block_size": 8}
     spec = _spec(safety={"requires_correctness_gate": True})
     res = apply_intervention(spec, DictApplicator(cfg, measure_fn=lambda s: +0.1))
-    assert not res.applied and not res.rolled_back
+    assert not res.applied and not res.rolled_back and not res.kept
     assert "requires a correctness gate" in res.error
     assert cfg == {"block_size": 8}
 
