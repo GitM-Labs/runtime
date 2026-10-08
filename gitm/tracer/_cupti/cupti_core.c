@@ -237,14 +237,25 @@ static atomic_uint g_session = 0;
 /* One stack per thread holding every domain's open ranges in push order; each
  * entry remembers its domain. Domains nest independently, so a pop removes the
  * innermost range of *its* domain, which need not be the top. A node is named
- * after the innermost range open in any domain. */
+ * after the innermost range open in any domain.
+ *
+ * Past RANGE_STACK_MAX a push is dropped but counted per domain. Dropped pushes
+ * are newer than every stored range, so a domain's pops consume its dropped
+ * count first; while any is open the innermost range is unknown and nodes stay
+ * unnamed. More overflowing domains than LOST_DOMAINS: unnamed for the rest of
+ * the session. */
+#define LOST_DOMAINS 8
 static __thread struct {
     struct {
         uintptr_t domain; /* 0: the default domain */
         char *name;
     } open[RANGE_STACK_MAX];
     int depth;
-    int lost; /* pushes past RANGE_STACK_MAX; their pops consume this */
+    struct {
+        uintptr_t domain;
+        int count;
+    } lost[LOST_DOMAINS];
+    int n_lost_domains, lost_total, untrusted;
     int instantiating;
     unsigned session;
 } tls_nvtx;
@@ -257,9 +268,26 @@ static void tls_sync(void) {
     tls_nvtx.session = now;
 }
 
+static int lost_slot(uintptr_t domain) {
+    for (int i = 0; i < tls_nvtx.n_lost_domains; i++)
+        if (tls_nvtx.lost[i].domain == domain) return i;
+    return -1;
+}
+
 static void nvtx_push(uintptr_t domain, const char *msg) {
     if (tls_nvtx.depth >= RANGE_STACK_MAX) {
-        tls_nvtx.lost++;
+        int i = lost_slot(domain);
+        if (i < 0 && tls_nvtx.n_lost_domains < LOST_DOMAINS) {
+            i = tls_nvtx.n_lost_domains++;
+            tls_nvtx.lost[i].domain = domain;
+            tls_nvtx.lost[i].count = 0;
+        }
+        if (i < 0) {
+            tls_nvtx.untrusted = 1;
+            return;
+        }
+        tls_nvtx.lost[i].count++;
+        tls_nvtx.lost_total++;
         return;
     }
     size_t n = msg ? strnlen(msg, GITM_NAME_MAX) : 0;
@@ -274,6 +302,12 @@ static void nvtx_push(uintptr_t domain, const char *msg) {
 }
 
 static void nvtx_pop(uintptr_t domain) {
+    int i = lost_slot(domain);
+    if (i >= 0 && tls_nvtx.lost[i].count > 0) { /* the innermost of this domain */
+        tls_nvtx.lost[i].count--;
+        tls_nvtx.lost_total--;
+        return;
+    }
     for (int d = tls_nvtx.depth - 1; d >= 0; d--) {
         if (tls_nvtx.open[d].domain != domain) continue;
         free(tls_nvtx.open[d].name);
@@ -282,11 +316,11 @@ static void nvtx_pop(uintptr_t domain) {
         tls_nvtx.depth--;
         return;
     }
-    if (tls_nvtx.lost > 0) tls_nvtx.lost--; /* the pop of an untracked push */
 }
 
 static const char *nvtx_top(void) {
     int d = tls_nvtx.depth;
+    if (tls_nvtx.lost_total > 0 || tls_nvtx.untrusted) return ""; /* unknown: unnamed */
     return d > 0 && tls_nvtx.open[d - 1].name ? tls_nvtx.open[d - 1].name : "";
 }
 
@@ -301,16 +335,31 @@ typedef struct reg_node {
 static reg_node *g_reg[REG_BUCKETS];
 static pthread_mutex_t g_reg_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* One entry per handle: a repeat registration of the same string is a no-op,
+ * and a handle re-registered with a new string is replaced in place. */
 static void reg_put(uintptr_t handle, const char *str) {
     size_t n = str ? strnlen(str, GITM_NAME_MAX) : 0;
-    reg_node *r = malloc(sizeof(reg_node) + n + 1);
-    if (!r) return;
-    r->handle = handle;
-    if (n) memcpy(r->name, str, n);
-    r->name[n] = '\0';
+    reg_node **head = &g_reg[(handle >> 4) % REG_BUCKETS];
     pthread_mutex_lock(&g_reg_lock);
-    r->next = g_reg[(handle >> 4) % REG_BUCKETS];
-    g_reg[(handle >> 4) % REG_BUCKETS] = r;
+    for (reg_node **pp = head; *pp; pp = &(*pp)->next) {
+        if ((*pp)->handle != handle) continue;
+        if (strlen((*pp)->name) == n && (n == 0 || memcmp((*pp)->name, str, n) == 0)) {
+            pthread_mutex_unlock(&g_reg_lock);
+            return;
+        }
+        reg_node *dead = *pp;
+        *pp = dead->next;
+        free(dead);
+        break;
+    }
+    reg_node *r = malloc(sizeof(reg_node) + n + 1);
+    if (r) {
+        r->handle = handle;
+        if (n) memcpy(r->name, str, n);
+        r->name[n] = '\0';
+        r->next = *head;
+        *head = r;
+    }
     pthread_mutex_unlock(&g_reg_lock);
 }
 

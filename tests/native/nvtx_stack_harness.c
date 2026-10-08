@@ -104,6 +104,23 @@ int main(void) {
     CHECK(strcmp(create_node(0x12), "L7/attn_out_proj") == 0, "registered string not resolved");
     pop_domain(OTHER);
 
+    /* overflow: while a dropped push is open the innermost range is unknown */
+    for (int i = 0; i < RANGE_STACK_MAX; i++) push_a("L2/qkv_proj");
+    push_a("L3/mlp_down"); /* dropped */
+    CHECK(strcmp(create_node(0x20), "") == 0, "named a node while a dropped range was open");
+    pop_default(); /* closes the dropped one, not a stored one */
+    CHECK(strcmp(create_node(0x21), "L2/qkv_proj") == 0, "pop closed a stored range first");
+    CHECK(tls_nvtx.depth == RANGE_STACK_MAX, "stored range removed by the dropped push's pop");
+    for (int i = 0; i < RANGE_STACK_MAX; i++) pop_default();
+    CHECK(strcmp(create_node(0x22), "") == 0, "stack not empty after unwinding");
+
+    /* repeat registration of one handle keeps one entry */
+    for (int i = 0; i < 1000; i++) nvtx(CUPTI_CBID_NVTX_nvtxDomainRegisterStringA, &rp, &h);
+    int entries = 0;
+    for (int b = 0; b < REG_BUCKETS; b++)
+        for (reg_node *n = g_reg[b]; n; n = n->next) entries += n->handle == (uintptr_t)h;
+    CHECK(entries == 1, "repeat registrations grew the table");
+
     /* a new session starts empty */
     push_a("L9/stale");
     node_map_stop();
