@@ -459,3 +459,10 @@ def test_a_saved_and_reloaded_h002_spec_is_refused_not_applied_ungated():
     res = apply_intervention(reloaded, DictApplicator(config, measure_fn=lambda s: 0.12))
     assert not res.applied and "requires a correctness gate" in (res.error or "")
     assert config == {"kv_cache_dtype": "auto"}
+
+
+def test_h002_gate_deadline_covers_its_own_gate_budget():
+    # docs/hypotheses/H-002-mla-kv-fp8.md budgets ~1.5 h for both arms' GSM8K +
+    # needle; the default 30 min would cut off every real H-002 gate.
+    spec = _prop(_k25()).propose("memory_bound")[0]
+    assert spec.safety.correctness_gate_timeout_s >= 45 * 60
