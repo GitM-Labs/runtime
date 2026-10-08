@@ -234,9 +234,17 @@ static int g_subscribed = 0;
  * next session's nodes; a thread resets the first time it is seen in a new one. */
 static atomic_uint g_session = 0;
 
+/* One stack per thread holding every domain's open ranges in push order; each
+ * entry remembers its domain. Domains nest independently, so a pop removes the
+ * innermost range of *its* domain, which need not be the top. A node is named
+ * after the innermost range open in any domain. */
 static __thread struct {
-    char *names[RANGE_STACK_MAX];
+    struct {
+        uintptr_t domain; /* 0: the default domain */
+        char *name;
+    } open[RANGE_STACK_MAX];
     int depth;
+    int lost; /* pushes past RANGE_STACK_MAX; their pops consume this */
     int instantiating;
     unsigned session;
 } tls_nvtx;
@@ -244,43 +252,87 @@ static __thread struct {
 static void tls_sync(void) {
     unsigned now = atomic_load(&g_session);
     if (tls_nvtx.session == now) return;
-    for (int d = 0; d < tls_nvtx.depth && d < RANGE_STACK_MAX; d++) {
-        free(tls_nvtx.names[d]);
-        tls_nvtx.names[d] = NULL;
-    }
-    tls_nvtx.depth = 0;
-    tls_nvtx.instantiating = 0;
+    for (int d = 0; d < tls_nvtx.depth; d++) free(tls_nvtx.open[d].name);
+    memset(&tls_nvtx, 0, sizeof tls_nvtx);
     tls_nvtx.session = now;
 }
 
-static void nvtx_push(const char *msg) {
-    int d = tls_nvtx.depth++;
-    if (d >= RANGE_STACK_MAX) return;
+static void nvtx_push(uintptr_t domain, const char *msg) {
+    if (tls_nvtx.depth >= RANGE_STACK_MAX) {
+        tls_nvtx.lost++;
+        return;
+    }
     size_t n = msg ? strnlen(msg, GITM_NAME_MAX) : 0;
     char *copy = malloc(n + 1);
     if (copy) {
         if (n) memcpy(copy, msg, n);
         copy[n] = '\0';
     }
-    tls_nvtx.names[d] = copy;
+    tls_nvtx.open[tls_nvtx.depth].domain = domain;
+    tls_nvtx.open[tls_nvtx.depth].name = copy;
+    tls_nvtx.depth++;
 }
 
-static void nvtx_pop(void) {
-    if (tls_nvtx.depth <= 0) return;
-    int d = --tls_nvtx.depth;
-    if (d >= RANGE_STACK_MAX) return;
-    free(tls_nvtx.names[d]);
-    tls_nvtx.names[d] = NULL;
+static void nvtx_pop(uintptr_t domain) {
+    for (int d = tls_nvtx.depth - 1; d >= 0; d--) {
+        if (tls_nvtx.open[d].domain != domain) continue;
+        free(tls_nvtx.open[d].name);
+        memmove(&tls_nvtx.open[d], &tls_nvtx.open[d + 1],
+                (size_t)(tls_nvtx.depth - d - 1) * sizeof tls_nvtx.open[0]);
+        tls_nvtx.depth--;
+        return;
+    }
+    if (tls_nvtx.lost > 0) tls_nvtx.lost--; /* the pop of an untracked push */
 }
 
 static const char *nvtx_top(void) {
     int d = tls_nvtx.depth;
-    if (d <= 0 || d > RANGE_STACK_MAX || !tls_nvtx.names[d - 1]) return "";
-    return tls_nvtx.names[d - 1];
+    return d > 0 && tls_nvtx.open[d - 1].name ? tls_nvtx.open[d - 1].name : "";
+}
+
+/* nvtxDomainRegisterStringA handle -> copy of its string, so ranges pushed with
+ * a registered message keep their name. Registration is rare; one lock. */
+#define REG_BUCKETS 256
+typedef struct reg_node {
+    uintptr_t handle;
+    struct reg_node *next;
+    char name[];
+} reg_node;
+static reg_node *g_reg[REG_BUCKETS];
+static pthread_mutex_t g_reg_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void reg_put(uintptr_t handle, const char *str) {
+    size_t n = str ? strnlen(str, GITM_NAME_MAX) : 0;
+    reg_node *r = malloc(sizeof(reg_node) + n + 1);
+    if (!r) return;
+    r->handle = handle;
+    if (n) memcpy(r->name, str, n);
+    r->name[n] = '\0';
+    pthread_mutex_lock(&g_reg_lock);
+    r->next = g_reg[(handle >> 4) % REG_BUCKETS];
+    g_reg[(handle >> 4) % REG_BUCKETS] = r;
+    pthread_mutex_unlock(&g_reg_lock);
+}
+
+/* Registered strings live for the process, so the returned pointer stays valid. */
+static const char *reg_get(uintptr_t handle) {
+    const char *out = NULL;
+    pthread_mutex_lock(&g_reg_lock);
+    for (reg_node *r = g_reg[(handle >> 4) % REG_BUCKETS]; r; r = r->next)
+        if (r->handle == handle) {
+            out = r->name;
+            break;
+        }
+    pthread_mutex_unlock(&g_reg_lock);
+    return out;
 }
 
 static const char *attr_message(const nvtxEventAttributes_t *a) {
-    return a && a->messageType == NVTX_MESSAGE_TYPE_ASCII ? a->message.ascii : NULL;
+    if (!a) return NULL;
+    if (a->messageType == NVTX_MESSAGE_TYPE_ASCII) return a->message.ascii;
+    if (a->messageType == NVTX_MESSAGE_TYPE_REGISTERED)
+        return reg_get((uintptr_t)a->message.registered);
+    return NULL;
 }
 
 static int node_kind(CUgraphNodeType t) {
@@ -326,24 +378,33 @@ static void CUPTIAPI on_callback(void *user, CUpti_CallbackDomain dom, CUpti_Cal
     (void)user;
     tls_sync();
     if (dom == CUPTI_CB_DOMAIN_NVTX) {
-        const void *params = ((const CUpti_NvtxData *)cbdata)->functionParams;
+        const CUpti_NvtxData *nd = cbdata;
+        const void *params = nd->functionParams;
         switch (cbid) {
             case CUPTI_CBID_NVTX_nvtxRangePushA:
-                nvtx_push(((const nvtxRangePushA_params *)params)->message);
+                nvtx_push(0, ((const nvtxRangePushA_params *)params)->message);
                 break;
             case CUPTI_CBID_NVTX_nvtxRangePushEx:
-                nvtx_push(attr_message(((const nvtxRangePushEx_params *)params)->eventAttrib));
-                break;
-            case CUPTI_CBID_NVTX_nvtxDomainRangePushEx:
-                nvtx_push(attr_message(
-                    ((const nvtxDomainRangePushEx_params *)params)->core.eventAttrib));
+                nvtx_push(0, attr_message(((const nvtxRangePushEx_params *)params)->eventAttrib));
                 break;
             case CUPTI_CBID_NVTX_nvtxRangePushW: /* unnamed, but keeps the stack balanced */
-                nvtx_push(NULL);
+                nvtx_push(0, NULL);
                 break;
+            case CUPTI_CBID_NVTX_nvtxDomainRangePushEx: {
+                const nvtxDomainRangePushEx_params *dp = params;
+                nvtx_push((uintptr_t)dp->domain, attr_message(dp->core.eventAttrib));
+                break;
+            }
             case CUPTI_CBID_NVTX_nvtxRangePop:
+                nvtx_pop(0);
+                break;
             case CUPTI_CBID_NVTX_nvtxDomainRangePop:
-                nvtx_pop();
+                nvtx_pop((uintptr_t)((const nvtxDomainRangePop_params *)params)->domain);
+                break;
+            case CUPTI_CBID_NVTX_nvtxDomainRegisterStringA:
+                if (nd->functionReturnValue)
+                    reg_put((uintptr_t)*(const nvtxStringHandle_t *)nd->functionReturnValue,
+                            ((const nvtxDomainRegisterStringA_params *)params)->string);
                 break;
             default:
                 break;

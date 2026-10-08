@@ -197,3 +197,30 @@ def test_a_new_session_starts_with_an_empty_range_stack():
     assert cb.index("tls_sync();") < cb.index("CUPTI_CB_DOMAIN_NVTX")
     start = _CORE[_CORE.index("static void node_map_start"):]
     assert "atomic_fetch_add(&g_session, 1);" in start[:start.index("\n}\n")]
+
+
+def test_nvtx_range_stack_behaviour_natively(tmp_path):
+    """Builds tests/native/nvtx_stack_harness.c (cupti_core.c with CUPTI stubbed)
+    and runs it: cross-domain pops, registered strings, per-session reset."""
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    inc = os.environ.get("GITM_CUDA_INCLUDE")
+    if not inc:
+        pytest.skip("set GITM_CUDA_INCLUDE (scripts/check_collectors.py --keep DIR)")
+    cc = next(([c] for c in (os.environ.get("CC"), "cc", "gcc", "clang") if c and shutil.which(c)),
+              None)
+    if cc is None:
+        pytest.importorskip("ziglang")
+        cc = [sys.executable, "-m", "ziglang", "cc"]
+    root = pathlib.Path(__file__).resolve().parents[1]
+    exe = tmp_path / ("harness.exe" if os.name == "nt" else "harness")
+    flags = ["-fms-extensions"] if os.name == "nt" else ["-pthread"]
+    build = subprocess.run([*cc, "-O1", *flags, "-w", "-isystem", inc, f"-I{_CUPTI}",
+                            str(root / "tests/native/nvtx_stack_harness.c"), "-o", str(exe)],
+                           capture_output=True, text=True)
+    assert build.returncode == 0, build.stderr[-3000:]
+    run = subprocess.run([str(exe)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout
