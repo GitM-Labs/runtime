@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import asdict
 from math import isfinite
 from pathlib import Path
@@ -443,7 +444,7 @@ def main(argv: list[str] | None = None) -> int:
         hw = _replace(hw, kernel_launch_overhead_s=args.launch_overhead)
     if args.gpu and args.gpu.lower() not in hw.name.lower():
         print(f"warning: --gpu {args.gpu!r} is not in the catalogue; priced against "
-              f"{hw.name}, whose bandwidth may differ by more than 2x.")
+              f"{hw.name}, whose bandwidth may differ by more than 2x.", file=sys.stderr)
 
     sharding = ShardingConfig(tp=args.tp, ep=args.ep, dp=args.dp)
 

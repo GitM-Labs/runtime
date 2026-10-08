@@ -165,14 +165,24 @@ def test_an_unknown_sku_warns_rather_than_silently_repricing(capsys):
     defaults, and 2.04 TB/s against an H200's 4.80 is a 2.4x error on every
     memory-bound node — which at decode is all of them."""
     main(["qwen3.6-35b-a3b", "--gpu", "RTX9090", "--batch", "1"])
-    out = capsys.readouterr().out
-    assert "not in the catalogue" in out
-    assert "A100" in out
+    err = capsys.readouterr().err
+    assert "not in the catalogue" in err
+    assert "A100" in err
+
+
+def test_the_unknown_sku_warning_leaves_json_output_parseable(capsys):
+    """On stdout the warning came before the JSON, so `--json` printed
+    something no JSON reader accepts, exactly when the SKU was wrong."""
+    assert main(["qwen3.6-35b-a3b", "--gpu", "RTX9090", "--batch", "1", "--json"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["hardware"] == "A100-SXM4-80GB"
+    assert "not in the catalogue" in captured.err
 
 
 def test_a_known_sku_does_not_warn(capsys):
     main(["qwen3.6-35b-a3b", "--gpu", "H200"])
-    assert "not in the catalogue" not in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "not in the catalogue" not in captured.out + captured.err
 
 
 def test_sweep_reports_where_the_model_stops_being_memory_bound(capsys):
