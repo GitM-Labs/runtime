@@ -7,9 +7,9 @@ derives the records from each collector's semantics:
 
 * CUPTI: a kernel carries its launch API's ``correlation_id``; runtime records
   carry the host window and thread; NVTX ranges arrive as marker halves. A graph
-  replay is one launch whose kernels report ``graphId``/instantiated
-  ``graphNodeId``; the capture-time node map is rendered only with
-  ``cupti_node_map`` (the planned collector).
+  replay is one launch whose kernels report ``graphId``/``graphNodeId``; the
+  capture-time node map (NVTX + RESOURCE callbacks) is rendered with
+  ``cupti_node_map``, off to model a collector built without it.
 * rocprofiler-sdk (``rocm_inject.c``): records are stamped at enqueue with the
   innermost range on the issuing thread, or inside a graph launch with
   ``(exec, ordinal)``; captured launches become signed ``graph_node`` records.
@@ -94,6 +94,9 @@ class EmulationConfig:
     swap_replay_pair: tuple[int, int] | None = None
     blit_memset_node: bool = False
     exec_untracked: bool = False
+    #: AMD_DIRECT_DISPATCH=0: a worker thread submits replays, outside the
+    #: launch's correlation scope — fresh correlation ids, no stamps
+    worker_dispatch: bool = False
     capture_unranged: bool = False
     pid: int = 4242
     seed: int = 0
@@ -260,7 +263,8 @@ def emulate(launches: Sequence[TruthLaunch], cfg: EmulationConfig) -> Emulation:
 
     if amd:
         records.insert(0, {"kind": "meta", "collector": "rocprofiler-sdk", "sdk_version": "1.1.0",
-                           "identity": 1, "agents": [{"ordinal": 0, "name": "gfx950",
+                           "identity": 1, "direct_dispatch": int(not cfg.worker_dispatch),
+                           "agents": [{"ordinal": 0, "name": "gfx950",
                                                       "product": "AMD Instinct MI355X"}]})
     for r in records:
         r["pid"] = cfg.pid
@@ -273,7 +277,9 @@ _EXEC, _CAPTURE = 1, 1
 
 
 def _replay_stamp(cfg: EmulationConfig, rec: dict, ordinal: int, node: int, rt: dict) -> dict:
-    if cfg.vendor != "amd":
+    if cfg.vendor == "amd" and cfg.worker_dispatch:
+        rec.update(correlation_id=10**9 + rec["start_ns"] % 10**9, range_id=0)
+    elif cfg.vendor != "amd":
         rec.update(graph_id=_CUPTI_GRAPH, graph_node_id=_CUPTI_CLONE + node)
     elif cfg.stamp_inherits_launch:
         rec["range_id"] = rt["range_id"]
@@ -305,9 +311,10 @@ def _capture(cfg: EmulationConfig, records: list[dict], template: list[TruthLaun
                 node["grid"], node["block"] = _geometry(la.op, cls)
             records.append(node)
         elif cfg.cupti_node_map:
-            records += [{"kind": "graph_node", "graph_node_id": _CUPTI_NODE + k, "name": name},
-                        {"kind": "graph_node", "graph_node_id": _CUPTI_CLONE + k,
-                         "cloned_from": _CUPTI_NODE + k}]
+            records += [{"kind": "graph_node", "graph_node_id": _CUPTI_NODE + k, "name": name,
+                         "node_kind": kind, "cloned_from": 0},
+                        {"kind": "graph_node", "graph_node_id": _CUPTI_CLONE + k, "name": "",
+                         "node_kind": kind, "cloned_from": _CUPTI_NODE + k}]
         if rn:
             host.pop(MAIN)
     if cfg.vendor == "amd" and not cfg.exec_untracked:

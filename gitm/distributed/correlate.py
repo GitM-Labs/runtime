@@ -44,8 +44,10 @@ instead::
 
 A ``graph_node`` record names the innermost NVTX range open on the capturing
 thread when the node was created, which is how Nsight Systems projects ranges
-onto replayed kernels. The CUPTI collector does not emit these yet, so there a
-graph kernel's op is ``None`` and falls back to name classification.
+onto replayed kernels (``cupti_core.c``, NVTX + RESOURCE callbacks). Records
+sharing an id are merged; along a clone chain the name nearest the captured
+node wins. Without a node map a graph kernel's op is ``None`` and falls back to
+name classification.
 
 ROCm (docs/rocm_correlation.md)
 -------------------------------
@@ -238,7 +240,9 @@ def correlate_records(records: list[dict]) -> tuple[list[dict], list[dict], Corr
         elif kind == "marker":
             markers.append(r)
         elif kind == "graph_node" and r.get("graph_node_id") is not None:
-            graph_nodes[r["graph_node_id"]] = r
+            prior = graph_nodes.get(r["graph_node_id"], {})
+            graph_nodes[r["graph_node_id"]] = {
+                **prior, **{k: v for k, v in r.items() if v not in (None, "", 0)}}
         elif kind == "graph_exec" and r.get("graph_id") and isinstance(r.get("n_nodes"), int):
             gid, cap = r["graph_id"], r.get("capture_id")
             n_nodes[gid] = r["n_nodes"]
@@ -285,7 +289,7 @@ def correlate_records(records: list[dict]) -> tuple[list[dict], list[dict], Corr
                 report.graph_refused[reason] += 1
             else:
                 chain = _node_chain(graph_nodes, k.get("graph_node_id"))
-                named = next((n for n in chain if n.get("name")), None)
+                named = next((n for n in reversed(chain) if n.get("name")), None)
                 if not chain:
                     report.graph_refused["no_node"] += 1
                 elif named is None:

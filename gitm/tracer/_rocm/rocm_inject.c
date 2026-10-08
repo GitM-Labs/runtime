@@ -72,6 +72,10 @@ static rocprofiler_context_id_t g_ctx = {0};    /* buffers + stamps */
 static rocprofiler_context_id_t g_cb_ctx = {0}; /* synchronous callbacks */
 static rocprofiler_buffer_id_t g_buffer = {0};
 static int g_nvtx = 0;
+/* CLR submits graph packets on the launching thread only under direct dispatch
+ * (the Linux default). With AMD_DIRECT_DISPATCH=0 a worker thread writes them,
+ * outside hipGraphLaunch's correlation scope, so no replay stamp can fire. */
+static int g_direct_dispatch = 1;
 
 static pthread_t g_flusher;
 static int g_flusher_started = 0;
@@ -782,9 +786,10 @@ static void emit_collector_meta(void) {
     if (g_fp) {
         fprintf(g_fp,
                 "{\"kind\":\"meta\",\"collector\":\"rocprofiler-sdk\","
-                "\"sdk_version\":\"%d.%d.%d\",\"identity\":%d,\"agents\":[",
+                "\"sdk_version\":\"%d.%d.%d\",\"identity\":%d,"
+                "\"direct_dispatch\":%d,\"agents\":[",
                 ROCPROFILER_VERSION_MAJOR, ROCPROFILER_VERSION_MINOR,
-                ROCPROFILER_VERSION_PATCH, g_nvtx);
+                ROCPROFILER_VERSION_PATCH, g_nvtx, g_direct_dispatch);
         for (int i = 0; i < g_n_agents; i++) {
             fprintf(g_fp, "%s{\"ordinal\":%u,\"name\":", i ? "," : "",
                     g_agents[i].ordinal);
@@ -894,6 +899,8 @@ rocprofiler_configure(uint32_t version, const char *runtime_version,
 
     const char *nvtx = getenv("GITM_TRACE_NVTX");
     g_nvtx = nvtx && *nvtx && strcmp(nvtx, "0") != 0;
+    const char *dd = getenv("AMD_DIRECT_DISPATCH");
+    g_direct_dispatch = !(dd && strcmp(dd, "0") == 0);
 
     static rocprofiler_tool_configure_result_t result = {
         sizeof(rocprofiler_tool_configure_result_t), tool_init, tool_fini, NULL};

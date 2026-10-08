@@ -69,7 +69,7 @@ def test_amd_graph_identity_comes_from_the_capture_projection():
 
 
 @pytest.mark.parametrize("scenario", list(SCENARIOS))
-def test_nvidia_graphs_today_say_nothing_rather_than_something_wrong(scenario):
+def test_nvidia_graphs_without_the_node_map_say_nothing_rather_than_something_wrong(scenario):
     s, report, _ = _run(_launches(scenario), EmulationConfig("nvidia", graphs=True))
     assert s.wrong == 0
     # A layer is needed for every per-layer op, and no name carries one, so
@@ -90,6 +90,9 @@ HAZARDS = [
     # must run before the stamped join, or the launch range becomes the op.
     pytest.param(dict(stamp_inherits_launch=True), "untracked_launch",
                  id="dispatch-inherits-the-launch-stamp"),
+    # AMD_DIRECT_DISPATCH=0: the replay looks eager and unranged — no refusal
+    # to count, which is why read_shards warns from the collector's meta.
+    pytest.param(dict(worker_dispatch=True), None, id="worker-thread-dispatch"),
 ]
 
 
@@ -99,7 +102,8 @@ def test_amd_graph_hazards_refuse_instead_of_guessing(kw, reason):
                              EmulationConfig("amd", graphs=True,
                                              graph_launch_range="L0/qkv_proj", **kw))
     assert s.wrong == 0, s.wrong_examples
-    assert any(r.startswith(reason) for r in report.graph_refused), report.graph_refused
+    if reason:
+        assert any(r.startswith(reason) for r in report.graph_refused), report.graph_refused
     # The refused kernels are still known to be replays: none carries the
     # range around the launch as its op.
     assert not any(e.range_op == "qkv_proj" and e.range_layer == 0 and e.identity != "graph_node"

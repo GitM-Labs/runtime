@@ -2,7 +2,7 @@
 
 Correlation tests feed the decoder dicts, which would pass against a collector
 that never wrote the fields; these read the C source. The real compile runs when
-GITM_ROCM_INCLUDE points at a header tree (scripts/check_rocm_collector.py).
+GITM_ROCM_INCLUDE points at a header tree (scripts/check_collectors.py).
 """
 
 from __future__ import annotations
@@ -121,11 +121,11 @@ def test_every_handled_hip_op_is_in_the_callback_filter():
 def test_compiles_against_rocprofiler_sdk_headers(tmp_path):
     inc = os.environ.get("GITM_ROCM_INCLUDE")
     if not inc:
-        pytest.skip("set GITM_ROCM_INCLUDE (scripts/check_rocm_collector.py --keep DIR)")
-    spec = importlib.util.spec_from_file_location("check", ROOT / "scripts/check_rocm_collector.py")
+        pytest.skip("set GITM_ROCM_INCLUDE (scripts/check_collectors.py --keep DIR)")
+    spec = importlib.util.spec_from_file_location("check", ROOT / "scripts/check_collectors.py")
     check = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(check)
     if check.compiler() is None:
         pytest.skip("no C compiler")
-    r = check.compile_collector(pathlib.Path(inc), tmp_path)
+    r = check.compile_rocm(pathlib.Path(inc), tmp_path)
     assert r.returncode == 0, r.stderr[-4000:]

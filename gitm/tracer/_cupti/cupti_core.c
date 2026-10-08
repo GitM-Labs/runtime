@@ -13,6 +13,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* The capture-time node map needs the NVTX callback parameter structs. Built
+ * without the NVTX headers, the collector still works; replayed kernels then
+ * keep range_op=None, as before the map existed. */
+#if defined(__has_include)
+#if __has_include(<nvtx3/nvToolsExt.h>) && __has_include(<nvtx3/nvToolsExtSync.h>) && \
+    __has_include(<generated_nvtx_meta.h>)
+#include <nvtx3/nvToolsExt.h>
+#include <nvtx3/nvToolsExtSync.h>
+#include <generated_nvtx_meta.h>
+#define GITM_HAVE_NODE_MAP 1
+#endif
+#endif
+
 #define BUF_SIZE (32 * 1024 * 1024)   /* 32 MiB activity buffers */
 #define BUF_ALIGN 32
 
@@ -191,6 +204,175 @@ static void ingest(CUpti_Activity *rec) {
     if (g_sink) g_sink(&r, g_sink_user);
 }
 
+const char *gitm_node_kind_name(int kind) {
+    switch (kind) {
+        case GITM_NODE_KERNEL: return "kernel";
+        case GITM_NODE_MEMCPY: return "memcpy";
+        case GITM_NODE_MEMSET: return "memset";
+        default:               return "other";
+    }
+}
+
+#ifdef GITM_HAVE_NODE_MAP
+/* ---- capture-time node map ("the Nsight approach", kernel_identity.md) ----
+ *
+ * MARKER activity arrives in buffers, too late to say which range was open
+ * when a graph node was created. NVTX callbacks are synchronous on the pushing
+ * thread, so a per-thread stack of names is current when the RESOURCE callback
+ * reports a node created by stream capture on that thread. GRAPHNODE_CREATED
+ * also fires for the copies cudaGraphInstantiate makes; those are skipped (as
+ * NVIDIA's cuda_graphs_trace sample does), or the range open at instantiate
+ * time would rename the captured nodes. */
+
+#define RANGE_STACK_MAX 128
+
+static CUpti_SubscriberHandle g_sub;
+static int g_subscribed = 0;
+
+static __thread struct {
+    char *names[RANGE_STACK_MAX];
+    int depth;
+    int instantiating;
+} tls_nvtx;
+
+static void nvtx_push(const char *msg) {
+    int d = tls_nvtx.depth++;
+    if (d >= RANGE_STACK_MAX) return;
+    size_t n = msg ? strnlen(msg, GITM_NAME_MAX) : 0;
+    char *copy = malloc(n + 1);
+    if (copy) {
+        if (n) memcpy(copy, msg, n);
+        copy[n] = '\0';
+    }
+    tls_nvtx.names[d] = copy;
+}
+
+static void nvtx_pop(void) {
+    if (tls_nvtx.depth <= 0) return;
+    int d = --tls_nvtx.depth;
+    if (d >= RANGE_STACK_MAX) return;
+    free(tls_nvtx.names[d]);
+    tls_nvtx.names[d] = NULL;
+}
+
+static const char *nvtx_top(void) {
+    int d = tls_nvtx.depth;
+    if (d <= 0 || d > RANGE_STACK_MAX || !tls_nvtx.names[d - 1]) return "";
+    return tls_nvtx.names[d - 1];
+}
+
+static const char *attr_message(const nvtxEventAttributes_t *a) {
+    return a && a->messageType == NVTX_MESSAGE_TYPE_ASCII ? a->message.ascii : NULL;
+}
+
+static int node_kind(CUgraphNodeType t) {
+    switch (t) {
+        case CU_GRAPH_NODE_TYPE_KERNEL: return GITM_NODE_KERNEL;
+        case CU_GRAPH_NODE_TYPE_MEMCPY: return GITM_NODE_MEMCPY;
+        case CU_GRAPH_NODE_TYPE_MEMSET: return GITM_NODE_MEMSET;
+        default:                        return GITM_NODE_OTHER;
+    }
+}
+
+static void emit_node(uint64_t id, uint64_t cloned_from, const char *name, int kind) {
+    gitm_record r;
+    memset(&r, 0, sizeof r);
+    r.kind = GITM_REC_GRAPH_NODE;
+    r.graph_node_id = id;
+    r.cloned_from = cloned_from;
+    r.node_kind = kind;
+    copy_name(&r, name);
+    pthread_mutex_lock(&g_lock);
+    if (g_sink) g_sink(&r, g_sink_user);
+    pthread_mutex_unlock(&g_lock);
+}
+
+static const CUpti_CallbackId RUNTIME_INSTANTIATE[] = {
+    CUPTI_RUNTIME_TRACE_CBID_cudaGraphInstantiate_v10000,
+    CUPTI_RUNTIME_TRACE_CBID_cudaGraphInstantiateWithFlags_v11040,
+    CUPTI_RUNTIME_TRACE_CBID_cudaGraphInstantiateWithParams_v12000,
+    CUPTI_RUNTIME_TRACE_CBID_cudaGraphInstantiateWithParams_ptsz_v12000,
+    CUPTI_RUNTIME_TRACE_CBID_cudaGraphInstantiate_v12000,
+};
+static const CUpti_CallbackId DRIVER_INSTANTIATE[] = {
+    CUPTI_DRIVER_TRACE_CBID_cuGraphInstantiate,
+    CUPTI_DRIVER_TRACE_CBID_cuGraphInstantiate_v2,
+    CUPTI_DRIVER_TRACE_CBID_cuGraphInstantiateWithFlags,
+    CUPTI_DRIVER_TRACE_CBID_cuGraphInstantiateWithParams,
+    CUPTI_DRIVER_TRACE_CBID_cuGraphInstantiateWithParams_ptsz,
+};
+#define N_OF(a) (sizeof(a) / sizeof((a)[0]))
+
+static void CUPTIAPI on_callback(void *user, CUpti_CallbackDomain dom, CUpti_CallbackId cbid,
+                                 const void *cbdata) {
+    (void)user;
+    if (dom == CUPTI_CB_DOMAIN_NVTX) {
+        const void *params = ((const CUpti_NvtxData *)cbdata)->functionParams;
+        switch (cbid) {
+            case CUPTI_CBID_NVTX_nvtxRangePushA:
+                nvtx_push(((const nvtxRangePushA_params *)params)->message);
+                break;
+            case CUPTI_CBID_NVTX_nvtxRangePushEx:
+                nvtx_push(attr_message(((const nvtxRangePushEx_params *)params)->eventAttrib));
+                break;
+            case CUPTI_CBID_NVTX_nvtxDomainRangePushEx:
+                nvtx_push(attr_message(
+                    ((const nvtxDomainRangePushEx_params *)params)->core.eventAttrib));
+                break;
+            case CUPTI_CBID_NVTX_nvtxRangePushW: /* unnamed, but keeps the stack balanced */
+                nvtx_push(NULL);
+                break;
+            case CUPTI_CBID_NVTX_nvtxRangePop:
+            case CUPTI_CBID_NVTX_nvtxDomainRangePop:
+                nvtx_pop();
+                break;
+            default:
+                break;
+        }
+    } else if (dom == CUPTI_CB_DOMAIN_RUNTIME_API || dom == CUPTI_CB_DOMAIN_DRIVER_API) {
+        /* Only the instantiate callbacks are enabled in these domains; runtime
+         * instantiate calls driver instantiate, hence a depth, not a flag. */
+        if (((const CUpti_CallbackData *)cbdata)->callbackSite == CUPTI_API_ENTER)
+            tls_nvtx.instantiating++;
+        else if (tls_nvtx.instantiating > 0)
+            tls_nvtx.instantiating--;
+    } else if (dom == CUPTI_CB_DOMAIN_RESOURCE) {
+        const CUpti_GraphData *g = ((const CUpti_ResourceData *)cbdata)->resourceDescriptor;
+        uint64_t id = 0, orig = 0;
+        if (!g || !g->node || cuptiGetGraphNodeId(g->node, &id) != CUPTI_SUCCESS) return;
+        if (cbid == CUPTI_CBID_RESOURCE_GRAPHNODE_CREATED && !tls_nvtx.instantiating) {
+            emit_node(id, 0, nvtx_top(), node_kind(g->nodeType));
+        } else if (cbid == CUPTI_CBID_RESOURCE_GRAPHNODE_CLONED && g->originalNode &&
+                   cuptiGetGraphNodeId(g->originalNode, &orig) == CUPTI_SUCCESS) {
+            emit_node(id, orig, "", node_kind(g->nodeType));
+        }
+    }
+}
+
+/* Tolerated like the NVTX activity kinds: another subscriber (Nsight) or an old
+ * CUPTI costs the node map, never the trace. */
+static void node_map_start(void) {
+    if (g_subscribed || cuptiSubscribe(&g_sub, on_callback, NULL) != CUPTI_SUCCESS) return;
+    g_subscribed = 1;
+    cuptiEnableDomain(1, g_sub, CUPTI_CB_DOMAIN_NVTX);
+    cuptiEnableCallback(1, g_sub, CUPTI_CB_DOMAIN_RESOURCE, CUPTI_CBID_RESOURCE_GRAPHNODE_CREATED);
+    cuptiEnableCallback(1, g_sub, CUPTI_CB_DOMAIN_RESOURCE, CUPTI_CBID_RESOURCE_GRAPHNODE_CLONED);
+    for (size_t i = 0; i < N_OF(RUNTIME_INSTANTIATE); i++)
+        cuptiEnableCallback(1, g_sub, CUPTI_CB_DOMAIN_RUNTIME_API, RUNTIME_INSTANTIATE[i]);
+    for (size_t i = 0; i < N_OF(DRIVER_INSTANTIATE); i++)
+        cuptiEnableCallback(1, g_sub, CUPTI_CB_DOMAIN_DRIVER_API, DRIVER_INSTANTIATE[i]);
+}
+
+static void node_map_stop(void) {
+    if (!g_subscribed) return;
+    cuptiUnsubscribe(g_sub);
+    g_subscribed = 0;
+}
+#else
+static void node_map_start(void) {}
+static void node_map_stop(void) {}
+#endif
+
 static void CUPTIAPI buffer_requested(uint8_t **buffer, size_t *size,
                                       size_t *maxNumRecords) {
     void *p = NULL;
@@ -243,6 +425,7 @@ CUptiResult gitm_cupti_start(void) {
         for (size_t i = 0; i < N_NVTX_KINDS; i++) {
             cuptiActivityEnable(NVTX_KINDS[i]);
         }
+        node_map_start();
     }
     g_enabled = 1;
     return CUPTI_SUCCESS;
@@ -261,6 +444,7 @@ CUptiResult gitm_cupti_stop(void) {
         for (size_t i = 0; i < N_NVTX_KINDS; i++) {
             cuptiActivityDisable(NVTX_KINDS[i]);
         }
+        node_map_stop();
     }
     g_enabled = 0;
     return gitm_cupti_flush();

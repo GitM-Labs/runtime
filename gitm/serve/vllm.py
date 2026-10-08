@@ -636,9 +636,9 @@ def add_serve_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
                          "halves are required and neither errors alone: ranges nobody "
                          "collects and collection with no ranges each produce a clean "
                          "trace with range_op null on every kernel. Under graphs (no "
-                         "--enforce-eager), AMD names replayed kernels from their "
-                         "capture-time nodes; NVIDIA keeps range_op null and carries "
-                         "the range around the launch as launch_range. Costs throughput — "
+                         "--enforce-eager), replayed kernels are named from the range "
+                         "their node was captured under, and the range around the "
+                         "launch becomes launch_range. Costs throughput — "
                          "capture the same workload with and without to quantify it.")
     ap.add_argument("--keep-server", action="store_true",
                     help="leave the server up after capture — the handoff into "

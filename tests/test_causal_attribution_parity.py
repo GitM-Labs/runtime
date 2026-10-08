@@ -117,7 +117,8 @@ def test_the_naive_decode_loses_the_cause(fx):
                                     dict(swap_replay_pair=(2, 3)),
                                     dict(exec_untracked=True),
                                     dict(stamp_inherits_launch=True),
-                                    dict(capture_unranged=True)])
+                                    dict(capture_unranged=True),
+                                    dict(worker_dispatch=True)])
 def test_a_refused_replay_never_invents_a_violation(fx, hazard):
     """Refusing identity loses evidence; it must not create any."""
     truth = {(v.invariant, v.node_op, v.layer) for v in observe(fx).violations}
@@ -128,7 +129,7 @@ def test_a_refused_replay_never_invents_a_violation(fx, hazard):
     assert {(v.invariant, v.node_op, v.layer) for v in got.violations} <= truth
 
 
-def test_nvidia_graphs_today_miss_the_cause_but_invent_nothing(fx):
+def test_nvidia_graphs_without_the_node_map_miss_the_cause_but_invent_nothing(fx):
     truth = {(v.invariant, v.node_op, v.layer) for v in observe(fx).violations}
     got = _observe(fx, emulate(launches_from_fixture(fx),
                                EmulationConfig("nvidia", graphs=True)).records)

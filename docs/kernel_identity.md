@@ -261,11 +261,18 @@ outside the graph. That makes them likely step boundaries that survive graph
 replay when kernel ranges don't. This is a candidate time-series label alongside
 `launch_range`, still to be measured.
 
-## Status after the ROCm port (2026-10-06)
+## Status after the ROCm port (2026-10-07)
 
-See `docs/rocm_correlation.md`. Landed for both vendors: unwindowed
-`graph_node`/`graph_exec` in `read_shards`, the attribute side table
-(`gitm.tracer.kernel_attributes`, with `#k=v` range annotations as the
-dynamic carrier), and memcpy `launch_range`. Still to do: the CUPTI
-capture-time collector. It should emit the same optional node signature fields
-(`node_kind`, `grid`, `block`) so replay validation covers it too.
+See `docs/rocm_correlation.md`. Landed for both vendors:
+
+- unwindowed `graph_node`/`graph_exec` in `read_shards`;
+- the attribute side table (`gitm.tracer.kernel_attributes`, with `#k=v`
+  range annotations as the dynamic carrier);
+- memcpy `launch_range`;
+- the CUPTI capture-time node map: `cupti_core.c` subscribes to the NVTX domain
+  and to RESOURCE `GRAPHNODE_CREATED`/`CLONED`, skipping nodes
+  `cudaGraphInstantiate` creates.
+
+Compiled against CUDA 12 and 13 headers (`scripts/check_collectors.py --vendor
+nvidia`); not yet run on a GPU. The first check there is
+`test_replayed_kernels_take_their_capture_range_end_to_end`.

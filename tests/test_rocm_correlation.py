@@ -322,3 +322,23 @@ def test_read_shards_warns_when_two_collectors_share_a_directory(tmp_path, monke
         {"kind": "meta", "collector": "cupti"}) + "\n")
     with pytest.warns(RuntimeWarning, match="more than one collector"):
         injection.read_shards()
+
+
+def test_read_shards_warns_when_direct_dispatch_is_off(tmp_path, monkeypatch):
+    monkeypatch.setenv(injection.ENV_OUT, str(tmp_path / "trace.jsonl"))
+    (tmp_path / "trace.jsonl.1").write_text(json.dumps(
+        {"kind": "meta", "collector": "rocprofiler-sdk", "identity": 1,
+         "direct_dispatch": 0}) + "\n")
+    with pytest.warns(RuntimeWarning, match="AMD_DIRECT_DISPATCH=0"):
+        injection.read_shards()
+
+
+def test_cupti_node_records_sharing_an_id_merge_and_the_captured_name_wins():
+    """CUPTI can report one node twice (created, then cloned into an exec); a
+    clone must never override the range its original was captured under."""
+    recs = [{"kind": "graph_node", "graph_node_id": 41, "name": "L3/mlp_down",
+             "node_kind": "kernel", "cloned_from": 0},
+            {"kind": "graph_node", "graph_node_id": 900, "name": "", "cloned_from": 41},
+            {"kind": "graph_node", "graph_node_id": 900, "name": "decode_step"},
+            _rt(9, 1, 2), _k(9, graph_id=3, graph_node_id=900)]
+    assert _ops(correlate_records(recs)[0]) == [("mlp_down", 3)]

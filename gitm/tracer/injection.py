@@ -351,6 +351,7 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
     dropped_lines = 0
     collector_drops = 0
     collectors: set[str] = set()
+    no_direct_dispatch = False
     stamp_faults: dict[str, int] = {}
     for shard in shard_paths():
         try:
@@ -397,6 +398,8 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
                     collector_drops += drops
                 if rec.get("collector"):
                     collectors.add(str(rec["collector"]))
+                if rec.get("identity") and rec.get("direct_dispatch") == 0:
+                    no_direct_dispatch = True
                 for key in ("graph_stamp_overflow", "graph_untracked_launch"):
                     if isinstance(rec.get(key), int):
                         stamp_faults[key] = stamp_faults.get(key, 0) + rec[key]
@@ -431,6 +434,14 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
         warnings.warn(
             f"injected trace shards come from more than one collector "
             f"({sorted(collectors)}); stale shards from another run are mixed in",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if no_direct_dispatch:
+        warnings.warn(
+            "injected trace identity: AMD_DIRECT_DISPATCH=0 — HIP submits graph "
+            "replays from a worker thread, where the ROCm collector cannot stamp "
+            "them; replayed kernels will be unnamed. Unset it for graph identity.",
             RuntimeWarning,
             stacklevel=2,
         )

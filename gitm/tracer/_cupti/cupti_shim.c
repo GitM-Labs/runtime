@@ -95,6 +95,13 @@ static PyObject *rec_to_dict(const gitm_record *r) {
             "start_ns", (unsigned long long)r->start_ns,
             "end_ns", (unsigned long long)r->end_ns,
             "correlation_id", r->correlation_id, "thread_id", r->thread_id);
+    } else if (r->kind == GITM_REC_GRAPH_NODE) {
+        return Py_BuildValue(
+            "{s:s, s:K, s:K, s:s, s:s}",
+            "kind", "graph_node",
+            "graph_node_id", (unsigned long long)r->graph_node_id,
+            "cloned_from", (unsigned long long)r->cloned_from,
+            "node_kind", gitm_node_kind_name(r->node_kind), "name", r->name);
     } else if (r->kind == GITM_REC_MARKER) {
         /* Half a range. `marker_id` pairs it with its counterpart and
          * `marker_flags` says which half; the name is present only on the start.

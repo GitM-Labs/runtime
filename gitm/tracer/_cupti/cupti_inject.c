@@ -84,7 +84,21 @@ static void refresh_armed(void *user) {
 
 static void file_sink(const gitm_record *r, void *user) {
     (void)user;
-    if (!g_fp || !g_armed) return;
+    if (!g_fp) return;
+    if (r->kind == GITM_REC_GRAPH_NODE) {
+        /* Structural: graphs are captured at engine start, before any window
+         * arms, so this is written armed or not. */
+        fprintf(g_fp,
+                "{\"kind\":\"graph_node\",\"graph_node_id\":%llu,"
+                "\"cloned_from\":%llu,\"node_kind\":\"%s\",\"name\":",
+                (unsigned long long)r->graph_node_id, (unsigned long long)r->cloned_from,
+                gitm_node_kind_name(r->node_kind));
+        write_json_string(g_fp, r->name);
+        fputs("}\n", g_fp);
+        fflush(g_fp);
+        return;
+    }
+    if (!g_armed) return;
 
     if (r->kind == GITM_REC_KERNEL) {
         fputs("{\"kind\":\"kernel\",\"name\":", g_fp);

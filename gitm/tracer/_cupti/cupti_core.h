@@ -54,6 +54,14 @@
  * capture is not. */
 #define GITM_REC_RUNTIME 3
 #define GITM_REC_MARKER 4
+/* Capture-time graph node (written unarmed): the NVTX range open on the
+ * capturing thread when the node was created, or the node it was cloned from. */
+#define GITM_REC_GRAPH_NODE 5
+
+#define GITM_NODE_OTHER 0
+#define GITM_NODE_KERNEL 1
+#define GITM_NODE_MEMCPY 2
+#define GITM_NODE_MEMSET 3
 
 /* CUpti_ActivityMarker2 arrives as two records per range — a START and an END
  * sharing an `id`. Pairing them needs state; the C side stays stateless and
@@ -95,7 +103,13 @@ typedef struct {
      * capture-time node -> range map joins on (docs/kernel_identity.md). */
     uint32_t graph_id;
     uint64_t graph_node_id;
+    /* GITM_REC_GRAPH_NODE only. */
+    uint64_t cloned_from;
+    int      node_kind;
 } gitm_record;
+
+/* "kernel" | "memcpy" | "memset" | "other", the decoder's node_kind values. */
+const char *gitm_node_kind_name(int kind);
 
 /** Whether RUNTIME/MARKER collection is on (GITM_TRACE_NVTX). Exposed so both
  * sinks and the build can report the mode a capture actually ran in — a trace

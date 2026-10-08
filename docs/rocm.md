@@ -103,7 +103,7 @@ draft rate the decode experiments measure.
 * `rocm_inject.c` is compiled against the installed rocprofiler-sdk headers;
   like `cupti_core.c`'s versioned-struct pins, a field rename in a future sdk
   fails the build loudly rather than corrupting offsets silently.
-  `python scripts/check_rocm_collector.py --ref rocm-7.2.3` (or `--ref develop`)
+  `python scripts/check_collectors.py --vendor amd --ref rocm-7.2.3` (or `--ref develop`)
   compiles it against that release's real headers on any machine, ROCm or
   not; both pass `-Wall -Wextra -Werror`. It has not yet run on the MI355X box.
 * In-process (non-injected) capture has no AMD backend; `capture()` degrades to
