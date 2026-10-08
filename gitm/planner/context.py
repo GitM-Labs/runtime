@@ -346,9 +346,9 @@ def _query_amd() -> tuple[str | None, int | None]:
     ``(None, None)`` without kfd or with an unreadable nodes directory;
     ``(None, 0)`` with kfd and no GPU node.
     """
-    if not _KFD_NODES.is_dir():
-        return None, None
     try:
+        if not _KFD_NODES.is_dir():
+            return None, None
         # (length, name) is numeric order for "0".."N": node 10 after node 2.
         nodes = sorted(_KFD_NODES.iterdir(), key=lambda p: (len(p.name), p.name))
     except OSError:
@@ -359,7 +359,7 @@ def _query_amd() -> tuple[str | None, int | None]:
             if (node / "gpu_id").read_text().strip() in ("", "0"):
                 continue
             gpus.append(_kfd_properties(node))
-        except OSError:
+        except (OSError, ValueError):  # ValueError: a file that is not UTF-8
             continue
     if not gpus:
         return None, 0
@@ -495,13 +495,17 @@ def build_planner_context(
     if (env_sku is None and not priced) or not (world or nvml_count or torch_count):
         amd_name, amd_count = _query_amd()
 
-    # The override is an instruction. Otherwise the first name with a peak, then
-    # the most specific name there is: torch's marketing name over kfd's id.
+    # The override is an instruction. Otherwise the first name with a peak.
+    # Failing that, a name kfd took from its PCI-id table, which is the same on
+    # every run on this box whether or not torch answered (torch can say
+    # "AMD Radeon Graphics"), so history files the box under one key; then
+    # NVML's or torch's name; then kfd's id-based name.
     names = (nvml_name, torch_name, amd_name)
+    amd_listed = amd_name if amd_name in _AMD_DEVICE_NAMES.values() else None
     sku = (
         env_sku
         or next((x for x in names if peak_for_sku(x)), None)
-        or next((x for x in names if x), None)
+        or next((x for x in (amd_listed, *names) if x), None)
     )
     n = world or nvml_count or torch_count or amd_count or 1
     peak = peak_for_sku(sku)

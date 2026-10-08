@@ -302,16 +302,34 @@ def test_a_torch_name_with_no_peak_does_not_block_kfd(kfd, monkeypatch, generic)
     assert pctx.peak is not None and pctx.peak.peak_bw_bytes_s == 8000e9
 
 
-def test_a_generic_torch_name_is_kept_when_kfd_has_no_peak_either(kfd, monkeypatch):
-    """Nothing prices the box, so keep the most specific human name: torch's
-    marketing name over kfd's id-based one."""
+def test_kfds_listed_name_beats_a_generic_torch_name_when_nothing_is_priced(kfd, monkeypatch):
+    """Nothing prices the box. kfd's table name is the same on every run, so
+    the box keeps one history key whether or not torch answered."""
     _torch_says(monkeypatch, "AMD Radeon Graphics", 1)
     _node(kfd, 1, 1001, MI350X_PROPERTIES)
 
     pctx = ctx.build_planner_context(None)
 
-    assert pctx.sku == "AMD Radeon Graphics"
+    assert pctx.sku == "AMD Instinct MI350X"
     assert pctx.peak is None
+
+
+def test_torch_name_beats_kfds_id_based_name_when_nothing_is_priced(kfd, monkeypatch):
+    _torch_says(monkeypatch, "AMD Instinct MI300X OAM", 1)
+    _node(kfd, 1, 1001, _gpu_properties(0x75AF))
+
+    pctx = ctx.build_planner_context(None)
+
+    assert pctx.sku == "AMD Instinct MI300X OAM"
+
+
+def test_a_gpu_id_that_is_not_utf8_is_skipped(kfd):
+    node = kfd / "1"
+    node.mkdir()
+    (node / "gpu_id").write_bytes(b"\xff\xfe")
+    (node / "properties").write_text(_gpu_properties(MI355X_DEVICE_ID))
+
+    assert ctx._query_amd() == (None, 0)
 
 
 def test_kfd_names_the_box_when_torch_gave_an_empty_name(kfd, monkeypatch):
