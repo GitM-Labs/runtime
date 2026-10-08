@@ -307,19 +307,23 @@ def _gfx_name(version: int) -> str:
 def _query_amd() -> tuple[str | None, int | None]:
     """(device name, count) from the kfd topology in sysfs.
 
-    The last SKU fallback. The MI355X pod still priced against A100 after
-    :func:`_query_torch` was added, because the torch probe gave no name
-    there. The kfd topology needs no GPU context, no subprocess and no torch:
-    it is the same tree :func:`gitm.tracer._rocm.device_count` reads, and a
-    node is a GPU iff its ``gpu_id`` is non-zero.
+    The last SKU fallback, asked when no earlier source names a part with a
+    peak. The MI355X pod still priced against A100 after :func:`_query_torch`
+    was added, because the torch probe gave no usable name there. The kfd
+    topology needs no GPU context, no subprocess and no torch: it is the same
+    tree :func:`gitm.tracer._rocm.device_count` reads, and a node is a GPU iff
+    its ``gpu_id`` is non-zero.
 
     The name comes from the PCI ``device_id`` via ``_AMD_DEVICE_NAMES``. An id
     not in the table gets a name such as ``"AMD gfx950 device 0x75af"``, which
     matches no ``_PEAKS`` key, so the run still falls back but says what it
     was on instead of matching the wrong entry.
 
-    kfd answers ``EPERM`` for a GPU outside the container's device cgroup, so
-    such a node is skipped and the count is what this process may use.
+    The count is the box's visible kfd GPU nodes, the last fallback below the
+    engine's world size and the NVML and torch counts. kfd answers ``EPERM``
+    for a GPU outside the container's device cgroup, so such a node is skipped.
+    Two limits: a partitioned part (CPX) shows one node per partition and
+    inflates the count, and ``ROCR_VISIBLE_DEVICES`` is not applied.
     ``(None, None)`` without kfd; ``(None, 0)`` with kfd and no GPU node.
     """
     if not _KFD_NODES.is_dir():
@@ -458,13 +462,23 @@ def build_planner_context(
     if need_sku or need_count:
         torch_name, torch_count = _query_torch()
 
-    # Still no SKU: read the kfd topology. A sysfs read with no device context,
-    # so asking costs nothing, but it only names AMD parts.
+    # Read the kfd topology where nothing so far prices the box, or where no
+    # count has turned up. A sysfs read with no device context, so asking costs
+    # nothing, but it only sees AMD parts. A torch name is not enough to skip
+    # it: ROCm torch can return a generic string, or "", that matches no peak.
+    priced = any(peak_for_sku(name) for name in (env_sku, nvml_name, torch_name))
     amd_name = amd_count = None
-    if need_sku and torch_name is None:
+    if (env_sku is None and not priced) or not (world or nvml_count or torch_count):
         amd_name, amd_count = _query_amd()
 
-    sku = env_sku or nvml_name or torch_name or amd_name
+    # The override is an instruction. Otherwise the first name with a peak, then
+    # the most specific name there is: torch's marketing name over kfd's id.
+    names = (nvml_name, torch_name, amd_name)
+    sku = (
+        env_sku
+        or next((x for x in names if peak_for_sku(x)), None)
+        or next((x for x in names if x), None)
+    )
     n = world or nvml_count or torch_count or amd_count or 1
     peak = peak_for_sku(sku)
     dtype = _engine_dtype(engine)

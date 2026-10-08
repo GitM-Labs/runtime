@@ -8,6 +8,8 @@ topology in sysfs names the device without either. These tests point
 
 from __future__ import annotations
 
+from types import SimpleNamespace as NS
+
 import pytest
 
 import gitm.planner.context as ctx
@@ -69,6 +71,10 @@ device_id 0
 """
 
 MI355X_DEVICE_ID = 0x75A3
+
+
+def _engine(world_size: int):
+    return NS(vllm_config=NS(parallel_config=NS(world_size=world_size)))
 
 
 def _gpu_properties(device_id: int) -> str:
@@ -196,13 +202,10 @@ def test_the_pod_case_resolves_to_mi355x(kfd, monkeypatch):
 
 
 def test_the_run_world_size_still_beats_the_kfd_count(kfd, monkeypatch):
-    from types import SimpleNamespace as NS
-
     _no_nvml_no_torch(monkeypatch)
     _mi355x_nodes(kfd)
-    engine = NS(vllm_config=NS(parallel_config=NS(world_size=1)))
 
-    assert ctx.build_planner_context(engine).num_gpus == 1
+    assert ctx.build_planner_context(_engine(1)).num_gpus == 1
 
 
 def _kfd_must_not_be_asked(monkeypatch):
@@ -229,11 +232,95 @@ def test_torch_wins_and_kfd_is_not_asked(monkeypatch):
     assert ctx.build_planner_context(None).sku == "AMD Instinct MI355X"
 
 
-def test_a_missing_count_alone_does_not_ask_kfd(monkeypatch):
-    """The SKU is set and only the count is unknown: kfd is a SKU fallback."""
+def _torch_says(monkeypatch, name, count):
+    monkeypatch.delenv("GITM_GPU_SKU", raising=False)
+    monkeypatch.setattr(ctx, "_query_nvml", lambda: (None, None))
+    monkeypatch.setattr(ctx, "_query_torch", lambda: (name, count))
+
+
+@pytest.mark.parametrize("generic", ["AMD Radeon Graphics", ""])
+def test_a_torch_name_with_no_peak_does_not_block_kfd(kfd, monkeypatch, generic):
+    """ROCm torch can name a part generically, or not at all. Either is an
+    answer to "what is it called" and no answer to "what are its peaks"."""
+    _torch_says(monkeypatch, generic, 8)
+    _mi355x_nodes(kfd)
+
+    pctx = ctx.build_planner_context(None)
+
+    assert pctx.sku == "AMD Instinct MI355X"
+    assert pctx.peak is not None and pctx.peak.peak_bw_bytes_s == 8000e9
+
+
+def test_a_generic_torch_name_is_kept_when_kfd_has_no_peak_either(kfd, monkeypatch):
+    """Nothing prices the box, so keep the most specific human name: torch's
+    marketing name over kfd's id-based one."""
+    _torch_says(monkeypatch, "AMD Radeon Graphics", 1)
+    _node(kfd, 1, 1001, MI350X_PROPERTIES)
+
+    pctx = ctx.build_planner_context(None)
+
+    assert pctx.sku == "AMD Radeon Graphics"
+    assert pctx.peak is None
+
+
+def test_kfd_names_the_box_when_torch_gave_an_empty_name(kfd, monkeypatch):
+    _torch_says(monkeypatch, "", 1)
+    _node(kfd, 1, 1001, MI350X_PROPERTIES)
+
+    assert ctx.build_planner_context(None).sku == "AMD Instinct MI350X"
+
+
+def test_an_empty_torch_name_and_no_kfd_is_no_sku(tmp_path, monkeypatch):
+    monkeypatch.setattr(ctx, "_KFD_NODES", tmp_path / "absent")
+    _torch_says(monkeypatch, "", 1)
+
+    assert ctx.build_planner_context(None).sku is None
+
+
+def test_an_nvml_name_with_no_peak_is_kept_when_kfd_has_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(ctx, "_KFD_NODES", tmp_path / "absent")
+    monkeypatch.delenv("GITM_GPU_SKU", raising=False)
+    monkeypatch.setattr(ctx, "_query_nvml", lambda: ("NVIDIA RTX 4090", 1))
+
+    assert ctx.build_planner_context(None).sku == "NVIDIA RTX 4090"
+
+
+def test_an_override_with_no_peak_is_still_the_override(monkeypatch):
+    """The override is an instruction, not a guess: it stays even when NVML
+    names a catalogued part."""
+    monkeypatch.setenv("GITM_GPU_SKU", "SomeFutureGPU-9000")
+    monkeypatch.setattr(ctx, "_query_nvml", lambda: ("NVIDIA H200", 2))
+    _kfd_must_not_be_asked(monkeypatch)
+
+    assert ctx.build_planner_context(_engine(2)).sku == "SomeFutureGPU-9000"
+
+
+def test_kfd_counts_the_box_when_nothing_else_does(kfd, monkeypatch):
+    """GITM_GPU_SKU names the part, so kfd is not needed for that, but with no
+    engine and no NVML or torch count it is the only count there is."""
     monkeypatch.setenv("GITM_GPU_SKU", "MI355X")
     monkeypatch.setattr(ctx, "_query_nvml", lambda: (None, None))
     monkeypatch.setattr(ctx, "_query_torch", lambda: (None, None))
+    _mi355x_nodes(kfd)
+
+    pctx = ctx.build_planner_context(None)
+
+    assert (pctx.sku, pctx.num_gpus) == ("MI355X", 8)
+    assert pctx.gate.has_collective is True
+
+
+def test_a_known_world_size_does_not_ask_kfd(monkeypatch):
+    monkeypatch.setenv("GITM_GPU_SKU", "MI355X")
+    monkeypatch.setattr(ctx, "_query_nvml", lambda: (None, None))
     _kfd_must_not_be_asked(monkeypatch)
 
-    assert ctx.build_planner_context(None).num_gpus == 1
+    assert ctx.build_planner_context(_engine(1)).num_gpus == 1
+
+
+def test_a_torch_count_is_asked_before_kfd(monkeypatch):
+    monkeypatch.setenv("GITM_GPU_SKU", "MI355X")
+    monkeypatch.setattr(ctx, "_query_nvml", lambda: (None, None))
+    monkeypatch.setattr(ctx, "_query_torch", lambda: ("AMD Instinct MI355X", 4))
+    _kfd_must_not_be_asked(monkeypatch)
+
+    assert ctx.build_planner_context(None).num_gpus == 4
