@@ -167,8 +167,10 @@ named workload and written down in `docs/hypotheses/` before anything runs.
   `safety.correctness_gate_timeout_s`; no verdict by then restores. The
   callable does not survive saving the spec, so the spec also carries
   `safety.requires_correctness_gate`, and a reloaded spec without its gate is
-  refused rather than applied ungated. An interrupt at any step after the
-  snapshot restores before it propagates.
+  refused rather than applied ungated. An interrupt during apply, measure or
+  the gate calls `restore()` once before it propagates. A gate cut off at its
+  deadline keeps running (a thread cannot be stopped), so no further candidate
+  is applied until it exits.
 - The emitted `applies_to_kernels` is the hypothesis's `kernel_scope`, kernel
   substrings narrower than its planner op where the taxonomy rule is wider
   than the mechanism.

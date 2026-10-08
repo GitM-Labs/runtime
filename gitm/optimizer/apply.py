@@ -115,6 +115,11 @@ def apply_intervention(
                            error="spec requires a correctness gate and carries none (the gate "
                                  "is runtime-only and is lost when a spec is saved); "
                                  "nothing applied")
+    if running := _gates_still_running():
+        return ApplyResult(False, rolled_back=False, measured_delta=None,
+                           error=f"a timed-out correctness gate is still running against the "
+                                 f"target ({', '.join(running)}); nothing applied until it "
+                                 f"exits, since an A/B measured beside it would carry its load")
 
     # Step 1: snapshot. On a live engine this benchmarks the baseline, so it can
     # fail the same ways a measurement can — and when it does, nothing has been
@@ -125,6 +130,8 @@ def apply_intervention(
     except Exception as exc:
         return ApplyResult(False, rolled_back=False, measured_delta=None,
                            error=f"snapshot failed, nothing applied: {exc}")
+
+    restore_started = False
 
     def _unrestored(applied: bool, delta: float | None, cause: str,
                     exc: BaseException) -> ApplyResult:
@@ -137,13 +144,13 @@ def apply_intervention(
         nothing was rolled back; saying otherwise would tell the reader the
         baseline is in place.
         """
+        nonlocal restore_started
+        restore_started = True  # attempted, by _rollback or inside apply
         _audit(audit, "restore_failed", spec, knobs=_knob_values(spec),
                cause=f"{cause}; restore failed: {exc}")
         return ApplyResult(applied, rolled_back=False, measured_delta=delta,
                            error=f"{cause}; restore failed: {exc}",
                            restore_failed=True)
-
-    restore_started = False
 
     def _rollback(applied: bool, delta: float | None, cause: str) -> ApplyResult | None:
         """Restore the snapshot. ``None`` on success, else the unrestored result."""
@@ -227,18 +234,22 @@ def apply_intervention(
         return ApplyResult(True, rolled_back=False, measured_delta=delta)
 
     # Every Exception in steps 2-4 is handled where it happens. What still
-    # escapes (KeyboardInterrupt, SystemExit) restores the snapshot before it
-    # propagates, so stopping a run never leaves the candidate applied. Skipped
-    # when a restore was already under way: the interrupt landed inside it, and
-    # running it a second time is not this function's call to make.
+    # escapes (KeyboardInterrupt, SystemExit) calls restore() once before it
+    # propagates, so stopping a run does not leave the candidate applied. Not
+    # when a restore had already begun: the interrupt landed in or after it,
+    # and a second attempt is not this function's call to make. The trail says
+    # only what is known; an applicator interrupted inside its own rebuild may
+    # have nothing left for restore() to undo.
     try:
         result = _decide()
     except BaseException as exc:
-        if not restore_started:
-            cause = f"aborted by {type(exc).__name__}"
-            if _rollback(True, None, cause) is None:
-                _audit(audit, "revert", spec, knobs=_knob_values(spec),
-                       cause=f"{cause}, restored")
+        cause = f"aborted by {type(exc).__name__}"
+        if restore_started:
+            _audit(audit, "interrupted", spec, knobs=_knob_values(spec),
+                   cause=f"{cause} after a restore began; whether it finished is unknown")
+        elif _rollback(True, None, cause) is None:
+            _audit(audit, "revert", spec, knobs=_knob_values(spec),
+                   cause=f"{cause}; applicator restore() completed")
         raise
     if not result.kept:
         return result
@@ -263,6 +274,16 @@ class _GateDeadline(Exception):
     """The correctness gate returned no verdict before its deadline."""
 
 
+#: Gates cut off at their deadline that have not returned. A thread cannot be
+#: stopped, so each may still be sending requests to the server.
+_timed_out_gates: list[threading.Thread] = []
+
+
+def _gates_still_running() -> list[str]:
+    _timed_out_gates[:] = [t for t in _timed_out_gates if t.is_alive()]
+    return [t.name for t in _timed_out_gates]
+
+
 def _run_gate(
     gate: Callable[[Any], str | None], spec: InterventionSpec, timeout_s: float
 ) -> str | None:
@@ -271,7 +292,8 @@ def _run_gate(
     The gate talks to a live server and can block forever on a hung connection
     or a stalled benchmark. It runs on a daemon thread so the caller can give
     up at the deadline. A Python thread cannot be stopped, so a hung gate keeps
-    running until it returns, and whatever it returns then is discarded.
+    running until it returns, and whatever it returns then is discarded; until
+    it does, :func:`apply_intervention` refuses new candidates.
     Anything the gate raises, an interrupt included, is re-raised here. Because
     it runs off the main thread, a gate must not install signal handlers
     (``signal.signal`` raises there); use the client's own timeout instead.
@@ -288,6 +310,7 @@ def _run_gate(
     t.start()
     t.join(timeout_s)
     if t.is_alive():
+        _timed_out_gates.append(t)
         raise _GateDeadline(f"no verdict within {timeout_s:g} s, not judged")
     if "exc" in box:
         raise box["exc"]

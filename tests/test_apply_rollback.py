@@ -226,6 +226,28 @@ def test_measure_overhead_runs_and_reports():
 # --- correctness gate: interrupts, hangs, and a gate lost in transit ---------
 
 
+@pytest.fixture(autouse=True)
+def _no_gate_outlives_its_test():
+    """A gate cut off at its deadline blocks every later apply until it exits."""
+    yield
+    from gitm.optimizer import apply as apply_mod
+
+    for t in list(apply_mod._timed_out_gates):
+        t.join(5)
+    assert not apply_mod._gates_still_running()
+
+
+class _Trail:
+    def __init__(self, raise_on: str | None = None):
+        self.events: list[tuple[str, str]] = []
+        self._raise_on = raise_on
+
+    def record(self, event, name, cause, **kw):
+        self.events.append((event, cause))
+        if event == self._raise_on:
+            raise KeyboardInterrupt
+
+
 def _gated(gate, **safety) -> InterventionSpec:
     spec = _spec(safety={"requires_correctness_gate": True, **safety})
     return spec.model_copy(update={"correctness_gate": gate})
@@ -331,11 +353,15 @@ class _CountingRestore(DictApplicator):
 
 def test_an_interrupt_inside_a_restore_does_not_restore_twice():
     cfg = {"block_size": 8}
+    trail = _Trail()
     app = _CountingRestore(cfg, interrupt_in_restore=True, measure_fn=lambda s: -0.5)
     with pytest.raises(KeyboardInterrupt):
-        apply_intervention(_spec(), app)
+        apply_intervention(_spec(), app, audit=trail)
     assert app.restores == 1
     assert cfg == {"block_size": 8}
+    assert trail.events[-1] == (
+        "interrupted",
+        "aborted by KeyboardInterrupt after a restore began; whether it finished is unknown")
 
 
 def test_an_interrupt_whose_restore_fails_still_propagates():
@@ -380,3 +406,54 @@ def test_an_interrupt_after_the_keep_does_not_undo_it():
     with pytest.raises(KeyboardInterrupt):
         apply_intervention(_spec(), InterruptedCommit(cfg, measure_fn=lambda s: +0.1))
     assert cfg == {"block_size": 16}
+
+
+def test_a_timed_out_gate_blocks_the_next_candidate_until_it_exits():
+    import threading
+
+    from gitm.optimizer import apply as apply_mod
+
+    release = threading.Event()
+    first = apply_intervention(
+        _gated(lambda _s: release.wait(), correctness_gate_timeout_s=0.2),
+        DictApplicator({"block_size": 8}, measure_fn=lambda s: +0.1))
+    assert "timed out" in first.error
+
+    cfg = {"block_size": 8}
+    blocked = apply_intervention(_spec(), DictApplicator(cfg, measure_fn=lambda s: +0.1))
+    assert not blocked.applied and "still running" in blocked.error
+    assert cfg == {"block_size": 8}
+
+    release.set()
+    for t in list(apply_mod._timed_out_gates):
+        t.join(5)
+    after = apply_intervention(_spec(), DictApplicator(cfg, measure_fn=lambda s: +0.1))
+    assert after.kept and cfg == {"block_size": 16}
+
+
+def test_a_spec_missing_its_gate_is_refused_before_the_snapshot():
+    class NoSnapshot(DictApplicator):
+        def snapshot(self):
+            raise AssertionError("snapshot taken for a spec that must be refused")
+
+    spec = _spec(safety={"requires_correctness_gate": True})
+    res = apply_intervention(spec, NoSnapshot({"block_size": 8}))
+    assert not res.applied and "requires a correctness gate" in res.error
+
+
+def test_an_interrupt_after_a_failed_restore_in_apply_does_not_retry_it():
+    from gitm.optimizer.apply import RestoreFailed
+
+    class RebuildFailed(_CountingRestore):
+        def apply(self, spec):
+            raise RestoreFailed("baseline rebuild failed inside apply")
+
+    app = RebuildFailed({"block_size": 8})
+    with pytest.raises(KeyboardInterrupt):
+        apply_intervention(_spec(), app, audit=_Trail(raise_on="restore_failed"))
+    assert app.restores == 0
+
+
+def test_an_infinite_gate_deadline_is_rejected():
+    with pytest.raises(ValueError):
+        _spec(safety={"correctness_gate_timeout_s": float("inf")})
