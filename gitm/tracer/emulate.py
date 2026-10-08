@@ -49,6 +49,8 @@ DIALECT: dict[str, dict[str, str]] = {
     },
 }
 MAIN, HELPER = 1001, 1002
+#: The range vLLM's TorchCompileWrapper pushes around the compiled model.
+COMPILED_WRAPPER_RANGE = "Torch Compiled Module (input):LlamaForCausalLM"
 
 
 def kernel_class(op: str | None, name: str) -> str:
@@ -98,6 +100,9 @@ class EmulationConfig:
     #: launch's correlation scope — fresh correlation ids, no stamps
     worker_dispatch: bool = False
     capture_unranged: bool = False
+    #: vLLM's compiled path: only the whole-model wrapper range is open while
+    #: graphs are captured (layerwise hooks never fire there)
+    capture_compiled: bool = False
     pid: int = 4242
     seed: int = 0
 
@@ -297,7 +302,8 @@ def _capture(cfg: EmulationConfig, records: list[dict], template: list[TruthLaun
     kinds = ["kernel"] * len(template) + (["memset"] if cfg.blit_memset_node else [])
     for k, kind in enumerate(kinds):
         la = template[k] if kind == "kernel" else None
-        rn = None if cfg.capture_unranged else _range_name(cfg, la)
+        rn = (None if cfg.capture_unranged else
+              COMPILED_WRAPPER_RANGE if cfg.capture_compiled else _range_name(cfg, la))
         if rn:
             host.push(MAIN, rn)
         top = host.top(MAIN)
@@ -339,8 +345,13 @@ class IdentityScore:
 
 def score(events, truth: dict[tuple[int, int], tuple[str | None, int | None, str]]
           ) -> IdentityScore:
-    """Judge identity as downstream consumes it: ``observed_op`` and ``range_layer``."""
-    from gitm.optimizer.deviation import classify_op, observed_op
+    """Judge identity as downstream consumes it: ``observed_op`` and ``range_layer``.
+
+    Wrong means a *modeled* op or a layer other than the one launched: a label
+    no rule knows (a whole-model range) reaches no predicted node, so it is
+    unnamed for every consumer, not misnamed.
+    """
+    from gitm.optimizer.deviation import _OP_RULES, classify_op, observed_op
 
     out = IdentityScore()
     for e in events:
@@ -353,8 +364,8 @@ def score(events, truth: dict[tuple[int, int], tuple[str | None, int | None, str
         out.n += 1
         if got == want:
             out.correct += 1
-        elif e.range_op is None or (e.range_layer is None and t_layer is not None
-                                    and got[0] == want[0]):
+        elif e.range_op is None or got[0] not in _OP_RULES or (
+                e.range_layer is None and t_layer is not None and got[0] == want[0]):
             out.missing += 1
         else:
             out.wrong += 1

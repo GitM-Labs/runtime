@@ -118,7 +118,8 @@ def test_the_naive_decode_loses_the_cause(fx):
                                     dict(exec_untracked=True),
                                     dict(stamp_inherits_launch=True),
                                     dict(capture_unranged=True),
-                                    dict(worker_dispatch=True)])
+                                    dict(worker_dispatch=True),
+                                    dict(capture_compiled=True)])
 def test_a_refused_replay_never_invents_a_violation(fx, hazard):
     """Refusing identity loses evidence; it must not create any."""
     truth = {(v.invariant, v.node_op, v.layer) for v in observe(fx).violations}

@@ -746,15 +746,15 @@ def instrument_model(model: Any, *, push: Any = None, pop: Any = None) -> Instru
     ``push``/``pop`` default to ``torch.cuda.nvtx``; they are injectable so the
     naming can be tested without a GPU.
 
-    This only works in eager mode. Forward hooks are Python, and CUDA-graph
-    replay executes no Python — so under vLLM's default
-    ``cudagraph_mode=FULL_AND_PIECEWISE`` the ranges are pushed while the graph
-    is captured and never again during replay. Under ``torch.compile`` a hook
-    additionally forces a graph break, changing the very timings being measured.
-    Correlation is therefore an ``--enforce-eager`` instrument. What it produces
-    is still useful against graph-mode traces indirectly: run it once eagerly to
-    learn which kernel names belong to which ops, then apply that mapping by
-    name.
+    Forward hooks are Python, and CUDA-graph replay executes no Python: the
+    ranges are pushed while a graph is captured and never during replay. Replayed
+    kernels are named from that capture by the collectors' capture-time node
+    maps (gitm.distributed.correlate). That needs the hooks to run during capture,
+    i.e. an uncompiled model: under ``torch.compile`` a hook forces a graph
+    break, and vLLM does not run its own layerwise hooks on the compiled path at
+    all. Eager works, and so do uncompiled full graphs (compilation mode 0,
+    ``cudagraph_mode`` FULL/FULL_DECODE_ONLY); compiled runs do not
+    (``gitm serve vllm --nvtx`` preflight warns).
 
     Pops are registered with ``always_call`` where torch supports it. Without
     it, a forward that raises would skip its pop and leave the NVTX stack

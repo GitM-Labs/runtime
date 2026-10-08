@@ -340,11 +340,17 @@ static void CUPTIAPI on_callback(void *user, CUpti_CallbackDomain dom, CUpti_Cal
         const CUpti_GraphData *g = ((const CUpti_ResourceData *)cbdata)->resourceDescriptor;
         uint64_t id = 0, orig = 0;
         if (!g || !g->node || cuptiGetGraphNodeId(g->node, &id) != CUPTI_SUCCESS) return;
-        if (cbid == CUPTI_CBID_RESOURCE_GRAPHNODE_CREATED && !tls_nvtx.instantiating) {
-            emit_node(id, 0, nvtx_top(), node_kind(g->nodeType));
-        } else if (cbid == CUPTI_CBID_RESOURCE_GRAPHNODE_CLONED && g->originalNode &&
-                   cuptiGetGraphNodeId(g->originalNode, &orig) == CUPTI_SUCCESS) {
+        if (cbid != CUPTI_CBID_RESOURCE_GRAPHNODE_CREATED &&
+            cbid != CUPTI_CBID_RESOURCE_GRAPHNODE_CLONED)
+            return;
+        /* Whether a replayed kernel reports the captured node or the copy
+         * instantiate/clone made is not documented; a copy that names its
+         * original becomes a link, so the decoder resolves either. */
+        if (g->originalNode && cuptiGetGraphNodeId(g->originalNode, &orig) == CUPTI_SUCCESS &&
+            orig != id) {
             emit_node(id, orig, "", node_kind(g->nodeType));
+        } else if (cbid == CUPTI_CBID_RESOURCE_GRAPHNODE_CREATED && !tls_nvtx.instantiating) {
+            emit_node(id, 0, nvtx_top(), node_kind(g->nodeType));
         }
     }
 }

@@ -418,6 +418,71 @@ def preflight(serve_argv: list[str], devices: Devices, tp: int,
     return checks
 
 
+def _compilation(serve_argv: list[str]) -> tuple[bool, bool]:
+    """``(compiled, cuda_graphs)`` for a ``vllm serve`` command line.
+
+    vLLM's defaults (-O2) compile and capture graphs. ``--enforce-eager`` and
+    ``-O0`` turn both off. ``--compilation-config`` / ``-cc`` can turn
+    compilation off (``mode`` 0) while keeping full graphs (``cudagraph_mode``
+    FULL or FULL_DECODE_ONLY): vLLM supports full graphs without compilation,
+    piecewise ones only with it.
+    """
+    compiled, graphs = True, True
+    for i, a in enumerate(serve_argv):
+        nxt = serve_argv[i + 1] if i + 1 < len(serve_argv) else ""
+        if a == "--enforce-eager":
+            return False, False
+        if a in ("-O0", "-O=0", "--optimization-level=0") or (
+                a in ("-O", "--optimization-level") and nxt == "0"):
+            compiled, graphs = False, False
+        cfg = (a.split("=", 1)[1] if a.startswith(("--compilation-config=", "-cc="))
+               else nxt if a in ("--compilation-config", "-cc") else None)
+        if cfg is None:
+            continue
+        if cfg.strip() == "0":
+            compiled = False
+            continue
+        try:
+            parsed = json.loads(cfg)
+        except ValueError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        if parsed.get("mode", parsed.get("level")) == 0:
+            compiled = False
+        mode = str(parsed.get("cudagraph_mode", "")).upper()
+        if mode:
+            graphs = mode != "NONE"
+    return compiled, graphs
+
+
+#: The launch shape that keeps decode graphs and still lets vLLM's layerwise
+#: hooks run: no torch.compile, full decode graphs.
+UNCOMPILED_GRAPHS = '--compilation-config \'{"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}\''
+
+
+def check_nvtx_graph_mode(serve_argv: list[str]) -> list[Check]:
+    """Where --nvtx can name kernels, given how vLLM will run the model.
+
+    vLLM's layerwise ranges are module hooks registered only on the uncompiled
+    model; on the compiled path they never fire (vLLM's gpu_model_runner says
+    so). Under compiled graphs the only range open while a graph is captured is
+    the whole-model wrapper, so the capture-time node map has nothing per-layer
+    to project onto replayed kernels.
+    """
+    compiled, graphs = _compilation(serve_argv)
+    if not compiled and not graphs:
+        return [Check("nvtx-mode", "pass", "eager: per-layer ranges around every launch")]
+    if not compiled:
+        return [Check("nvtx-mode", "pass",
+                      "uncompiled full CUDA graphs: ranges fire during capture and "
+                      "replayed kernels are named from their capture-time nodes")]
+    return [Check("nvtx-mode", "warn",
+                  "torch.compile on: vLLM's layerwise ranges never fire on the compiled "
+                  "path, so kernels get no per-layer identity.\n"
+                  f"Use --enforce-eager, or {UNCOMPILED_GRAPHS} to keep decode graphs.")]
+
+
 def print_checks(checks: list[Check]) -> None:
     colour = {"pass": "\033[32mPASS\033[0m", "warn": "\033[33mWARN\033[0m", "fail": "\033[31mFAIL\033[0m"}
     for c in checks:
@@ -635,10 +700,11 @@ def add_serve_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
                          "on RUNTIME/DRIVER/MARKER collection (records them). Both "
                          "halves are required and neither errors alone: ranges nobody "
                          "collects and collection with no ranges each produce a clean "
-                         "trace with range_op null on every kernel. Under graphs (no "
-                         "--enforce-eager), replayed kernels are named from the range "
-                         "their node was captured under, and the range around the "
-                         "launch becomes launch_range. Costs throughput — "
+                         "trace with range_op null on every kernel. Per-layer identity "
+                         "needs vLLM's hooks to run, i.e. no torch.compile: "
+                         "--enforce-eager, or compilation mode 0 with full CUDA graphs "
+                         "(replayed kernels are then named from their capture-time "
+                         "nodes). Preflight warns otherwise. Costs throughput — "
                          "capture the same workload with and without to quantify it.")
     ap.add_argument("--keep-server", action="store_true",
                     help="leave the server up after capture — the handoff into "
@@ -751,6 +817,8 @@ def launch_and_capture(args, serve_argv: list[str] | None = None):
     bind_port = int(_arg_of(serve_argv, "--port") or args.port)
     checks = ([] if args.skip_preflight
               else preflight(serve_argv, devices, tp, skip_args=False, port=bind_port))
+    if nvtx:
+        checks += check_nvtx_graph_mode(serve_argv)
     print_checks(checks)
     write_preflight(out_dir, checks)
     if any(c.status == "fail" for c in checks):

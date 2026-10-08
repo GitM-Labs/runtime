@@ -137,6 +137,8 @@ def test_nodes_created_by_instantiate_are_not_named():
     after the range open at instantiate time would rename the captured nodes."""
     assert ("cbid == CUPTI_CBID_RESOURCE_GRAPHNODE_CREATED && !tls_nvtx.instantiating"
             in _CORE)
+    # ...but a copy that names its original is kept, as a link with no name.
+    assert "emit_node(id, orig, \"\", node_kind(g->nodeType));" in _CORE
     assert "node_map_start();" in _CORE and "node_map_stop();" in _CORE
 
 

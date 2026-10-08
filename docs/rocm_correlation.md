@@ -58,7 +58,30 @@ runtime, can't be told apart.
 - `GRAPHNODE_CLONED` links clones to their original.
 
 The decoder merges records that share an id. Along a clone chain, the name nearest
-the captured node wins.
+the captured node wins. A copy made by instantiate or clone that reports its
+`originalNode` is kept as a link, so replays resolve whichever ID the kernel
+carries. The callback subscriber is exclusive per process: another CUPTI
+subscriber (Nsight, torch.profiler) costs the node map, not the trace, and one
+started after ours fails to subscribe.
+
+## When there is anything to project
+
+Both node maps name a node after the range open while it was captured. vLLM's
+layerwise ranges are module hooks it registers only on the uncompiled model
+(`gpu_model_runner.py`: they "will never be called on the compiled model
+execution path"). So:
+
+- **Eager** (`--enforce-eager`, `-O0`, which also turns graphs off): ranges
+  around every launch. No graphs to project.
+- **No compile, full graphs**: `--compilation-config '{"mode": 0,
+  "cudagraph_mode": "FULL_DECODE_ONLY"}'`. vLLM supports full graphs without
+  compilation, and piecewise graphs only with it. Ranges fire during capture,
+  and replayed kernels are named from their nodes.
+- **Compiled (vLLM's default)**: only the whole-model wrapper range is open
+  during capture. Replays come back layerless, and `CorrelationReport` reports
+  `graph_layerless`.
+
+`gitm serve vllm --nvtx` runs this check in preflight (`nvtx-mode`).
 
 ## Does ROCm 7.2.3 stamp each kernel of a graph launch? (source review)
 
@@ -114,8 +137,8 @@ What breaks it:
 2. Eager: `identity == "range_id"`, and `stamp_containment_disagree == 0`.
 3. Graphs: no `duplicate_ordinal` / `untracked_launch` refusals, and every
    `graph_exec` has a `capture_id`.
-4. `graph_unnamed` is not reported. If it is, torch.compile may have traced the
-   range hooks away.
+4. Neither `graph_unnamed` nor `graph_layerless` is reported. Either one means the
+   ranges didn't run during capture: torch.compile is on.
 5. Overhead: run e1 (`docs/mi355x_experiment_plan.md`) with and without
    `GITM_TRACE_NVTX`.
 

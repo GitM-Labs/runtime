@@ -148,6 +148,9 @@ class CorrelationReport:
     graph_refused: Counter = field(default_factory=Counter)
     #: replayed kernels whose node was captured outside every range
     graph_unnamed: int = 0
+    #: replayed kernels named by a range with no layer — under vLLM's compiled
+    #: path only the whole-model wrapper range is open during capture
+    graph_layerless: int = 0
     stamp_containment_disagree: int = 0
     stamp_unresolved: int = 0
     memcpys: int = 0
@@ -171,6 +174,10 @@ class CorrelationReport:
             out.append(f"{self.graph_unnamed} of {self.graph_kernels} graph-replayed kernel(s) "
                        "ran from nodes captured outside every range — were ranges pushed "
                        "during graph capture? (torch.compile can trace forward hooks away)")
+        if self.graph_kernels and self.graph_layerless >= UNNAMED_SHARE * self.graph_kernels:
+            out.append(f"{self.graph_layerless} of {self.graph_kernels} graph-replayed kernel(s) "
+                       "were captured under a range with no layer — vLLM's layerwise hooks "
+                       "do not run on the compiled path; use --enforce-eager or -O0")
         if self.stamp_containment_disagree:
             out.append(f"{self.stamp_containment_disagree} kernel(s): stamped range and "
                        "host-time containment disagree (stamp used)")
@@ -309,6 +316,7 @@ def correlate_records(records: list[dict]) -> tuple[list[dict], list[dict], Corr
         if name:
             k["range_op"], k["range_layer"] = parse_range_name(name)
             k["range_attrs"], k["identity"] = attrs, source
+            report.graph_layerless += source == "graph_node" and k["range_layer"] is None
         report.identity[k["identity"] or "none"] += 1
         out.append(k)
 

@@ -273,6 +273,8 @@ See `docs/rocm_correlation.md`. Landed for both vendors:
   and to RESOURCE `GRAPHNODE_CREATED`/`CLONED`, skipping nodes
   `cudaGraphInstantiate` creates.
 
-Compiled against CUDA 12 and 13 headers (`scripts/check_collectors.py --vendor
+Per-layer projection needs vLLM's hooks to run during capture: no torch.compile
+(see `docs/rocm_correlation.md`, "When there is anything to project"). Compiled
+against CUDA 12 and 13 headers (`scripts/check_collectors.py --vendor
 nvidia`); not yet run on a GPU. The first check there is
 `test_replayed_kernels_take_their_capture_range_end_to_end`.

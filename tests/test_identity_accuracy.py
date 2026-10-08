@@ -173,3 +173,13 @@ def test_a_few_unranged_nodes_are_normal():
     _, report, _ = _run(_launches("side_stream"), EmulationConfig("amd", graphs=True))
     assert 0 < report.graph_unnamed < report.graph_kernels / 2
     assert report.problems() == []
+
+
+def test_a_compiled_capture_is_reported_not_counted_as_identity():
+    """Under vLLM's compiled path only the whole-model wrapper range is open
+    while graphs are captured: every node is named, by a range with no layer."""
+    s, report, _ = _run(_launches("dense"), EmulationConfig("amd", graphs=True,
+                                                            capture_compiled=True))
+    assert s.wrong == 0 and s.correct < s.n
+    assert report.graph_layerless == report.graph_kernels
+    assert any("no layer" in p for p in report.problems())
