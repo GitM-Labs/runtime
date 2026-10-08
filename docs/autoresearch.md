@@ -169,8 +169,9 @@ named workload and written down in `docs/hypotheses/` before anything runs.
   `safety.requires_correctness_gate`, and a reloaded spec without its gate is
   refused rather than applied ungated. An interrupt during apply, measure or
   the gate calls `restore()` once before it propagates. A gate cut off at its
-  deadline keeps running (a thread cannot be stopped), so no further candidate
-  is applied until it exits.
+  deadline, or abandoned by a Ctrl-C while the caller waited on it, keeps
+  running (a thread cannot be stopped), so no further candidate is applied
+  until it exits.
 - The emitted `applies_to_kernels` is the hypothesis's `kernel_scope`, kernel
   substrings narrower than its planner op where the taxonomy rule is wider
   than the mechanism.

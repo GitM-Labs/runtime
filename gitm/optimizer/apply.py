@@ -117,7 +117,8 @@ def apply_intervention(
                                  "nothing applied")
     if running := _gates_still_running():
         return ApplyResult(False, rolled_back=False, measured_delta=None,
-                           error=f"a timed-out correctness gate is still running against the "
+                           error=f"a correctness gate that timed out or was interrupted is "
+                                 f"still running against the "
                                  f"target ({', '.join(running)}); nothing applied until it "
                                  f"exits, since an A/B measured beside it would carry its load")
 
@@ -274,8 +275,9 @@ class _GateDeadline(Exception):
     """The correctness gate returned no verdict before its deadline."""
 
 
-#: Gates cut off at their deadline that have not returned. A thread cannot be
-#: stopped, so each may still be sending requests to the server.
+#: Gates cut off at their deadline, or abandoned when an interrupt ended the
+#: wait for them, that have not returned. A thread cannot be stopped, so each
+#: may still be sending requests to the server.
 _timed_out_gates: list[threading.Thread] = []
 
 
@@ -293,7 +295,8 @@ def _run_gate(
     or a stalled benchmark. It runs on a daemon thread so the caller can give
     up at the deadline. A Python thread cannot be stopped, so a hung gate keeps
     running until it returns, and whatever it returns then is discarded; until
-    it does, :func:`apply_intervention` refuses new candidates.
+    it does, :func:`apply_intervention` refuses new candidates. The same holds
+    when an interrupt ends the wait instead of the deadline.
     Anything the gate raises, an interrupt included, is re-raised here. Because
     it runs off the main thread, a gate must not install signal handlers
     (``signal.signal`` raises there); use the client's own timeout instead.
@@ -307,8 +310,15 @@ def _run_gate(
             box["exc"] = exc
 
     t = threading.Thread(target=run, name=f"correctness-gate:{spec.name}", daemon=True)
-    t.start()
-    t.join(timeout_s)
+    try:
+        t.start()
+        t.join(timeout_s)
+    except BaseException:
+        # A real Ctrl-C lands here in the main thread, never inside the gate,
+        # so the gate is still running when the caller restores.
+        if t.is_alive():
+            _timed_out_gates.append(t)
+        raise
     if t.is_alive():
         _timed_out_gates.append(t)
         raise _GateDeadline(f"no verdict within {timeout_s:g} s, not judged")

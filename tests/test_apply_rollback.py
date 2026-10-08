@@ -431,6 +431,38 @@ def test_a_timed_out_gate_blocks_the_next_candidate_until_it_exits():
     assert after.kept and cfg == {"block_size": 16}
 
 
+def test_a_real_ctrl_c_during_the_gate_holds_the_next_candidate():
+    import _thread
+    import threading
+
+    release = threading.Event()
+
+    def gate(_spec):
+        # interrupt_main delivers SIGINT to the main thread, as a real Ctrl-C
+        # does, so it surfaces from the join, not from this thread.
+        _thread.interrupt_main()
+        release.wait(10)
+
+    cfg = {"block_size": 8}
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            apply_intervention(_gated(gate, correctness_gate_timeout_s=60),
+                               DictApplicator(cfg, measure_fn=lambda s: +0.1))
+        assert cfg == {"block_size": 8}
+        assert any(t.name.startswith("correctness-gate") and t.is_alive()
+                   for t in threading.enumerate())
+
+        nxt = {"block_size": 8}
+        blocked = apply_intervention(_spec(), DictApplicator(nxt, measure_fn=lambda s: +0.1))
+        assert not blocked.applied and "still running" in blocked.error
+        assert nxt == {"block_size": 8}
+    finally:
+        release.set()
+        for t in threading.enumerate():
+            if t.name.startswith("correctness-gate"):
+                t.join(5)
+
+
 def test_a_spec_missing_its_gate_is_refused_before_the_snapshot():
     class NoSnapshot(DictApplicator):
         def snapshot(self):
