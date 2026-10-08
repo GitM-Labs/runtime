@@ -8,6 +8,7 @@ topology in sysfs names the device without either. These tests point
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace as NS
 
 import pytest
@@ -142,8 +143,20 @@ def test_an_unlisted_device_is_named_visibly_and_matches_nothing(kfd):
 
     name, _ = ctx._query_amd()
 
-    assert name == "AMD gfx950 device 0x75af"
+    assert name == "AMD gfx950 device id 30127"
     assert ctx.peak_for_sku(name) is None
+
+
+@pytest.mark.parametrize("device", [0xA100, 0xB200, 0xB300, 0x4000, 0xFFFF])
+def test_no_fallback_name_can_contain_a_catalogue_key(kfd, device):
+    """`peak_for_sku` matches substrings, and a hex id such as 0xa100 spelled
+    "A100" priced an unknown AMD part as an A100."""
+    _node(kfd, 1, 1001, _gpu_properties(device))
+
+    name, _ = ctx._query_amd()
+
+    assert ctx.peak_for_sku(name) is None, name
+    assert all(key.lower() not in name.lower() for key in ctx._PEAKS), name
 
 
 def test_a_node_that_does_not_say_amd_is_counted_but_not_named(kfd):
@@ -156,6 +169,18 @@ def test_a_node_that_does_not_say_amd_is_counted_but_not_named(kfd):
 
 def test_cpu_nodes_are_not_gpus(kfd):
     assert ctx._query_amd() == (None, 0)
+
+
+def test_an_unreadable_nodes_directory_is_no_answer(kfd):
+    """Another probe that must not raise out of build_planner_context."""
+    _mi355x_nodes(kfd)
+    kfd.chmod(0)
+    try:
+        if os.access(kfd, os.R_OK):
+            pytest.skip("permissions are not enforced for this user")
+        assert ctx._query_amd() == (None, None)
+    finally:
+        kfd.chmod(0o755)
 
 
 def test_no_kfd_is_no_answer(tmp_path, monkeypatch):

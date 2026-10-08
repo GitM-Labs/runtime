@@ -315,22 +315,28 @@ def _query_amd() -> tuple[str | None, int | None]:
     its ``gpu_id`` is non-zero.
 
     The name comes from the PCI ``device_id`` via ``_AMD_DEVICE_NAMES``. An id
-    not in the table gets a name such as ``"AMD gfx950 device 0x75af"``, which
-    matches no ``_PEAKS`` key, so the run still falls back but says what it
-    was on instead of matching the wrong entry.
+    not in the table gets a name such as ``"AMD gfx950 device id 30127"``. The
+    id is decimal so the name cannot spell a ``_PEAKS`` key (hex 0xa100 would
+    match ``A100``): the run still falls back but says what it was on instead
+    of matching the wrong entry.
 
     The count is the box's visible kfd GPU nodes, the last fallback below the
     engine's world size and the NVML and torch counts. kfd answers ``EPERM``
     for a GPU outside the container's device cgroup, so such a node is skipped.
     Two limits: a partitioned part (CPX) shows one node per partition and
     inflates the count, and ``ROCR_VISIBLE_DEVICES`` is not applied.
-    ``(None, None)`` without kfd; ``(None, 0)`` with kfd and no GPU node.
+    ``(None, None)`` without kfd or with an unreadable nodes directory;
+    ``(None, 0)`` with kfd and no GPU node.
     """
     if not _KFD_NODES.is_dir():
         return None, None
+    try:
+        # (length, name) is numeric order for "0".."N": node 10 after node 2.
+        nodes = sorted(_KFD_NODES.iterdir(), key=lambda p: (len(p.name), p.name))
+    except OSError:
+        return None, None
     gpus = []
-    # (length, name) is numeric order for "0".."N": node 10 after node 2.
-    for node in sorted(_KFD_NODES.iterdir(), key=lambda p: (len(p.name), p.name)):
+    for node in nodes:
         try:
             if (node / "gpu_id").read_text().strip() in ("", "0"):
                 continue
@@ -345,7 +351,7 @@ def _query_amd() -> tuple[str | None, int | None]:
     device = first.get("device_id", 0)
     name = _AMD_DEVICE_NAMES.get(device)
     if name is None:
-        name = f"AMD {_gfx_name(first.get('gfx_target_version', 0))} device 0x{device:04x}"
+        name = f"AMD {_gfx_name(first.get('gfx_target_version', 0))} device id {device}"
     return name, len(gpus)
 
 
