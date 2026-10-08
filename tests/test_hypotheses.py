@@ -467,4 +467,4 @@ def test_h002_gate_deadline_covers_its_own_gate_budget():
     # in gitm/agents/hypotheses.py and the doc's gate section both give 2x that.
     per_arm_s = 90 * 60 / 2
     spec = _prop(_k25()).propose("memory_bound")[0]
-    assert spec.safety.correctness_gate_timeout_s >= 2 * per_arm_s
+    assert spec.safety.correctness_gate_timeout_s == 2 * per_arm_s

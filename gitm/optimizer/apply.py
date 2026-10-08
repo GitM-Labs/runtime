@@ -281,15 +281,24 @@ class _GateDeadline(Exception):
     """The correctness gate returned no verdict before its deadline."""
 
 
-#: Gates cut off at their deadline, or abandoned when an interrupt ended the
-#: wait for them, that have not returned. A thread cannot be stopped, so each
-#: may still be sending requests to the server.
-_timed_out_gates: list[threading.Thread] = []
+@dataclass(frozen=True)
+class _GateRun:
+    thread: threading.Thread
+    finished: threading.Event
+
+
+#: Every gate that has started and not yet returned. A thread cannot be
+#: stopped, so one cut off at its deadline or abandoned by an interrupt may
+#: still be sending requests to the server. Each gate is registered before its
+#: thread starts and marks itself finished on return: ``Thread.is_alive`` is
+#: not trusted, because on CPython 3.10 to 3.12 a ``join`` interrupted by
+#: Ctrl-C marks a thread that is still running as stopped.
+_unfinished_gates: list[_GateRun] = []
 
 
 def _gates_still_running() -> list[str]:
-    _timed_out_gates[:] = [t for t in _timed_out_gates if t.is_alive()]
-    return [t.name for t in _timed_out_gates]
+    _unfinished_gates[:] = [g for g in _unfinished_gates if not g.finished.is_set()]
+    return [g.thread.name for g in _unfinished_gates]
 
 
 def _run_gate(
@@ -308,25 +317,27 @@ def _run_gate(
     (``signal.signal`` raises there); use the client's own timeout instead.
     """
     box: dict[str, Any] = {}
+    finished = threading.Event()
 
     def run() -> None:
         try:
             box["why"] = gate(spec)
         except BaseException as exc:
             box["exc"] = exc
+        finally:
+            finished.set()
 
     t = threading.Thread(target=run, name=f"correctness-gate:{spec.name}", daemon=True)
+    # Registered before it starts, so no interrupt can land between the gate
+    # outliving its wait and the gate being recorded.
+    _unfinished_gates.append(_GateRun(t, finished))
     try:
         t.start()
-        t.join(timeout_s)
-    except BaseException:
-        # A real Ctrl-C lands here in the main thread, never inside the gate,
-        # so the gate is still running when the caller restores.
-        if t.is_alive():
-            _timed_out_gates.append(t)
+    except RuntimeError:  # the thread could not be created; nothing runs
+        finished.set()
         raise
-    if t.is_alive():
-        _timed_out_gates.append(t)
+    t.join(timeout_s)
+    if not finished.is_set():
         raise _GateDeadline(f"no verdict within {timeout_s:g} s, not judged")
     if "exc" in box:
         raise box["exc"]

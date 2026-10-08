@@ -232,8 +232,8 @@ def _no_gate_outlives_its_test():
     yield
     from gitm.optimizer import apply as apply_mod
 
-    for t in list(apply_mod._timed_out_gates):
-        t.join(5)
+    for g in list(apply_mod._unfinished_gates):
+        g.thread.join(5)
     assert not apply_mod._gates_still_running()
 
 
@@ -425,33 +425,43 @@ def test_a_timed_out_gate_blocks_the_next_candidate_until_it_exits():
     assert cfg == {"block_size": 8}
 
     release.set()
-    for t in list(apply_mod._timed_out_gates):
-        t.join(5)
+    for g in list(apply_mod._unfinished_gates):
+        g.finished.wait(5)
     assert blocked.restore_failed, "the loops stop only on restore_failed"
     after = apply_intervention(_spec(), DictApplicator(cfg, measure_fn=lambda s: +0.1))
     assert after.kept and cfg == {"block_size": 16}
 
 
 def test_a_real_ctrl_c_during_the_gate_holds_the_next_candidate():
-    import _thread
+    """A real SIGINT reaches the main thread while it waits in ``join``. On
+    CPython 3.10 to 3.12 that interrupted join marks the still-running gate
+    thread as stopped, so ``is_alive`` cannot be what holds the next candidate.
+    """
+    import signal
     import threading
 
+    from gitm.optimizer import apply as apply_mod
+
     release = threading.Event()
+    waiting = threading.Event()
 
     def gate(_spec):
-        # interrupt_main delivers SIGINT to the main thread, as a real Ctrl-C
-        # does, so it surfaces from the join, not from this thread.
-        _thread.interrupt_main()
+        waiting.set()
         release.wait(10)
 
+    def ctrl_c():
+        waiting.wait(5)
+        # The main thread is inside join by now: measure and apply are instant.
+        threading.Event().wait(0.2)
+        signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+
+    threading.Thread(target=ctrl_c, daemon=True).start()
     cfg = {"block_size": 8}
     try:
         with pytest.raises(KeyboardInterrupt):
             apply_intervention(_gated(gate, correctness_gate_timeout_s=60),
                                DictApplicator(cfg, measure_fn=lambda s: +0.1))
         assert cfg == {"block_size": 8}
-        assert any(t.name.startswith("correctness-gate") and t.is_alive()
-                   for t in threading.enumerate())
 
         nxt = {"block_size": 8}
         blocked = apply_intervention(_spec(), DictApplicator(nxt, measure_fn=lambda s: +0.1))
@@ -459,9 +469,9 @@ def test_a_real_ctrl_c_during_the_gate_holds_the_next_candidate():
         assert nxt == {"block_size": 8}
     finally:
         release.set()
-        for t in threading.enumerate():
-            if t.name.startswith("correctness-gate"):
-                t.join(5)
+        for g in list(apply_mod._unfinished_gates):
+            g.finished.wait(5)
+    assert apply_intervention(_spec(), DictApplicator(cfg, measure_fn=lambda s: +0.1)).kept
 
 
 def test_a_spec_missing_its_gate_is_refused_before_the_snapshot():
