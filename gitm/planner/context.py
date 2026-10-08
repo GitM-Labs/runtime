@@ -7,7 +7,7 @@ the hardware peak FLOP/bandwidth. This module assembles that once, from NVML and
 the live engine, so downstream code never guesses.
 
 Everything degrades cleanly: no NVML → read ``GITM_GPU_SKU``; unknown SKU →
-``None`` peaks (HFU/MFU simply stay unreported rather than wrong). Engine
+``None`` peaks (HFU/MFU unreported) but the A100 roofline defaults. Engine
 introspection is duck-typed so it survives vLLM version drift.
 """
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from gitm.optimizer.metrics import HardwarePeak
@@ -265,6 +266,85 @@ def _engine_world_size(engine: Any) -> int | None:
     return int(val) if isinstance(val, int) and not isinstance(val, bool) and val > 0 else None
 
 
+#: One directory per kfd node, CPU sockets included. A module constant so a test
+#: can point it at a fake tree.
+_KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
+
+_AMD_PCI_VENDOR = 0x1002
+
+#: PCI device id -> name, spelled as libdrm's ``data/amdgpu.ids`` spells it.
+#: ROCm's thunk (libhsakmt) names devices from that file, so these are the names
+#: ROCm itself reports. MI350X and MI355X are both gfx950, so
+#: ``gfx_target_version`` cannot tell them apart; the device id can. MI350P is
+#: gfx950 too, with half the CUs and HBM. The PCI ID database (pci-ids.ucw.cz,
+#: vendor 1002) lists the same 75A0/75A3/75A8; the VF ids are in libdrm only.
+_AMD_DEVICE_NAMES: dict[int, str] = {
+    0x75A0: "AMD Instinct MI350X",
+    0x75A3: "AMD Instinct MI355X",
+    0x75A8: "AMD Instinct MI350P",
+    0x75B0: "AMD Instinct MI350X VF",
+    0x75B3: "AMD Instinct MI355X VF",
+    0x75B8: "AMD Instinct MI350P VF",
+}
+
+
+def _kfd_properties(node: Path) -> dict[str, int]:
+    """A kfd node's ``properties`` file: one ``name value`` line each, decimal."""
+    props: dict[str, int] = {}
+    for line in (node / "properties").read_text().splitlines():
+        key, _, value = line.partition(" ")
+        if value.isdigit():
+            props[key] = int(value)
+    return props
+
+
+def _gfx_name(version: int) -> str:
+    """``gfx_target_version`` 90500 -> ``"gfx950"``: major, then minor and
+    stepping in hex, which is how 90010 becomes gfx90a."""
+    return f"gfx{version // 10000}{version // 100 % 100:x}{version % 100:x}"
+
+
+def _query_amd() -> tuple[str | None, int | None]:
+    """(device name, count) from the kfd topology in sysfs.
+
+    The last SKU fallback. The MI355X pod still priced against A100 after
+    :func:`_query_torch` was added, because the torch probe gave no name
+    there. The kfd topology needs no GPU context, no subprocess and no torch:
+    it is the same tree :func:`gitm.tracer._rocm.device_count` reads, and a
+    node is a GPU iff its ``gpu_id`` is non-zero.
+
+    The name comes from the PCI ``device_id`` via ``_AMD_DEVICE_NAMES``. An id
+    not in the table gets a name such as ``"AMD gfx950 device 0x75af"``, which
+    matches no ``_PEAKS`` key, so the run still falls back but says what it
+    was on instead of matching the wrong entry.
+
+    kfd answers ``EPERM`` for a GPU outside the container's device cgroup, so
+    such a node is skipped and the count is what this process may use.
+    ``(None, None)`` without kfd; ``(None, 0)`` with kfd and no GPU node.
+    """
+    if not _KFD_NODES.is_dir():
+        return None, None
+    gpus = []
+    # (length, name) is numeric order for "0".."N": node 10 after node 2.
+    for node in sorted(_KFD_NODES.iterdir(), key=lambda p: (len(p.name), p.name)):
+        try:
+            if (node / "gpu_id").read_text().strip() in ("", "0"):
+                continue
+            gpus.append(_kfd_properties(node))
+        except OSError:
+            continue
+    if not gpus:
+        return None, 0
+    first = gpus[0]
+    if first.get("vendor_id") != _AMD_PCI_VENDOR:
+        return None, len(gpus)
+    device = first.get("device_id", 0)
+    name = _AMD_DEVICE_NAMES.get(device)
+    if name is None:
+        name = f"AMD {_gfx_name(first.get('gfx_target_version', 0))} device 0x{device:04x}"
+    return name, len(gpus)
+
+
 def peak_for_sku(sku: str | None) -> HardwarePeak | None:
     """Look up dense peaks for a SKU string (substring match), else None."""
     if not sku:
@@ -378,8 +458,14 @@ def build_planner_context(
     if need_sku or need_count:
         torch_name, torch_count = _query_torch()
 
-    sku = env_sku or nvml_name or torch_name
-    n = world or nvml_count or torch_count or 1
+    # Still no SKU: read the kfd topology. A sysfs read with no device context,
+    # so asking costs nothing, but it only names AMD parts.
+    amd_name = amd_count = None
+    if need_sku and torch_name is None:
+        amd_name, amd_count = _query_amd()
+
+    sku = env_sku or nvml_name or torch_name or amd_name
+    n = world or nvml_count or torch_count or amd_count or 1
     peak = peak_for_sku(sku)
     dtype = _engine_dtype(engine)
     kv_len = _engine_kv_len(engine)
