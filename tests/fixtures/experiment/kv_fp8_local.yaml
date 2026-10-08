@@ -1,0 +1,49 @@
+# Wiring fixture for the experiment contract. It runs against a deterministic
+# fake engine in tests/test_experiment_contract.py. It is NOT a hardware result:
+# nothing here was measured on a GPU.
+schema_version: gitm.experiment.contract/v1
+candidate_id: fixture-kv-cache-fp8
+hypothesis:
+  id: H-fixture-001
+  submitter: fixture
+  claim: fp8 KV cache raises decode throughput at the rag c=64 point
+  mechanism: >-
+    MLA's latent KV is the decode-attention traffic term; storing it in fp8
+    halves the bytes read per step on a memory-bound decode.
+  expected_effect: {mean: 0.08, lo: 0.03, hi: 0.15}
+  reject_if_effect_below: 0.03
+intervention:
+  kv_cache_dtype: fp8
+primary_metric:
+  name: output_tok_s
+  unit: tokens/s
+  direction: higher_is_better
+workload:
+  trace_id: fixture-synthetic-0000
+  source: fixture
+  operating_point: fixture/rag-4096-512/c64
+  max_concurrency: 64
+  duration_s: 180
+baseline:
+  label: B
+  engine_args: {tensor_parallel_size: 8, max_num_seqs: 256, kv_cache_dtype: auto}
+candidate:
+  label: I
+  engine_args: {tensor_parallel_size: 8, max_num_seqs: 256, kv_cache_dtype: fp8}
+budget:
+  max_wall_clock_s: 7200
+  max_accelerator_s: 57600
+correctness_gate:
+  method: token_agreement
+  reference: fixture-reference-outputs
+  min_score: 0.99
+latency_gates:
+  - {metric: ttft_ms_p95, max_regression: 0.05}
+  - {metric: itl_ms_p95, max_regression: 0.05}
+protocol:
+  repetitions: 5
+  warmup_reps: 1
+  comparison_order: ABBA
+  pairing: paired
+  alpha: 0.05
+noise_floor_ref: null
