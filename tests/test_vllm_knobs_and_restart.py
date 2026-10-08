@@ -261,6 +261,62 @@ def test_restart_apply_rolls_back_to_original_engine_on_regression():
     assert app.engine is e0  # original engine restored
 
 
+class _ShutEngine(_TpsEngine):
+    def __init__(self, tps: float):
+        super().__init__(tps)
+        self.shutdown_calls = 0
+
+    def shutdown(self):
+        self.shutdown_calls += 1
+
+
+def test_parallel_restart_kept_candidate_releases_old_engine():
+    """A kept parallel-mode candidate must release the engine it replaced.
+
+    Regression: restore() was the only release path, so on a keep the previous
+    engine sat in _prev until the next snapshot() dropped it unreleased — every
+    later candidate was built beside two resident engines, not one.
+    """
+    e0 = _ShutEngine(100.0)
+    e1 = _ShutEngine(200.0)  # wins against e0
+    e2 = _ShutEngine(150.0)  # loses against e1
+    builds = iter([e1, e2])
+    built_from: list = []
+
+    def restart_fn(old, _knob_values):
+        built_from.append(old)
+        return next(builds)
+
+    app = LiveEngineApplicator(e0, throughput_fn=_tps_of, restart_fn=restart_fn)
+
+    res = apply_intervention(_spec("block_size", 16), app, min_keep_delta=0.0)
+    assert res.applied and not res.rolled_back
+    # Released at the keep itself — not deferred to a next candidate that a
+    # last-candidate win would never get.
+    assert e0.shutdown_calls == 1
+    assert app.engine is e1 and e1.shutdown_calls == 0
+
+    res = apply_intervention(_spec("block_size", 32), app, min_keep_delta=0.0)
+    assert res.rolled_back
+    assert built_from == [e0, e1]  # the winner is the next baseline
+    assert e2.shutdown_calls == 1  # rollback drops the losing candidate...
+    assert app.engine is e1 and e1.shutdown_calls == 0  # ...and keeps the winner
+    assert e0.shutdown_calls == 1  # never released twice
+
+
+def test_engine_release_failure_is_warned_not_swallowed():
+    class Broken(_TpsEngine):
+        def shutdown(self):
+            raise RuntimeError("rank 3 did not exit")
+
+    e0 = Broken(100.0)
+    app = LiveEngineApplicator(e0, throughput_fn=_tps_of,
+                               restart_fn=lambda *_: _TpsEngine(200.0))
+    with pytest.warns(RuntimeWarning, match="rank 3 did not exit"):
+        res = apply_intervention(_spec("block_size", 16), app, min_keep_delta=0.0)
+    # A failed release still never aborts the A/B: the winner is kept.
+    assert res.applied and not res.rolled_back
+
 
 def test_serial_restart_releases_baseline_before_building_candidate():
     class Engine(_TpsEngine):
@@ -417,6 +473,10 @@ class _FullEngine:
         self.scheduler_config.max_num_seqs = max_num_seqs
         self.gitm_throughput_fn = lambda e: float(e.scheduler_config.max_num_seqs)
         self.gitm_restart_fn = self._restart
+        self.shut_down = False
+
+    def shutdown(self):
+        self.shut_down = True
 
     def get_num_unfinished_requests(self):
         return 2
@@ -448,8 +508,9 @@ def test_run_loop_scheduler_stats_feed_attribution_and_claims(tmp_path, monkeypa
     # Non-expiring budget: max_num_seqs_dynamic ranks low and this asserts it's
     # reached + kept; a short wall-clock would make that racy under load (loop
     # is budget-bounded).
-    out = run_loop(LoopConfig(engine=engine, workload="vllm-decode", budget="24h",
-                              scratch=str(tmp_path), top_n_interventions=50))
+    cfg = LoopConfig(engine=engine, workload="vllm-decode", budget="24h",
+                     scratch=str(tmp_path), top_n_interventions=50)
+    out = run_loop(cfg)
 
     run_dir = Path(out["run_dir"])
     residuals = json.loads((run_dir / "residuals.json").read_text())
@@ -463,6 +524,10 @@ def test_run_loop_scheduler_stats_feed_attribution_and_claims(tmp_path, monkeypa
     assert "max_num_seqs" in out["report_md"]
     # Scheduler summary surfaced in the run summary (synchronous first sample).
     assert out["summary"]["scheduler_stats"] is not None
+    # The kept restart released the original engine, and the caller is handed
+    # the live winner instead of that released handle.
+    assert engine.shut_down
+    assert cfg.engine is not engine and not cfg.engine.shut_down
 
 def test_report_kernel_time_residual_uses_weighted_total_and_clamps():
     from gitm.optimizer.monitor import KernelResidual, Residuals

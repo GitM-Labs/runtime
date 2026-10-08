@@ -553,6 +553,10 @@ def _openfold_factory(cfg: LoopConfig) -> WorkloadRunner:
 ENGINE_WORKER_PREFIX = "EngineCore"
 
 
+def _warn_release(step: str, exc: Exception) -> None:
+    warnings.warn(f"engine release step {step!r} failed: {exc}", RuntimeWarning, stacklevel=3)
+
+
 def _shutdown_timeout() -> float:
     """Seconds to wait for workers before forcing them, from the environment.
 
@@ -666,6 +670,9 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
                               -> vLLM's "auto". Lets a serial A/B build each leg
                               directly in its dtype, one engine per process, so
                               each can use the full GITM_VLLM_GPU_MEM budget.
+        GITM_SHUTDOWN_TIMEOUT_S  seconds an engine shutdown waits for its
+                              EngineCore/TP worker processes to exit before
+                              killing the stragglers (default 30)
         GITM_VLLM_SYNTHETIC   "1" -> CPU-only decode stand-in instead of vLLM
                               (exercises the wire/registry path with no GPU or
                               vLLM; produces no GPU kernels)
@@ -782,8 +789,12 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         _base_kwargs.update(extra)
 
     engine_ref: dict[str, Any] = {}
+    # ids of engines built and not yet shut down. In parallel restart mode two
+    # are live at once, sharing this process's distributed state.
+    live_engines: set[int] = set()
 
     def _shutdown_engine(engine: Any) -> None:
+        live_engines.discard(id(engine))
         if engine_ref.get("engine") is engine:
             engine_ref["engine"] = None
         try:
@@ -807,28 +818,37 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
             if callable(obj):
                 try:
                     obj()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _warn_release(path, exc)
                 break
 
-        try:
-            from vllm.distributed.parallel_state import (
-                destroy_distributed_environment,
-                destroy_model_parallel,
-            )
+        # Process-global teardown only once no engine needs it: in parallel mode
+        # the baseline (or a kept winner) is still live and would lose it.
+        if not live_engines:
+            try:
+                from vllm.distributed.parallel_state import (
+                    destroy_distributed_environment,
+                    destroy_model_parallel,
+                )
+            except ImportError:
+                pass
+            else:
+                try:
+                    destroy_model_parallel()
+                    destroy_distributed_environment()
+                except Exception as exc:
+                    _warn_release("destroy vllm distributed state", exc)
 
-            destroy_model_parallel()
-            destroy_distributed_environment()
-        except Exception:
-            pass
-
-        try:
-            import torch.distributed as dist
-
-            if dist.is_available() and dist.is_initialized():
-                dist.destroy_process_group()
-        except Exception:
-            pass
+            try:
+                import torch.distributed as dist
+            except ImportError:
+                pass
+            else:
+                try:
+                    if dist.is_available() and dist.is_initialized():
+                        dist.destroy_process_group()
+                except Exception as exc:
+                    _warn_release("destroy_process_group", exc)
 
         for attr in ("llm_engine", "engine"):
             try:
@@ -869,8 +889,10 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
-        except Exception:
+        except ImportError:
             pass
+        except Exception as exc:
+            _warn_release("cuda cache release", exc)
 
     def _activate_engine(engine: Any) -> None:
         engine_ref["engine"] = engine
@@ -887,6 +909,7 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         before = engine_worker_pids()
         engine = LLM(model=model, **kwargs)
         engine.gitm_worker_pids = engine_worker_pids() - before
+        live_engines.add(id(engine))
         engine.gitm_llm_kwargs = dict(kwargs)
         engine.gitm_shutdown_fn = _shutdown_engine
         engine.gitm_activate_fn = _activate_engine
