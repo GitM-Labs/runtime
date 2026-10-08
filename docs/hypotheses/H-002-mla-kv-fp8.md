@@ -55,7 +55,7 @@ Checked in code before a candidate is emitted (`_h002_applies`), each with a rea
 1. The model uses MLA (`kv_lora_rank > 0`). A GQA cache splits across TP ranks, and the effect would divide by TP.
 2. The model is *dense* MLA: no DSA indexer on any layer. On sparse MLA (GLM-5.2) an fp8 cache takes the `fp8_ds_mla` layout, 656 B per entry with per-128 fp32 scales on a sparse backend (`mla_attention.py:341-362`), which is not the 576 B this derivation prices.
 3. The executed cache is bf16 or fp16, and not already any fp8 flavour (`fp8`, `fp8_e4m3`, `fp8_e5m2`). An explicit `serving["kv_cache_dtype"]` wins. Otherwise it is the catalogue's `kv_dtype`, which records what `auto` resolves to.
-4. The attention kernel is one the derivation priced. With no `attention_backend` in the serving config that is vLLM's default pair for the arch (Hopper `FLASH_ATTN_MLA` to `FLASHMLA`, Blackwell `FLASHINFER_MLA` both sides, CDNA4 `ROCM_AITER_MLA` both sides, requiring `VLLM_ROCM_USE_AITER=1`; without AITER ROCm selects `TRITON_MLA`, `platforms/rocm.py:324-326`, which is not priced). An explicit backend is accepted only if it is one of that pair; forcing the fp8-capable one on the bf16 side (the H200 arm B) makes it a same-kernel prediction with the narrower band. Anything else is refused with the reason.
+4. The attention kernel is one the derivation priced. With no `attention_backend` in the serving config that is vLLM's default pair for the arch (Hopper `FLASH_ATTN_MLA` to `FLASHMLA`, Blackwell `FLASHINFER_MLA` both sides, CDNA4 `ROCM_AITER_MLA` both sides, requiring `VLLM_ROCM_USE_AITER=1`; without AITER ROCm selects `TRITON_MLA`, `platforms/rocm.py:324-326`, which is not priced). An explicit backend is accepted only if it is one of that pair; forcing the fp8-capable one on the bf16 side (the H200 pinned-backend arm) makes it a same-kernel prediction with the narrower band. Anything else is refused with the reason.
 5. The step is decode.
 6. The mean predicted step reduction clears the measured noise floor (`HypothesisProposer(noise_floor=...)`).
 
@@ -85,30 +85,33 @@ The `rag` point fits comfortably. The fit ledger (`memory_fit`, the loop's 0.92 
 
 ## Experiment
 
-On the loop deployment (`deploy/k8s/mi355x-kimi-loop.yaml`: TP8, `VLLM_ROCM_USE_AITER=1`, `--gpu-memory-utilization 0.92`, `--max-num-batched-tokens 8192`), two arms, changed by `arm.sh` in-pod:
+On the loop deployment (`deploy/k8s/mi355x-kimi-loop.yaml`: TP8, `VLLM_ROCM_USE_AITER=1`, `--gpu-memory-utilization 0.92`, `--max-num-batched-tokens 8192`), two arms, switched in-pod by `scripts/kimi_loop/arm.sh`. Both load the GITM tracer dormant, so their timings compare like for like:
 
-| Arm | Extra flags | MLA backend and kernel |
+| Arm | `arm.sh` call | MLA backend and kernel |
 |---|---|---|
-| A | none (the loop's existing headline run) | ROCM_AITER_MLA; `mla_decode_stage1_asm_fwd` running `mla_a16w16_qh16_*`, then `mla_reduce_v1` |
-| C | `--kv-cache-dtype fp8` | ROCM_AITER_MLA; `mla_a8w8_qh16_qseqlen1_gqaratio16`, then `mla_reduce_v1`; query quantised to fp8 |
+| B | `arm.sh B` | ROCM_AITER_MLA; `mla_decode_stage1_asm_fwd` running `mla_a16w16_qh16_*`, then `mla_reduce_v1` |
+| I | `arm.sh I --kv-cache-dtype fp8` | ROCM_AITER_MLA; `mla_a8w8_qh16_qseqlen1_gqaratio16`, then `mla_reduce_v1`; query quantised to fp8 |
 
-There is no bf16-cache arm on the fp8 kernel here, unlike H200's arm B, because AITER's kernel choice follows the cache dtype and cannot be forced.
+These letters are `arm.sh`'s own. Its arm C is the correlation arm (rocTX ranges and `--enforce-eager`), not an fp8 arm. Its A and L are the untraced twins of B and I, which the P1 experiment (`docs/experiments/p1_fp8_kv_separation.md`) uses for the same lever at c=16; agree with P1's owner which band a run is judged against before running either.
 
-1. **Load.** Run `INTERVENTION='--kv-cache-dtype fp8' bash run_loop.sh e8`. It re-runs the headline (`rag`, c=64) under the lever. Add the `chat` config at c=64 for the scaling check, with 3 repetitions each.
-2. **Kernel plane.** Take one GITM-traced window per arm (the loop's arm B tracer, not during the timed runs) and read the per-layer MLA decode kernel duration.
-3. **Pre-run check.** The spec's `kernel_scope` carries AITER's cache-reading decode names read from source (`mla_a16w16`, `mla_a8w8`, `mla_decode`, from `aiter/aiter/mla.py:318-349` and `asm_mla.cu`). Confirm on the first trace that the captured symbols contain them. Replay excludes `mla_reduce`, `reshape_and_cache`, and `slot_mapping`: none represents reading the cached KV bytes whose size is halved by fp8.
+There is no bf16-cache arm on the fp8 kernel here, unlike the H200 pinned-backend arm below, because AITER's kernel choice follows the cache dtype and cannot be forced.
 
-On H200, run a third arm to separate the backend switch from the byte halving. Arm B is `--attention-backend FLASHMLA` with a bf16 cache (`engine/arg_utils.py:597`). Its fp8-vs-bf16 comparison on the same kernel then isolates the mechanism.
+1. **Load.** Run `INTERVENTION='--kv-cache-dtype fp8' bash run_loop.sh e8`. It times the headline (`rag`, c=64) on arm B, then on arm I, and captures one traced window during each run. Before arm I's timed run it runs a validity check (`python -m gitm.optimizer.separation sanity`); if arm I cannot answer coherently, e8 restores arm B and stops. That check does not judge accuracy, so it does not replace step 2. Add the `chat` config at c=64 for the scaling check, with 3 repetitions each.
+2. **Correctness, before any keep decision.** With the server still in arm I, run the correctness gate below, and compare it with the same runs on arm B. If arm I fails, restore with `arm.sh B`; the lever is rejected (rejection condition 4).
+3. **Kernel plane.** From the two captured windows, read the per-layer MLA decode kernel duration.
+4. **Pre-run check.** The spec's `kernel_scope` carries AITER's cache-reading decode names read from source (`mla_a16w16`, `mla_a8w8`, `mla_decode`, from `aiter/aiter/mla.py:318-349` and `asm_mla.cu`). Confirm on the first trace that the captured symbols contain them. Replay excludes `mla_reduce`, `reshape_and_cache`, and `slot_mapping`: none represents reading the cached KV bytes whose size is halved by fp8.
+
+On H200, run a third arm to separate the backend switch from the byte halving. The pinned-backend arm is `--attention-backend FLASHMLA` with a bf16 cache (`engine/arg_utils.py:597`). Its fp8-vs-bf16 comparison on the same kernel then isolates the mechanism.
 
 ## Gates
 
-The loop's keep decision (`optimizer/apply.py`) measures throughput only, so a faster but wrong cache could be kept. `HypothesisProposer` therefore refuses to emit this candidate unless it is built with a `correctness_gate`, and the emitted `InterventionSpec` carries that gate in its `correctness_gate` field. `apply_intervention` runs it after measuring and before keeping, with whatever applicator the caller passed, so there is no wrapper to forget. A failing gate restores the change and puts the reason in `ApplyResult.error`. A gate that *crashes* (the benchmark times out, the server drops) is treated the same way: the change is restored and the error recorded as "not judged", because an unjudged candidate must never stay applied. `tests/test_hypotheses.py::test_a_faster_but_wrong_candidate_is_rolled_back` and `::test_the_gate_is_on_the_spec_not_the_proposer` pin that. The gate itself is the sentinel below; wiring it to lm-eval is the loop's job, not this spec's.
+The loop's keep decision (`optimizer/apply.py`) measures throughput only, so a faster but wrong cache could be kept. `HypothesisProposer` therefore refuses to emit this candidate unless it is built with a `correctness_gate`, and the emitted `InterventionSpec` carries that gate in its `correctness_gate` field. `apply_intervention` runs it after measuring and before keeping, with whatever applicator the caller passed, so there is no wrapper to forget. A failing gate restores the change and puts the reason in `ApplyResult.error`. A gate that *crashes* (the benchmark times out, the server drops) is treated the same way: the change is restored and the error recorded as "not judged", because an unjudged candidate must never stay applied. A gate that returns no verdict within `safety.correctness_gate_timeout_s` (30 minutes by default) is cut off and restored the same way. The callable is runtime-only and is lost when the spec is saved, so the spec also carries `safety.requires_correctness_gate`, and `apply_intervention` refuses a reloaded spec that lacks its gate. `tests/test_hypotheses.py::test_a_faster_but_wrong_candidate_is_rolled_back`, `::test_the_gate_is_on_the_spec_not_the_proposer` and `::test_a_saved_and_reloaded_h002_spec_is_refused_not_applied_ungated` pin that. The gate itself is the sentinel below; wiring it to lm-eval is the loop's job, not this spec's.
 
-**Correctness.** Kimi K2.5 ships no `k_scale`/`v_scale`, so vLLM stores with scale 1.0 (`quantization/kv_cache.py:71-75`). Run on arms A and C:
-- GSM8K (lm-eval-harness `gsm8k`, 5-shot, all 1,319 items, `local-completions` against the server). Arm C may not score more than 1.0 point below arm A.
-- Needle retrieval at the loop's `long` context (8,192 prompt), 100 prompts. Arm C may not score more than 2 points below arm A.
+**Correctness.** Kimi K2.5 ships no `k_scale`/`v_scale`, so vLLM stores with scale 1.0 (`quantization/kv_cache.py:71-75`). Run on arms B and I:
+- GSM8K (lm-eval-harness `gsm8k`, 5-shot, all 1,319 items, `local-completions` against the server). Arm I may not score more than 1.0 point below arm B.
+- Needle retrieval at the loop's `long` context (8,192 prompt), 100 prompts. Arm I may not score more than 2 points below arm B.
 
-**Latency.** Arm C's TTFT p50 may not rise more than 5%. Arm C's ITL p99 may not exceed arm A's by more than the noise floor.
+**Latency.** Arm I's TTFT p50 may not rise more than 5% over arm B's. Arm I's ITL p99 may not exceed arm B's by more than the noise floor.
 
 ## Rejection conditions
 
@@ -128,7 +131,7 @@ The loop's keep decision (`optimizer/apply.py`) measures throughput only, so a f
 | Item | Estimate | Owner |
 |---|---|---|
 | Hardware | the existing MI355X loop pod; weights already on `/mnt/shared/hf-cache` | team |
-| Server restart for arm C | in-pod through `arm.sh`, up to 1 h cold | |
+| Server restart for arm I | in-pod through `arm.sh`, up to 1 h cold | |
 | Load runs, 2 configs x 3 reps x 3 min, plus one traced window per arm | about 1 h | |
 | GSM8K and needle, 2 arms | about 1.5 h | |
 | Total | about 3.5 node-hours (28 GPU-hours); arm A reuses the loop's headline run if the config matches | Abhiram approves |

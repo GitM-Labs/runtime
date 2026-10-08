@@ -22,6 +22,7 @@ from __future__ import annotations
 import copy
 import gc
 import math
+import threading
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -98,13 +99,23 @@ def apply_intervention(
     (e.g. a slowdown) is rolled back. With no measurement (``measure`` returns
     ``None``) the change is kept — apply-only mode. A spec carrying a
     ``correctness_gate`` is additionally rolled back when that gate fails,
-    regardless of the measured delta.
+    regardless of the measured delta. The gate runs under the deadline in
+    ``spec.safety.correctness_gate_timeout_s``; no verdict by then is "not
+    judged" and restores. A spec whose safety says it needs a gate but which
+    carries none (the callable does not survive saving the spec) is refused
+    before anything is touched.
 
     When an ``audit`` log is supplied, every live mutation and every rollback is
     recorded to the durable safety trail (best-effort — a broken audit sink never
     blocks the apply). Pass one only where the applicator mutates a real target;
     a dry-run leaves it ``None`` so the trail stays free of no-op entries.
     """
+    if spec.safety.requires_correctness_gate and spec.correctness_gate is None:
+        return ApplyResult(False, rolled_back=False, measured_delta=None,
+                           error="spec requires a correctness gate and carries none (the gate "
+                                 "is runtime-only and is lost when a spec is saved); "
+                                 "nothing applied")
+
     # Step 1: snapshot. On a live engine this benchmarks the baseline, so it can
     # fail the same ways a measurement can — and when it does, nothing has been
     # applied yet. Returned as an error, not raised: one candidate whose baseline
@@ -132,78 +143,106 @@ def apply_intervention(
                            error=f"{cause}; restore failed: {exc}",
                            restore_failed=True)
 
+    restore_started = False
+
     def _rollback(applied: bool, delta: float | None, cause: str) -> ApplyResult | None:
         """Restore the snapshot. ``None`` on success, else the unrestored result."""
+        nonlocal restore_started
+        restore_started = True
         try:
             applicator.restore(snapshot)
         except Exception as exc:
             return _unrestored(applied, delta, cause, exc)
         return None
 
-    # Step 2: apply. A bad value (validation error) rolls straight back.
-    try:
-        applicator.apply(spec)
-    except RestoreFailed as exc:
-        # The applicator already tried to put the baseline back inside apply and
-        # could not. Calling restore() again would retry the same rebuild that
-        # just failed.
-        return _unrestored(False, None, "apply failed", exc)
-    except Exception as exc:
-        if (bad := _rollback(False, None, f"apply failed: {exc}")) is not None:
-            return bad
-        _audit(audit, "revert", spec, cause=f"apply failed, restored: {exc}",
-               knobs=_knob_values(spec))
-        return ApplyResult(False, rolled_back=True, measured_delta=None,
-                           error=f"apply failed, restored: {exc}")
-    _audit(audit, "apply", spec, cause="applied live", knobs=_knob_values(spec))
-
-    # Step 3: measure. A crash mid-measurement also rolls back.
-    try:
-        delta = applicator.measure(spec)
-    except Exception as exc:
-        if (bad := _rollback(False, None, f"measure failed: {exc}")) is not None:
-            return bad
-        _audit(audit, "revert", spec, cause=f"measure failed, restored: {exc}",
-               knobs=_knob_values(spec))
-        return ApplyResult(False, rolled_back=True, measured_delta=None,
-                           error=f"measure failed, restored: {exc}")
-
-    # Step 3b: the spec's own correctness gate, before any keep decision. A
-    # faster candidate that fails it is restored with the reason, so the
-    # throughput number alone can never keep a change that alters output.
-    if spec.correctness_gate is not None:
-        # The gate is a benchmark against a live server: it can time out, lose
-        # the connection, or crash. Any of those is "not judged", and an
-        # unjudged change is restored exactly like a failed one — the same
-        # shape as the measure step above, so a crash mid-gate can never leave
-        # the candidate applied.
+    def _decide() -> ApplyResult:
+        """Steps 2-4: apply, measure, judge. The result says whether it was kept."""
+        # Step 2: apply. A bad value (validation error) rolls straight back.
         try:
-            why = spec.correctness_gate(spec)
+            applicator.apply(spec)
+        except RestoreFailed as exc:
+            # The applicator already tried to put the baseline back inside apply
+            # and could not. Calling restore() again would retry the same
+            # rebuild that just failed.
+            return _unrestored(False, None, "apply failed", exc)
         except Exception as exc:
-            if (bad := _rollback(True, delta, f"correctness gate crashed: {exc}")) is not None:
+            if (bad := _rollback(False, None, f"apply failed: {exc}")) is not None:
                 return bad
-            _audit(audit, "revert", spec, knobs=_knob_values(spec),
-                   cause=f"correctness gate crashed, restored: {exc}")
-            return ApplyResult(True, rolled_back=True, measured_delta=delta,
-                               error=f"correctness gate crashed, restored: {exc}")
-        if why is not None:
-            if (bad := _rollback(True, delta, f"correctness gate failed: {why}")) is not None:
-                return bad
-            _audit(audit, "revert", spec, knobs=_knob_values(spec),
-                   cause=f"correctness gate failed: {why}")
-            return ApplyResult(True, rolled_back=True, measured_delta=delta,
-                               error=f"correctness gate failed: {why}, restored")
+            _audit(audit, "revert", spec, cause=f"apply failed, restored: {exc}",
+                   knobs=_knob_values(spec))
+            return ApplyResult(False, rolled_back=True, measured_delta=None,
+                               error=f"apply failed, restored: {exc}")
+        _audit(audit, "apply", spec, cause="applied live", knobs=_knob_values(spec))
 
-    # Step 4: keep-or-rollback on the regression threshold.
-    if delta is not None and delta < min_keep_delta:
-        cause = f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}"
-        if (bad := _rollback(True, delta, cause)) is not None:
-            return bad
-        _audit(audit, "revert", spec, knobs=_knob_values(spec),
-               cause=f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}")
-        return ApplyResult(True, rolled_back=True, measured_delta=delta,
-                           error=f"regression {delta:+.3f} < keep threshold "
-                                 f"{min_keep_delta:+.3f}, restored")
+        # Step 3: measure. A crash mid-measurement also rolls back.
+        try:
+            delta = applicator.measure(spec)
+        except Exception as exc:
+            if (bad := _rollback(False, None, f"measure failed: {exc}")) is not None:
+                return bad
+            _audit(audit, "revert", spec, cause=f"measure failed, restored: {exc}",
+                   knobs=_knob_values(spec))
+            return ApplyResult(False, rolled_back=True, measured_delta=None,
+                               error=f"measure failed, restored: {exc}")
+
+        # Step 3b: the spec's own correctness gate, before any keep decision. A
+        # faster candidate that fails it is restored with the reason, so the
+        # throughput number alone can never keep a change that alters output.
+        if spec.correctness_gate is not None:
+            # The gate is a benchmark against a live server: it can time out,
+            # lose the connection, crash, or never return. Any of those is "not
+            # judged", and an unjudged change is restored exactly like a failed
+            # one — the same shape as the measure step above, so a gate that
+            # crashes or hangs can never leave the candidate applied.
+            try:
+                why = _run_gate(spec.correctness_gate, spec,
+                                spec.safety.correctness_gate_timeout_s)
+            except Exception as exc:
+                what = "timed out" if isinstance(exc, _GateDeadline) else "crashed"
+                cause = f"correctness gate {what}: {exc}"
+                if (bad := _rollback(True, delta, cause)) is not None:
+                    return bad
+                _audit(audit, "revert", spec, knobs=_knob_values(spec),
+                       cause=f"correctness gate {what}, restored: {exc}")
+                return ApplyResult(True, rolled_back=True, measured_delta=delta,
+                                   error=f"correctness gate {what}, restored: {exc}")
+            if why is not None:
+                if (bad := _rollback(True, delta, f"correctness gate failed: {why}")) is not None:
+                    return bad
+                _audit(audit, "revert", spec, knobs=_knob_values(spec),
+                       cause=f"correctness gate failed: {why}")
+                return ApplyResult(True, rolled_back=True, measured_delta=delta,
+                                   error=f"correctness gate failed: {why}, restored")
+
+        # Step 4: keep-or-rollback on the regression threshold.
+        if delta is not None and delta < min_keep_delta:
+            cause = f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}"
+            if (bad := _rollback(True, delta, cause)) is not None:
+                return bad
+            _audit(audit, "revert", spec, knobs=_knob_values(spec),
+                   cause=f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}")
+            return ApplyResult(True, rolled_back=True, measured_delta=delta,
+                               error=f"regression {delta:+.3f} < keep threshold "
+                                     f"{min_keep_delta:+.3f}, restored")
+        return ApplyResult(True, rolled_back=False, measured_delta=delta)
+
+    # Every Exception in steps 2-4 is handled where it happens. What still
+    # escapes (KeyboardInterrupt, SystemExit) restores the snapshot before it
+    # propagates, so stopping a run never leaves the candidate applied. Skipped
+    # when a restore was already under way: the interrupt landed inside it, and
+    # running it a second time is not this function's call to make.
+    try:
+        result = _decide()
+    except BaseException as exc:
+        if not restore_started:
+            cause = f"aborted by {type(exc).__name__}"
+            if _rollback(True, None, cause) is None:
+                _audit(audit, "revert", spec, knobs=_knob_values(spec),
+                       cause=f"{cause}, restored")
+        raise
+    if not result.kept:
+        return result
+    delta = result.measured_delta
 
     # Kept: whatever restore() would have needed is now garbage (for a restart,
     # the whole previous engine). Optional hook — only applicators holding
@@ -218,6 +257,41 @@ def apply_intervention(
             return ApplyResult(True, rolled_back=False, measured_delta=delta,
                                error=f"kept; releasing the replaced engine failed: {exc}")
     return ApplyResult(True, rolled_back=False, measured_delta=delta)
+
+
+class _GateDeadline(Exception):
+    """The correctness gate returned no verdict before its deadline."""
+
+
+def _run_gate(
+    gate: Callable[[Any], str | None], spec: InterventionSpec, timeout_s: float
+) -> str | None:
+    """Run ``gate(spec)`` and return its verdict, or raise past ``timeout_s``.
+
+    The gate talks to a live server and can block forever on a hung connection
+    or a stalled benchmark. It runs on a daemon thread so the caller can give
+    up at the deadline. A Python thread cannot be stopped, so a hung gate keeps
+    running until it returns, and whatever it returns then is discarded.
+    Anything the gate raises, an interrupt included, is re-raised here. Because
+    it runs off the main thread, a gate must not install signal handlers
+    (``signal.signal`` raises there); use the client's own timeout instead.
+    """
+    box: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            box["why"] = gate(spec)
+        except BaseException as exc:
+            box["exc"] = exc
+
+    t = threading.Thread(target=run, name=f"correctness-gate:{spec.name}", daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        raise _GateDeadline(f"no verdict within {timeout_s:g} s, not judged")
+    if "exc" in box:
+        raise box["exc"]
+    return box.get("why")
 
 
 def _audit(

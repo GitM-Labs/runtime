@@ -508,6 +508,7 @@ class HypothesisProposer:
                        f"{p.step_delta[1]:.1%} / {p.step_delta[2]:.1%} (lo/mean/hi)"),
             ),
             safety=SafetyGate(tier="moderate", requires_rollback_window_s=120,
+                              requires_correctness_gate=h.requires_correctness_gate,
                               notes=h.safety_notes),
             correctness_gate=self.correctness_gate if h.requires_correctness_gate else None,
         )

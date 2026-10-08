@@ -447,3 +447,15 @@ def test_h002_rejects_forced_backend_that_cannot_follow_fp8_switch():
     assert proposer.propose("memory_bound") == []
     assert "explicitly pinned" in dict(proposer.skipped)["H-002"]
     assert proposer.predictions == {}
+
+
+def test_a_saved_and_reloaded_h002_spec_is_refused_not_applied_ungated():
+    from gitm.kernels.spec import InterventionSpec
+
+    spec = _prop(_k25()).propose("memory_bound")[0]
+    reloaded = InterventionSpec.model_validate_json(spec.model_dump_json())
+    assert reloaded.safety.requires_correctness_gate and reloaded.correctness_gate is None
+    config = {"kv_cache_dtype": "auto"}
+    res = apply_intervention(reloaded, DictApplicator(config, measure_fn=lambda s: 0.12))
+    assert not res.applied and "requires a correctness gate" in (res.error or "")
+    assert config == {"kv_cache_dtype": "auto"}

@@ -221,3 +221,162 @@ def test_measure_overhead_runs_and_reports():
     assert result["runs"] == 3
     assert result["baseline_mean_s"] > 0
     assert "overhead_fraction" in result
+
+
+# --- correctness gate: interrupts, hangs, and a gate lost in transit ---------
+
+
+def _gated(gate, **safety) -> InterventionSpec:
+    spec = _spec(safety={"requires_correctness_gate": True, **safety})
+    return spec.model_copy(update={"correctness_gate": gate})
+
+
+class _InterruptingApplicator(DictApplicator):
+    """Mutates the config, then is interrupted before apply returns."""
+
+    def apply(self, spec):
+        super().apply(spec)
+        raise KeyboardInterrupt
+
+
+@pytest.mark.parametrize("where", ["apply", "measure", "gate"])
+def test_interrupt_restores_then_propagates(where):
+    cfg = {"block_size": 8}
+
+    def interrupt(_spec):
+        raise KeyboardInterrupt
+
+    if where == "apply":
+        app, spec = _InterruptingApplicator(cfg, measure_fn=lambda s: +0.1), _spec()
+    elif where == "measure":
+        app, spec = DictApplicator(cfg, measure_fn=interrupt), _spec()
+    else:
+        app = DictApplicator(cfg, measure_fn=lambda s: +0.1)
+        spec = _spec().model_copy(update={"correctness_gate": interrupt})
+    with pytest.raises(KeyboardInterrupt):
+        apply_intervention(spec, app)
+    assert cfg == {"block_size": 8}
+
+
+def test_a_gate_that_never_returns_times_out_and_restores():
+    import threading
+    import time
+
+    cfg = {"block_size": 8}
+    release = threading.Event()
+    spec = _gated(lambda _s: release.wait(), correctness_gate_timeout_s=0.2)
+    t0 = time.monotonic()
+    try:
+        res = apply_intervention(spec, DictApplicator(cfg, measure_fn=lambda s: +0.1))
+    finally:
+        release.set()
+    assert time.monotonic() - t0 < 5
+    assert res.applied and res.rolled_back
+    assert "timed out" in res.error
+    assert cfg == {"block_size": 8}
+
+
+def test_a_spec_that_needs_a_gate_but_carries_none_is_not_applied():
+    cfg = {"block_size": 8}
+    spec = _spec(safety={"requires_correctness_gate": True})
+    res = apply_intervention(spec, DictApplicator(cfg, measure_fn=lambda s: +0.1))
+    assert not res.applied and not res.rolled_back
+    assert "requires a correctness gate" in res.error
+    assert cfg == {"block_size": 8}
+
+
+def test_the_gate_requirement_survives_a_save_and_reload():
+    spec = _gated(lambda _s: None)
+    reloaded = InterventionSpec.model_validate(json.loads(spec.model_dump_json()))
+    assert reloaded.correctness_gate is None
+    assert reloaded.safety.requires_correctness_gate
+    cfg = {"block_size": 8}
+    res = apply_intervention(reloaded, DictApplicator(cfg, measure_fn=lambda s: +0.1))
+    assert not res.applied
+    assert cfg == {"block_size": 8}
+
+
+def test_intervention_spec_has_a_json_schema():
+    schema = InterventionSpec.model_json_schema()
+    assert "correctness_gate" not in schema["properties"]
+    safety = schema["$defs"]["SafetyGate"]["properties"]
+    assert "requires_correctness_gate" in safety
+
+
+def test_a_zero_gate_deadline_is_rejected():
+    with pytest.raises(ValueError):
+        _spec(safety={"correctness_gate_timeout_s": 0})
+
+
+# --- the guard against main's restore-failure path ---------------------------
+
+
+class _CountingRestore(DictApplicator):
+    """Counts restores; optionally interrupted inside one, or failing every one."""
+
+    def __init__(self, config, *, interrupt_in_restore=False, restore_raises=False, **kw):
+        super().__init__(config, **kw)
+        self.restores = 0
+        self._interrupt = interrupt_in_restore
+        self._raises = restore_raises
+
+    def restore(self, snapshot):
+        self.restores += 1
+        if self._raises:
+            raise RuntimeError("could not rebuild the baseline")
+        super().restore(snapshot)
+        if self._interrupt:
+            raise KeyboardInterrupt
+
+
+def test_an_interrupt_inside_a_restore_does_not_restore_twice():
+    cfg = {"block_size": 8}
+    app = _CountingRestore(cfg, interrupt_in_restore=True, measure_fn=lambda s: -0.5)
+    with pytest.raises(KeyboardInterrupt):
+        apply_intervention(_spec(), app)
+    assert app.restores == 1
+    assert cfg == {"block_size": 8}
+
+
+def test_an_interrupt_whose_restore_fails_still_propagates():
+    class Audit:
+        events: list = []
+
+        def record(self, event, name, cause, **kw):
+            self.events.append((event, cause))
+
+    def interrupt(_spec):
+        raise KeyboardInterrupt
+
+    audit = Audit()
+    app = _CountingRestore({"block_size": 8}, restore_raises=True, measure_fn=interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        apply_intervention(_spec(), app, audit=audit)
+    assert app.restores == 1
+    assert ("restore_failed", "aborted by KeyboardInterrupt; restore failed: "
+            "could not rebuild the baseline") in audit.events
+
+
+def test_a_timed_out_gate_whose_restore_fails_is_reported_unrestored():
+    import threading
+
+    release = threading.Event()
+    app = _CountingRestore({"block_size": 8}, restore_raises=True, measure_fn=lambda s: +0.1)
+    try:
+        res = apply_intervention(
+            _gated(lambda _s: release.wait(), correctness_gate_timeout_s=0.2), app)
+    finally:
+        release.set()
+    assert res.restore_failed and not res.kept
+    assert "timed out" in res.error
+
+
+def test_an_interrupt_after_the_keep_does_not_undo_it():
+    class InterruptedCommit(DictApplicator):
+        def commit(self):
+            raise KeyboardInterrupt
+
+    cfg = {"block_size": 8}
+    with pytest.raises(KeyboardInterrupt):
+        apply_intervention(_spec(), InterruptedCommit(cfg, measure_fn=lambda s: +0.1))
+    assert cfg == {"block_size": 16}

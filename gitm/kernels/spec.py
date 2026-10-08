@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic.json_schema import SkipJsonSchema
 
 SafetyTier = Literal["low_risk", "moderate", "high_risk"]
 
@@ -33,6 +34,11 @@ class SafetyGate(BaseModel):
     requires_rollback_window_s: int = 60
     forbid_if_oom_history: bool = True
     requires_qualification_commit: bool = False
+    # Persisted twin of InterventionSpec.correctness_gate: the callable is
+    # runtime-only and is dropped when a spec is saved, so a reloaded spec that
+    # needs a gate must be refused rather than applied ungated.
+    requires_correctness_gate: bool = False
+    correctness_gate_timeout_s: float = Field(default=1800.0, gt=0)
     notes: str = ""
 
 
@@ -103,7 +109,7 @@ class InterventionSpec(BaseModel):
     # alone, so a lever that can change model output carries its own check here
     # and apply_intervention rolls back on failure whatever applicator is used.
     # Runtime-only: a callable, never read from or written to library YAML.
-    correctness_gate: Callable[[Any], str | None] | None = Field(
+    correctness_gate: SkipJsonSchema[Callable[[Any], str | None] | None] = Field(
         default=None, exclude=True, repr=False
     )
 

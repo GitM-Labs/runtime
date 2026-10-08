@@ -230,6 +230,11 @@ e8() {
   wait "$CAPPID" || true
   bash "$SCRIPTS/arm.sh" I $LEVER
   manifest e8 I "$LEVER"
+  # Validity gate (the one P1 runs): an arm that cannot answer coherently is
+  # restored to B before any timed run. It does not judge accuracy; a lever
+  # that can change output still needs its spec's correctness gate.
+  python -m gitm.optimizer.separation sanity --base-url "$EP" --model "$MODEL" --out "$D/sanity.json" \
+    || { log "!!! e8 validity gate failed under $LEVER, restoring arm B"; bash "$SCRIPTS/arm.sh" B; exit 1; }
   capture_window "$D/cap_after" 190 & CAPPID=$!; sleep 3
   guide "$D/guidellm_after.json" "$HEADLINE_C" "$prompt" "$output" 180
   wait "$CAPPID" || true
