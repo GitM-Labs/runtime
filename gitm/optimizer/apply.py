@@ -66,6 +66,15 @@ class ApplyResult:
         return not self.rolled_back and not self.restore_failed
 
 
+class EngineTimeout(RuntimeError):
+    """An engine call ran past its deadline and the engine's processes were killed.
+
+    Raised by the workload's watchdog (K-2). The engine it was raised for is
+    gone: a candidate that timed out is a failed candidate, and a baseline that
+    timed out leaves nothing to measure against.
+    """
+
+
 class RestoreFailed(RuntimeError):
     """The baseline could not be restored, and the target is in an unknown state.
 
@@ -111,6 +120,12 @@ def apply_intervention(
     # could not be taken must not end a run that has other candidates to try.
     try:
         snapshot = applicator.snapshot()
+    except EngineTimeout as exc:
+        # The baseline itself hung and was killed, so there is no engine left to
+        # measure the next candidate against: the run has lost its engine.
+        return ApplyResult(False, rolled_back=False, measured_delta=None,
+                           error=f"baseline timed out, nothing applied: {exc}",
+                           restore_failed=True)
     except Exception as exc:
         return ApplyResult(False, rolled_back=False, measured_delta=None,
                            error=f"snapshot failed, nothing applied: {exc}")

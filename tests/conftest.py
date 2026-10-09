@@ -7,7 +7,25 @@ loop. Lives at the tests/ root so pytest picks it up automatically.
 
 from __future__ import annotations
 
+import sys
+
+import pytest
+
 from gitm.tracer.schema import KernelEvent, MemcpyEvent, SyncEvent, Trace
+
+
+@pytest.fixture
+def without_vllm(monkeypatch):
+    """vLLM is not importable for the duration of the test, wherever it runs.
+
+    CI installs ``.[dev,bench]``, which has no vLLM, and the tests of the offline
+    fallback were written against that box. Anywhere vLLM is installed — every
+    machine that actually runs the loop — they failed, and the end-to-end one
+    built a real engine on the GPU. A ``None`` entry in ``sys.modules`` makes
+    ``import vllm`` (and any ``from vllm... import``) raise ``ImportError``, which
+    is exactly what the fallback paths catch.
+    """
+    monkeypatch.setitem(sys.modules, "vllm", None)
 
 
 def make_kernel(

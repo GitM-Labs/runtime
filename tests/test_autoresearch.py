@@ -407,7 +407,7 @@ def test_engineargs_proposer_scopes_specs_to_target_op() -> None:
     assert all(s.applies_to_kernels == ["paged_attention"] for s in specs)
 
 
-def test_engineargs_offline_fallback_runs_without_vllm() -> None:
+def test_engineargs_offline_fallback_runs_without_vllm(without_vllm) -> None:
     """vLLM isn't importable in CI; the frozen fallback catalog still yields
     candidates for compute_bound, and every candidate stays outside the
     curated library. memory_bound's fallback knobs (cpu_offload_gb,
@@ -615,7 +615,7 @@ def test_engineargs_proposer_is_a_vllm_bound_generative_proposer() -> None:
     assert specs and all(s.applicability.workloads == ["vllm-decode"] for s in specs)
 
 
-def test_vllm_knob_source_yields_offline_fallback_without_vllm() -> None:
+def test_vllm_knob_source_yields_offline_fallback_without_vllm(without_vllm) -> None:
     # vLLM isn't importable in CI → the source yields the frozen fallback catalog.
     knobs = VLLMKnobSource().knobs()
     assert knobs and all(isinstance(k, Knob) for k in knobs)
@@ -758,7 +758,7 @@ def test_visible_gpu_count_is_a_positive_int() -> None:
     assert isinstance(n, int) and n >= 1
 
 
-def test_vllm_knob_source_gpu_count_override_is_accepted_offline() -> None:
+def test_vllm_knob_source_gpu_count_override_is_accepted_offline(without_vllm) -> None:
     # vLLM isn't importable in CI, so the offline fallback catalog is returned
     # regardless of gpu_count — this just proves the parameter doesn't crash
     # the offline path (the fallback catalog has no multi-GPU knobs to filter).
@@ -1039,3 +1039,19 @@ def test_stochastic_candidates_route_through_gate_and_rollback() -> None:
     )
     assert results and all(r.applicable and not r.rolled_back for r in results)
     assert all(s.safety.tier == "moderate" for s in (r.spec for r in results))
+
+
+def test_settings_that_cannot_move_decode_are_not_searched():
+    """P2-2 / L-21. Each was proposed on real runs, cost an engine rebuild, and
+    either failed to build or came back as a noise-level 'win'."""
+    from gitm.agents.autoresearch import _is_tunable
+
+    for knob in ("offload_backend", "offload_num_in_group", "offload_prefetch_step",
+                 "mm_processor_cache_gb", "mm_shm_cache_max_object_size_mb",
+                 "safetensors_prefetch_block_size", "kv_cache_metrics",
+                 "kv_cache_metrics_sample"):
+        assert not _is_tunable(knob), knob
+    # Real decode knobs are untouched.
+    for knob in ("max_num_seqs", "max_num_batched_tokens", "block_size",
+                 "kv_cache_dtype", "gpu_memory_utilization", "enable_chunked_prefill"):
+        assert _is_tunable(knob), knob

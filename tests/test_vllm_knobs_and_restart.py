@@ -571,3 +571,48 @@ def test_ar_target_residual_uses_the_search_target_not_a_hardcoded_zero():
         target=ResidualTarget(op="attn_score_value", residual=17.8, n_kernels=8),
     )
     assert _ar_target_residual(huge) == 1.0
+
+
+def test_nested_knobs_reach_llm_as_the_argument_vllm_takes():
+    """P2-1, which was marked fixed but was not: LLM() rejects
+    num_speculative_tokens at the top level; it lives in speculative_config."""
+    from gitm.optimizer.vllm_knobs import engine_kwargs, knob_from_server_arg, server_arg
+
+    assert engine_kwargs({"num_speculative_tokens": 5, "max_num_seqs": 64}) == {
+        "speculative_config": {"method": "ngram", "num_speculative_tokens": 5},
+        "max_num_seqs": 64,
+    }
+    flag, value = server_arg("num_speculative_tokens", 5)
+    assert flag == "--speculative-config"
+    assert knob_from_server_arg("speculative_config", value) == ("num_speculative_tokens", 5)
+    # Read back as the lever only when the token count is all that changed from
+    # the baseline. Against no baseline, that is the n-gram config gitm emits.
+    other = '{"method": "eagle", "model": "x", "num_speculative_tokens": 5}'
+    assert knob_from_server_arg("speculative_config", other)[0] == "speculative_config"
+    eagle_base = '{"method": "eagle", "model": "x", "num_speculative_tokens": 2}'
+    assert knob_from_server_arg("speculative_config", other, eagle_base) == \
+        ("num_speculative_tokens", 5)
+    # A changed method is not the token-count lever, even at the lever's count.
+    ngram_base = '{"method": "ngram", "num_speculative_tokens": 5}'
+    assert knob_from_server_arg("speculative_config", other, ngram_base)[0] == \
+        "speculative_config"
+    assert knob_from_server_arg("speculative_config", "not json")[0] == "speculative_config"
+
+
+def test_a_nested_knob_is_merged_into_the_baselines_config_not_put_in_its_place():
+    """Replacing it would drop the baseline's method, draft model and lookup
+    window, and the A/B would measure all of that, not the lever."""
+    import json
+
+    from gitm.optimizer.vllm_knobs import engine_kwargs, server_arg
+
+    base = {"speculative_config": {"method": "eagle", "model": "x",
+                                   "num_speculative_tokens": 2}}
+    assert engine_kwargs({"num_speculative_tokens": 5}, base) == {
+        "speculative_config": {"method": "eagle", "model": "x", "num_speculative_tokens": 5}}
+    assert base["speculative_config"]["num_speculative_tokens"] == 2     # not mutated
+    _, value = server_arg("num_speculative_tokens", 5,
+                          '{"method":"ngram","prompt_lookup_max":4}')
+    assert json.loads(value) == {"method": "ngram", "prompt_lookup_max": 4,
+                                 "num_speculative_tokens": 5}
+    assert server_arg("max_num_seqs", 64) == ("--max-num-seqs", 64)

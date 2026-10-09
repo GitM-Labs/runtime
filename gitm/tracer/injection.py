@@ -23,6 +23,7 @@ them in the shell that launches the run; ``run_env()`` renders the exact pair.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -503,3 +504,37 @@ def clock_now() -> int | None:
 
         return _rocm.timestamp()
     return cupti_now()
+
+
+@contextlib.contextmanager
+def untraced_env(env=None):
+    """Run a block with this collector's injection removed from the environment.
+
+    For starting a process that must not load the tracer. vLLM's EngineCore and
+    workers inherit the environment when they start, so an engine built inside
+    this block runs without the collector, while the variables are back for the
+    next traced build as soon as the block exits.
+
+    Why an engine would not want it: on MI355X, rocprofiler-sdk's queue
+    interposition can deadlock against hipGraph replay (vLLM #56506, ROCm
+    #11623), and it is loaded into every process the tool is injected into,
+    traced window or not. An engine that is only A/B-measured is never traced,
+    so it has no reason to carry the interposition, or its overhead.
+    """
+    env = os.environ if env is None else env
+    from gitm.tracer._rocm import SHIM_NAME
+
+    saved = {k: env.pop(k) for k in (ENV_LIB, ENV_ROCP, ENV_NVTX_INJECT) if k in env}
+    preload = env.get("LD_PRELOAD")
+    if preload is not None:
+        kept = ":".join(p for p in preload.split(":") if p and Path(p).name != SHIM_NAME)
+        if kept:
+            env["LD_PRELOAD"] = kept
+        else:
+            del env["LD_PRELOAD"]
+    try:
+        yield
+    finally:
+        env.update(saved)
+        if preload is not None:
+            env["LD_PRELOAD"] = preload

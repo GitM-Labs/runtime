@@ -243,3 +243,82 @@ def test_vllm_spells_the_shared_expert_with_a_leading_underscore():
 
     assert op_for_module("model.layers.2.mlp.experts._shared_experts") == ("moe_shared", 2)
     assert op_for_module("model.layers.2.mlp.shared_expert") == ("moe_shared", 2)
+
+
+# --------------------------------------------------------------------------- #
+# vLLM's own metrics: the offline engine's scheduler is in another process     #
+# --------------------------------------------------------------------------- #
+def _metric(name, value, engine="0"):
+    return SimpleNamespace(name=name, labels={"model_name": "m", "engine": engine}, value=value)
+
+
+def _offline_engine(metrics, max_seqs=256):
+    """The shape `LLM()` presents offline: no scheduler object in this process,
+    but `get_metrics()` reads the stat loggers' gauges here."""
+    def get():
+        if isinstance(metrics, Exception):
+            raise metrics
+        return list(metrics)
+
+    return SimpleNamespace(
+        get_metrics=get,
+        llm_engine=SimpleNamespace(vllm_config=SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=max_seqs))),
+    )
+
+
+def test_metrics_fill_what_the_scheduler_cannot_on_the_offline_engine():
+    s = read_scheduler_stats(_offline_engine([
+        _metric("vllm:num_requests_running", 200.0),
+        _metric("vllm:num_requests_waiting", 56.0),
+        _metric("vllm:num_preemptions", 7),
+        _metric("vllm:kv_cache_usage_perc", 0.97),
+        _metric("vllm:generation_tokens", 1234),   # unrelated, ignored
+    ]))
+    assert (s.num_running, s.num_waiting, s.preemptions_cumulative) == (200, 56, 7)
+    assert s.gpu_cache_usage == 0.97
+    assert s.batch_occupancy == 200 / 256
+
+
+def test_counts_sum_across_engines_and_cache_takes_the_highest():
+    """Data-parallel engines each report their own series."""
+    s = read_scheduler_stats(_offline_engine([
+        _metric("vllm:num_requests_running", 10.0, engine="0"),
+        _metric("vllm:num_requests_running", 30.0, engine="1"),
+        _metric("vllm:kv_cache_usage_perc", 0.5, engine="0"),
+        _metric("vllm:kv_cache_usage_perc", 0.9, engine="1"),
+    ]))
+    assert s.num_running == 40
+    assert s.gpu_cache_usage == 0.9
+
+
+def test_a_direct_scheduler_read_still_wins():
+    engine = _v1_engine(running=3, waiting=12, cache=0.87)
+    engine.get_metrics = lambda: [_metric("vllm:num_requests_running", 99.0)]
+    assert read_scheduler_stats(engine).num_running == 3
+
+
+def test_stats_off_or_unreadable_metrics_are_no_data_not_zero():
+    """get_metrics asserts when stats are off. That must read as unknown: a 0
+    would say the batch was empty."""
+    assert read_scheduler_stats(_offline_engine(AssertionError("Stat logging disabled"))) is None
+    assert read_scheduler_stats(_offline_engine([_metric("vllm:num_requests_running", True)])) is None
+
+
+def test_scheduler_causes_fire_from_metrics_on_the_offline_engine():
+    """The point of the source. Every offline run so far produced zero
+    scheduler causes, because every input to them was None."""
+    from gitm.optimizer.scheduler_attribution import scheduler_causes
+    from gitm.tracer.vllm_stats import summarize
+
+    samples = []
+    for t, (running, waiting, preempt, cache) in enumerate(
+            [(100, 0, 0, 0.80), (120, 40, 3, 0.95), (110, 60, 9, 0.98)]):
+        samples.append(read_scheduler_stats(_offline_engine([
+            _metric("vllm:num_requests_running", float(running)),
+            _metric("vllm:num_requests_waiting", float(waiting)),
+            _metric("vllm:num_preemptions", preempt),
+            _metric("vllm:kv_cache_usage_perc", cache),
+        ]), t_ns=t))
+    signals = {c.signal for c in scheduler_causes(summarize(samples, max_num_seqs=256))}
+    assert {"kv_cache_preemption", "under_filled_batch", "kv_cache_pressure"} <= signals

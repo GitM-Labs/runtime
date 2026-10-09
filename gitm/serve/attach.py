@@ -402,8 +402,8 @@ def attach_and_capture(opts: AttachOptions) -> tuple[int, CaptureResult | None]:
         )
         if server_window.ttft_mean_s is not None:
             print(
-                f"    server TTFT mean {server_window.ttft_mean_s * 1e3:.0f} ms   "
-                f"TPOT mean {(server_window.tpot_mean_s or 0) * 1e3:.1f} ms"
+                f"    server TTFT mean {metrics.fmt_ms(server_window.ttft_mean_s, 0)}   "
+                f"TPOT mean {metrics.fmt_ms(server_window.tpot_mean_s)}"
             )
         if server_window.running_p50 is not None and server_window.waiting_p50 is not None:
             print(

@@ -330,6 +330,54 @@ def _v1_scheduler_stats(scheduler: Any) -> dict[str, Any]:
     return out
 
 
+#: vLLM's Prometheus metrics that carry what the scheduler knows, mapped to the
+#: sample fields they fill. Read in gitm's own process, so they work on the
+#: offline engine, where the scheduler lives in the EngineCore child.
+_METRIC_FIELDS = {
+    "vllm:num_requests_running": "num_running",
+    "vllm:num_requests_waiting": "num_waiting",
+    "vllm:num_preemptions": "preemptions_cumulative",
+    "vllm:kv_cache_usage_perc": "gpu_cache_usage",
+}
+
+
+def _metrics_scheduler_stats(engine: Any) -> dict[str, Any]:
+    """Scheduler state from vLLM's own metrics, via ``LLM.get_metrics()``.
+
+    The offline engine runs its scheduler in a separate EngineCore process
+    (``VLLM_ENABLE_V1_MULTIPROCESSING`` defaults on), so ``_schedulers`` finds
+    nothing and running, waiting, preemptions and cache usage all came back
+    ``None``. That emptied every scheduler cause on every offline run. But the
+    engine's stat loggers record each step into Prometheus gauges in this
+    process, and ``get_metrics()`` reads them. It needs stats on, which the
+    vLLM factory sets (``disable_log_stats=False``).
+
+    Counts are summed across engine labels (data-parallel engines each report
+    their own); cache usage takes the highest, since pressure on any engine is
+    pressure. The registry is process-wide: two engines alive at once with the
+    same labels (parallel restart mode) would share series, which is one more
+    reason serial is the default.
+    """
+    get = _first_attr(engine, "get_metrics", "llm_engine.get_metrics", "engine.get_metrics")
+    if not callable(get):
+        return {}
+    try:
+        metrics = get()
+    except Exception:
+        return {}
+    sums: dict[str, float] = {}
+    for m in metrics or ():
+        field_name = _METRIC_FIELDS.get(getattr(m, "name", None))
+        value = getattr(m, "value", None)
+        if field_name is None or isinstance(value, bool) or not isinstance(value, int | float):
+            continue
+        if field_name == "gpu_cache_usage":
+            sums[field_name] = max(sums.get(field_name, 0.0), float(value))
+        else:
+            sums[field_name] = sums.get(field_name, 0.0) + value
+    return {k: (v if k == "gpu_cache_usage" else int(v)) for k, v in sums.items()}
+
+
 #: Where an engine object keeps vLLM's config, across versions and wrappers:
 #: on itself, on ``.engine`` or on ``.llm_engine`` (``LLM`` holds an
 #: ``LLMEngine``), and either directly or under ``vllm_config``.
@@ -417,6 +465,14 @@ def read_scheduler_stats(engine: Any, *, t_ns: int = 0) -> SchedulerSample | Non
                 if getattr(sample, field_name) is None:
                     setattr(sample, field_name, val)
                     saw_any = True
+
+    # vLLM's own metrics, for whatever the scheduler objects could not supply.
+    # On the offline engine that is all of it: the scheduler is in another
+    # process. Only fills gaps, so a direct read where one exists still wins.
+    for field_name, val in _metrics_scheduler_stats(engine).items():
+        if getattr(sample, field_name) is None:
+            setattr(sample, field_name, val)
+            saw_any = True
 
     # Total unfinished — a stable public method on LLMEngine across versions.
     getter = _first_attr(

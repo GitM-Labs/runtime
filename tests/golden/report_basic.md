@@ -7,7 +7,7 @@
 
 ## Summary
 
-1 verified claims, aggregate measured delta +4.8%.
+1 claim(s) kept on a measured A/B; the largest is +4.8% (kv_cache_block_size_16). Each was measured in its own A/B, so the deltas do not add up to a run total.
 
 ## Claims
 

@@ -976,10 +976,12 @@ def launch_and_capture(args, serve_argv: list[str] | None = None):
         },
     )
 
+    from gitm.serve.metrics import fmt_ms
+
     print(f"\n==> {len(records)} ok / {failures} failed in {wall:.1f}s")
     if summary.ttft_p50_s is not None:
-        print(f"    TTFT p50/p95 {summary.ttft_p50_s * 1e3:.0f}/{summary.ttft_p95_s * 1e3:.0f} ms"
-              f"   TPOT p50 {(summary.tpot_p50_s or 0) * 1e3:.1f} ms")
+        print(f"    TTFT p50/p95 {fmt_ms(summary.ttft_p50_s, 0)}/{fmt_ms(summary.ttft_p95_s, 0)}"
+              f"   TPOT p50 {fmt_ms(summary.tpot_p50_s)}")
     print_result(result)
 
     if result.status == "no_kernels":

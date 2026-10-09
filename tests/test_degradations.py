@@ -447,7 +447,7 @@ def test_report_counts_the_good_claims_and_marks_only_the_bad_one():
                                       affects=(AFFECTS_AB,), scope="late")])
     md = write_report([_claim("early"), _claim("late", [AB_PROBE])], _provenance(log))
     assert "## Degradations" in md and "[during late]" not in md  # rendered from dicts
-    assert "1 verified claims" in md and "1 more not counted" in md
+    assert "1 claim(s) kept on a measured A/B" in md and "1 more not counted" in md
     assert md.count("(unreliable A/B: ") == 1
 
 
@@ -559,7 +559,7 @@ def test_unscoped_search_is_recorded_but_target_is_kept():
 # ── end to end ───────────────────────────────────────────────────────────────
 
 
-def test_every_run_writes_degradations_and_summarises_them(tmp_path: Path):
+def test_every_run_writes_degradations_and_summarises_them(tmp_path: Path, without_vllm):
     from gitm import optimize
 
     with _quiet():

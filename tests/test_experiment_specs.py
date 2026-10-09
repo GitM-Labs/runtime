@@ -255,3 +255,45 @@ def test_named_levers_each_round_trip(name):
     """A spread of value kinds: bool, string, enum-ish string, string."""
     arms, _ = plan_arms(BASE, [s for s in LIB if s.name == name])
     assert _resolve(BASE, arms[0].serve_argv).name == name
+
+
+def test_speculative_decoding_is_emitted_as_the_flag_vllm_accepts():
+    """L-3. `--num-speculative-tokens 5` is rejected by the server, so the
+    top-ranked arm of every sweep was a cluster job that could not start."""
+    import json
+
+    lever = next(s for s in LIB if s.knob == "num_speculative_tokens")
+    arms, _ = plan_arms(BASE, [lever])
+    argv = list(arms[0].serve_argv)
+    assert "--num-speculative-tokens" not in argv
+    cfg = json.loads(argv[argv.index("--speculative-config") + 1])
+    assert cfg == {"method": "ngram", "num_speculative_tokens": lever.value}
+    # And it reads back as the same lever.
+    assert _resolve(BASE, arms[0].serve_argv).name == lever.name
+
+
+def test_a_baseline_already_speculating_is_not_proposed_again():
+    import json
+
+    lever = next(s for s in LIB if s.knob == "num_speculative_tokens")
+    base = [*BASE, "--speculative-config",
+            json.dumps({"method": "ngram", "num_speculative_tokens": lever.value})]
+    arms, unreachable = plan_arms(base, [lever])
+    assert not arms and "already runs" in unreachable[0].reason
+
+
+def test_an_arm_changes_only_the_token_count_of_a_baseline_speculative_config():
+    """The baseline's own method and lookup window stay, so the arm differs from
+    it in the lever and nothing else."""
+    import json
+
+    lever = next(s for s in LIB if s.knob == "num_speculative_tokens")
+    base = [*BASE, "--speculative-config",
+            json.dumps({"method": "ngram", "prompt_lookup_max": 4,
+                        "num_speculative_tokens": lever.value + 1})]
+    arms, _ = plan_arms(base, [lever])
+    argv = list(arms[0].serve_argv)
+    cfg = json.loads(argv[argv.index("--speculative-config") + 1])
+    assert cfg == {"method": "ngram", "prompt_lookup_max": 4,
+                   "num_speculative_tokens": lever.value}
+    assert argv.count("--speculative-config") == 1

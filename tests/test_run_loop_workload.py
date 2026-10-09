@@ -19,7 +19,7 @@ from .conftest import make_kernel, make_trace
 EMPTY_DIGEST = "4f53cda18c2baa0c"
 
 
-def test_no_data_guard_does_not_fabricate_claims(tmp_path: Path):
+def test_no_data_guard_does_not_fabricate_claims(tmp_path: Path, without_vllm):
     """No GPU/shim and no registered runner → honest no-data, zero claims."""
     from gitm import optimize
 
@@ -140,7 +140,8 @@ def test_runner_workload_id_empty_string_falls_back_to_default(tmp_path, capture
     assert captured_workload_id["workload_id"] == "vllm-decode"
 
 
-def test_no_runner_and_no_explicit_workload_uses_default(tmp_path, captured_workload_id):
+def test_no_runner_and_no_explicit_workload_uses_default(tmp_path, captured_workload_id,
+                                                         without_vllm):
     """With nothing to read from at all (no runner, no cfg.workload, no
     cfg.engine), the simplest path still resolves to the hardcoded default —
     the relabeling guard must not require a runner to be present. Relies on
@@ -252,7 +253,7 @@ def test_vllm_workload_still_uses_intervention_path(tmp_path: Path, monkeypatch)
     assert result["summary"]["mode"] == "intervention"
 
 
-def test_vllm_loop_runs_autoresearch(tmp_path: Path, monkeypatch):
+def test_vllm_loop_runs_autoresearch(tmp_path: Path, monkeypatch, without_vllm):
     """The vllm path runs agentic autoresearch: it classifies the bottleneck via
     trace telemetry (the serialized same-stream "paged_attention" kernels are
     also roofline-predicted memory-bound at batch=1, so classification is

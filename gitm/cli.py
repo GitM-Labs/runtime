@@ -798,6 +798,13 @@ def main(argv: list[str] | None = None) -> int:
         # CUPTI shim, or the workload never ran) instead of seeing a fake pass.
         if summary.get("status") == "no_data":
             return 3
+        if summary.get("live") and summary.get("n_measured") == 0:
+            # A live run that finished without measuring a single A/B is not a
+            # success, whatever "status" says (P2-5). Every candidate failed to
+            # build, was rejected, or the budget ran out first.
+            print("gitm run: completed, but no candidate was measured; see the "
+                  "report's rejected list", file=sys.stderr)
+            return 6
         if summary.get("engine_lost"):
             # The report is complete for what was tried, but the run stopped
             # early with the engine in an unknown state. A job that exits 0 here

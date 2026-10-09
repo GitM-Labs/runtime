@@ -27,6 +27,7 @@ makes the autonomous loop observe a real workload.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import socket
 import time
@@ -575,6 +576,127 @@ def _shutdown_timeout() -> float:
         return 30.0
 
 
+def _timeout_s(var: str, default: float) -> float | None:
+    """A watchdog limit from the environment, in seconds; ``None`` disables it."""
+    raw = os.environ.get(var)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        warnings.warn(f"{var}={raw!r} is not a number; using {default:g}s",
+                      RuntimeWarning, stacklevel=2)
+        return default
+    return None if value <= 0 else value
+
+
+def _kill_engine_processes(pids: set[int]) -> list[int]:
+    """Kill these engine processes and everything under them. Returns what was killed.
+
+    The tree, not only the EngineCore: at TP>1 the GPU workers are its children,
+    and a worker left behind keeps its device memory.
+    """
+    killed: list[int] = []
+    try:
+        import psutil
+    except ImportError:  # vLLM depends on psutil; this is a last resort
+        import signal
+
+        for pid in pids:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+                killed.append(pid)
+        return killed
+    for pid in pids:
+        try:
+            root = psutil.Process(pid)
+            tree = [*root.children(recursive=True), root]
+        except psutil.Error:
+            continue
+        for proc in tree:
+            with contextlib.suppress(psutil.Error):
+                proc.kill()
+                killed.append(proc.pid)
+    return killed
+
+
+#: After the watchdog kills the engine, how long the blocked call gets to notice
+#: before the watchdog stops waiting for it.
+_WATCHDOG_GRACE_S = 60.0
+
+
+def _with_watchdog(fn: Callable[[], Any], *, what: str, timeout_s: float | None,
+                   pids: Callable[[], set[int]]) -> Any:
+    """``fn()``, killing the engine's processes if it runs past ``timeout_s`` (K-2).
+
+    Engine builds and decodes are blocking calls in this process, and a collective
+    deadlock inside them never returns: the first Kimi run on MI355X sat for 20
+    minutes until it was killed by hand, and lost the run. The watchdog kills the
+    engine's processes at the deadline; vLLM then raises in the blocked call
+    (its client notices the engine died), and that surfaces here as
+    :class:`~gitm.optimizer.apply.EngineTimeout`, which the apply path treats as
+    a failed candidate, or as a lost engine for a baseline.
+
+    Killing is not always enough: a build can stall before its engine process
+    exists, or in this process, and then there is nothing to kill. So if the call
+    is still blocked :data:`_WATCHDOG_GRACE_S` after the kill, the watchdog
+    interrupts it with a signal and raises ``EngineTimeout`` regardless. That
+    needs a signal handler, so it is only available on the main thread; off it,
+    the kill is all the watchdog can do.
+    """
+    from gitm.optimizer.apply import EngineTimeout
+
+    if timeout_s is None:
+        return fn()
+    import signal
+    import threading
+
+    done = threading.Event()
+    fired: list[int] = []
+    why = f"{what} ran past {timeout_s:g}s; its engine was killed"
+
+    def _interrupt(_signum: int, _frame: Any) -> None:
+        if not done.is_set():
+            raise EngineTimeout(f"{what} ran past {timeout_s:g}s and did not return "
+                                "after its engine was killed; abandoned")
+
+    main = threading.current_thread() is threading.main_thread()
+    previous = signal.signal(signal.SIGUSR1, _interrupt) if main else None
+    main_id = threading.get_ident()
+    # Held while the signal is sent and while the call is marked finished, so the
+    # signal can never arrive after the handler is put back: under the default
+    # handler SIGUSR1 terminates the process, and the run with it.
+    handler_lock = threading.Lock()
+
+    def _watch() -> None:
+        if done.wait(timeout_s):
+            return
+        fired.extend(_kill_engine_processes(pids()) or [-1])
+        if main and not done.wait(_WATCHDOG_GRACE_S):
+            with handler_lock:
+                if not done.is_set():
+                    signal.pthread_kill(main_id, signal.SIGUSR1)
+
+    watcher = threading.Thread(target=_watch, name=f"gitm-watchdog:{what}", daemon=True)
+    watcher.start()
+    try:
+        result = fn()
+    except EngineTimeout:
+        raise
+    except Exception as exc:
+        if fired:
+            raise EngineTimeout(why) from exc
+        raise
+    finally:
+        with handler_lock:
+            done.set()
+        if main:
+            signal.signal(signal.SIGUSR1, signal.SIG_DFL if previous is None else previous)
+    if fired:
+        raise EngineTimeout(why)
+    return result
+
+
 def engine_worker_pids() -> set[int]:
     """PIDs of vLLM engine-core processes that are children of this one.
 
@@ -670,6 +792,10 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
                               -> vLLM's "auto". Lets a serial A/B build each leg
                               directly in its dtype, one engine per process, so
                               each can use the full GITM_VLLM_GPU_MEM budget.
+        GITM_BUILD_TIMEOUT_S  seconds an engine build may take before the watchdog
+                              kills it and the candidate fails (default 3600; 0 off)
+        GITM_DECODE_TIMEOUT_S seconds a decode may take before the watchdog kills
+                              the engine (default 1800; 0 off)
         GITM_SHUTDOWN_TIMEOUT_S  seconds an engine shutdown waits for its
                               EngineCore/TP worker processes to exit before
                               killing the stragglers (default 30)
@@ -702,6 +828,7 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
 
     import time
 
+    from gitm.optimizer.vllm_knobs import engine_kwargs
     from gitm.tracer import injection
 
     # Spawn is what gives a ROCm EngineCore its profiler back (P1-1), but it is
@@ -901,21 +1028,36 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         except NameError:
             pass
 
-    def _build_engine(kwargs: dict[str, Any]) -> Any:
+    # Whether this run is traced at all. Only engines that are actually traced
+    # carry the collector (K-1): the opening engine, and a re-trace's engine. A
+    # candidate or baseline that is only A/B-measured is built without it.
+    tracing = injection.active_vendor() is not None
+    # The loop's hooks, attached to every engine built here rather than only the
+    # first: the loop may swap in a rebuilt baseline and read them off that.
+    hooks: dict[str, Any] = {}
+
+    def _build_engine(kwargs: dict[str, Any], *, traced: bool = False) -> Any:
         # Sampled either side of the build so this engine knows which workers
         # are its own. In parallel restart mode two engines are up at once and
         # their workers share a name, so ownership is the only thing that keeps
         # a candidate's teardown from taking the baseline's workers with it.
         before = engine_worker_pids()
-        engine = LLM(model=model, **kwargs)
+        with contextlib.nullcontext() if traced else injection.untraced_env():
+            engine = _with_watchdog(
+                lambda: LLM(model=model, **kwargs), what="engine build",
+                timeout_s=_timeout_s("GITM_BUILD_TIMEOUT_S", 3600.0),
+                pids=lambda: engine_worker_pids() - before)
         engine.gitm_worker_pids = engine_worker_pids() - before
         live_engines.add(id(engine))
         engine.gitm_llm_kwargs = dict(kwargs)
+        engine.gitm_traced = traced and tracing
         engine.gitm_shutdown_fn = _shutdown_engine
         engine.gitm_activate_fn = _activate_engine
+        for name, fn in hooks.items():
+            setattr(engine, name, fn)
         return engine
 
-    llm = _build_engine(dict(_base_kwargs))
+    llm = _build_engine(dict(_base_kwargs), traced=True)
     _activate_engine(llm)
     prompts = [f"Benchmark decode prompt {i}." for i in range(n_prompts)]
     params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
@@ -924,7 +1066,10 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         active = engine_ref.get("engine")
         if active is None:
             raise RuntimeError("vLLM engine is not active")
-        outputs = active.generate(prompts, params)
+        outputs = _with_watchdog(
+            lambda: active.generate(prompts, params), what="decode",
+            timeout_s=_timeout_s("GITM_DECODE_TIMEOUT_S", 1800.0),
+            pids=lambda: set(getattr(active, "gitm_worker_pids", ()) or ()))
         produced = sum(len(o.outputs[0].token_ids) for o in outputs)
         sync_device()
         # Per-request lifecycle alongside the token count: the loop turns these
@@ -947,7 +1092,10 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         original runner, which cannot measure a restarted engine.)
         """
         t0 = time.perf_counter()
-        outs = eng.generate(prompts, params)
+        outs = _with_watchdog(
+            lambda: eng.generate(prompts, params), what="A/B decode",
+            timeout_s=_timeout_s("GITM_DECODE_TIMEOUT_S", 1800.0),
+            pids=lambda: set(getattr(eng, "gitm_worker_pids", ()) or ()))
         toks = sum(len(o.outputs[0].token_ids) for o in outs)
         sync_device()
         return toks / max(time.perf_counter() - t0, 1e-9)
@@ -969,7 +1117,9 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         never a silent no-op.
         """
         kwargs = dict(getattr(_old_engine, "gitm_llm_kwargs", _base_kwargs))
-        kwargs.update(knob_values)
+        # Through vllm_knobs: a nested knob (speculative decoding) is not an
+        # argument LLM() accepts on its own.
+        kwargs.update(engine_kwargs(knob_values, kwargs))
         # Give each restarted engine a fresh distributed port so V1 init does not
         # collide with any prior in-process engine state.
         os.environ["VLLM_PORT"] = str(_free_port())
@@ -1003,6 +1153,19 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         kwargs = dict(getattr(old_engine, "gitm_llm_kwargs", _base_kwargs))
         return _build_engine(kwargs)
 
+    def _traced_rebuild(old_engine: Any) -> Any:
+        """The current configuration, rebuilt with the collector, for a re-trace.
+
+        Forced eager. Graph replay hides decode kernels from the tracer (L-19),
+        and on MI355X the collector's queue interposition can deadlock against
+        it. ``gitm_llm_kwargs`` keeps the configuration as it was, so a rebuild
+        from this engine does not inherit the forced eager mode.
+        """
+        kwargs = dict(getattr(old_engine, "gitm_llm_kwargs", _base_kwargs))
+        engine = _build_engine({**kwargs, "enforce_eager": True}, traced=True)
+        engine.gitm_llm_kwargs = kwargs
+        return engine
+
     # Expose the live engine + its A/B hooks so the loop can (a) sample scheduler
     # stats and (b) run the Phase-4 decode-throughput A/B on it. ``run.engine`` is
     # picked up as ``cfg.engine``; the loop reads ``gitm_throughput_fn`` /
@@ -1013,9 +1176,15 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     # ``.applicator`` convention the hft/edge/openfold factories use.
     run.engine = llm
     run.workload_id = "vllm-decode"
-    llm.gitm_throughput_fn = _throughput
-    llm.gitm_restart_fn = _restart
-    llm.gitm_baseline_restart_fn = _baseline_restart
+    hooks.update(
+        gitm_throughput_fn=_throughput,
+        gitm_restart_fn=_restart,
+        gitm_baseline_restart_fn=_baseline_restart,
+        gitm_traced_rebuild_fn=_traced_rebuild,
+        gitm_untraced_rebuild_fn=_baseline_restart,
+    )
+    for name, fn in hooks.items():
+        setattr(llm, name, fn)
     return run
 
 def _vllm_synthetic_runner(n_prompts: int, max_tokens: int) -> WorkloadRunner:
