@@ -22,6 +22,7 @@ from __future__ import annotations
 import copy
 import gc
 import math
+import time
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -403,15 +404,46 @@ class NoiseFloor:
             return None
         return math.sqrt(sum(d * d for d in self.samples) / len(self.samples))
 
-    def threshold(self, rounds: int, *, minimum: float, without_floor: float) -> float:
-        """The mean gain a candidate measured over ``rounds`` paired rounds must
-        beat: twice the noise of a ``rounds``-round mean, and never less than
-        ``minimum``, the smallest gain worth a change. ``without_floor`` stands
-        in until the first A/A sample exists."""
+    def threshold(self, factor: float, *, minimum: float, without_floor: float) -> float:
+        """The mean gain a candidate must beat: twice the noise of its measured
+        mean, ``factor * floor`` (see :func:`mean_noise_factor`), and never less
+        than ``minimum``, the smallest gain worth a change. ``without_floor``
+        stands in until the first A/A sample exists."""
         floor = self.floor
         if floor is None:
             return max(without_floor, minimum)
-        return max(2.0 * floor / math.sqrt(max(rounds, 1)), minimum)
+        return max(2.0 * floor * factor, minimum)
+
+
+def mean_noise_factor(rounds: int, *, rebuilt: bool) -> float:
+    """How much of the A/A floor survives averaging ``rounds`` paired rounds.
+
+    The floor is the spread of one A/A pair: two builds. A round's ratio is one
+    candidate build against one baseline build, so a single round's spread is
+    the floor itself (factor 1).
+
+    Averaging only helps where the rounds measured *different* builds. Serial
+    validation alternates and reuses the running engine (A1 B1, B1 A2, A2 B2,
+    ...), so neighbouring rounds share a build and are not independent: with
+    two rounds the mean is ``B1 - (A1 + A2) / 2``, whose spread is 0.87 of the
+    floor, not the 0.71 that ``1 / sqrt(2)`` would claim. This adds up each
+    build's weight in the mean for that pattern and returns the exact factor,
+    ``sqrt(sum(w^2) / 2)``. Rounds that rebuild nothing (a hot-swapped knob, or
+    two engines resident in parallel) re-measure the same two builds, so their
+    mean has the same build noise as one round: factor 1.
+    """
+    if not rebuilt or rounds <= 1:
+        return 1.0
+    weights: dict[tuple[str, int], float] = {}
+    a, b = 0, 0
+    for k in range(1, rounds + 1):
+        if k > 1 and k % 2 == 0:
+            a += 1          # B then A: a fresh baseline build
+        elif k > 1:
+            b += 1          # A then B: a fresh candidate build
+        weights[("B", b)] = weights.get(("B", b), 0.0) + 1.0 / rounds
+        weights[("A", a)] = weights.get(("A", a), 0.0) - 1.0 / rounds
+    return math.sqrt(sum(w * w for w in weights.values()) / 2.0)
 
 
 class StructuralKnobRequiresRestart(RuntimeError):
@@ -604,6 +636,7 @@ class LiveEngineApplicator:
         setter: Callable[[Any, str, Any], None] | None = None,
         reps: int = 1,
         force_restart: bool = False,
+        noise_gate: bool = False,
         validation: int = 1,
         min_effect: float = 0.0,
         threshold_without_floor: float = 0.0,
@@ -666,6 +699,10 @@ class LiveEngineApplicator:
         #: The threshold used until the first A/A sample exists.
         self.threshold_without_floor = float(threshold_without_floor)
         self.noise = noise if noise is not None else NoiseFloor()
+        #: Judge candidates against the noise floor at all. Off by default: a
+        #: caller that does not ask for it keeps the old rule (keep at >= 0),
+        #: even though A/A samples are still collected.
+        self.noise_gate = bool(noise_gate)
         # The last baseline measurement: (configuration generation, the engine it
         # was measured on, tok/s). A later measurement of the same generation on
         # a different engine object is a rebuild of the same configuration, so
@@ -701,6 +738,7 @@ class LiveEngineApplicator:
         # runs) must not leave the *previous* candidate's A/B result visible.
         self._prev = None
         self.last_result = None
+        self._state_is_baseline = False
         self._baseline_tps, self._baseline_std = self._bench_stats()
         self._note_baseline(self._baseline_tps)
         return {"baseline_tps": self._baseline_tps}
@@ -715,25 +753,46 @@ class LiveEngineApplicator:
             self.noise.samples.append(tps / last[2] - 1.0)
         self._last_baseline = (self._generation, engine_id, tps)
 
-    def calibrate(self, pairs: int) -> list[float]:
+    def calibrate(self, pairs: int, *, deadline_ns: int | None = None) -> list[float]:
         """Measure the baseline ``pairs + 1`` times, rebuilding it in between, so
         the first candidate is judged against a measured noise floor.
 
-        Serial restart only: it needs ``baseline_restart_fn``. Returns the A/A
-        samples it added. A rebuild that fails raises :class:`RestoreFailed`,
-        the same as a failed rollback: the run has lost its engine.
+        Serial restart only: it needs ``baseline_restart_fn``. Stops early at
+        ``deadline_ns``. Returns the A/A samples it added. A rebuild or a
+        baseline measurement that fails raises :class:`RestoreFailed`, the same
+        as a failed rollback: the run has lost its engine.
         """
         if pairs < 1 or self._baseline_restart_fn is None or self._restart_mode != "serial":
             return []
         before = len(self.noise.samples)
-        self._note_baseline(self._bench_stats()[0])
+        self._note_baseline(self._bench_baseline())
         for _ in range(pairs):
+            if deadline_ns is not None and time.time_ns() >= deadline_ns:
+                break
             old = self.engine
             self._shutdown(old)
             self._rebuild_baseline(lambda old=old: self._baseline_restart_fn(old),
                                    "calibrating the noise floor")
-            self._note_baseline(self._bench_stats()[0])
+            self._note_baseline(self._bench_baseline())
         return self.noise.samples[before:]
+
+    def _bench_baseline(self) -> float:
+        """The running baseline's throughput, where losing it loses the run.
+
+        Used where nothing else can stand in for the baseline (calibration, a
+        validation round after the baseline was rebuilt). A measurement that
+        fails there, a hang the watchdog killed included, leaves no baseline to
+        compare against, so it is :class:`RestoreFailed` rather than a candidate
+        failure that rolls back to an engine that is not there.
+        """
+        try:
+            return self._bench_stats()[0]
+        except RestoreFailed:
+            raise
+        except Exception as exc:
+            self.engine = None
+            self._prev = None
+            raise RestoreFailed(f"could not measure the baseline: {exc}") from exc
 
     def apply(self, spec: InterventionSpec) -> None:
         values = _knob_values(spec)  # single knob, or a joint candidate's set
@@ -930,24 +989,37 @@ class LiveEngineApplicator:
                 f"for knob {spec.knob!r}"
             )
         candidate, cand_std = self._bench_stats()
-        via = "restart" if (self._prev and self._prev[0] in {"restart", "serial_restart"}) else "hot-swap"
+        tag = self._prev[0] if self._prev else None
+        via = "restart" if tag in {"restart", "serial_restart"} else "hot-swap"
         rounds = [(baseline, candidate)]
-        if self._prev and self._prev[0] == "serial_restart" and self.validation > 1:
-            rounds = self._validation_rounds(spec, rounds)
+        rebuilt = tag == "serial_restart"
+        if self.validation > 1 and not self._clear_loss(rounds):
+            if rebuilt:
+                rounds = self._validation_rounds(spec, rounds)
+            elif tag in {"hotswap", "restart"}:
+                rounds = self._rounds_in_place(spec, rounds)
         ratios = [b / a for a, b in rounds]
         speedup = sum(ratios) / len(ratios)
         delta = speedup - 1.0
         # Noise band = combined relative scatter of baseline+candidate over reps on
         # one engine (GITM_AB_REPS). reps=1 → std=0 → band=0.
         noise_band = (self._baseline_std + cand_std) / baseline
-        # The keep threshold: the A/A noise of a mean over this many rounds, or
-        # the smallest gain worth keeping, whichever is larger. The defaults
-        # (no A/A samples, 0 minimum, 0 stand-in) make it 0: the old rule.
-        threshold = self.noise.threshold(len(rounds), minimum=self.min_effect,
-                                         without_floor=self.threshold_without_floor)
+        # The keep bar: twice the A/A noise of this mean (allowing for rounds
+        # that share a build), the smallest gain worth keeping, and the reps
+        # band, whichever is largest. Without the noise gate it is the reps band
+        # alone: the old rule.
+        threshold = (self.noise.threshold(
+            mean_noise_factor(len(rounds), rebuilt=rebuilt),
+            minimum=self.min_effect, without_floor=self.threshold_without_floor)
+            if self.noise_gate else 0.0)
         bar = max(threshold, noise_band)
-        significant = delta > bar
-        if significant and self._prev and self._prev[0] == "baseline_running":
+        # One comparison decides everything: apply_intervention keeps at
+        # ``delta - bar >= 0``, and the candidate rebuild below must agree with it.
+        keep = delta - bar >= 0
+        significant = keep if self.noise_gate else delta > noise_band
+        if tag == "hotswap" and keep and self._state_is_baseline:
+            self._set_knobs(_knob_values(spec))
+        if keep and self._prev and self._prev[0] == "baseline_running":
             # Kept, but the last round left the baseline running: build the
             # candidate again so the keep leaves it live, and so a later
             # rollback (a failed correctness gate) rebuilds the baseline.
@@ -960,7 +1032,7 @@ class LiveEngineApplicator:
             speedup=speedup, kept=significant, via=via,
             baseline_std=self._baseline_std, candidate_std=cand_std,
             reps=self._reps, significant=significant, rounds=tuple(rounds),
-            threshold=threshold, noise_floor=self.noise.floor,
+            threshold=bar, noise_floor=self.noise.floor,
         )
         return delta - bar
 
@@ -974,16 +1046,10 @@ class LiveEngineApplicator:
         B); and so on. Alternating cancels drift within a round, and each round
         after the first costs one build rather than two.
 
-        Stops after round 1 if the candidate is already clearly worse: there is
-        no point confirming a loss. A rebuild that fails rolls the candidate back
-        (the baseline is put back first); a baseline that cannot be put back is
+        A rebuild that fails rolls the candidate back (the baseline is put back
+        first); a baseline that cannot be put back, or measured, is
         :class:`RestoreFailed`.
         """
-        a1, b1 = rounds[0]
-        first = self.noise.threshold(1, minimum=self.min_effect,
-                                     without_floor=self.threshold_without_floor)
-        if b1 / a1 - 1.0 <= -first:
-            return rounds
         _, restore_baseline = self._prev
         self._round_restore = restore_baseline
         for k in range(2, self.validation + 1):
@@ -993,14 +1059,67 @@ class LiveEngineApplicator:
                 self._shutdown(self.engine)
                 self._rebuild_baseline(restore_baseline, f"validation round {k}")
                 self._prev = ("baseline_running",)
-                a = self._bench_stats()[0]
+                a = self._bench_baseline()
                 self._note_baseline(a)
             else:
                 # A then B: the baseline is running.
-                a = self._bench_stats()[0]
+                a = self._bench_baseline()
                 self._note_baseline(a)
                 self._swap_to_candidate(spec)
                 self._prev = ("serial_restart", restore_baseline)
+                b = self._bench_stats()[0]
+            rounds.append((a, b))
+        return rounds
+
+    def _clear_loss(self, rounds: list[tuple[float, float]]) -> bool:
+        """Round 1 already lost by more than one round's noise: not worth
+        confirming. Without the noise gate, any loss."""
+        a1, b1 = rounds[0]
+        if not self.noise_gate:
+            return b1 < a1
+        bar = self.noise.threshold(1.0, minimum=self.min_effect,
+                                   without_floor=self.threshold_without_floor)
+        return b1 / a1 - 1.0 <= -bar
+
+    _state_is_baseline = False
+
+    def _set_knobs(self, values: dict[str, Any]) -> None:
+        for knob, value in values.items():
+            self._setter(self.engine, knob, value)
+        self._state_is_baseline = False
+
+    def _rounds_in_place(self, spec: InterventionSpec,
+                         rounds: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        """Validation rounds where nothing is rebuilt, alternating order.
+
+        A hot-swapped candidate toggles its knobs back and forth on the one
+        engine; a parallel-restart candidate has both engines resident and
+        measures each in turn. Neither rebuilds, so the rounds re-measure the
+        same two builds: they average out decode noise and drift, not build
+        noise, and :func:`mean_noise_factor` does not shrink the threshold for
+        them.
+        """
+        tag = self._prev[0]
+        values = _knob_values(spec)
+        for k in range(2, self.validation + 1):
+            if tag == "restart":
+                old = self._prev[1]
+                if k % 2 == 0:
+                    b = self._bench_stats()[0]
+                    a = sum(self._tps(old) for _ in range(self._reps)) / self._reps
+                else:
+                    a = sum(self._tps(old) for _ in range(self._reps)) / self._reps
+                    b = self._bench_stats()[0]
+            elif k % 2 == 0:
+                # B then A: put the old values back for the baseline half.
+                b = self._bench_stats()[0]
+                for knob, old_value in self._prev[1].items():
+                    self._setter(self.engine, knob, old_value)
+                self._state_is_baseline = True
+                a = self._bench_stats()[0]
+            else:
+                a = self._bench_stats()[0]
+                self._set_knobs(values)
                 b = self._bench_stats()[0]
             rounds.append((a, b))
         return rounds

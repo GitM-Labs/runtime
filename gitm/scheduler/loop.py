@@ -36,6 +36,7 @@ from gitm.optimizer.apply import (
     LiveEngineApplicator,
     RestoreFailed,
     apply_intervention,
+    mean_noise_factor,
     resolve_restart_mode,
 )
 from gitm.optimizer.attribution import attribute
@@ -1382,6 +1383,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             # Keep a candidate only on a gain above the run's own noise floor,
             # and above the smallest gain worth a change. Before a floor
             # exists, a conservative stand-in.
+            noise_gate=True,
             validation=_validation,
             min_effect=_min_effect,
             threshold_without_floor=_THRESHOLD_WITHOUT_FLOOR,
@@ -1393,10 +1395,15 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         }, indent=2))
         # The run's own noise floor, before the first candidate is judged: the
         # baseline measured against itself, rebuilt each time. Serial restart
-        # only (it needs a baseline rebuild); otherwise the floor comes from
-        # later re-measurements and the stand-in threshold covers the start.
+        # only (it needs a baseline rebuild), within the budget, and only with
+        # an engine-owned throughput probe: the fallback probe re-runs the
+        # opening runner and can measure only the original engine, so it cannot
+        # measure a rebuilt one. Otherwise the floor comes from later
+        # re-measurements and the stand-in threshold covers the start.
         try:
-            noise_calibration = applicator.calibrate(_validation)
+            if callable(getattr(cfg.engine, "gitm_throughput_fn", None)):
+                noise_calibration = applicator.calibrate(
+                    _validation, deadline_ns=started_ns + int(budget_s * 1e9))
         except RestoreFailed as exc:
             calibration_lost = f"could not rebuild the baseline while measuring noise: {exc}"
             degradations.record(
@@ -1465,6 +1472,13 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         queue = []
 
     while queue:
+        if time.time_ns() - started_ns >= int(budget_s * 1e9):
+            # The budget can run out before a candidate starts (the noise
+            # calibration spends it too): do not start an A/B it cannot afford.
+            n_untried = sum(1 for x in queue if x.rejected_reason is None)
+            rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
+                            for x in queue if x.rejected_reason is not None)
+            break
         c = queue.pop(0)
         if c.rejected_reason is not None:
             rejected.append(f"{c.spec.name} ({c.rejected_reason})")
@@ -1817,7 +1831,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             "samples": _noise.samples,
             "floor": _noise.floor,
             "threshold": {
-                str(r): _noise.threshold(r, minimum=_min_effect,
+                str(r): _noise.threshold(mean_noise_factor(r, rebuilt=True),
+                                         minimum=_min_effect,
                                          without_floor=_THRESHOLD_WITHOUT_FLOOR)
                 for r in sorted({1, _validation})},
         }, indent=2))
