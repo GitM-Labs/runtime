@@ -280,7 +280,12 @@ Useful switches:
 
 - **History from before the noise floor still counts.** Records from runs kept at "≥ 0" have no `threshold` field, and many of their wins are noise. With history on, they still feed the ranking.
 - **An unstable build isn't re-measured.** A build whose own repeated decodes disagree badly is a symptom (a neighbour, throttling), but spotting it needs 2+ decodes per build, which doubles the A/B cost.
-- **One candidate at a time.** In serial mode a kept candidate costs one full engine build and a rolled-back one costs two, since the baseline is rebuilt. On a large model, allow for up to two builds per A/B, which is about two candidates an hour on Kimi K2.5 at TP=8.
+- **One candidate at a time, and validation costs builds.** In serial mode at the default `--validation 2`:
+  - a winner costs three builds: the candidate, the baseline again for round 2, then the candidate again to leave it running;
+  - a candidate that reaches round 2 and loses costs two;
+  - a clear loss stops after round 1 and costs two, the candidate plus the baseline rebuilt by the rollback.
+
+  The run also spends N + 1 baseline builds measuring its noise first. On Kimi K2.5 at TP=8, where a build takes minutes, plan on roughly one candidate an hour, or use `--validation 1` for a quicker, noisier pass.
 - **The cluster round is manual.** The arms `gitm propose` writes have to be turned into harness jobs, launched and collected by hand. Each arm has one traffic point, and `gitm ingest` reads throughput only.
 - **Engine settings aren't priced.** The predicted graph depends on the model, the GPU and the batch, never on tensor parallelism, KV-cache dtype or quantization settings. Production extras like a speculative draft model aren't modelled either.
 - **Attribution beyond residuals isn't acted on.** Granger and doubly-robust results are reported, but they don't affect the ranking.

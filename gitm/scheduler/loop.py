@@ -1179,7 +1179,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # ran), do NOT proceed to attribution + emit claims — that fabricates a
     # result from an empty trace. Report no-data honestly instead.
     if trace.vendor == "none" or not trace.kernels():
-        why_empty = _why_no_kernels(runner_s)
+        why_empty = _why_no_kernels(runner_s, getattr(trace, "source", "none"))
         diagnostic = runner_error or why_empty or qual.diagnostic or (
             "Tracer captured no GPU kernels. Either no GPU/CUPTI shim is present, "
             "or the workload did not run under the runtime."
@@ -2656,15 +2656,21 @@ def _edge_intervention_result(
 _SHORT_WORKLOAD_S = 10.0
 
 
-def _why_no_kernels(runner_s: float | None) -> str | None:
+def _why_no_kernels(runner_s: float | None, source: str = "none") -> str | None:
     """Which of the empty-trace causes this was, when the evidence says (L-4).
 
     They have opposite fixes, so the run says which: no tracer was configured;
     one was configured but never loaded in any process; or it loaded and the
     workload was too short for it to flush anything. ``None`` when none of these
     is what the evidence shows, so the caller's general message stands.
+
+    ``source`` is how the capture traced (``trace.source``). Without injection
+    settings a capture can still trace in-process; if it did, the missing
+    settings are not the cause, and its own diagnostic says what is.
     """
     vendor = injection.active_vendor()
+    if vendor is None and source not in (None, "none"):
+        return None
     if vendor is None:
         return ("no tracer was configured: export CUDA_INJECTION64_PATH (NVIDIA) or "
                 "ROCP_TOOL_LIBRARIES (AMD) before starting the run, so the engine "

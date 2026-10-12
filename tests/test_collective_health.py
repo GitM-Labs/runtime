@@ -38,7 +38,7 @@ def test_detects_amd(monkeypatch):
 
 
 def test_skips_when_fewer_than_two_gpus(monkeypatch):
-    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda: ("none", 0))
+    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda **_k: ("none", 0))
     result = run_collective_health()
     assert result.ok
     assert result.status == "skipped"
@@ -60,7 +60,7 @@ def test_allreduce_runs_across_all_visible_gpus(monkeypatch):
             Path(seen["cmd"][-1]).write_text(json.dumps({"ok": True}))
             return "", ""
 
-    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda: ("nvidia", 4))
+    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda **_k: ("nvidia", 4))
     monkeypatch.setattr("gitm.health.collective.subprocess.Popen", Proc)
 
     result = run_collective_health(timeout_s=5)
@@ -82,7 +82,7 @@ def test_wrong_result_fails(monkeypatch):
             self.result_path.write_text(json.dumps({"ok": False}))
             return "", ""
 
-    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda: ("amd", 2))
+    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda **_k: ("amd", 2))
     monkeypatch.setattr("gitm.health.collective.subprocess.Popen", Proc)
     result = run_collective_health()
     assert not result.ok
@@ -92,7 +92,7 @@ def test_wrong_result_fails(monkeypatch):
 def test_timeout_kills_torchrun_process_group(monkeypatch):
     proc = Mock(pid=123, returncode=None)
     proc.communicate.side_effect = subprocess.TimeoutExpired("torchrun", 1)
-    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda: ("nvidia", 2))
+    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda **_k: ("nvidia", 2))
     monkeypatch.setattr("gitm.health.collective.subprocess.Popen", lambda *a, **k: proc)
     killpg = Mock()
     monkeypatch.setattr("gitm.health.collective.os.killpg", killpg)
@@ -108,7 +108,7 @@ def test_timeout_kills_torchrun_process_group(monkeypatch):
 def test_keyboard_interrupt_kills_torchrun_process_group(monkeypatch):
     proc = Mock(pid=123, returncode=None)
     proc.communicate.side_effect = KeyboardInterrupt()
-    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda: ("nvidia", 2))
+    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda **_k: ("nvidia", 2))
     monkeypatch.setattr("gitm.health.collective.subprocess.Popen", lambda *a, **k: proc)
     killpg = Mock()
     monkeypatch.setattr("gitm.health.collective.os.killpg", killpg)
@@ -171,3 +171,15 @@ def test_a_child_that_prints_then_fails_reads_as_no_gpus(monkeypatch):
     monkeypatch.setattr("gitm.health.collective.subprocess.run",
                         lambda *a, **k: SimpleNamespace(stdout='["nvidia", 4]\n', returncode=1))
     assert detect_gpus() == ("none", 0)
+
+
+def test_detection_gets_the_callers_timeout(monkeypatch):
+    seen = {}
+
+    def fake_detect(timeout_s=60.0):
+        seen["timeout"] = timeout_s
+        return "none", 0
+
+    monkeypatch.setattr("gitm.health.collective.detect_gpus", fake_detect)
+    run_collective_health(timeout_s=1.0)
+    assert seen["timeout"] == 1.0

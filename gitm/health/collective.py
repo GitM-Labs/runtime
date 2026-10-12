@@ -71,7 +71,7 @@ def detect_gpus(timeout_s: float = 60.0) -> tuple[str, int]:
 
 def run_collective_health(timeout_s: float = 60.0) -> HealthResult:
     """AllReduce once across every visible local GPU."""
-    vendor, count = detect_gpus()
+    vendor, count = detect_gpus(timeout_s=timeout_s)
     if count < 2:
         return HealthResult(vendor, count, "skipped", "fewer than 2 GPUs visible")
 

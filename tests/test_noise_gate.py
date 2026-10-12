@@ -369,3 +369,37 @@ def test_the_loop_skips_calibration_without_an_engine_owned_probe(tmp_path, monk
                               scratch=str(tmp_path), top_n_interventions=1))
     assert out["summary"]["status"] != "no_data"           # it reached Phase 4
     assert called == []
+
+
+def test_a_parallel_baseline_that_dies_mid_validation_is_a_lost_engine():
+    """Measuring the resident baseline can take it down (a killed hang). A
+    rollback would make that dead engine current and report success."""
+    base = type("E", (), {"kind": "A", "dead": False})()
+    cand = type("E", (), {"kind": "B", "dead": False})()
+    calls = {"A": 0}
+    released = []
+
+    def tps(e):
+        if e.kind == "A":
+            calls["A"] += 1
+            if calls["A"] == 2:
+                e.dead = True
+                raise TimeoutError("A/B decode ran past 1800s; its engine was killed")
+            return 1000.0
+        return 1050.0
+
+    app = LiveEngineApplicator(
+        base, throughput_fn=tps, restart_fn=lambda _o, _v: cand,
+        restart_mode="parallel", noise_gate=True, validation=2, min_effect=0.01,
+        threshold_without_floor=0.02)
+    app._shutdown = lambda e: released.append(e.kind)
+    from gitm.optimizer import apply as apply_mod
+
+    orig = apply_mod.parallel_restart_fits
+    apply_mod.parallel_restart_fits = lambda *_a, **_k: (True, "")
+    try:
+        res = apply_intervention(_spec(), app)
+    finally:
+        apply_mod.parallel_restart_fits = orig
+    assert res.restore_failed and not res.rolled_back
+    assert app.engine is not base and "A" in released

@@ -1126,9 +1126,9 @@ class LiveEngineApplicator:
                 old = self._prev[1]
                 if k % 2 == 0:
                     b = self._bench_stats()[0]
-                    a = sum(self._tps(old) for _ in range(self._reps)) / self._reps
+                    a = self._bench_resident_baseline(old)
                 else:
-                    a = sum(self._tps(old) for _ in range(self._reps)) / self._reps
+                    a = self._bench_resident_baseline(old)
                     b = self._bench_stats()[0]
             elif k % 2 == 0:
                 # B then A: put the old values back for the baseline half.
@@ -1143,6 +1143,21 @@ class LiveEngineApplicator:
                 b = self._bench_stats()[0]
             rounds.append((a, b))
         return rounds
+
+    def _bench_resident_baseline(self, old: Any) -> float:
+        """The parallel-mode baseline, still resident beside the candidate.
+
+        A measurement that fails there (a hang the watchdog killed included)
+        may have taken the baseline with it, and a rollback would then make a
+        dead engine current and report success. It is a lost engine instead: the
+        baseline is released, not restored, and the candidate stays where it is.
+        """
+        try:
+            return sum(self._tps(old) for _ in range(self._reps)) / self._reps
+        except Exception as exc:
+            self._shutdown(old)
+            self._prev = None
+            raise RestoreFailed(f"could not measure the resident baseline: {exc}") from exc
 
     def _swap_to_candidate(self, spec: InterventionSpec) -> None:
         """Replace the running baseline with a fresh build of the candidate. If

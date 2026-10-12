@@ -46,3 +46,11 @@ def test_a_run_that_traced_nothing_is_never_clean(tmp_path: Path, without_vllm):
     assert summary["status"] == "no_data"
     assert summary["degraded"] is True
     assert TRACE_EMPTY in summary["degradations"]["unreliable"]
+
+
+def test_an_in_process_capture_is_not_blamed_on_missing_injection(monkeypatch):
+    """Without injection settings a capture can still trace in-process; then the
+    missing settings are not the cause and its own diagnostic stands."""
+    monkeypatch.setattr(injection, "active_vendor", lambda: None)
+    assert loop._why_no_kernels(30.0, "cupti") is None
+    assert "no tracer was configured" in loop._why_no_kernels(30.0, "none")
