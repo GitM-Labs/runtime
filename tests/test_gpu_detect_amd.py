@@ -163,6 +163,15 @@ def test_only_mi355x_names_reach_the_mi355x_entry():
         assert matched == ("MI355X" in name), (hex(device), name)
 
 
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [(90010, "gfx90a"), (90402, "gfx942"), (90500, "gfx950"), (120001, "gfx1201")],
+)
+def test_gfx_name_writes_minor_and_stepping_in_hex(version, expected):
+    """90010 is gfx90a, not gfx9010: only 90500 reads the same either way."""
+    assert ctx._gfx_name(version) == expected
+
+
 def test_an_unlisted_device_is_named_visibly_and_matches_nothing(kfd):
     """A wrong match is silent; a miss names what the box was."""
     _node(kfd, 1, 1001, _gpu_properties(0x75AF))
