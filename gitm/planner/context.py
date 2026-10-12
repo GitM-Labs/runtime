@@ -490,9 +490,10 @@ def build_planner_context(
     # count has turned up. A sysfs read with no device context, so asking costs
     # nothing, but it only sees AMD parts. A torch name is not enough to skip
     # it: ROCm torch can return a generic string, or "", that matches no peak.
+    counts = (world, nvml_count, torch_count)
     priced = any(peak_for_sku(name) for name in (env_sku, nvml_name, torch_name))
     amd_name = amd_count = None
-    if (env_sku is None and not priced) or not (world or nvml_count or torch_count):
+    if (env_sku is None and not priced) or all(c is None for c in counts):
         amd_name, amd_count = _query_amd()
 
     # The override is an instruction. Otherwise the first name with a peak.
@@ -507,7 +508,9 @@ def build_planner_context(
         or next((x for x in names if peak_for_sku(x)), None)
         or next((x for x in (amd_listed, *names) if x), None)
     )
-    n = world or nvml_count or torch_count or amd_count or 1
+    # The first count that answered. torch's 0 (no visible device) is an answer
+    # and stays 1, as it did before kfd was read.
+    n = next((c for c in (*counts, amd_count) if c is not None), None) or 1
     peak = peak_for_sku(sku)
     dtype = _engine_dtype(engine)
     kv_len = _engine_kv_len(engine)

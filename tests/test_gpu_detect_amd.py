@@ -393,3 +393,15 @@ def test_a_torch_count_is_asked_before_kfd(monkeypatch):
     _kfd_must_not_be_asked(monkeypatch)
 
     assert ctx.build_planner_context(None).num_gpus == 4
+
+
+def test_torch_seeing_no_device_is_not_overruled_by_the_kfd_count(kfd, monkeypatch):
+    """torch is present and every device is masked. kfd still names the box,
+    but the count stays 1 as it did before kfd was read."""
+    _torch_says(monkeypatch, None, 0)
+    _mi355x_nodes(kfd)
+
+    pctx = ctx.build_planner_context(None)
+
+    assert pctx.sku == "AMD Instinct MI355X"
+    assert (pctx.num_gpus, pctx.gate.has_collective) == (1, False)
