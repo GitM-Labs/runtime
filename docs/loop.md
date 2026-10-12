@@ -65,13 +65,14 @@ flowchart TD
     R3 -.-> L3
 
     P3 --> SWAP["swap in an untraced baseline engine"]
-    SWAP --> P4
+    SWAP --> CAL["noise floor: baseline measured against itself<br/>N + 1 times, rebuilt each time (--validation N)"]
+    CAL --> P4
 
     subgraph P4["Phase 4: try each candidate, roll back if worse"]
         Q{"candidates left and budget left?"}
         A1["measure baseline → shut it down → build candidate"]
-        A2["measure candidate"]
-        A3{"delta ≥ noise band?<br/>(band is 0 at 1 rep)"}
+        A2["measure candidate; up to N paired rounds,<br/>alternating A→B / B→A"]
+        A3{"mean gain > max(2 × floor × factor, 1%)?"}
         Q -->|yes| A1 --> A2 --> A3
         A3 -->|yes| KEEP["keep: candidate is the new baseline"]
         A3 -->|no| BACK["roll back: rebuild baseline"]
@@ -116,7 +117,9 @@ If earlier runs left results, the CLI asks whether to rank this run from them, u
 
 **The engine.** The `vllm-decode` workload (`gitm/workloads.py`) builds an offline `vllm.LLM` from environment variables:
 - `GITM_VLLM_MODEL`, `GITM_VLLM_TP`, `GITM_VLLM_ENFORCE_EAGER`, `GITM_VLLM_MAX_MODEL_LEN`, …
-- the workload size: `GITM_VLLM_PROMPTS` × `GITM_VLLM_MAX_TOKENS`.
+- the workload size: `GITM_VLLM_PROMPTS` × `GITM_VLLM_MAX_TOKENS`, 256 × 512 by default. A much shorter decode (the old 64 × 128 took about 1.4 s) finishes before the tracer flushes anything.
+
+**Before the engine is built,** a collective health check runs an AllReduce across the visible GPUs (skipped with fewer than 2). It detects the GPUs in a separate process: initialising CUDA in gitm's own process would stop vLLM from forking its engine.
 
 **The tracer** is loaded into this opening engine only.
 - On NVIDIA it's CUPTI, via `CUDA_INJECTION64_PATH`. On AMD it's rocprofiler-sdk, via `ROCP_TOOL_LIBRARIES`.
@@ -191,9 +194,16 @@ Only one engine is ever on the GPU. Parallel mode, where both are resident, is u
 3. It swaps back to an untraced engine and re-orders what's left. Causes always come from the re-trace.
 4. Lost time is used again only while the engine still has the settings the floors were priced for, and runs within 10% of the priced batch. Otherwise the floors describe a different engine, and the step records why it didn't use them.
 
-**The keep rule.** `measure()` returns the candidate's gain minus a noise band. The band comes from the spread of `GITM_AB_REPS` repeated decodes on each engine.
-- **At the default of 1 rep, the band is 0,** so any gain ≥ 0 is kept.
-- **The band only sees spread within one engine.** Two identical builds can differ by more than that; see Known limits.
+**The keep rule: beat this run's own noise** (`--validation N`, default 2, or `GITM_VALIDATION`).
+1. **The run measures its noise.** Before the first candidate, the baseline is measured N + 1 times, rebuilt each time. Each pair is an A/A sample: the same configuration on two builds. Every later re-measurement of the same baseline on a fresh build (after a rollback, or between rounds) adds another sample. The floor is the RMS of the samples. Calibration runs only with an engine-owned throughput probe, and within the budget.
+2. **Each candidate gets up to N paired rounds.** The order alternates (A then B, then B then A), so drift within a round cancels, and each extra round costs one build because the running engine is measured again. A clear loss stops after round 1. Hot-swapped and parallel-restart candidates get their rounds too, measured in place.
+3. **It's kept only if the mean of the rounds' B/A ratios beats `max(2 × floor × factor, minimum effect)`:**
+   - the factor is the exact noise of that mean, since neighbouring rounds share a build (two rounds give 0.87, not 1/√2);
+   - the minimum effect is `GITM_MIN_EFFECT`, 1% by default;
+   - until the first A/A sample exists, the threshold is 2%.
+4. **Autoresearch candidates always get at least 2 rounds:** it tries many guesses, so a lucky single A/B is likelier there.
+
+On an RTX 4050 (Qwen2.5-0.5B, 256 × 512), identical builds differ by about 0.45%, so the threshold is about 1%. The previous rule, "keep if ≥ 0", kept 8 of 15 changes that did nothing.
 
 ### Phase 4b: autoresearch
 
@@ -201,7 +211,7 @@ Proposes engine settings outside the catalogue, aimed at the classified bottlene
 
 ### Phase 5: write down what happened
 
-- **`verification.json`:** for each lever, the measured speedup, repetitions, noise band, keep or rollback, the GPU, and the full baseline and candidate engine settings.
+- **`verification.json`:** for each lever, the measured speedup, its rounds, the threshold it had to beat and the noise floor that set it, keep or rollback, the GPU, and the full baseline and candidate engine settings.
 - **`report.md`:**
   - claims backed by a measured A/B;
   - a candidate that never ran listed as a rejection, not a claim;
@@ -211,7 +221,7 @@ Proposes engine settings outside the catalogue, aimed at the classified bottlene
 | Code | Meaning |
 |---|---|
 | 0 | Finished |
-| 3 | Nothing was traced (no data) |
+| 3 | Nothing was traced (no data). The run records `trace.empty` and says which cause it was: no tracer configured, a tracer no process loaded, or a workload too short to flush |
 | 5 | The baseline engine was lost; the report covers what was tried |
 | 6 | A live run measured no candidate |
 
@@ -238,6 +248,8 @@ Everything lands in `$GITM_SCRATCH/runs/<run_id>/`.
 | `tracing.json` | 4 | Which engines carried the tracer, and every swap |
 | `rerank.json` | 4 | Each re-rank: order before and after, causes, whether lost time was used |
 | `autoresearch.json` | 4b | Proposals, outcomes, why it stopped |
+| `collective_health.json` | 0 | The GPU health check's result |
+| `noise_floor.json` | 4 | The A/A samples, the floor, and the threshold for 1 round and for this run's validation level |
 | `verification.json` | 4–5 | The A/B behind every claim |
 | `degradations.json`, `report.md` | 5 | Every fallback the run took, and the summary |
 
@@ -248,11 +260,8 @@ export CUDA_INJECTION64_PATH=...           # NVIDIA tracer, or ROCP_TOOL_LIBRARI
 export GITM_TRACE_OUT=/path/to/fresh.jsonl # a fresh path per capture: shared, two runs' shards mix
 export GITM_VLLM_MODEL=Qwen/Qwen2.5-0.5B-Instruct
 export GITM_VLLM_ENFORCE_EAGER=1           # required on AMD for the traced opening capture
-export GITM_VLLM_PROMPTS=256               # 64 x 128 finishes before the tracer flushes anything
-export GITM_VLLM_MAX_TOKENS=512
-export GITM_TRACE_SETTLE_S=5
 
-gitm run --workload vllm-decode --budget 2h --rerank recapture
+gitm run --workload vllm-decode --budget 2h --rerank recapture --validation 2
 ```
 
 Useful switches:
@@ -261,16 +270,16 @@ Useful switches:
 |---|---|
 | `--no-history` / `--use-history` | Skip the question in Phase 0 |
 | `--skip-lever PATTERN` | Exclude levers by name or setting (also `GITM_SKIP_LEVERS`) |
+| `--validation N` | Noise calibration pairs and paired rounds per candidate (default 2, also `GITM_VALIDATION`) |
+| `GITM_MIN_EFFECT` | Smallest mean gain worth keeping (default 0.01) |
 | `GITM_AB_REPS=N` | Decodes per side of each A/B (default 1) |
 | `GITM_RESTART_MODE` | Force `serial` or `parallel`; serial is the default |
 | `GITM_BUILD_TIMEOUT_S`, `GITM_DECODE_TIMEOUT_S` | Hang deadlines; 0 turns them off |
 
 ## Known limits
 
-- **The keep rule is weaker than the noise.**
-  - An engine rebuilt with *identical* settings has measured ±8–11% apart on an RTX 4050, while repeated decodes on one engine vary by about 2%.
-  - The noise band only sees the second kind. So at any repetition count, a single A/B can keep a change that did nothing, and later runs then rank from it.
-  - `noise_harness/` measures this properly, as a noise floor per setup.
+- **History from before the noise floor still counts.** Records from runs kept at "≥ 0" have no `threshold` field, and many of their wins are noise. With history on, they still feed the ranking.
+- **An unstable build isn't re-measured.** A build whose own repeated decodes disagree badly is a symptom (a neighbour, throttling), but spotting it needs 2+ decodes per build, which doubles the A/B cost.
 - **One candidate at a time.** In serial mode a kept candidate costs one full engine build and a rolled-back one costs two, since the baseline is rebuilt. On a large model, allow for up to two builds per A/B, which is about two candidates an hour on Kimi K2.5 at TP=8.
 - **The cluster round is manual.** The arms `gitm propose` writes have to be turned into harness jobs, launched and collected by hand. Each arm has one traffic point, and `gitm ingest` reads throughput only.
 - **Engine settings aren't priced.** The predicted graph depends on the model, the GPU and the batch, never on tensor parallelism, KV-cache dtype or quantization settings. Production extras like a speculative draft model aren't modelled either.
