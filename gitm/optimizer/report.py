@@ -126,8 +126,13 @@ def _default_summary(claims: list[Claim]) -> str:
             if bad else "")
     if not verified:
         return "No claims verified within budget. See diagnostic below." + note
-    total = sum(c.measured_delta or 0.0 for c in verified)
-    return f"{len(verified)} verified claims, aggregate measured delta {total:+.1%}." + note
+    # Not summed (L-10). Each claim was measured in its own A/B against its own
+    # baseline, and nothing ran with them all applied, so a total is not a
+    # quantity anything measured. Runs reported +324.6% that way.
+    best = max(verified, key=lambda c: c.measured_delta or 0.0)
+    return (f"{len(verified)} claim(s) kept on a measured A/B; the largest is "
+            f"{best.measured_delta:+.1%} ({best.intervention_name}). Each was measured "
+            "in its own A/B, so the deltas do not add up to a run total." + note)
 
 
 def build_provenance(

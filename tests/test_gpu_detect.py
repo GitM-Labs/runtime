@@ -164,3 +164,23 @@ def test_world_size_and_max_num_seqs_read_the_same_places():
             engine = wrap(cfg)
             assert ctx._engine_world_size(engine) == 2
             assert _max_num_seqs(engine) == 64
+
+
+def test_an_unidentified_gpu_says_what_each_source_returned(monkeypatch):
+    """L-18. On the MI355X pod the run reported only "NVML gave no name", though
+    the torch fallback had also been asked. It now says what torch returned."""
+    monkeypatch.delenv("GITM_GPU_SKU", raising=False)
+    monkeypatch.setattr(ctx, "_query_nvml", lambda: (None, None))
+    monkeypatch.setattr(ctx, "_query_torch", lambda: (None, 0))
+    p = ctx.build_planner_context(None)
+    assert p.sku is None
+    assert "NVML gave no name" in p.sku_source and "device_count=0" in p.sku_source
+
+
+def test_the_sku_source_is_recorded_when_found(monkeypatch):
+    monkeypatch.delenv("GITM_GPU_SKU", raising=False)
+    monkeypatch.setattr(ctx, "_query_nvml", lambda: (None, None))
+    monkeypatch.setattr(ctx, "_query_torch", lambda: ("AMD Instinct MI355X", 8))
+    p = ctx.build_planner_context(None)
+    assert p.sku == "AMD Instinct MI355X" and p.peak is not None
+    assert "torch reported" in p.sku_source
