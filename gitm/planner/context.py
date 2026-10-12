@@ -266,24 +266,17 @@ def _engine_world_size(engine: Any) -> int | None:
     return int(val) if isinstance(val, int) and not isinstance(val, bool) and val > 0 else None
 
 
-#: One directory per kfd node, CPU sockets included. A module constant so a test
-#: can point it at a fake tree.
+#: One directory per kfd node, CPU sockets included. Tests point it at a fake tree.
 _KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
 
 _AMD_PCI_VENDOR = 0x1002
 
-#: PCI device id -> name, spelled as libdrm's ``data/amdgpu.ids`` spells it
-#: (mesa/drm at b97cbde1). ROCm's thunk (libhsakmt) names devices from that
-#: file, so these are the names ROCm itself reports, and a part needs one so
-#: that its SKU, which keys the run history, does not depend on which probe
-#: answered. MI350X and MI355X are both gfx950, so ``gfx_target_version``
-#: cannot tell them apart; the device id can. MI350P is gfx950 too, with half
-#: the CUs and HBM. The PCI ID database (pci-ids.ucw.cz, vendor 1002) lists
-#: every id below except 0x7410 and the gfx950 VFs.
-#:
-#: Names only: nothing here is a ``_PEAKS`` entry. Left out on purpose: 0x74A2
-#: and 0x74B6, which libdrm names MI308X at revision 00 and MI300X at A1 (kfd
-#: does not expose the revision), and the "HF" ids 0x74A8, 0x74A9 and 0x74BD.
+#: PCI device id -> name, spelled as libdrm's ``data/amdgpu.ids`` (mesa/drm at
+#: b97cbde1) spells it, which is where ROCm takes its marketing names from.
+#: MI350X and MI355X are both gfx950, so only the device id tells them apart.
+#: Names only, nothing here is a ``_PEAKS`` entry. 0x74A2 and 0x74B6 are left
+#: out (libdrm names them by revision, which kfd does not expose), as are the
+#: "HF" ids.
 _AMD_DEVICE_NAMES: dict[int, str] = {
     # gfx90a (CDNA2)
     0x7408: "AMD Instinct MI250X",
@@ -317,33 +310,19 @@ def _kfd_properties(node: Path) -> dict[str, int]:
 
 
 def _gfx_name(version: int) -> str:
-    """``gfx_target_version`` 90500 -> ``"gfx950"``: major, then minor and
-    stepping in hex, which is how 90010 becomes gfx90a."""
+    """90500 -> "gfx950". Minor and stepping are hex: 90010 -> "gfx90a"."""
     return f"gfx{version // 10000}{version // 100 % 100:x}{version % 100:x}"
 
 
 def _query_amd() -> tuple[str | None, int | None]:
-    """(device name, count) from the kfd topology in sysfs.
+    """(device name, count) from the kfd topology in sysfs, the last fallback.
 
-    The last SKU fallback, asked when no earlier source names a part with a
-    peak. The MI355X pod still priced against A100 after :func:`_query_torch`
-    was added, because the torch probe gave no usable name there. The kfd
-    topology needs no GPU context, no subprocess and no torch: it is the same
-    tree :func:`gitm.tracer._rocm.device_count` reads, and a node is a GPU iff
-    its ``gpu_id`` is non-zero.
-
-    The name comes from the PCI ``device_id`` via ``_AMD_DEVICE_NAMES``. An id
-    not in the table gets a name such as ``"AMD gfx950 device id 30127"``. The
-    id is decimal so the name cannot spell a ``_PEAKS`` key (hex 0xa100 would
-    match ``A100``): the run still falls back but says what it was on instead
-    of matching the wrong entry.
-
-    The count is the box's visible kfd GPU nodes, the last fallback below the
-    engine's world size and the NVML and torch counts. kfd answers ``EPERM``
-    for a GPU outside the container's device cgroup, so such a node is skipped.
-    Two limits: a partitioned part (CPX) shows one node per partition and
-    inflates the count, and ``ROCR_VISIBLE_DEVICES`` is not applied.
-    ``(None, None)`` without kfd or with an unreadable nodes directory;
+    A node is a GPU iff its ``gpu_id`` is non-zero. The name comes from the PCI
+    ``device_id``; an unlisted id becomes ``"AMD gfx950 device id 30127"``,
+    decimal so it cannot spell a ``_PEAKS`` key (hex 0xa100 would match A100).
+    The count is the readable GPU nodes: a node outside the container's device
+    cgroup reads EPERM and is skipped, a CPX partition is its own node, and
+    ``ROCR_VISIBLE_DEVICES`` is not applied. ``(None, None)`` without kfd,
     ``(None, 0)`` with kfd and no GPU node.
     """
     try:
@@ -486,21 +465,18 @@ def build_planner_context(
     if need_sku or need_count:
         torch_name, torch_count = _query_torch()
 
-    # Read the kfd topology where nothing so far prices the box, or where no
-    # count has turned up. A sysfs read with no device context, so asking costs
-    # nothing, but it only sees AMD parts. A torch name is not enough to skip
-    # it: ROCm torch can return a generic string, or "", that matches no peak.
+    # kfd is read when nothing so far prices the box, or when no source gave a
+    # count. A torch name alone does not skip it: ROCm torch can return a
+    # generic string, or "", that matches no peak.
     counts = (world, nvml_count, torch_count)
     priced = any(peak_for_sku(name) for name in (env_sku, nvml_name, torch_name))
     amd_name = amd_count = None
     if (env_sku is None and not priced) or all(c is None for c in counts):
         amd_name, amd_count = _query_amd()
 
-    # The override is an instruction. Otherwise the first name with a peak.
-    # Failing that, a name kfd took from its PCI-id table, which is the same on
-    # every run on this box whether or not torch answered (torch can say
-    # "AMD Radeon Graphics"), so history files the box under one key; then
-    # NVML's or torch's name; then kfd's id-based name.
+    # The override, else the first name with a peak, else kfd's PCI-table name
+    # (the same on every run, so history keys the box once; torch can say
+    # "AMD Radeon Graphics"), else NVML's or torch's name, else kfd's id-based one.
     names = (nvml_name, torch_name, amd_name)
     amd_listed = amd_name if amd_name in _AMD_DEVICE_NAMES.values() else None
     sku = (
