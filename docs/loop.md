@@ -271,7 +271,7 @@ Useful switches:
   - An engine rebuilt with *identical* settings has measured ±8–11% apart on an RTX 4050, while repeated decodes on one engine vary by about 2%.
   - The noise band only sees the second kind. So at any repetition count, a single A/B can keep a change that did nothing, and later runs then rank from it.
   - `noise_harness/` measures this properly, as a noise floor per setup.
-- **One candidate at a time.** On a large model each A/B costs two full engine builds, which is about two candidates an hour on Kimi K2.5 at TP=8.
+- **One candidate at a time.** In serial mode a kept candidate costs one full engine build and a rolled-back one costs two, since the baseline is rebuilt. On a large model, allow for up to two builds per A/B, which is about two candidates an hour on Kimi K2.5 at TP=8.
 - **The cluster round is manual.** The arms `gitm propose` writes have to be turned into harness jobs, launched and collected by hand. Each arm has one traffic point, and `gitm ingest` reads throughput only.
 - **Engine settings aren't priced.** The predicted graph depends on the model, the GPU and the batch, never on tensor parallelism, KV-cache dtype or quantization settings. Production extras like a speculative draft model aren't modelled either.
 - **Attribution beyond residuals isn't acted on.** Granger and doubly-robust results are reported, but they don't affect the ranking.
