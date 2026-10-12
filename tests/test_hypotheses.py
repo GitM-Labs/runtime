@@ -9,7 +9,9 @@ wins. A performance verdict needs a measured run on hardware.
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -461,10 +463,9 @@ def test_a_saved_and_reloaded_h002_spec_is_refused_not_applied_ungated():
     assert config == {"kv_cache_dtype": "auto"}
 
 
-def test_h002_gate_deadline_covers_its_own_gate_budget():
-    # docs/hypotheses/H-002-mla-kv-fp8.md (Budget) gives about 1.5 h for GSM8K +
-    # needle across 2 arms, so one arm is about 45 min. The H-002 registration
-    # in gitm/agents/hypotheses.py and the doc's gate section both give 2x that.
-    per_arm_s = 90 * 60 / 2
+def test_h002_gate_deadline_is_twice_the_docs_per_arm_gate_budget():
+    doc = Path(__file__).resolve().parents[1] / "docs/hypotheses/H-002-mla-kv-fp8.md"
+    budget = re.search(r"\| GSM8K and needle, 2 arms \| about ([\d.]+) h \|", doc.read_text())
+    per_arm_s = float(budget.group(1)) * 3600 / 2
     spec = _prop(_k25()).propose("memory_bound")[0]
     assert spec.safety.correctness_gate_timeout_s == 2 * per_arm_s
