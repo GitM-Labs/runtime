@@ -164,3 +164,10 @@ def test_a_child_that_fails_reads_as_no_gpus(monkeypatch):
     monkeypatch.setattr("gitm.health.collective.subprocess.run",
                         lambda *a, **k: SimpleNamespace(stdout="", returncode=1))
     assert detect_gpus() == ("none", 0)
+
+
+def test_a_child_that_prints_then_fails_reads_as_no_gpus(monkeypatch):
+    """A result printed before a failing exit is not trusted."""
+    monkeypatch.setattr("gitm.health.collective.subprocess.run",
+                        lambda *a, **k: SimpleNamespace(stdout='["nvidia", 4]\n', returncode=1))
+    assert detect_gpus() == ("none", 0)
