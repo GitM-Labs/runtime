@@ -285,8 +285,11 @@ def test_a_baseline_that_cannot_be_measured_mid_validation_is_a_lost_engine():
         baseline_restart_fn=lambda _o: box.build("A"),
         restart_mode="serial", noise_gate=True, validation=2, min_effect=0.01,
         threshold_without_floor=0.02)
+    released = []
+    app._shutdown = lambda e: released.append(e.kind)
     res = apply_intervention(_spec(), app)
     assert res.restore_failed and not res.rolled_back and app.engine is None
+    assert released[-1] == "A"           # the unmeasurable baseline was released, not dropped
 
 
 def test_calibration_stops_at_the_deadline():

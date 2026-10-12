@@ -790,6 +790,11 @@ class LiveEngineApplicator:
         except RestoreFailed:
             raise
         except Exception as exc:
+            # A probe that raised has not necessarily stopped the engine. Release
+            # it before letting go of the handle, or its workers keep their GPU
+            # memory after the run stops and the next run cannot build.
+            # _shutdown never raises.
+            self._shutdown(self.engine)
             self.engine = None
             self._prev = None
             raise RestoreFailed(f"could not measure the baseline: {exc}") from exc
