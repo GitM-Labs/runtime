@@ -221,7 +221,7 @@ Proposes engine settings outside the catalogue, aimed at the classified bottlene
 | Code | Meaning |
 |---|---|
 | 0 | Finished |
-| 3 | Nothing was traced (no data). The run records `trace.empty` and says which cause it was: no tracer configured, a tracer no process loaded, or a workload too short to flush |
+| 3 | Nothing was traced (no data). The run records `trace.empty` and says which cause the evidence shows: no injected tracer configured (and the in-process fallback traced nothing), a tracer no process loaded, or a workload too short to flush |
 | 5 | The baseline engine was lost; the report covers what was tried |
 | 6 | A live run measured no candidate |
 

@@ -16,7 +16,9 @@ from gitm.tracer import injection
 
 def test_no_tracer_configured(monkeypatch):
     monkeypatch.setattr(injection, "active_vendor", lambda: None)
-    assert "no tracer was configured" in loop._why_no_kernels(1.0)
+    why = loop._why_no_kernels(1.0)
+    assert "no injected tracer is configured" in why
+    assert "in-process fallback" in why       # does not claim nothing could trace
 
 
 def test_configured_but_never_loaded(monkeypatch):
@@ -53,4 +55,4 @@ def test_an_in_process_capture_is_not_blamed_on_missing_injection(monkeypatch):
     missing settings are not the cause and its own diagnostic stands."""
     monkeypatch.setattr(injection, "active_vendor", lambda: None)
     assert loop._why_no_kernels(30.0, "cupti") is None
-    assert "no tracer was configured" in loop._why_no_kernels(30.0, "none")
+    assert "no injected tracer is configured" in loop._why_no_kernels(30.0, "none")

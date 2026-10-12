@@ -2672,9 +2672,14 @@ def _why_no_kernels(runner_s: float | None, source: str = "none") -> str | None:
     if vendor is None and source not in (None, "none"):
         return None
     if vendor is None:
-        return ("no tracer was configured: export CUDA_INJECTION64_PATH (NVIDIA) or "
-                "ROCP_TOOL_LIBRARIES (AMD) before starting the run, so the engine "
-                "loads it when it initialises the GPU")
+        # Without injection settings, capture falls back to an in-process tracer,
+        # which may be unavailable or fail to start; both leave source "none".
+        # Say only what is known, and point at its own warning for which.
+        return ("no injected tracer is configured (CUDA_INJECTION64_PATH on NVIDIA, "
+                "ROCP_TOOL_LIBRARIES on AMD), and the in-process fallback traced "
+                "nothing: it is unavailable here or failed to start (see the warning "
+                "above). For gitm run, export the injection path before starting the "
+                "run, so the engine loads it when it initialises the GPU")
     try:
         shards = injection.shard_paths()
     except Exception:
