@@ -49,6 +49,23 @@ T95 = {
 }
 
 
+def problem(point: dict) -> str | None:
+    """Why a parsed GuideLLM run cannot be used, or None if it can.
+
+    One rule for A/A reps and e8 arms alike: a run with errored requests, no
+    completed requests, or no throughput is a failed run, not a measurement.
+    """
+    if point.get("error"):
+        return f"unreadable ({point['error']})"
+    if point.get("errored"):
+        return f"{point['errored']} errored requests"
+    if point.get("successful") == 0:
+        return "no completed requests"
+    if not point.get("out_tok_s"):
+        return "no throughput reported"
+    return None
+
+
 def t95(df: int) -> float:
     return T95.get(df) or T95[max(k for k in T95 if k <= df)]
 
@@ -63,7 +80,7 @@ def main() -> int:
         print(f"need >= 2 A/A reps under {run / 'aa'}, found {len(files)}")
         return 1
     reps = [guidellm_point(f) for f in files]
-    bad = [r for r in reps if r.get("error") or r.get("out_tok_s") is None or r.get("errored")]
+    bad = [r for r in reps if problem(r)]
 
     lines = [
         f"# A/A noise floor: rag 4096/512, c=64, 180 s ({len(reps)} reps, one session)",
@@ -108,16 +125,24 @@ def main() -> int:
 
     e8 = run / "e8"
     if e8.is_dir() and "out_tok_s" in band:
-        b = guidellm_point(e8 / "guidellm_before.json").get("out_tok_s")
-        a = guidellm_point(e8 / "guidellm_after.json").get("out_tok_s")
+        before = guidellm_point(e8 / "guidellm_before.json")
+        after = guidellm_point(e8 / "guidellm_after.json")
         lever = (e8 / "LEVER").read_text().strip() if (e8 / "LEVER").is_file() else "?"
-        if b and a:
+        lines += ["", f"## e8 (`{lever}`) against this floor", ""]
+        skipped = [
+            (arm, why) for arm, pt in (("before", before), ("after", after)) if (why := problem(pt))
+        ]
+        if skipped:
+            lines.append(
+                "No verdict: failed the health check the A/A reps use: "
+                + "; ".join(f"{arm} ({why})" for arm, why in skipped)
+                + "."
+            )
+        else:
+            b, a = before["out_tok_s"], after["out_tok_s"]
             d = (a - b) / b
             beyond = abs(d) > band["out_tok_s"]
             lines += [
-                "",
-                f"## e8 (`{lever}`) against this floor",
-                "",
                 f"throughput delta {100 * d:+.2f}% vs 1-vs-1 noise band "
                 f"±{100 * band['out_tok_s']:.2f}%: "
                 + (
