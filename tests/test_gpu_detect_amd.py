@@ -395,6 +395,17 @@ def test_a_torch_count_is_asked_before_kfd(monkeypatch):
     assert ctx.build_planner_context(None).num_gpus == 4
 
 
+def test_torchs_count_beats_kfds_when_both_answer(kfd, monkeypatch):
+    """HIP_VISIBLE_DEVICES=0,1: torch sees two of the eight nodes kfd lists.
+    kfd is still read for the name, but the process-visible count wins."""
+    _torch_says(monkeypatch, "AMD Radeon Graphics", 2)
+    _mi355x_nodes(kfd)
+
+    pctx = ctx.build_planner_context(None)
+
+    assert (pctx.sku, pctx.num_gpus) == ("AMD Instinct MI355X", 2)
+
+
 def test_torch_seeing_no_device_is_not_overruled_by_the_kfd_count(kfd, monkeypatch):
     """torch is present and every device is masked. kfd still names the box,
     but the count stays 1 as it did before kfd was read."""
