@@ -61,6 +61,8 @@ def detect_gpus(timeout_s: float = 60.0) -> tuple[str, int]:
              "import json; from gitm.health.collective import _detect_in_process; "
              "print(json.dumps(_detect_in_process()))"],
             capture_output=True, text=True, timeout=timeout_s)
+        if out.returncode != 0:
+            return "none", 0
         vendor, count = json.loads(out.stdout.strip().splitlines()[-1])
         return str(vendor), int(count)
     except Exception:
