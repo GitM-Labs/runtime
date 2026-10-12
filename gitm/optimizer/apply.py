@@ -51,9 +51,8 @@ class ApplyResult:
     #: The baseline could not be put back after this candidate, so whatever the
     #: applicator mutates is in a state nothing measured. A caller holding more
     #: candidates must stop: every A/B after this one would be taken against an
-    #: unknown baseline, or against no engine at all. Also set, with nothing
-    #: applied, when a gate that timed out or was interrupted is still running
-    #: against the target.
+    #: unknown baseline, or against no engine at all. Also set when an earlier
+    #: gate is still running against the target.
     restore_failed: bool = False
 
     @property
@@ -64,8 +63,7 @@ class ApplyResult:
         back, but it was not kept either: every restore follows a rejection, so
         the gate had already said no. Reading ``not rolled_back`` as kept turned a
         candidate measured at -20% whose rollback then failed into a kept result,
-        which history counts as a win. Nor is a candidate that was never applied
-        (refused, or its snapshot failed) kept.
+        which history counts as a win.
         """
         return self.applied and not self.rolled_back and not self.restore_failed
 
@@ -102,28 +100,25 @@ def apply_intervention(
     (e.g. a slowdown) is rolled back. With no measurement (``measure`` returns
     ``None``) the change is kept — apply-only mode. A spec carrying a
     ``correctness_gate`` is additionally rolled back when that gate fails,
-    regardless of the measured delta, or gives no verdict within
-    ``spec.safety.correctness_gate_timeout_s``. A spec that needs a gate and
-    carries none (the callable does not survive a save) is refused untouched.
+    regardless of the measured delta, or when it gives no verdict within
+    ``spec.safety.correctness_gate_timeout_s``.
 
     When an ``audit`` log is supplied, every live mutation and every rollback is
     recorded to the durable safety trail (best-effort — a broken audit sink never
     blocks the apply). Pass one only where the applicator mutates a real target;
     a dry-run leaves it ``None`` so the trail stays free of no-op entries.
     """
+    # The gate callable is dropped when a spec is saved; don't apply ungated.
     if spec.safety.requires_correctness_gate and spec.correctness_gate is None:
         return ApplyResult(False, rolled_back=False, measured_delta=None,
-                           error="spec requires a correctness gate and carries none (the gate "
-                                 "is runtime-only and is lost when a spec is saved); "
+                           error="spec requires a correctness gate and carries none; "
                                  "nothing applied")
+    # An earlier gate is still loading the server, so no A/B can be trusted.
+    # restore_failed=True makes the loops stop.
     if running := _gates_still_running():
-        # Not a failed restore, but the same stop: the target is under load no
-        # A/B measured, so every candidate after this one would be judged on it.
         return ApplyResult(False, rolled_back=False, measured_delta=None,
-                           error=f"a correctness gate that timed out or was interrupted is "
-                                 f"still running against the target ({', '.join(running)}); "
-                                 f"nothing applied, and no candidate can be measured until "
-                                 f"it exits, since an A/B beside it would carry its load",
+                           error=f"correctness gate still running ({', '.join(running)}); "
+                                 "nothing applied",
                            restore_failed=True)
 
     # Step 1: snapshot. On a live engine this benchmarks the baseline, so it can
@@ -150,7 +145,7 @@ def apply_intervention(
         baseline is in place.
         """
         nonlocal restore_started
-        restore_started = True  # attempted, by _rollback or inside apply
+        restore_started = True
         _audit(audit, "restore_failed", spec, knobs=_knob_values(spec),
                cause=f"{cause}; restore failed: {exc}")
         return ApplyResult(applied, rolled_back=False, measured_delta=delta,
@@ -201,11 +196,11 @@ def apply_intervention(
         # faster candidate that fails it is restored with the reason, so the
         # throughput number alone can never keep a change that alters output.
         if spec.correctness_gate is not None:
-            # The gate is a benchmark against a live server: it can time out,
-            # lose the connection, crash, or never return. Any of those is "not
-            # judged", and an unjudged change is restored exactly like a failed
-            # one — the same shape as the measure step above, so a gate that
-            # crashes or hangs can never leave the candidate applied.
+            # The gate is a benchmark against a live server: it can time out, lose
+            # the connection, or crash. Any of those is "not judged", and an
+            # unjudged change is restored exactly like a failed one — the same
+            # shape as the measure step above, so a crash mid-gate can never leave
+            # the candidate applied.
             try:
                 why = _run_gate(spec.correctness_gate, spec,
                                 spec.safety.correctness_gate_timeout_s)
@@ -238,9 +233,8 @@ def apply_intervention(
                                      f"{min_keep_delta:+.3f}, restored")
         return ApplyResult(True, rolled_back=False, measured_delta=delta)
 
-    # KeyboardInterrupt and SystemExit escape _decide: restore once before they
-    # propagate, unless a restore had already begun, in which case a second
-    # attempt is not this function's call and the trail says only what is known.
+    # Ctrl-C or SystemExit: restore once, then re-raise. A restore that already
+    # started is not retried.
     try:
         result = _decide()
     except BaseException as exc:
@@ -281,11 +275,9 @@ class _GateRun:
     finished: threading.Event
 
 
-#: Gates started and not yet returned. A thread cannot be stopped, so one cut
-#: off at its deadline or abandoned by an interrupt may still be loading the
-#: server. Each gate sets its own ``finished`` event; ``Thread.is_alive`` is not
-#: trusted because on CPython 3.10 to 3.12 a join interrupted by Ctrl-C reports
-#: a running thread as stopped.
+# Every gate thread that has not returned. A thread can't be killed, so a
+# timed-out or interrupted gate stays here until it ends. Not Thread.is_alive():
+# on CPython 3.10-3.12 an interrupted join() marks a running thread as stopped.
 _unfinished_gates: list[_GateRun] = []
 
 
@@ -297,13 +289,7 @@ def _gates_still_running() -> list[str]:
 def _run_gate(
     gate: Callable[[Any], str | None], spec: InterventionSpec, timeout_s: float
 ) -> str | None:
-    """Run ``gate(spec)`` on a daemon thread; its verdict, or raise past ``timeout_s``.
-
-    A gate that outlives its wait cannot be stopped: it stays registered and
-    :func:`apply_intervention` refuses new candidates until it returns. Off the
-    main thread, a gate must not install signal handlers; use the client's own
-    timeout instead.
-    """
+    """Run ``gate(spec)`` on a thread and return its verdict, or raise after ``timeout_s``."""
     box: dict[str, Any] = {}
     finished = threading.Event()
 
@@ -316,13 +302,8 @@ def _run_gate(
             finished.set()
 
     t = threading.Thread(target=run, name=f"correctness-gate:{spec.name}", daemon=True)
-    # Registered before it starts, so no interrupt can land before the record.
-    _unfinished_gates.append(_GateRun(t, finished))
-    try:
-        t.start()
-    except RuntimeError:  # the thread could not be created; nothing runs
-        finished.set()
-        raise
+    _unfinished_gates.append(_GateRun(t, finished))  # before start(), so Ctrl-C can't skip it
+    t.start()
     t.join(min(timeout_s, threading.TIMEOUT_MAX))
     if not finished.is_set():
         raise _GateDeadline(f"no verdict within {timeout_s:g} s, not judged")
