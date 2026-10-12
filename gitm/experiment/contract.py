@@ -186,8 +186,11 @@ class GateResult(_Model):
 
 
 class Cost(_Model):
+    #: Sampler time plus setup time: the whole run, not just the measured load.
     wall_clock_s: float
     accelerator_s: float
+    #: Time spent in snapshot / apply / restore (engine rebuilds, model reloads).
+    setup_s: float = 0.0
     estimated_usd: float | None = None
 
 

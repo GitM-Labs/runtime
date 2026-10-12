@@ -17,19 +17,29 @@ and returns the raw metrics. On the MI355X that is a timed replay through
 
 The terminal state is decided by fixed rules, applied in this order:
 
-1. an apply, sample or restore raised → ``failed_to_execute``
-2. a known-effect control failed for this operating point → ``invalid``
-3. the budget ran out before the protocol finished → ``inconclusive``
-4. too few samples, or the primary metric or a correctness score is missing → ``invalid``
+1. an apply, sample, restore or the decision itself raised → ``failed_to_execute``
+2. a known-effect control failed for this operating point, or a dollar budget
+   was set with no rate to enforce it → ``invalid``
+3. the budget (wall clock, accelerator time or dollars) ran out before the
+   protocol finished → ``inconclusive``
+4. too few samples, the primary metric or a correctness score is missing, or a
+   metric is zero, negative or non-finite → ``invalid``
 5. the correctness gate or any latency gate failed → ``regressed``
 6. the interval lies entirely above 0 → ``improved``; entirely below 0 → ``regressed``
 7. otherwise → ``inconclusive``
+
+Wall clock and cost cover the whole run: sampler time plus the snapshot, apply
+and restore calls between arms, which on a served engine are model reloads.
+An ``improved`` run that ended on a baseline arm re-applies the candidate before
+reporting it ``kept``.
 """
 
 from __future__ import annotations
 
 import math
 import random
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
 
@@ -116,9 +126,11 @@ def effect_interval(
     vc = sum((x - mc) ** 2 for x in candidate) / (nc - 1)
     ratio = mc / mb
     # Delta method for the ratio of means; Welch-Satterthwaite degrees of freedom.
-    se = ratio * math.sqrt(vc / (nc * mc**2) + vb / (nb * mb**2))
-    sb, sc = vb / nb, vc / nc
-    df = (sb + sc) ** 2 / (sb**2 / (nb - 1) + sc**2 / (nc - 1)) if sb + sc > 0 else nb + nc - 2
+    # The df uses the same per-arm contributions as the SE (relative variances),
+    # so arms with equal relative noise weigh equally whatever their means.
+    ub, uc = vb / (nb * mb**2), vc / (nc * mc**2)
+    se = ratio * math.sqrt(ub + uc)
+    df = (ub + uc) ** 2 / (ub**2 / (nb - 1) + uc**2 / (nc - 1)) if ub + uc > 0 else nb + nc - 2
     half = stats.t.ppf(1 - alpha / 2, df) * se
     mean = sign * (ratio - 1.0)
     method = (f"ratio of means mc/mb-1, delta-method SE, Welch df={df:.1f}, "
@@ -134,19 +146,46 @@ def evaluate(
     control_status: Literal["passed", "failed", "not_run"] = "not_run",
     provenance: dict[str, Any] | None = None,
     usd_per_accelerator_s: float | None = None,
+    accelerators_held: int = 0,
+    clock: Callable[[], float] = time.monotonic,
 ) -> Verdict:
-    """Run ``contract`` and return its verdict, leaving the candidate applied only if improved."""
+    """Run ``contract`` and return its verdict, leaving the candidate applied only if improved.
+
+    ``accelerators_held`` is how many accelerators the engine occupies while it
+    is being snapshotted, switched or restored; setup time is billed at that
+    count, since a model reload holds the hardware without sampling. ``clock``
+    times those setup calls (injectable for tests).
+    """
     spec = intervention_spec(contract)
     raw: list[RawSample] = []
-    wall = accel = 0.0
+    wall = accel = setup = 0.0
     error: str | None = None
     budget_hit = False
 
+    def usd() -> float | None:
+        return accel * usd_per_accelerator_s if usd_per_accelerator_s is not None else None
+
+    def over_budget() -> bool:
+        b = contract.budget
+        cost = usd()
+        return (wall >= b.max_wall_clock_s or accel >= b.max_accelerator_s
+                or (b.max_cost_usd is not None and cost is not None and cost >= b.max_cost_usd))
+
+    def timed(fn: Callable[..., Any], *args: Any) -> Any:
+        # Snapshot / apply / restore can rebuild the engine (a model reload on
+        # MI355X); that time is spent, so it counts toward the budget and cost.
+        nonlocal wall, accel, setup
+        t0 = clock()
+        try:
+            return fn(*args)
+        finally:
+            dt = clock() - t0
+            setup += dt
+            wall += dt
+            accel += dt * accelerators_held
+
     def verdict(state: str, reason: str, rollback: str, **extra: Any) -> Verdict:
-        cost = Cost(
-            wall_clock_s=wall, accelerator_s=accel,
-            estimated_usd=accel * usd_per_accelerator_s if usd_per_accelerator_s else None,
-        )
+        cost = Cost(wall_clock_s=wall, accelerator_s=accel, setup_s=setup, estimated_usd=usd())
         fields: dict[str, Any] = dict(
             candidate_id=contract.candidate_id,
             hypothesis_id=contract.hypothesis.id,
@@ -166,8 +205,11 @@ def evaluate(
     if control_status == "failed":
         return verdict("invalid", "a known-effect control failed for this operating point; "
                        "no performance verdict until the evaluator passes again", "not_applied")
+    if contract.budget.max_cost_usd is not None and usd_per_accelerator_s is None:
+        return verdict("invalid", "the contract sets max_cost_usd but no $/accelerator-s rate "
+                       "was supplied, so the dollar budget cannot be enforced", "not_applied")
 
-    snapshot = applicator.snapshot()
+    snapshot = timed(applicator.snapshot)
     applied = False
     try:
         current: Arm | None = None
@@ -177,16 +219,16 @@ def evaluate(
                     # Marked before the call: a failed apply may leave a partial
                     # change, so it is restored like apply_intervention does.
                     applied = True
-                    applicator.apply(spec)
+                    timed(applicator.apply, spec)
                 elif applied:
-                    applicator.restore(snapshot)
+                    timed(applicator.restore, snapshot)
                     applied = False
                 current = arm
                 warm = contract.protocol.warmup_reps
             else:
                 warm = 0
             for w in range(warm + 1):
-                if wall >= contract.budget.max_wall_clock_s or accel >= contract.budget.max_accelerator_s:
+                if over_budget():
                     budget_hit = True
                     break
                 s = sampler.sample(arm, len(raw))
@@ -201,7 +243,19 @@ def evaluate(
     except Exception as exc:  # noqa: BLE001 - any failure is a terminal state, not a crash
         error = f"{type(exc).__name__}: {exc}"
 
-    state, reason, extra = _decide(contract, raw, error=error, budget_hit=budget_hit)
+    try:
+        state, reason, extra = _decide(contract, raw, error=error, budget_hit=budget_hit)
+    except Exception as exc:  # noqa: BLE001 - a decision bug must still restore the baseline
+        state, reason, extra = "failed_to_execute", f"decision failed: {type(exc).__name__}: {exc}", {}
+
+    if state == "improved" and not applied:
+        # The run ended on a baseline arm (ABBA with even reps, or a randomized
+        # order), so the candidate is not live. Re-apply it before calling it kept.
+        try:
+            applied = True
+            timed(applicator.apply, spec)
+        except Exception as exc:  # noqa: BLE001
+            state, reason = "failed_to_execute", f"{reason}; re-applying the candidate failed: {exc}"
 
     # Keep only on improved; otherwise put the baseline back.
     rollback = "kept"
@@ -209,7 +263,7 @@ def evaluate(
         rollback = "rolled_back" if applied else "not_applied"
         if applied:
             try:
-                applicator.restore(snapshot)
+                timed(applicator.restore, snapshot)
             except Exception as exc:  # noqa: BLE001
                 rollback = "restore_failed"
                 state, reason = "failed_to_execute", f"{reason}; restore failed: {exc}"
@@ -233,6 +287,13 @@ def _decide(
     missing = [s.order_index for s in kept if metric not in s.metrics]
     if missing:
         return "invalid", f"primary metric {metric!r} missing from samples {missing}", {}
+    # Effects are ratios against the baseline, so a zero, negative or non-finite
+    # value cannot be judged; it is a measurement problem, not a result.
+    checked = [metric] + [g.metric for g in contract.latency_gates]
+    bad = sorted({(s.order_index, m) for s in kept for m in checked
+                  if m in s.metrics and not (math.isfinite(s.metrics[m]) and s.metrics[m] > 0)})
+    if bad:
+        return "invalid", f"non-positive or non-finite metric values at (sample, metric) {bad}", {}
 
     extra: dict[str, Any] = {}
     gate = contract.correctness_gate

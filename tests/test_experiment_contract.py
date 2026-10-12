@@ -216,3 +216,157 @@ def test_cost_is_accounted():
     n = len(v.raw)
     assert v.cost.wall_clock_s == pytest.approx(180.0 * n)
     assert v.cost.estimated_usd == pytest.approx(0.001 * 8 * 180.0 * n)
+
+
+# --- review fixes (Greptile on #136) -----------------------------------------
+
+
+def test_improved_run_ending_on_baseline_reapplies_candidate():
+    from gitm.experiment.contract import ExperimentContract
+    c = ExperimentContract.model_validate(_edit(protocol__repetitions=4))
+    assert run_order(c)[-1] == "baseline"  # ABBA with even reps ends on baseline
+    v, config = _run(c, effect=0.10)
+    assert v.state == "improved"
+    assert v.rollback == "kept" and config["kv_cache_dtype"] == "fp8"
+
+
+class _CountingApplicator:
+    """DictApplicator that fails its Nth apply call."""
+
+    def __init__(self, config: dict, fail_apply_call: int):
+        self.inner, self.calls, self.fail_at = DictApplicator(config), 0, fail_apply_call
+
+    def snapshot(self):
+        return self.inner.snapshot()
+
+    def apply(self, spec):
+        self.calls += 1
+        if self.calls == self.fail_at:
+            raise RuntimeError("engine would not come back on the candidate")
+        self.inner.apply(spec)
+
+    def restore(self, snap):
+        self.inner.restore(snap)
+
+
+def test_failed_reapply_is_failed_to_execute_and_restores():
+    from gitm.experiment.contract import ExperimentContract
+    c = ExperimentContract.model_validate(_edit(protocol__repetitions=4))
+    config = dict(c.baseline.engine_args)
+    # ABBA x4 applies the candidate twice during the run; the 3rd apply is the re-apply.
+    v = evaluate(c, _CountingApplicator(config, 3), FakeServer(config, effect=0.10))
+    assert v.state == "failed_to_execute" and "re-applying" in v.reason
+    assert v.rollback == "rolled_back" and config["kv_cache_dtype"] == "auto"
+
+
+def test_zero_metric_is_invalid_and_restores():
+    contract = load_contract(FIXTURE)
+    config = dict(contract.baseline.engine_args)
+
+    class ZeroServer(FakeServer):
+        def sample(self, arm, index):
+            s = super().sample(arm, index)
+            s.metrics["output_tok_s"] = 0.0
+            return s
+
+    v = evaluate(contract, DictApplicator(config), ZeroServer(config))
+    assert v.state == "invalid" and "non-positive" in v.reason
+    assert config["kv_cache_dtype"] == "auto"
+
+
+def test_decision_error_is_failed_to_execute_and_restores(monkeypatch):
+    import sys
+    ev = sys.modules["gitm.experiment.evaluate"]  # the package re-exports evaluate() over the module name
+
+    def boom(*a, **k):
+        raise ZeroDivisionError("float division by zero")
+
+    monkeypatch.setattr(ev, "_decide", boom)
+    v, config = _run(effect=0.10)  # fixture ends on the candidate arm
+    assert v.state == "failed_to_execute" and "decision failed" in v.reason
+    assert v.rollback == "rolled_back" and config["kv_cache_dtype"] == "auto"
+
+
+def test_dollar_budget_stops_the_run():
+    from gitm.experiment.contract import ExperimentContract
+    c = ExperimentContract.model_validate(_edit(budget__max_cost_usd=5.0))
+    config = dict(c.baseline.engine_args)
+    # 8 x 180 accelerator-s per sample at $0.001 = $1.44 per sample.
+    v = evaluate(c, DictApplicator(config), FakeServer(config), usd_per_accelerator_s=0.001)
+    assert v.state == "inconclusive" and "budget" in v.reason
+    assert 5.0 <= v.cost.estimated_usd < 5.0 + 1.44 + 1e-9
+    assert config["kv_cache_dtype"] == "auto"
+
+
+def test_dollar_budget_without_a_rate_is_refused():
+    from gitm.experiment.contract import ExperimentContract
+    c = ExperimentContract.model_validate(_edit(budget__max_cost_usd=5.0))
+    config = dict(c.baseline.engine_args)
+    v = evaluate(c, DictApplicator(config), FakeServer(config))
+    assert v.state == "invalid" and "max_cost_usd" in v.reason
+    assert v.rollback == "not_applied" and v.raw == []
+
+
+class _ReloadingApplicator(DictApplicator):
+    """Each apply/restore costs `reload_s` on a fake clock, like a model reload."""
+
+    def __init__(self, config, clock, reload_s):
+        super().__init__(config)
+        self.clock, self.reload_s = clock, reload_s
+
+    def apply(self, spec):
+        self.clock[0] += self.reload_s
+        super().apply(spec)
+
+    def restore(self, snap):
+        self.clock[0] += self.reload_s
+        super().restore(snap)
+
+
+def test_setup_time_counts_toward_wall_clock_and_cost():
+    contract = load_contract(FIXTURE)
+    config = dict(contract.baseline.engine_args)
+    now = [0.0]
+    app = _ReloadingApplicator(config, now, reload_s=600.0)
+    v = evaluate(contract, app, FakeServer(config), clock=lambda: now[0],
+                 accelerators_held=8, usd_per_accelerator_s=0.001)
+    n = len(v.raw)
+    assert v.cost.setup_s > 0 and v.cost.setup_s % 600.0 == 0
+    assert v.cost.wall_clock_s == pytest.approx(180.0 * n + v.cost.setup_s)
+    assert v.cost.accelerator_s == pytest.approx(8 * 180.0 * n + 8 * v.cost.setup_s)
+    assert v.cost.estimated_usd == pytest.approx(0.001 * v.cost.accelerator_s)
+
+
+def test_setup_time_can_exhaust_the_wall_clock_budget():
+    from gitm.experiment.contract import ExperimentContract
+    c = ExperimentContract.model_validate(_edit(budget__max_wall_clock_s=3000))
+    config = dict(c.baseline.engine_args)
+    now = [0.0]
+    v = evaluate(c, _ReloadingApplicator(config, now, reload_s=1500.0), FakeServer(config),
+                 clock=lambda: now[0])
+    # Sampler time alone (~2 x 180 s before the first switch) would not hit 3000 s.
+    assert v.state == "inconclusive" and "budget" in v.reason
+    assert config["kv_cache_dtype"] == "auto"
+
+
+def test_unpaired_interval_ignores_arm_scale():
+    from gitm.experiment.evaluate import effect_interval
+    rng = random.Random(3)
+    b = [1000.0 * (1 + rng.gauss(0, 0.01)) for _ in range(6)]
+    c = [1000.0 * (1 + rng.gauss(0, 0.01)) for _ in range(6)]
+    kw = dict(higher_is_better=True, paired=False, alpha=0.05)
+    _, lo1, hi1, m1 = effect_interval(b, c, **kw)
+    # Same relative noise, candidate 10x larger: the relative interval and df
+    # must not change.
+    _, lo2, hi2, m2 = effect_interval(b, [10 * x for x in c], **kw)
+    df = lambda m: m.split("Welch df=")[1].split(",")[0]  # noqa: E731
+    assert df(m1) == df(m2)
+    assert (hi2 - lo2) / 10 == pytest.approx(hi1 - lo1)
+
+
+def test_cli_malformed_yaml_does_not_stop_the_batch(capsys, tmp_path):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("candidate_id: [unclosed\n")
+    assert cli_main(["validate", str(bad), str(FIXTURE)]) == 1
+    out = capsys.readouterr().out
+    assert f"FAIL {bad}" in out and f"ok   {FIXTURE}" in out

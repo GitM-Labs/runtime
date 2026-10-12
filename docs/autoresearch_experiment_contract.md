@@ -30,7 +30,7 @@ the metric's direction. `+0.08` means 8% more throughput or 8% less latency.
 | `primary_metric` | `name`, `unit`, `direction` |
 | `workload` | `trace_id` (replay identity), `source`, `operating_point`, `max_concurrency`, `duration_s` |
 | `baseline`, `candidate` | full `engine_args` for each arm. **Validated:** candidate = baseline + intervention, nothing else |
-| `budget` | `max_wall_clock_s`, `max_accelerator_s`, optional `max_cost_usd` |
+| `budget` | `max_wall_clock_s`, `max_accelerator_s`, optional `max_cost_usd` (needs a $/accelerator-s rate at run time, or the run is refused). All three count setup time (snapshot, apply, restore) as well as sampling |
 | `correctness_gate` | `method`, `reference`, `min_score` (every candidate sample must meet it) |
 | `latency_gates` | per metric: `max_regression` of the mean, as a fraction of baseline |
 | `protocol` | `repetitions` (kept per arm), `warmup_reps` (discarded after **every** arm switch), `comparison_order` (`ABAB`, `ABBA`, `randomized` + `order_seed`), `pairing`, `stopping_rule` (`fixed_n` only), `alpha` |
@@ -45,16 +45,16 @@ The verdict carries:
 - `n_baseline`, `n_candidate`
 - the `correctness` and `latency` gate results, and `control_status`
 - `claim_rejected` and `detectability`
-- `cost` (wall clock, accelerator-seconds, estimated $)
-- `rollback`: `kept`, `rolled_back`, `not_applied` or `restore_failed`
+- `cost` (wall clock, accelerator-seconds, `setup_s` spent on snapshot/apply/restore, estimated $)
+- `rollback`: `kept`, `rolled_back`, `not_applied` or `restore_failed`. An `improved` run that ended on a baseline arm re-applies the candidate before reporting `kept`
 - `provenance`, the `contract_sha256`, and every `raw` sample, warmup included and flagged
 
 The terminal state is decided by rules applied **in this order**:
 
-1. an apply, sample or restore raised → `failed_to_execute`
-2. a known-effect control failed for this operating point → `invalid`
-3. the budget ran out before the protocol finished → `inconclusive`
-4. too few samples, or a missing primary metric, correctness score or latency metric → `invalid`
+1. an apply, sample, restore or the decision itself raised → `failed_to_execute`
+2. a known-effect control failed for this operating point, or `max_cost_usd` was set with no rate to enforce it → `invalid`
+3. the budget (wall clock, accelerator time or dollars) ran out before the protocol finished → `inconclusive`
+4. too few samples; a missing primary metric, correctness score or latency metric; or a zero, negative or non-finite metric → `invalid`
 5. the correctness gate or any latency gate failed → `regressed`
 6. the interval lies entirely above 0 → `improved`; entirely below 0 → `regressed`
 7. otherwise → `inconclusive`

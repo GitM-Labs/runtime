@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 
+import yaml
 from pydantic import ValidationError
 
 from gitm.experiment.contract import load_contract
@@ -23,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     for path in args[1:]:
         try:
             c = load_contract(path)
-        except (ValidationError, OSError, ValueError) as exc:
+        except (ValidationError, OSError, ValueError, yaml.YAMLError) as exc:
             ok = False
             print(f"FAIL {path}\n{exc}")
         else:
