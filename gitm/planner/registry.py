@@ -437,12 +437,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         spec = _replace_spec(spec, **kv)
 
+    from gitm.planner.context import peak_for_sku
+
     hw = _hardware(args.gpu)
     if args.launch_overhead is not None:
         from dataclasses import replace as _replace
 
         hw = _replace(hw, kernel_launch_overhead_s=args.launch_overhead)
-    if args.gpu and args.gpu.lower() not in hw.name.lower():
+    # Not a name check: "A10" is inside the fallback's "A100-SXM4-80GB".
+    if args.gpu and peak_for_sku(args.gpu) is None:
         print(f"warning: --gpu {args.gpu!r} is not in the catalogue; priced against "
               f"{hw.name}, whose bandwidth may differ by more than 2x.", file=sys.stderr)
 

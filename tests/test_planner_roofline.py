@@ -185,6 +185,13 @@ def test_a_known_sku_does_not_warn(capsys):
     assert "not in the catalogue" not in captured.out + captured.err
 
 
+def test_a_sku_inside_the_fallback_name_still_warns(capsys):
+    """An A10 has no entry, but "a10" is a substring of "A100-SXM4-80GB", so a
+    name check priced it as an A100 (2.04 TB/s against its 600 GB/s) in silence."""
+    main(["qwen3.6-35b-a3b", "--gpu", "A10", "--batch", "1"])
+    assert "not in the catalogue" in capsys.readouterr().err
+
+
 def test_sweep_reports_where_the_model_stops_being_memory_bound(capsys):
     """The knee is the capacity-planning answer: below it, throughput is set by
     how efficiently bytes move, and no amount of extra FLOPs helps."""
