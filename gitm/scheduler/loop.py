@@ -34,6 +34,7 @@ from gitm.optimizer.apply import (
     Applicator,
     DryRunApplicator,
     LiveEngineApplicator,
+    RestoreFailed,
     apply_intervention,
     resolve_restart_mode,
 )
@@ -89,6 +90,11 @@ from gitm.safety.audit import AuditLog, _write_report
 from gitm.tracer.capture import capture
 from gitm.tracer.vllm_stats import sample_scheduler_stats, summarize_requests
 from gitm.workloads import WorkloadRunner, get_factory, sync_device
+
+#: The keep threshold before a run has any A/A sample of its own. Conservative:
+#: until the run has measured its noise, a gain has to be clearly outside the
+#: range earlier runs saw on any setup.
+_THRESHOLD_WITHOUT_FLOOR = 0.02
 
 _BUDGET_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd])\s*$")
 
@@ -267,6 +273,12 @@ class LoopConfig:
     #: before anything else. Without this the only way past was to edit the
     #: library.
     skip_levers: tuple[str, ...] = ()
+    #: How hard a candidate is tested before it is kept: the run first measures
+    #: its baseline against itself this many times (rebuilding it each time) to
+    #: get a noise floor, and every candidate must then beat the noise of a mean
+    #: over this many paired A/B rounds. ``None`` reads ``GITM_VALIDATION``,
+    #: else 2. Autoresearch candidates always get at least 2.
+    validation: int | None = None
     # Optional explicit driver for the embedded/engine path. When unset, the
     # loop looks up ``workload`` in the workload registry (gitm.workloads).
     workload_runner: WorkloadRunner | None = None
@@ -1345,6 +1357,11 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # candidates land in the report as unverified (measured_delta=None), never
     # claimed as won.
     live_restart_fn = getattr(cfg.engine, "gitm_restart_fn", None) if cfg.engine else None
+    _validation = max(1, int(cfg.validation if cfg.validation is not None
+                             else os.environ.get("GITM_VALIDATION", "2")))
+    _min_effect = float(os.environ.get("GITM_MIN_EFFECT", "0.01"))
+    noise_calibration: list[float] = []
+    calibration_lost: str | None = None
     if cfg.engine is not None:
         # Serial wherever a baseline rebuild is available, rather than parallel
         # by default. Parallel holds the baseline and the candidate at once, and
@@ -1362,12 +1379,29 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             # Compatibility escape hatch for custom scheduling-classified knobs
             # that should still be measured through engine rebuild.
             force_restart=os.environ.get("GITM_KNOBS_VIA_RESTART") == "1",
+            # Keep a candidate only on a gain above the run's own noise floor,
+            # and above the smallest gain worth a change. Before a floor
+            # exists, a conservative stand-in.
+            validation=_validation,
+            min_effect=_min_effect,
+            threshold_without_floor=_THRESHOLD_WITHOUT_FLOOR,
         )
         (run_dir / "restart_mode.json").write_text(json.dumps({
             "mode": _restart_mode,
             "why": _restart_why,
             "cannot_fit": applicator.restart_mode_warning,
         }, indent=2))
+        # The run's own noise floor, before the first candidate is judged: the
+        # baseline measured against itself, rebuilt each time. Serial restart
+        # only (it needs a baseline rebuild); otherwise the floor comes from
+        # later re-measurements and the stand-in threshold covers the start.
+        try:
+            noise_calibration = applicator.calibrate(_validation)
+        except RestoreFailed as exc:
+            calibration_lost = f"could not rebuild the baseline while measuring noise: {exc}"
+            degradations.record(
+                ENGINE_LOST, used="no live A/B", reason=calibration_lost,
+                severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
         if applicator.restart_mode_warning:
             # Warned, not recorded as a degradation. A run-wide AFFECTS_AB entry
             # would mark every candidate unreliable, including the hot-swapped
@@ -1420,8 +1454,16 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # Set when a candidate's rollback failed. From then on there is no baseline
     # to measure against, so the run stops trying candidates and goes straight
     # to writing up what it has.
-    engine_lost: str | None = None
+    engine_lost: str | None = calibration_lost
     n_untried = 0
+    if engine_lost is not None and isinstance(applicator, LiveEngineApplicator):
+        # The engine was lost before the first candidate (a failed noise
+        # calibration): there is nothing to measure them against.
+        n_untried = sum(1 for x in queue if x.rejected_reason is None)
+        rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
+                        for x in queue if x.rejected_reason is not None)
+        queue = []
+
     while queue:
         c = queue.pop(0)
         if c.rejected_reason is not None:
@@ -1596,6 +1638,12 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 return reason
             return None
 
+        # Autoresearch proposes guesses, many of them: a single A/B that clears
+        # the threshold by chance is likelier among twenty proposals than among
+        # five catalogue levers, so its candidates always get a second round.
+        _catalogue_validation = getattr(applicator, "validation", None)
+        if _catalogue_validation is not None:
+            applicator.validation = max(_catalogue_validation, 2)
         ar_run = autoresearch(
             trace,
             applicator=applicator,
@@ -1609,6 +1657,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             fingerprint=qual.fingerprint,
             degradations=degradations,
         )
+        if _catalogue_validation is not None:
+            applicator.validation = _catalogue_validation
     else:
         # An empty result list reads the same as "searched and found nothing";
         # say that the pass never ran, and why.
@@ -1753,6 +1803,25 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     )
     _write_report(run_dir, report_md)
 
+    if isinstance(applicator, LiveEngineApplicator):
+        # The noise every keep was judged against: the A/A samples (the opening
+        # calibration, then each re-measurement of the same baseline on a fresh
+        # build), the floor they give, and the threshold that floor sets for one
+        # round and for this run's validation level.
+        _noise = applicator.noise
+        (run_dir / "noise_floor.json").write_text(json.dumps({
+            "validation": _validation,
+            "min_effect": _min_effect,
+            "threshold_without_floor": _THRESHOLD_WITHOUT_FLOOR,
+            "calibration_samples": noise_calibration,
+            "samples": _noise.samples,
+            "floor": _noise.floor,
+            "threshold": {
+                str(r): _noise.threshold(r, minimum=_min_effect,
+                                         without_floor=_THRESHOLD_WITHOUT_FLOOR)
+                for r in sorted({1, _validation})},
+        }, indent=2))
+
     summary = {
         "run_id": run_id,
         "workload": workload,
@@ -1773,6 +1842,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         # report is still written; this is what says it is a partial one.
         "engine_lost": engine_lost,
         "n_untried": n_untried,
+        # How hard candidates were tested, and the noise they had to beat.
+        "validation": _validation,
+        "noise_floor": (applicator.noise.floor
+                        if isinstance(applicator, LiveEngineApplicator) else None),
         "scheduler_stats": asdict(sched_summary) if sched_stats.samples else None,
         "report_path": str(run_dir / "report.md"),
     }

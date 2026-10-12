@@ -93,6 +93,14 @@ def _parser() -> argparse.ArgumentParser:
              "and re-ranks what is left against it; 'off' keeps the opening order.",
     )
     run.add_argument(
+        "--validation", type=int, default=None, metavar="N",
+        help="How hard a candidate is tested before it is kept (default 2, or "
+             "GITM_VALIDATION). The baseline is first measured against itself N "
+             "times to get this run's noise floor, and each candidate must beat "
+             "that noise averaged over N paired A/B rounds. Autoresearch always "
+             "uses at least 2.",
+    )
+    run.add_argument(
         "--skip-lever", action="append", metavar="PATTERN", default=None,
         help="Do not try this lever. Matches its name or the knob it sets, with "
              "shell globs and ignoring case (e.g. 'speculative*' or "
@@ -787,6 +795,7 @@ def main(argv: list[str] | None = None) -> int:
             use_history=_resolve_use_history(args),
             rerank=args.rerank,
             skip_levers=args.skip_lever,
+            validation=args.validation,
         )
         summary = result.get("summary", {})
         if args.report is not None:

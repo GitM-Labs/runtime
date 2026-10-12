@@ -24,6 +24,7 @@ def optimize(
     use_history: bool | None = None,
     rerank: str = "off",
     skip_levers: str | Iterable[str] | None = None,
+    validation: int | None = None,
 ) -> dict[str, Any]:
     """Run the autonomous 24-hour optimization loop and return a report.
 
@@ -50,6 +51,12 @@ def optimize(
     than merely regress it, and until now the only way past one was to edit the
     catalogue.
 
+    ``validation`` is how hard a candidate is tested before it is kept: the
+    baseline is first measured against itself that many times (rebuilt each
+    time) for this run's noise floor, and each candidate must beat that noise
+    averaged over that many paired A/B rounds. ``None`` reads
+    ``GITM_VALIDATION``, else 2.
+
     ``workload_runner`` optionally supplies an explicit zero-arg callable that
     launches the workload's GPU work; it runs inside the capture window. When
     omitted, the loop resolves ``workload`` against the registry in
@@ -64,6 +71,7 @@ def optimize(
         workload_runner=workload_runner,
         use_history=use_history,
         rerank=rerank,
+        validation=validation,
         skip_levers=parse_skips(skip_levers),
     )
     return run_loop(cfg)
