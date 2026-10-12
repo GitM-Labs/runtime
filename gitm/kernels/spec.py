@@ -34,9 +34,8 @@ class SafetyGate(BaseModel):
     requires_rollback_window_s: int = 60
     forbid_if_oom_history: bool = True
     requires_qualification_commit: bool = False
-    # Persisted twin of InterventionSpec.correctness_gate: the callable is
-    # runtime-only and is dropped when a spec is saved, so a reloaded spec that
-    # needs a gate must be refused rather than applied ungated.
+    # Persisted twin of InterventionSpec.correctness_gate, which a save drops:
+    # a reloaded spec that needs a gate is refused, not applied ungated.
     requires_correctness_gate: bool = False
     correctness_gate_timeout_s: float = Field(default=1800.0, gt=0, allow_inf_nan=False)
     notes: str = ""

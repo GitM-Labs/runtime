@@ -102,11 +102,9 @@ def apply_intervention(
     (e.g. a slowdown) is rolled back. With no measurement (``measure`` returns
     ``None``) the change is kept — apply-only mode. A spec carrying a
     ``correctness_gate`` is additionally rolled back when that gate fails,
-    regardless of the measured delta. The gate runs under the deadline in
-    ``spec.safety.correctness_gate_timeout_s``; no verdict by then is "not
-    judged" and restores. A spec whose safety says it needs a gate but which
-    carries none (the callable does not survive saving the spec) is refused
-    before anything is touched.
+    regardless of the measured delta, or gives no verdict within
+    ``spec.safety.correctness_gate_timeout_s``. A spec that needs a gate and
+    carries none (the callable does not survive a save) is refused untouched.
 
     When an ``audit`` log is supplied, every live mutation and every rollback is
     recorded to the durable safety trail (best-effort — a broken audit sink never
@@ -240,13 +238,9 @@ def apply_intervention(
                                      f"{min_keep_delta:+.3f}, restored")
         return ApplyResult(True, rolled_back=False, measured_delta=delta)
 
-    # Every Exception in steps 2-4 is handled where it happens. What still
-    # escapes (KeyboardInterrupt, SystemExit) calls restore() once before it
-    # propagates, so stopping a run does not leave the candidate applied. Not
-    # when a restore had already begun: the interrupt landed in or after it,
-    # and a second attempt is not this function's call to make. The trail says
-    # only what is known; an applicator interrupted inside its own rebuild may
-    # have nothing left for restore() to undo.
+    # KeyboardInterrupt and SystemExit escape _decide: restore once before they
+    # propagate, unless a restore had already begun, in which case a second
+    # attempt is not this function's call and the trail says only what is known.
     try:
         result = _decide()
     except BaseException as exc:
@@ -287,12 +281,11 @@ class _GateRun:
     finished: threading.Event
 
 
-#: Every gate that has started and not yet returned. A thread cannot be
-#: stopped, so one cut off at its deadline or abandoned by an interrupt may
-#: still be sending requests to the server. Each gate is registered before its
-#: thread starts and marks itself finished on return: ``Thread.is_alive`` is
-#: not trusted, because on CPython 3.10 to 3.12 a ``join`` interrupted by
-#: Ctrl-C marks a thread that is still running as stopped.
+#: Gates started and not yet returned. A thread cannot be stopped, so one cut
+#: off at its deadline or abandoned by an interrupt may still be loading the
+#: server. Each gate sets its own ``finished`` event; ``Thread.is_alive`` is not
+#: trusted because on CPython 3.10 to 3.12 a join interrupted by Ctrl-C reports
+#: a running thread as stopped.
 _unfinished_gates: list[_GateRun] = []
 
 
@@ -304,17 +297,12 @@ def _gates_still_running() -> list[str]:
 def _run_gate(
     gate: Callable[[Any], str | None], spec: InterventionSpec, timeout_s: float
 ) -> str | None:
-    """Run ``gate(spec)`` and return its verdict, or raise past ``timeout_s``.
+    """Run ``gate(spec)`` on a daemon thread; its verdict, or raise past ``timeout_s``.
 
-    The gate talks to a live server and can block forever on a hung connection
-    or a stalled benchmark. It runs on a daemon thread so the caller can give
-    up at the deadline. A Python thread cannot be stopped, so a hung gate keeps
-    running until it returns, and whatever it returns then is discarded; until
-    it does, :func:`apply_intervention` refuses new candidates. The same holds
-    when an interrupt ends the wait instead of the deadline.
-    Anything the gate raises, an interrupt included, is re-raised here. Because
-    it runs off the main thread, a gate must not install signal handlers
-    (``signal.signal`` raises there); use the client's own timeout instead.
+    A gate that outlives its wait cannot be stopped: it stays registered and
+    :func:`apply_intervention` refuses new candidates until it returns. Off the
+    main thread, a gate must not install signal handlers; use the client's own
+    timeout instead.
     """
     box: dict[str, Any] = {}
     finished = threading.Event()
@@ -328,8 +316,7 @@ def _run_gate(
             finished.set()
 
     t = threading.Thread(target=run, name=f"correctness-gate:{spec.name}", daemon=True)
-    # Registered before it starts, so no interrupt can land between the gate
-    # outliving its wait and the gate being recorded.
+    # Registered before it starts, so no interrupt can land before the record.
     _unfinished_gates.append(_GateRun(t, finished))
     try:
         t.start()
