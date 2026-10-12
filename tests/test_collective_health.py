@@ -11,7 +11,12 @@ from unittest.mock import Mock
 
 import pytest
 
-from gitm.health.collective import HealthResult, detect_gpus, run_collective_health
+from gitm.health.collective import (
+    HealthResult,
+    _detect_in_process,
+    detect_gpus,
+    run_collective_health,
+)
 
 
 def test_detects_nvidia(monkeypatch):
@@ -20,7 +25,7 @@ def test_detects_nvidia(monkeypatch):
         version=SimpleNamespace(hip=None),
     )
     monkeypatch.setitem(sys.modules, "torch", torch)
-    assert detect_gpus() == ("nvidia", 4)
+    assert _detect_in_process() == ("nvidia", 4)
 
 
 def test_detects_amd(monkeypatch):
@@ -29,7 +34,7 @@ def test_detects_amd(monkeypatch):
         version=SimpleNamespace(hip="6.3"),
     )
     monkeypatch.setitem(sys.modules, "torch", torch)
-    assert detect_gpus() == ("amd", 8)
+    assert _detect_in_process() == ("amd", 8)
 
 
 def test_skips_when_fewer_than_two_gpus(monkeypatch):
@@ -133,3 +138,29 @@ def test_loop_aborts_before_factory_on_health_failure(tmp_path: Path, monkeypatc
     assert "unreachable GPU" in out["summary"]["diagnostic"]
     health = Path(out["summary"]["report_path"]).parent / "collective_health.json"
     assert json.loads(health.read_text())["status"] == "fail"
+
+
+def test_detection_never_touches_cuda_in_this_process(monkeypatch):
+    """vLLM forks its EngineCore on NVIDIA; a CUDA runtime initialised here
+    first makes that fork unusable. The question goes to a child process."""
+    def poisoned():
+        raise AssertionError("asked torch in the engine's own process")
+
+    torch = SimpleNamespace(cuda=SimpleNamespace(is_available=poisoned, device_count=poisoned),
+                            version=SimpleNamespace(hip=None))
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return SimpleNamespace(stdout='["nvidia", 2]\n', returncode=0)
+
+    monkeypatch.setattr("gitm.health.collective.subprocess.run", fake_run)
+    assert detect_gpus() == ("nvidia", 2)
+    assert "_detect_in_process" in seen["cmd"][-1]
+
+
+def test_a_child_that_fails_reads_as_no_gpus(monkeypatch):
+    monkeypatch.setattr("gitm.health.collective.subprocess.run",
+                        lambda *a, **k: SimpleNamespace(stdout="", returncode=1))
+    assert detect_gpus() == ("none", 0)
