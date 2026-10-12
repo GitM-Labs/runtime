@@ -336,7 +336,7 @@ def _run_gate(
     except RuntimeError:  # the thread could not be created; nothing runs
         finished.set()
         raise
-    t.join(timeout_s)
+    t.join(min(timeout_s, threading.TIMEOUT_MAX))
     if not finished.is_set():
         raise _GateDeadline(f"no verdict within {timeout_s:g} s, not judged")
     if "exc" in box:

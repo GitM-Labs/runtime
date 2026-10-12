@@ -500,3 +500,12 @@ def test_an_interrupt_after_a_failed_restore_in_apply_does_not_retry_it():
 def test_an_infinite_gate_deadline_is_rejected():
     with pytest.raises(ValueError):
         _spec(safety={"correctness_gate_timeout_s": float("inf")})
+
+
+def test_a_gate_deadline_past_the_join_limit_is_not_a_crash():
+    import threading
+
+    cfg = {"block_size": 8}
+    spec = _gated(lambda _s: None, correctness_gate_timeout_s=2 * threading.TIMEOUT_MAX)
+    res = apply_intervention(spec, DictApplicator(cfg, measure_fn=lambda s: +0.1))
+    assert res.kept and cfg == {"block_size": 16}
