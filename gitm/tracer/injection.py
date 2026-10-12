@@ -71,8 +71,10 @@ AMD_PROCESS_ENV: dict[str, str] = {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}
 # other processes to land on disk. We cannot reach into the child to force a
 # flush, so the injected library flushes on a period (GITM_TRACE_FLUSH_MS, default
 # 100ms) and we wait out one period plus slack before merging. Too short and the
-# tail of the trace is silently missing.
-DEFAULT_SETTLE_S = 0.5
+# tail of the trace is silently missing. 0.5 s was the default, and real runs
+# (RTX 4050, MI355X) read the shards before they had landed; every working run
+# command exported 5. A few seconds per capture is cheap next to a lost trace.
+DEFAULT_SETTLE_S = 5.0
 
 
 def lib_path() -> Path:

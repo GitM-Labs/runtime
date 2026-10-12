@@ -786,8 +786,11 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
 
     Reads its config from the environment:
         GITM_VLLM_MODEL       HF model id (default facebook/opt-125m)
-        GITM_VLLM_PROMPTS     number of prompts to decode (default 64)
-        GITM_VLLM_MAX_TOKENS  tokens to generate per prompt (default 128)
+        GITM_VLLM_PROMPTS     number of prompts to decode (default 256)
+        GITM_VLLM_MAX_TOKENS  tokens to generate per prompt (default 512).
+                              The old 64 x 128 decoded in ~1.4 s on an RTX 4050
+                              and finished before the tracer flushed anything
+                              (L-4); 256 x 512 traces there and on MI355X.
         GITM_VLLM_KV_DTYPE    kv_cache_dtype for the engine (e.g. "fp8"); unset
                               -> vLLM's "auto". Lets a serial A/B build each leg
                               directly in its dtype, one engine per process, so
@@ -820,8 +823,8 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     empty-trace guard reports "no-data" rather than fabricating a result.
     """
     model = os.environ.get("GITM_VLLM_MODEL", "facebook/opt-125m")
-    n_prompts = int(os.environ.get("GITM_VLLM_PROMPTS", "64"))
-    max_tokens = int(os.environ.get("GITM_VLLM_MAX_TOKENS", "128"))
+    n_prompts = int(os.environ.get("GITM_VLLM_PROMPTS", "256"))
+    max_tokens = int(os.environ.get("GITM_VLLM_MAX_TOKENS", "512"))
 
     if os.environ.get("GITM_VLLM_SYNTHETIC") == "1":
         return _vllm_synthetic_runner(n_prompts, max_tokens)

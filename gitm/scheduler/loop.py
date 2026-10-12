@@ -48,6 +48,7 @@ from gitm.optimizer.degradation import (
     AB_UNITS,
     AFFECTS_AB,
     AFFECTS_CLAIMS,
+    AFFECTS_RANKING,
     AFFECTS_RESIDUALS,
     APPROXIMATE,
     AR_SKIPPED,
@@ -57,6 +58,7 @@ from gitm.optimizer.degradation import (
     GRAPH_HARDWARE,
     GRAPH_MODEL,
     TOKENS,
+    TRACE_EMPTY,
     UNRELIABLE,
     WORKLOAD_RUNNER,
     Degradation,
@@ -965,16 +967,19 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # over the same window as the CUPTI capture — engine-level telemetry the GPU
     # trace can't see. A no-op when no engine is attached (empty series).
     run_out: Any = None
+    runner_s: float | None = None
     with (
         capture(trace_path, workload_id=workload, run_id=run_id) as trace,
         sample_scheduler_stats(cfg.engine) as sched_stats,
     ):
         if runner is not None:
+            _t_run = time.perf_counter()
             try:
                 run_out = runner()
                 sync_device()  # ensure all kernels land in the trace before stop
             except Exception as exc:
                 runner_error = f"workload run failed: {exc}"
+            runner_s = time.perf_counter() - _t_run
     if runner_error is not None:
         # Carried on every path, not only the no-data one: a runner that failed
         # part-way still leaves kernels, and residuals, deviations and an A/B
@@ -1174,10 +1179,17 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # ran), do NOT proceed to attribution + emit claims — that fabricates a
     # result from an empty trace. Report no-data honestly instead.
     if trace.vendor == "none" or not trace.kernels():
-        diagnostic = runner_error or qual.diagnostic or (
+        why_empty = _why_no_kernels(runner_s)
+        diagnostic = runner_error or why_empty or qual.diagnostic or (
             "Tracer captured no GPU kernels. Either no GPU/CUPTI shim is present, "
             "or the workload did not run under the runtime."
         )
+        # Never "clean": a run that measured nothing must not read as one that
+        # measured everything without a fallback (L-4).
+        degradations.record(
+            TRACE_EMPTY, used="no trace: nothing was measured",
+            reason=diagnostic, severity=UNRELIABLE,
+            affects=(AFFECTS_RESIDUALS, AFFECTS_RANKING, AFFECTS_CLAIMS))
         return _no_data_result(
             degradations=degradations,
             run_dir=run_dir,
@@ -2638,6 +2650,40 @@ def _edge_intervention_result(
         "report_path": str(run_dir / "report.md"),
     }
     return {"summary": summary, "report_md": report_md, "run_dir": str(run_dir)}
+
+
+#: A decode shorter than this can finish before the tracer flushes a buffer.
+_SHORT_WORKLOAD_S = 10.0
+
+
+def _why_no_kernels(runner_s: float | None) -> str | None:
+    """Which of the empty-trace causes this was, when the evidence says (L-4).
+
+    They have opposite fixes, so the run says which: no tracer was configured;
+    one was configured but never loaded in any process; or it loaded and the
+    workload was too short for it to flush anything. ``None`` when none of these
+    is what the evidence shows, so the caller's general message stands.
+    """
+    vendor = injection.active_vendor()
+    if vendor is None:
+        return ("no tracer was configured: export CUDA_INJECTION64_PATH (NVIDIA) or "
+                "ROCP_TOOL_LIBRARIES (AMD) before starting the run, so the engine "
+                "loads it when it initialises the GPU")
+    try:
+        shards = injection.shard_paths()
+    except Exception:
+        return None
+    if not shards:
+        return (f"the {vendor} tracer is configured but no process loaded it: no trace "
+                "shard was written. It is read once, when a process initialises the "
+                "GPU, so it must be exported before the engine starts, and its "
+                "library path must exist")
+    if runner_s is not None and runner_s < _SHORT_WORKLOAD_S:
+        return (f"the tracer loaded ({len(shards)} shard(s) written) but the workload "
+                f"decoded for only {runner_s:.1f}s and finished before it flushed any "
+                "kernels. Raise GITM_VLLM_PROMPTS / GITM_VLLM_MAX_TOKENS (256 x 512 "
+                "traces on an RTX 4050)")
+    return None
 
 
 def _no_data_result(
