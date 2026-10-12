@@ -222,6 +222,7 @@ e8() {
   local LEVER="${INTERVENTION:?set INTERVENTION='--kv-cache-dtype fp8' (or another lever) for e8}"
   log "E8: intervention arm: $LEVER (headline point, before/after)"
   local D="$RUN/e8"; mkdir -p "$D"
+  rm -f "$D/guidellm_after.json" "$D/LEVER"  # never pair this baseline with an earlier lever's after-run
   IFS=: read -r name prompt output <<< "$HEADLINE"
   bash "$SCRIPTS/arm.sh" B
   manifest e8 B "baseline for intervention"
