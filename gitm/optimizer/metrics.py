@@ -26,6 +26,8 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
+import numpy as np
+
 from gitm.tracer.schema import KernelEvent, Trace
 
 FlopsModel = Callable[[KernelEvent], float]
@@ -110,10 +112,59 @@ def _idle_gaps(kernels: list[KernelEvent], duration_ns: int) -> list[tuple[int, 
     return gaps
 
 
-def _clip_union_ns(spans: list[tuple[int, int]], lo: int, hi: int) -> int:
-    """Total length of ``spans`` clipped to [lo, hi), overlaps counted once."""
-    clipped = [(max(s, lo), min(e, hi)) for s, e in spans if min(e, hi) > max(s, lo)]
-    return sum(e - s for s, e in _merge_intervals(clipped))
+def _overlap_sweep(spans: list[tuple[int, int]], gaps: list[tuple[int, int]]) -> list[int]:
+    """Length of ``spans`` (sorted, disjoint) inside each of ``gaps`` (sorted by start).
+
+    Linear when the gaps are disjoint; gaps that overlap each other are still answered
+    correctly but rescan the spans they share.
+    """
+    out: list[int] = []
+    i, n = 0, len(spans)
+    for g0, g1 in gaps:
+        # A span ending at or before this gap's start cannot reach a later gap either.
+        while i < n and spans[i][1] <= g0:
+            i += 1
+        covered = 0
+        j = i
+        while j < n and spans[j][0] < g1:
+            piece = min(spans[j][1], g1) - max(spans[j][0], g0)
+            if piece > 0:
+                covered += piece
+            j += 1
+        out.append(covered)
+    return out
+
+
+def _stall_ns_per_gap(gaps: list[tuple[int, int]], memcpys: list, syncs: list) -> np.ndarray:
+    """Per gap, sorted by start: columns ``start, transfer, sync, launch, idle`` in ns.
+
+    One sweep over the sorted gaps and the merged records, so for disjoint gaps the
+    cost is linear in gaps plus records after the sorts rather than their product.
+    An int64 array, one row per gap: a list of tuples costs about three times as much.
+    (Object dtype, holding exact Python integers, when a timestamp does not fit int64.)
+    """
+    try:
+        ordered = np.array(sorted(gaps), dtype=np.int64).reshape(-1, 2)
+    except OverflowError:
+        # A timestamp past int64 (a corrupt header's sentinel): exact Python integers.
+        ordered = np.array(sorted(gaps), dtype=object).reshape(-1, 2)
+    dtype = ordered.dtype
+    start, length = ordered[:, 0], ordered[:, 1] - ordered[:, 0]
+    # Fast path: no memcpy/sync overlays — just classify gaps by length.
+    if not memcpys and not syncs:
+        transfer = covered = np.zeros(len(ordered), dtype=dtype)
+    else:
+        # Empty and reversed records cover nothing; dropped before the merge.
+        cp = [(e.start_ns, e.end_ns) for e in memcpys if e.end_ns > e.start_ns]
+        sy = [(e.start_ns, e.end_ns) for e in syncs if e.end_ns > e.start_ns]
+        pairs = ordered.tolist()
+        transfer = np.array(_overlap_sweep(_merge_intervals(cp), pairs), dtype=dtype)
+        covered = np.array(_overlap_sweep(_merge_intervals(cp + sy), pairs), dtype=dtype)
+    residual = length - covered
+    # The 20 us test is on the whole gap; covered - transfer is sync time not already a copy.
+    short = length <= _LAUNCH_LATENCY_NS
+    return np.column_stack([start, transfer, covered - transfer,
+                            np.where(short, residual, 0), np.where(short, 0, residual)])
 
 
 def _classify_stalls(
@@ -129,25 +180,12 @@ def _classify_stalls(
     uncovered remainder is ``launch_latency`` for short gaps (dispatch latency),
     else ``idle``. The four fractions sum to ``stall_fraction``.
     """
-    ns = {"sync_wait": 0, "transfer_bound": 0, "launch_latency": 0, "idle": 0}
+    # The column order of _stall_ns_per_gap.
+    keys = ("transfer_bound", "sync_wait", "launch_latency", "idle")
     if wall_ns <= 0:
-        return {k: 0.0 for k in ns}
-    # Fast path: no memcpy/sync overlays — just classify gaps by length.
-    if not memcpys and not syncs:
-        for g0, g1 in gaps:
-            residual = g1 - g0
-            ns["launch_latency" if residual <= _LAUNCH_LATENCY_NS else "idle"] += residual
-        return {k: v / wall_ns for k, v in ns.items()}
-    cp = [(e.start_ns, e.end_ns) for e in memcpys]
-    sy = [(e.start_ns, e.end_ns) for e in syncs]
-    for g0, g1 in gaps:
-        transfer = _clip_union_ns(cp, g0, g1)
-        transfer_or_sync = _clip_union_ns(cp + sy, g0, g1)
-        ns["transfer_bound"] += transfer
-        ns["sync_wait"] += transfer_or_sync - transfer  # sync time not already a copy
-        residual = (g1 - g0) - transfer_or_sync
-        ns["launch_latency" if (g1 - g0) <= _LAUNCH_LATENCY_NS else "idle"] += residual
-    return {k: v / wall_ns for k, v in ns.items()}
+        return dict.fromkeys(keys, 0.0)
+    totals = _stall_ns_per_gap(gaps, memcpys, syncs)[:, 1:].sum(axis=0)
+    return {k: int(v) / wall_ns for k, v in zip(keys, totals, strict=True)}
 
 
 def compute_metrics(
@@ -203,8 +241,3 @@ def compute_metrics(
         mbu=mbu,
         recompute_fraction=recompute_fraction,
     )
-
-
-
-
-
