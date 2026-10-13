@@ -155,6 +155,9 @@ class GlmMoeDsaModelSpec:
     #: The MTP block reuses the main model's index instead of recomputing it,
     #: and the weight map agrees: it carries no indexer tensors.
     index_share_for_mtp_iteration: bool = True
+    #: Checkpoint inventory can show separate MTP embedding/head/fusion tensors.
+    #: Footprint and execution pricing follow in the planner integration PR.
+    mtp_separate_embedding_head: bool = False
 
     # ── precision ────────────────────────────────────────────────────────────
     weight_dtype: str = "bf16"
@@ -169,6 +172,8 @@ class GlmMoeDsaModelSpec:
     #: A tuple, not a mapping, so the spec stays hashable. Read from the
     #: checkpoint, never assumed — see the module docstring.
     op_dtype_overrides: tuple[tuple[str, str], ...] = ()
+    #: Tensor storage can differ from the runtime execution dtype.
+    stored_dtype_overrides: tuple[tuple[str, str], ...] = ()
 
     # ── derived shapes / schedule ────────────────────────────────────────────
 
