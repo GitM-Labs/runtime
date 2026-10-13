@@ -240,7 +240,7 @@ def test_nvfp4_ridge_follows_execution_not_storage():
     """Marlin NVFP4 on H200 answers to the bf16 ridge (206). The old ladder priced
     it at fp8 (412), doubling its compute ceiling and flagging it as a fallback."""
     assert ridge(H200, "nvfp4") == ridge(H200, "bf16")
-    assert ridge(B200, "nvfp4") == pytest.approx(9000e12 / 8e12)
+    assert ridge(B200, "nvfp4") == pytest.approx(9000e12 / 7.7e12)
     pred = roofline("moe_routed", 1e12, 1e9, H200, "nvfp4")
     assert pred.compute_dtype == "bf16" and not pred.peak_is_fallback
 
@@ -298,8 +298,13 @@ def test_case_fp8_kv_figure_was_the_wrong_layout():
 
 
 def test_case_expert_row_reproduces_on_b200_tp4():
-    """H1 in the case: 1,165.7 MB per layer per rank and 8.74 ms over 60 layers."""
-    g = predict_glm_graph(_case_spec(), B200, BASELINE, ShardingConfig(tp=4))
+    """H1 in the case: 1,165.7 MB per layer per rank and 8.74 ms over 60 layers.
+
+    The case assumed 8 TB/s for B200; the catalogue now carries the HGX B200
+    datasheet's 7.7, so the reproduction states the case's own bandwidth.
+    """
+    case_b200 = replace(B200, peak_mem_bw_bytes_per_s=8000e9)
+    g = predict_glm_graph(_case_spec(), case_b200, BASELINE, ShardingConfig(tp=4))
     routed = [n for n in g.nodes if n.op == "moe_routed"]
     weight_bytes_per_layer = distinct_experts(32, 384, 8) * 24_772_608 / 4
     assert weight_bytes_per_layer / 1e6 == pytest.approx(1165.7, abs=0.1)
@@ -594,3 +599,12 @@ def test_plan_json_leaves_fit_unavailable_without_capacity(capsys):
     assert "no HBM capacity" in data["memory_fit_unavailable_reason"]
     assert main(argv) == 0
     assert "fit       no HBM capacity" in capsys.readouterr().out
+
+
+def test_b200_bandwidth_is_the_hgx_per_gpu_datasheet_figure():
+    # NVIDIA Blackwell datasheet, HGX B200 column: 7.7 TB/s per GPU. The GB200
+    # GPU's 8 TB/s must not leak into the part NVML calls "NVIDIA B200".
+    from gitm.planner.context import hardware_spec_for, peak_for_sku
+
+    assert hardware_spec_for(peak_for_sku("NVIDIA B200")).peak_mem_bw_bytes_per_s == 7700e9
+    assert hardware_spec_for(peak_for_sku("NVIDIA GB200")).peak_mem_bw_bytes_per_s == 8000e9
