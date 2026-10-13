@@ -9,6 +9,22 @@ from pathlib import Path
 
 from gitm.serve.deployment_contract import load_contract, validate_contract
 
+REQUIRED_TESTS = frozenset({
+    "test_catalogue_graph_and_raw_config_gate",
+    "test_header_manifest_closes_exact_stored_bytes_but_formula_does_not",
+    "test_parallelism_changes_per_rank_work_and_rejects_invalid_heads",
+    "test_static_verifier_accepts_identity_and_exposes_engine_unknowns",
+    "test_live_production_path_uses_verified_catalogue_and_serving_kv",
+    "test_live_hub_revision_must_match_loaded_snapshot",
+    "test_deepseek_architecture_cannot_fall_back_to_glm_defaults",
+    "test_changed_revision_dimensions_and_recipe_fail",
+    "test_changed_tensor_schedule_fails_even_with_updated_hash",
+    "test_deployment_contract_reports_blockers_and_rejects_drift",
+    "test_deployment_contract_rejects_inconsistent_rank_groups",
+    "test_coverage_requires_all_core_cases",
+    "test_header_auditor_checks_offsets_against_shape",
+})
+
 
 def _test_state(path: Path | None) -> tuple[str, str]:
     if path is None:
@@ -20,8 +36,11 @@ def _test_state(path: Path | None) -> tuple[str, str]:
         return "UNVERIFIED", "No DeepSeek test cases in JUnit report"
     failed = [c for c in cases if c.find("failure") is not None or c.find("error") is not None]
     skipped = [c for c in cases if c.find("skipped") is not None]
-    return ("PASS" if not failed and not skipped else "FAIL",
-            f"{len(cases)} cases, {len(failed)} failed, {len(skipped)} skipped")
+    present = {c.get("name", "") for c in cases}
+    missing = REQUIRED_TESTS - present
+    status = "FAIL" if failed or skipped else "PARTIAL" if missing else "PASS"
+    return (status, f"{len(cases)} cases, {len(failed)} failed, "
+            f"{len(skipped)} skipped, {len(missing)} required cases missing")
 
 
 def coverage(contract_path: Path, *, config_path: Path | None = None,

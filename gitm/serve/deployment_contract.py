@@ -81,10 +81,20 @@ def validate_contract(data: dict[str, Any]) -> dict[str, Any]:
     known = [x for x in (tp, ep, dp) if x != "UNVERIFIED"]
     if any(type(x) is not int or x <= 0 for x in known):
         raise ValueError("TP/EP/DP must be positive integers or UNVERIFIED")
-    if isinstance(tp, int) and load_spec("deepseek-v3.2").n_heads % tp:
+    spec = load_spec("deepseek-v3.2")
+    if isinstance(tp, int) and spec.n_heads % tp:
         raise ValueError("TP does not divide DeepSeek attention heads")
-    if isinstance(tp, int) and isinstance(ep, int) and ep > tp:
-        raise ValueError("EP exceeds the declared TP group; check engine interpretation")
+    if isinstance(tp, int) and isinstance(ep, int):
+        if ep > tp or tp % ep:
+            raise ValueError("EP must divide the declared TP group")
+        if spec.n_routed_experts % ep:
+            raise ValueError("EP must divide the routed expert count")
+    expected_ranks = data["telemetry"]["expected_ranks"]
+    if expected_ranks != "UNVERIFIED":
+        if type(expected_ranks) is not int or expected_ranks <= 0:
+            raise ValueError("telemetry.expected_ranks must be a positive integer or UNVERIFIED")
+        if isinstance(tp, int) and isinstance(dp, int) and expected_ranks != tp * dp:
+            raise ValueError("telemetry.expected_ranks disagrees with TP * DP")
     if any(v == "UNVERIFIED" for v in (tp, ep, dp)):
         blockers.append({"field": "parallelism.shape", "owner": "Adit",
                          "blocks": "per-rank memory and collective ledger"})

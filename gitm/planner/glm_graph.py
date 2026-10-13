@@ -1154,6 +1154,14 @@ def predict_glm_graph(
     return g
 
 
+def is_deepseek_v32_config(cfg: dict[str, Any]) -> bool:
+    """Recognize either checkpoint identity signal before applying GLM defaults."""
+    if str(cfg.get("model_type", "")).lower() == "deepseek_v32":
+        return True
+    return any("deepseekv32" in str(arch).lower()
+               for arch in cfg.get("architectures") or [])
+
+
 def is_glm_moe_dsa_config(cfg: dict[str, Any]) -> bool:
     """True for the GLM-5.2-class checkpoints this module models.
 
@@ -1166,11 +1174,10 @@ def is_glm_moe_dsa_config(cfg: dict[str, Any]) -> bool:
     """
     if str(cfg.get("model_type", "")).lower() == "glm_moe_dsa":
         return True
-    if str(cfg.get("model_type", "")).lower() == "deepseek_v32":
+    if is_deepseek_v32_config(cfg):
         return True
     archs = cfg.get("architectures") or []
-    if any("glmmoedsa" in str(a).lower() or "deepseekv32" in str(a).lower()
-           for a in archs):
+    if any("glmmoedsa" in str(a).lower() for a in archs):
         return True
     # Structural fallback, for the checkpoints that are this shape without
     # saying so. This graph models MLA attention over a mixture FFN; the DSA
@@ -1276,7 +1283,7 @@ def spec_from_hf_config(
     are the IndexShare and dense/sparse schedules, and a rule guessed from the
     frequencies would misplace layers while producing a plausible total.
     """
-    if str(cfg.get("model_type", "")).lower() == "deepseek_v32":
+    if is_deepseek_v32_config(cfg):
         raise ValueError(
             "DeepSeek V3.2 config.json lacks an indexer schedule and serving choices; "
             "verify its pinned tensor index with verify_deepseek_checkpoint and "

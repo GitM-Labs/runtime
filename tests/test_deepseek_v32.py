@@ -18,7 +18,7 @@ from gitm.planner.glm_graph import model_weight_bytes
 from gitm.planner.model_catalogue import load_spec, predict
 from gitm.planner.registry import detect_family, spec_from_hf_config
 from gitm.planner.roofline import BatchConfig, ShardingConfig
-from gitm.serve import discover, model_config
+from gitm.serve import deepseek_coverage, discover, model_config
 from gitm.serve.deployment_contract import load_contract, validate_contract
 
 CONFIG = json.loads((Path(__file__).parent / "fixtures/deepseek_v32_config.json").read_text())
@@ -136,6 +136,46 @@ def test_live_production_path_uses_verified_catalogue_and_serving_kv(synthetic_p
     assert "SHA256 mismatch" in bad.reason
 
 
+def test_live_hub_revision_must_match_loaded_snapshot(synthetic_pin, tmp_path):
+    config_path, index_path, _ = synthetic_pin
+    hub = tmp_path / "hub"
+    snapshots = hub / "models--deepseek-ai--DeepSeek-V3.2" / "snapshots"
+    for revision in ("0" * 40, REVISION):
+        snapshot = snapshots / revision
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_bytes(config_path.read_bytes())
+        (snapshot / index_path.name).write_bytes(index_path.read_bytes())
+    model = "deepseek-ai/DeepSeek-V3.2"
+    target = discover.Target(pid=123, cmdline=["vllm", "serve", model, "--revision", "0" * 40])
+    bad = model_config.live_moe_spec(target, environ={}, cache_root=hub)
+    assert isinstance(bad, model_config.LiveSpecError)
+    assert "revision mismatch" in bad.reason
+    target.cmdline = ["vllm", "serve", model, "--revision", REVISION]
+    good = model_config.live_moe_spec(target, environ={}, cache_root=hub)
+    assert isinstance(good, model_config.LiveSpec)
+    target.cmdline = ["vllm", "serve", model]
+    unknown = model_config.live_moe_spec(target, environ={}, cache_root=hub)
+    assert isinstance(unknown, model_config.LiveSpecError)
+    assert "explicit immutable --revision" in unknown.reason
+
+
+def test_deepseek_architecture_cannot_fall_back_to_glm_defaults(synthetic_pin):
+    config_path, index_path, _ = synthetic_pin
+    cfg = json.loads(config_path.read_text())
+    cfg["model_type"] = "other"
+    cfg["architectures"] = ["DeepseekV32ForCausalLM"]
+    with pytest.raises(ValueError, match="pinned tensor index"):
+        spec_from_hf_config(cfg)
+    snapshot = config_path.parent / "snapshots" / REVISION
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text(json.dumps(cfg))
+    (snapshot / index_path.name).write_bytes(index_path.read_bytes())
+    target = discover.Target(pid=123, cmdline=["vllm", "serve", str(snapshot)])
+    bad = model_config.live_moe_spec(target, environ={})
+    assert isinstance(bad, model_config.LiveSpecError)
+    assert "static verification failed" in bad.reason
+
+
 def test_changed_revision_dimensions_and_recipe_fail(synthetic_pin):
     config_path, index_path, entry = synthetic_pin
     with pytest.raises(ValueError, match="revision mismatch"):
@@ -183,6 +223,30 @@ def test_deployment_contract_reports_blockers_and_rejects_drift():
     data["parallelism"]["tp"] = 7
     with pytest.raises(ValueError, match="does not divide"):
         validate_contract(data)
+
+
+def test_deployment_contract_rejects_inconsistent_rank_groups():
+    path = Path(__file__).parents[1] / "docs/deepseek-v3.2/deployment-contract.yaml"
+    data = load_contract(path)
+    data["parallelism"].update(tp=8, ep=3, dp=2)
+    with pytest.raises(ValueError, match="EP must divide"):
+        validate_contract(data)
+    data["parallelism"]["ep"] = 4
+    data["telemetry"]["expected_ranks"] = 8
+    with pytest.raises(ValueError, match=r"TP \* DP"):
+        validate_contract(data)
+
+
+def test_coverage_requires_all_core_cases(tmp_path):
+    report = tmp_path / "partial.xml"
+    report.write_text('<testsuite><testcase classname="tests.test_deepseek_v32" '
+                      'name="test_catalogue_graph_and_raw_config_gate"/></testsuite>')
+    status, detail = deepseek_coverage._test_state(report)
+    assert status == "PARTIAL" and "required cases missing" in detail
+    cases = "".join(f'<testcase classname="tests.test_deepseek_v32" name="{name}"/>'
+                    for name in deepseek_coverage.REQUIRED_TESTS)
+    report.write_text(f"<testsuite>{cases}</testsuite>")
+    assert deepseek_coverage._test_state(report)[0] == "PASS"
 
 
 def test_header_auditor_checks_offsets_against_shape(tmp_path):
