@@ -199,6 +199,24 @@ def test_a_candidate_that_fails_to_rebuild_mid_validation_is_rolled_back():
     assert app.engine.kind == "A"
 
 
+def test_ctrl_c_while_validation_rebuilds_the_candidate_rebuilds_the_baseline():
+    box = _Box([1000.0, 1000.0, 1000.0], candidate=[1050.0])
+    app = box.applicator(noise_gate=True, validation=3, min_effect=0.01, threshold_without_floor=0.02)
+    calls = []
+
+    def restart(_old, _v):
+        calls.append(1)
+        if len(calls) > 1:
+            raise KeyboardInterrupt
+        return box.build("B")
+
+    app._restart_fn = restart
+    with pytest.raises(KeyboardInterrupt):
+        apply_intervention(_spec(), app)
+    assert box.built == ["A", "B", "A", "A"]
+    assert app.engine.kind == "A"
+
+
 def test_a_baseline_lost_mid_validation_is_a_lost_engine():
     box = _Box([1000.0], candidate=[1050.0])     # no second A to rebuild
     app = box.applicator(noise_gate=True, validation=2, min_effect=0.01, threshold_without_floor=0.02)

@@ -509,3 +509,13 @@ def test_a_gate_deadline_past_the_join_limit_is_not_a_crash():
     spec = _gated(lambda _s: None, correctness_gate_timeout_s=2 * threading.TIMEOUT_MAX)
     res = apply_intervention(spec, DictApplicator(cfg, measure_fn=lambda s: +0.1))
     assert res.kept and cfg == {"block_size": 16}
+
+
+def test_a_gate_thread_that_never_started_does_not_block_later_candidates():
+    import threading
+
+    from gitm.optimizer import apply as apply_mod
+
+    apply_mod._unfinished_gates.append(
+        apply_mod._GateRun(threading.Thread(target=lambda: None), threading.Event()))
+    assert apply_mod._gates_still_running() == []

@@ -306,7 +306,8 @@ _unfinished_gates: list[_GateRun] = []
 
 
 def _gates_still_running() -> list[str]:
-    _unfinished_gates[:] = [g for g in _unfinished_gates if not g.finished.is_set()]
+    _unfinished_gates[:] = [g for g in _unfinished_gates
+                           if g.thread.ident is not None and not g.finished.is_set()]
     return [g.thread.name for g in _unfinished_gates]
 
 
@@ -1257,6 +1258,9 @@ class LiveEngineApplicator:
         candidate is rolled back rather than left half-applied."""
         base = self.engine
         self._shutdown(base)
+        self.engine = None
+        # A Ctrl-C during the build must still leave restore() able to rebuild the baseline.
+        self._prev = ("serial_restart", lambda: self._baseline_restart_fn(base))
         try:
             new_engine = self._restart_fn(base, _knob_values(spec))
             if new_engine is None:
