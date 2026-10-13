@@ -13,6 +13,8 @@ import os
 import re
 import time
 import uuid
+import warnings
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -27,21 +29,49 @@ from gitm.agents.autoresearch import (
     classify_bottleneck,
 )
 from gitm.agents.policy import Policy, select_interventions
-from gitm.kernels.library import load_library
+from gitm.agents.targeting import targets_from_recoverable
+from gitm.kernels.library import load_library, parse_skips, skipped_by
 from gitm.optimizer.apply import (
     Applicator,
     DryRunApplicator,
     LiveEngineApplicator,
+    RestoreFailed,
     apply_intervention,
+    mean_noise_factor,
+    resolve_restart_mode,
 )
 from gitm.optimizer.attribution import attribute
 from gitm.optimizer.collective_signal import collective_causes, worst_device_comm
+from gitm.optimizer.degradation import (
+    AB_PROBE,
+    AB_UNIT,
+    AB_UNITS,
+    AFFECTS_AB,
+    AFFECTS_CLAIMS,
+    AFFECTS_RANKING,
+    AFFECTS_RESIDUALS,
+    APPROXIMATE,
+    AR_SKIPPED,
+    BUDGET_SPENT,
+    ENGINE_LOST,
+    GRAPH_BATCH,
+    GRAPH_HARDWARE,
+    GRAPH_MODEL,
+    TOKENS,
+    TRACE_EMPTY,
+    UNRELIABLE,
+    WORKLOAD_RUNNER,
+    Degradation,
+    DegradationLog,
+    ab_unit,
+    unreliable_ab,
+)
 from gitm.optimizer.deviation import deviation_summary, deviation_trace, write_deviation_jsonl
 from gitm.optimizer.dr import attribute_dr
 from gitm.optimizer.history import load_history
 from gitm.optimizer.measure import measure_trace, measurement_claims, measurement_summary
-from gitm.optimizer.monitor import check_invariants, residuals
-from gitm.optimizer.qualification import qualify
+from gitm.optimizer.monitor import check_invariants, recoverable_by_op, residuals
+from gitm.optimizer.qualification import QualificationResult, qualify
 from gitm.optimizer.report import Claim, build_provenance, write_report
 from gitm.optimizer.scheduler_attribution import scheduler_causes
 from gitm.optimizer.verification_export import (
@@ -51,6 +81,7 @@ from gitm.optimizer.verification_export import (
 )
 from gitm.optimizer.vllm_knobs import (
     KNOB_PREREQUISITES,
+    engine_kwargs,
     expand_relative_candidates,
     knob_kind,
     unmet_prerequisite,
@@ -62,9 +93,15 @@ from gitm.planner.moe_graph import (
     spec_from_hf_config,
 )
 from gitm.safety.audit import AuditLog, _write_report
+from gitm.tracer import injection
 from gitm.tracer.capture import capture
 from gitm.tracer.vllm_stats import sample_scheduler_stats, summarize_requests
 from gitm.workloads import WorkloadRunner, get_factory, sync_device
+
+#: The keep threshold before a run has any A/A sample of its own. Conservative:
+#: until the run has measured its noise, a gain has to be clearly outside the
+#: range earlier runs saw on any setup.
+_THRESHOLD_WITHOUT_FLOOR = 0.02
 
 _BUDGET_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd])\s*$")
 
@@ -96,7 +133,18 @@ def _parse_budget_s(budget: str) -> float:
     value, unit = float(m.group(1)), m.group(2)
     return value * {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}[unit]
 
-def _engine_throughput_fn(engine: Any, runner: Any) -> Any:
+def _note_ab(
+    degradations: DegradationLog | None, stage: str, used: str, reason: str, severity: str
+) -> None:
+    """Record a throughput-probe fallback, when the caller passed a log."""
+    if degradations is not None:
+        degradations.record(stage, used=used, reason=reason, severity=severity,
+                            affects=(AFFECTS_AB, AFFECTS_CLAIMS))
+
+
+def _engine_throughput_fn(
+    engine: Any, runner: Any, degradations: DegradationLog | None = None
+) -> Any:
     """Resolve a decode-throughput probe for the live A/B.
 
     Prefers an explicit ``engine.gitm_throughput_fn`` (the engine owns what "a
@@ -109,24 +157,75 @@ def _engine_throughput_fn(engine: Any, runner: Any) -> Any:
     hot-swap A/Bs. A deployment that supplies ``gitm_restart_fn`` (structural-knob
     restart-apply, which swaps in a *new* engine) MUST also supply an engine-aware
     ``gitm_throughput_fn`` — the default cannot measure the restarted engine.
+
+    Both halves of that contract are now enforced rather than documented, and
+    each refusal is a raise: :func:`apply_intervention` turns a failed measure
+    into a restore with the error on the record, so the candidate is neither kept
+    nor written to ``verification.json`` as a measured loss.
+
+    * No runner: there is nothing to time. The old probe timed an empty call and
+      divided 1 by ~1e-9 s, so keep-or-rollback followed timer noise.
+    * A restarted engine: the runner drives the engine it was built with, so
+      timing it after a restart measures the old engine and credits the new one.
+    * No token count in the runner's output: the probe still works, as workload
+      runs per second, and the unit is recorded so no report calls it tok/s.
+    * The unit is fixed by an A/B's first call and held for that A/B. A speedup
+      is a ratio of two probe calls, so a runner that reports ``generated_tokens``
+      on one call and nothing (or ``decode_steps``) on the next would divide one
+      unit by another; that call raises and the A/B ends as an error. The lock is
+      keyed by :attr:`DegradationLog.current_scope`, so the next candidate starts
+      fresh and a consistent A/B in another unit is still measured.
+    * Any count other than ``generated_tokens`` is recorded as an
+      :data:`AB_UNIT` degradation naming its unit, so nothing reports steps or
+      events as tok/s.
     """
     explicit = getattr(engine, "gitm_throughput_fn", None)
     if callable(explicit):
         return explicit
 
+    if runner is None:
+        why = "no workload runner and no engine.gitm_throughput_fn: nothing to time"
+        _note_ab(degradations, AB_PROBE, "no throughput probe", why, UNRELIABLE)
+
+        def _no_probe(_engine: Any) -> float:
+            raise RuntimeError(why)
+
+        return _no_probe
+
+    # Per A/B: the unit of its first call, held for the rest of it. Keyed by the
+    # candidate being measured; one key for everything when there is no log.
+    locked: dict[str | None, str] = {}
+
     def _tps(_engine: Any) -> float:
+        if _engine is not engine:
+            why = ("the default probe drives the engine the runner was built with, "
+                   "not the restarted one; supply engine.gitm_throughput_fn")
+            _note_ab(degradations, AB_PROBE, "no measurement of the restarted engine", why,
+                     UNRELIABLE)
+            raise RuntimeError(why)
         t0 = time.perf_counter()
-        out = runner() if runner is not None else {}
+        out = runner()
         dt = max(time.perf_counter() - t0, 1e-9)
         # First key that is actually present wins — `or` would treat a legitimate
         # 0 (a window that produced no tokens) as missing and fabricate a count.
-        toks: float = 1.0
+        unit, count = "runs", 1.0
         if isinstance(out, dict):
             for key in ("generated_tokens", "decode_steps", "events"):
                 if out.get(key) is not None:
-                    toks = float(out[key])
+                    unit, count = key, float(out[key])
                     break
-        return toks / dt
+        ab = degradations.current_scope if degradations is not None else None
+        first = locked.setdefault(ab, unit)
+        if unit != first:
+            why = (f"the runner reported {unit!r} after reporting {first!r} in the same A/B; "
+                   "a speedup across the two would divide one unit by another")
+            _note_ab(degradations, AB_PROBE, "no measurement in a mixed unit", why, UNRELIABLE)
+            raise RuntimeError(why)
+        if unit != TOKENS:
+            counted = "" if unit == "runs" else f"; counted {unit} instead"
+            _note_ab(degradations, AB_UNIT, AB_UNITS[unit][2],
+                     "the runner reported no generated_tokens" + counted, APPROXIMATE)
+        return count / dt
 
     return _tps
 
@@ -171,6 +270,22 @@ class LoopConfig:
     #: always behaved. ``"recapture"`` traces the workload again after each
     #: applied candidate and re-ranks what is left against it.
     rerank: str = "off"
+    #: Levers this run must not try, as names or knobs with shell globs (see
+    #: :func:`gitm.kernels.library.skipped_by`). Merged with ``GITM_SKIP_LEVERS``
+    #: so a Kubernetes manifest can set it without a new flag in the pod spec.
+    #:
+    #: Exists because a lever can hang the model rather than merely regress: on
+    #: Kimi at TP=8 on ROCm, n-gram speculative decoding stalls in an RCCL
+    #: all-gather, and it ranks first in the catalogue, so every run met it
+    #: before anything else. Without this the only way past was to edit the
+    #: library.
+    skip_levers: tuple[str, ...] = ()
+    #: How hard a candidate is tested before it is kept: the run first measures
+    #: its baseline against itself this many times (rebuilding it each time) to
+    #: get a noise floor, and every candidate must then beat the noise of a mean
+    #: over this many paired A/B rounds. ``None`` reads ``GITM_VALIDATION``,
+    #: else 2. Autoresearch candidates always get at least 2.
+    validation: int | None = None
     # Optional explicit driver for the embedded/engine path. When unset, the
     # loop looks up ``workload`` in the workload registry (gitm.workloads).
     workload_runner: WorkloadRunner | None = None
@@ -208,6 +323,13 @@ def _hf_config_dict(hf: Any) -> dict[str, Any]:
     q = raw.get("quantization_config")
     if q is not None and not isinstance(q, dict):
         raw["quantization_config"] = q.to_dict() if hasattr(q, "to_dict") else dict(vars(q))
+    # Same treatment for the multimodal wrapper's text sub-config, and for the
+    # same reason. ``vars()`` is shallow, so on a config with no ``to_dict`` the
+    # inner config stays an *object*; ``registry.text_config`` unwraps dicts, so
+    # a wrapped MoE would still read as dense on exactly that engine shape.
+    inner = raw.get("text_config")
+    if inner is not None and not isinstance(inner, dict):
+        raw["text_config"] = inner.to_dict() if hasattr(inner, "to_dict") else dict(vars(inner))
     return raw
 
 
@@ -223,6 +345,10 @@ def _model_spec_from_hf(hf: Any):
     """
     if hf is None:
         return None
+    # Same wrapper, read off an object rather than a dict: a multimodal config
+    # carries the decode shapes on ``hf.text_config``, and reading ``hidden_size``
+    # from the wrapper raises straight into the except below.
+    hf = getattr(hf, "text_config", None) or hf
     try:
         from gitm.planner.roofline import ModelSpec
 
@@ -243,6 +369,22 @@ def _model_spec_from_hf(hf: Any):
         )
     except Exception:
         return None
+
+
+def _model_spec_from_hf_explained(hf: Any):
+    """``(spec, None)``, or ``(None, why)`` when the default graph will be used.
+
+    :func:`_model_spec_from_hf` is kept for callers that only want the spec; this
+    is what the loop records, because "no engine" and "a config field this
+    reader could not parse" are different fixes for whoever reads the run.
+    """
+    if hf is None:
+        return None, "no HF config to read"
+    for need in ("hidden_size", "num_attention_heads", "num_hidden_layers", "vocab_size"):
+        if getattr(hf, need, None) is None:
+            return None, f"HF config has no {need!r}"
+    spec = _model_spec_from_hf(hf)
+    return (spec, None) if spec is not None else (None, "HF config fields did not parse")
 
 
 def _model_spec_from_engine(engine: Any):
@@ -276,20 +418,40 @@ _ATTN_ALIASES: dict[str, tuple[str, ...]] = {
 _QUANT_WEIGHT_BYTES: dict[str, int] = {"fp8": 1, "compressed-tensors": 1, "modelopt_fp8": 1}
 
 
-def _batch_config_from_stats(sched: Any):
-    """A :class:`BatchConfig` carrying the *observed* decode batch, or ``None``.
+def _batch_config_from_stats(sched: Any) -> tuple[Any, str | None]:
+    """``(BatchConfig, source)`` carrying the *observed* decode batch, or ``(None, None)``.
 
     ``predict_graph``'s default is ``batch=1``. That is wrong for any real serving
     window and especially wrong for a mixture-of-experts model, where weight
     traffic scales with the distinct experts a batch activates: at top-8 of 256,
     a batch of 1 touches 8 experts but a batch of 16 touches ~100, so scoring a
     batch-16 step against the batch-1 ceiling understates expert traffic by more
-    than 10x. ``mean_running`` is vLLM's own count of concurrently running
-    sequences, which is exactly the decode batch.
+    than 10x.
 
-    Returns ``None`` (caller falls back to the default) when no scheduler samples
-    were taken — a CPU box, a dry run, or an engine that exposes no stats. Better
-    a documented default than a fabricated batch.
+    Two sources, in order of directness:
+
+    ``mean_running`` is vLLM's own count of concurrently running sequences, which
+    *is* the decode batch. It is also the one most often missing: it comes off the
+    scheduler, and for the offline ``LLM`` engine the scheduler lives in a separate
+    process (``VLLM_ENABLE_V1_MULTIPROCESSING`` defaults on), so nothing in this
+    process can reach it.
+
+    ``mean_bounded_inflight`` comes from ``get_num_unfinished_requests()``, a
+    method on the engine handle itself and therefore readable whatever the engine
+    core does. It counts requests in flight rather than requests decoding, so
+    each sample is an upper bound: anything the scheduler has admitted is
+    decoding, anything it has not is queued. Bounding each sample by
+    ``max_num_seqs`` — the most the engine will ever decode at once — turns that
+    into the batch wherever the queue is what the surplus is, which is the shape
+    of every workload gitm submits (all prompts at once, then drain). The
+    bounding happens per sample in :func:`~gitm.tracer.vllm_stats.summarize`,
+    which is not the same as bounding the average and is the reason this reads a
+    separate field rather than clamping ``mean_unfinished`` here. Without a
+    capacity to bound against it stays unused rather than becoming a guess.
+
+    Returns ``(None, None)`` when neither is available — a CPU box, a dry run, or
+    an engine that exposes no stats. Better a documented default than a fabricated
+    batch, and the caller records which of the two it got.
 
     ``kv_cache_len`` is deliberately left at its default: nothing in the sampled
     stats gives a token count (``peak_gpu_cache_usage`` is a fraction of blocks,
@@ -299,11 +461,19 @@ def _batch_config_from_stats(sched: Any):
     from gitm.planner.roofline import BatchConfig
 
     if sched is None or getattr(sched, "n_samples", 0) == 0:
-        return None
+        return None, None
+
+    def _batch(value: Any) -> Any:
+        return BatchConfig(batch=max(int(round(float(value))), 1))
+
     running = getattr(sched, "mean_running", None)
-    if running is None or running < 1:
-        return None
-    return BatchConfig(batch=max(int(round(float(running))), 1))
+    if running is not None and running >= 1:
+        return _batch(running), "running"
+
+    bounded = getattr(sched, "mean_bounded_inflight", None)
+    if bounded is not None and bounded >= 1:
+        return _batch(bounded), "unfinished"
+    return None, None
 
 
 def _read_int_aliases(hf: Any, table: dict[str, tuple[str, ...]]) -> dict[str, Any]:
@@ -382,7 +552,18 @@ def _quant_weight_bytes(quant: Any) -> int | None:
 
 
 def _execution_graph_family(engine: Any, hw: Any, batch: Any):
-    """The predicted graph for the model that actually ran, and its family.
+    """``(graph, family)`` — :func:`_execution_graph_basis` without the reason."""
+    graph, family, _why = _execution_graph_basis(engine, hw, batch)
+    return graph, family
+
+
+def _execution_graph_basis(engine: Any, hw: Any, batch: Any):
+    """The predicted graph for the model that actually ran, its family, and —
+    when it could not be read — why the default dense graph stands in.
+
+    The third element is ``None`` when the graph describes the engine's own
+    model. Otherwise every residual scored against it is scored against
+    Llama-2-7B, and the caller must say so rather than write it beside real ones.
 
     The family comes from :func:`gitm.planner.registry.detect_family` — the same
     dispatch ``gitm plan`` and ``gitm deviate`` use — so the live loop can never
@@ -398,29 +579,40 @@ def _execution_graph_family(engine: Any, hw: Any, batch: Any):
     comparison basis against the in-process trace, rather than predicting one
     rank against an all-rank capture.
     """
-    from gitm.planner.registry import detect_family
+    from gitm.planner.registry import detect_family, text_config
     from gitm.planner.registry import spec_from_hf_config as family_spec
     from gitm.planner.roofline import ShardingConfig
 
     hf = _hf_config_from_engine(engine)
     if hf is not None:
-        cfg = _hf_config_dict(hf)
+        # The wrapper is stripped once here rather than inside each reader: a
+        # multimodal checkpoint keeps every decode shape under ``text_config``,
+        # and a predicate reading the top level finds nothing and resolves to
+        # ``dense``.
+        cfg = text_config(_hf_config_dict(hf))
         family = detect_family(cfg)
         name = str(cfg.get("model_type") or family)
         if family == "sparse_moe":
             spec = spec_from_hf_config(cfg, name=name)
-            return predict_moe_graph(spec, hw, batch, ShardingConfig()), family
+            return predict_moe_graph(spec, hw, batch, ShardingConfig()), family, None
         if family == "glm_moe_dsa":
             from gitm.planner.glm_graph import predict_glm_graph
 
             return predict_glm_graph(family_spec(cfg, name=name), hw, batch,
-                                     ShardingConfig()), family
+                                     ShardingConfig()), family, None
         if family == "hybrid":
             from gitm.planner.hybrid_graph import predict_hybrid_graph
 
             return predict_hybrid_graph(family_spec(cfg, name=name), hw, batch,
-                                        ShardingConfig()), family
-    return predict_graph(model=_model_spec_from_hf(hf), hw=hw, batch=batch), "dense"
+                                        ShardingConfig()), family, None
+    if hf is None:
+        # More specific than the helper's "no HF config": which of the two it is
+        # decides the fix (attach an engine vs. teach the reader a config path).
+        spec, why = None, ("no engine attached" if engine is None
+                           else "the engine exposes no HF config at any known path")
+    else:
+        spec, why = _model_spec_from_hf_explained(hf)
+    return predict_graph(model=spec, hw=hw, batch=batch), "dense", why
 
 
 def _execution_graph(engine: Any, hw: Any, batch: Any):
@@ -465,6 +657,77 @@ def _ar_target_residual(ar_run: AutoresearchRun, fallback: float = 0.0) -> float
     return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else fallback
 
 
+def _ab_evidence(
+    ab: Any, rolled_back: bool, measured_under: Iterable[Any], *, restore_failed: bool = False,
+) -> str:
+    """The claim sentence for a live A/B, in the unit the probe actually measured.
+
+    ``measured_under`` is this candidate's own list
+    (:meth:`DegradationLog.measured_under`), never the run's: a runs/s fallback
+    in a later A/B says nothing about the unit of this one.
+    """
+    what, unit, _export = AB_UNITS[ab_unit(measured_under)]
+    outcome = ("not kept, baseline not restored" if restore_failed
+               else "rolled back" if rolled_back else "kept")
+    return (
+        f"live A/B: {outcome} ({ab.speedup - 1.0:+.1%} {what}, via {ab.via}); "
+        f"baseline {ab.baseline_tps:.1f} → candidate {ab.candidate_tps:.1f} {unit}"
+    )
+
+
+def _record_graph_basis(
+    log: DegradationLog, *, pctx: Any, batch: Any, batch_source: str | None,
+    sched: Any, graph_default_why: str | None,
+) -> None:
+    """Record each default the predicted graph was built on.
+
+    The model is ``unreliable``: a default dense graph is another model, and
+    residuals against it describe nothing about this run. Hardware is
+    ``approximate``: the graph is still this model, priced under a stated default.
+
+    Having to default the *batch* is ``unreliable`` too, and used not to be.
+    ``approximate`` was the first reading, on the same grounds as hardware —
+    same model, stated default — but the measured gap on an MoE decode is ~30x
+    (5.1 ms/step predicted against ~157 ms observed, 74% of kernels matching no
+    graph op, 99.96% of residuals violating). A ceiling an order of magnitude
+    under the floor describes this run no better than the wrong model does: every
+    deviation computed against it is noise rather than a measurement with error
+    bars. So it belongs with the default dense graph, and it ``AFFECTS_CLAIMS``
+    as well as residuals, because the ranking reads the table it poisons.
+
+    A batch that was *observed* but bounded (see ``_batch_config_from_stats``)
+    stays ``approximate`` — that is a real measurement with a stated caveat.
+    """
+    if graph_default_why is not None:
+        log.record(GRAPH_MODEL, used="default dense graph (Llama-2-7B shape)",
+                   reason=graph_default_why, severity=UNRELIABLE,
+                   affects=(AFFECTS_RESIDUALS, AFFECTS_CLAIMS))
+    if getattr(pctx, "peak", None) is None:
+        sku = getattr(pctx, "sku", None)
+        log.record(GRAPH_HARDWARE, used="A100-SXM4-80GB peaks",
+                   reason=(f"GPU SKU {sku!r} has no entry in the peak table"
+                           f" (found via {getattr(pctx, 'sku_source', '') or 'unknown'})"
+                           if sku else
+                           f"no GPU SKU ({getattr(pctx, 'sku_source', '') or 'GITM_GPU_SKU unset and NVML gave no name'})"),
+                   severity=APPROXIMATE, affects=(AFFECTS_RESIDUALS,))
+    if batch is None:
+        n = getattr(sched, "n_samples", 0) if sched is not None else 0
+        log.record(GRAPH_BATCH, used="batch=1",
+                   reason=("no scheduler samples (no engine stats in the window)" if not n
+                           else "no running-sequence count and no in-flight count to "
+                                "fall back to (or no max_num_seqs to bound it)"),
+                   severity=UNRELIABLE, affects=(AFFECTS_RESIDUALS, AFFECTS_CLAIMS))
+    elif batch_source == "unfinished":
+        log.record(GRAPH_BATCH, used=f"batch={batch.batch} from in-flight requests",
+                   reason="the scheduler exposed no running count, so the batch is the "
+                          "mean in-flight request count clamped to max_num_seqs — an "
+                          "upper bound, exact only while nothing is queued",
+                   severity=APPROXIMATE, affects=(AFFECTS_RESIDUALS,))
+    log.record(GRAPH_BATCH, used="kv_cache_len=128 (BatchConfig default)",
+               reason="the sampled scheduler stats carry no context length",
+               severity=APPROXIMATE, affects=(AFFECTS_RESIDUALS,))
+
+
 RERANK_MODES = ("off", "recapture")
 """What a run may do with what it learns between candidates.
 
@@ -474,9 +737,77 @@ without the thing it asked for.
 """
 
 
+def _swap_engine(old: Any, build: Any) -> tuple[Any, str | None]:
+    """Shut ``old`` down and replace it with ``build(old)``, made the live engine.
+
+    ``(new_engine, None)``, or ``(None, reason)`` when the rebuild failed. Used to
+    move between a traced and an untraced build of the same configuration (K-1):
+    only an engine that is traced carries the collector, so an A/B is always
+    between two untraced engines.
+    """
+    LiveEngineApplicator._shutdown(old)
+    try:
+        new = build(old)
+    except Exception as exc:  # noqa: BLE001 - reported as the engine being lost
+        return None, f"{type(exc).__name__}: {exc}"
+    if new is None:
+        return None, "the rebuild produced no engine"
+    activate = getattr(new, "gitm_activate_fn", None)
+    if callable(activate):
+        activate(new)
+    return new, None
+
+
+def _motivation(sched_causes: Any, coll_causes: Any) -> dict[str, str]:
+    """Knob -> the observed cause that argues for it (S-3). Scheduler causes
+    first, the same precedence a claim's attribution uses, so the cause a lever
+    was ranked for is the cause its claim names."""
+    out: dict[str, str] = {}
+    for cause in (*sched_causes, *coll_causes):
+        for knob in cause.motivates_knobs:
+            out.setdefault(knob, cause.signal)
+    return out
+
+
+def _floors_hold(priced: Any, observed: Any, opening_config: Any = None,
+                 running_config: Any = None, tolerance: float = 0.10) -> str | None:
+    """Why the opening graph's floors no longer describe a re-trace, or ``None``.
+
+    The floors were priced for the opening engine at the batch its scheduler
+    saw. Two things can make them stop describing a re-trace, and each is
+    asked of what knows it rather than guessed from which lever was kept:
+
+    * **The engine.** The graph is priced from the model config, the GPU and
+      the batch only — never from engine settings such as tensor parallelism,
+      KV-cache dtype or quantization. Once a kept lever changes any of those,
+      the running engine is not the one the floors stand for, and re-pricing
+      would not help because pricing does not read them. The engine's own
+      ``gitm_llm_kwargs`` are compared, opening against running.
+    * **The batch.** Load moves it even with the settings unchanged. Both sides
+      come from :func:`_batch_config_from_stats`, the same derivation.
+
+    Gating or ordering on gaps measured against floors for another engine or
+    batch could reject a lever on a floor that was never its own.
+    """
+    if opening_config is not None and running_config is not None:
+        changed = sorted(k for k in set(opening_config) | set(running_config)
+                         if opening_config.get(k) != running_config.get(k))
+        if changed:
+            return (f"the engine changed since the floors were priced "
+                    f"({', '.join(changed)})")
+    if priced is None:
+        return "the floors were priced at the default batch, not an observed one"
+    if observed is None:
+        return "the re-trace's scheduler gave no batch to check the floors against"
+    p, o = priced.batch, observed.batch
+    if abs(o - p) > tolerance * p:
+        return f"the batch moved from {p} to {o}, and the floors were priced at {p}"
+    return None
+
+
 def _recapture(
-    path, *, workload: str, run_id: str, runner
-) -> tuple[Any, str | None]:
+    path, *, workload: str, run_id: str, runner, engine: Any = None
+) -> tuple[Any, str | None, dict[str, str], Any]:
     """Trace the workload again, as it stands after what has been applied.
 
     The deviation profile moves as candidates land: a region the last one fixed
@@ -490,7 +821,14 @@ def _recapture(
     the tracing overhead never lands on the numbers that decide keep or
     rollback.
 
-    Returns ``(trace, None)``, or ``(None, reason)`` when it could not be taken.
+    The scheduler is sampled over the same window, so the re-rank reads the
+    causes the workload shows now rather than the ones it showed at the start:
+    a kept lever can relieve the pressure that motivated the next one.
+
+    The batch it ran at comes from the same window, for :func:`_floors_hold`.
+
+    Returns ``(trace, None, motivated, batch)``, or ``(None, reason, {}, None)``
+    when it could not be taken.
     A run that has already paid for its trace and its A/Bs must not be lost to a
     failed re-measurement, so the caller keeps the order it had — but the reason
     is carried out rather than swallowed. The workload failing during the extra
@@ -498,20 +836,42 @@ def _recapture(
     the run afterwards, and recording both as "no trace" hides the first.
     """
     try:
-        with capture(path, workload_id=workload, run_id=run_id) as trace:
+        with (
+            capture(path, workload_id=workload, run_id=run_id) as trace,
+            sample_scheduler_stats(engine) as stats,
+        ):
             if runner is not None:
                 try:
                     runner()
                 except Exception as exc:
-                    return None, f"workload run failed: {exc}"
+                    return None, f"workload run failed: {exc}", {}, None
                 sync_device()
-        return trace, None
+        summary = stats.summary()
+        motivated = _motivation(scheduler_causes(summary),
+                                collective_causes(worst_device_comm(trace)))
+        return trace, None, motivated, _batch_config_from_stats(summary)[0]
     except Exception as exc:
-        return None, f"capture failed: {exc}"
+        return None, f"capture failed: {exc}", {}, None
 
 
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
-    """Execute the 24-hour loop and return ``{summary, report_md, ...}``."""
+    """Execute the 24-hour loop and return ``{summary, report_md, ...}``.
+
+    Every fallback the run takes is recorded in one
+    :class:`~gitm.optimizer.degradation.DegradationLog`: it travels on the
+    provenance (report, ``verification.json``), is written to
+    ``degradations.json`` on every path, and is summarised in the summary as
+    ``degraded`` / ``degradations``.
+    """
+    degradations = DegradationLog()
+    out = _run_loop(cfg, degradations)
+    degradations.write(out["run_dir"])
+    out["summary"]["degraded"] = bool(degradations.unreliable)
+    out["summary"]["degradations"] = degradations.summary()
+    return out
+
+
+def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     workload = cfg.workload or (getattr(cfg.engine, "workload_id", None) or "vllm-decode")
     if cfg.rerank not in RERANK_MODES:
         # Silently reading as "off" would let a scripted run spend its whole
@@ -529,6 +889,34 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     run_dir = runs_dir(cfg.scratch) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     trace_path = traces_dir(cfg.scratch) / f"{run_id}.jsonl"
+
+    # Verify that every visible GPU can participate in NCCL (NVIDIA) or RCCL
+    # (AMD) before building the workload.
+    from gitm.health import run_collective_health
+
+    health = run_collective_health()
+    (run_dir / "collective_health.json").write_text(
+        json.dumps(health.to_dict(), indent=2)
+    )
+    if not health.ok:
+        diagnostic = (
+            "GPU collective health check failed before the Runtime loop: "
+            + health.detail
+        )
+        return _no_data_result(
+            run_dir=run_dir,
+            run_id=run_id,
+            workload=workload,
+            qual=QualificationResult(
+                commit=False,
+                floor=0.0,
+                fingerprint="none:collective_health",
+                diagnostic=diagnostic,
+            ),
+            started_ns=started_ns,
+            trace_path=trace_path,
+            diagnostic=diagnostic,
+        )
 
     # Phase 1 — capture, fingerprint, predict graph
     # Resolve a workload runner: an explicit one wins, else the registry. The
@@ -579,16 +967,28 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # over the same window as the CUPTI capture — engine-level telemetry the GPU
     # trace can't see. A no-op when no engine is attached (empty series).
     run_out: Any = None
+    runner_s: float | None = None
     with (
         capture(trace_path, workload_id=workload, run_id=run_id) as trace,
         sample_scheduler_stats(cfg.engine) as sched_stats,
     ):
         if runner is not None:
+            _t_run = time.perf_counter()
             try:
                 run_out = runner()
                 sync_device()  # ensure all kernels land in the trace before stop
             except Exception as exc:
                 runner_error = f"workload run failed: {exc}"
+            runner_s = time.perf_counter() - _t_run
+    if runner_error is not None:
+        # Carried on every path, not only the no-data one: a runner that failed
+        # part-way still leaves kernels, and residuals, deviations and an A/B
+        # re-running the same runner all describe that fragment, not the workload.
+        degradations.record(
+            WORKLOAD_RUNNER,
+            used="a partial workload run" if runner is not None else "no workload run",
+            reason=runner_error, severity=UNRELIABLE,
+            affects=(AFFECTS_RESIDUALS, AFFECTS_AB, AFFECTS_CLAIMS))
 
     # Persist the scheduler series + summary when an engine actually produced one.
     # Turn the summary into ranked causal hypotheses (feeds attribution / claim
@@ -629,14 +1029,88 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         )
     )
 
+    # Parsed here, above the curated-intervention branches below, because each of
+    # those *returns*. Parsing it at the catalogue instead left hft, openfold and
+    # edge applying the very lever the operator excluded, which is worse than the
+    # flag not existing: it was asked for and silently ignored.
+    _skips = parse_skips([*cfg.skip_levers, os.environ.get("GITM_SKIP_LEVERS") or ""])
+    _excluded: list[dict[str, str]] = []
+
+    def _record_skip(spec: Any, source: str) -> str | None:
+        """Note the exclusion of ``spec`` and return the pattern, or ``None``.
+
+        Deduplicated on lever and source: autoresearch proposes the same knob
+        repeatedly, and a count that grew with each proposal would describe the
+        proposer rather than what the run held back.
+        """
+        if not _skips:
+            return None
+        why = skipped_by(spec, _skips)
+        if why is None:
+            return None
+        entry = {"lever": spec.name, "knob": spec.knob, "pattern": why, "source": source}
+        if entry not in _excluded:
+            _excluded.append(entry)
+        return why
+
+    def _write_skips() -> None:
+        """Written whether or not anything was excluded, so an empty list is the
+        evidence that nothing was held back quietly."""
+        (run_dir / "skipped_levers.json").write_text(
+            json.dumps({"patterns": list(_skips), "excluded": _excluded}, indent=2))
+
+    def _with_skips(result: dict[str, Any]) -> dict[str, Any]:
+        """Put the exclusion count in a curated path's summary too.
+
+        The curated results are built by their own functions and returned
+        straight out, so without this an operator comparing two run summaries
+        sees the count on a catalogue run and nothing on an hft one — and has to
+        open the run directory to find out whether anything was held back.
+        """
+        summary = result.get("summary")
+        if isinstance(summary, dict):
+            summary["n_skipped_levers"] = len(_excluded)
+        return result
+
+    def _curated_skipped(spec_fn: Any, source: str) -> bool:
+        """Whether the one curated lever on this workload was excluded.
+
+        Read through a factory because each lives behind a lazy import in its own
+        result function, and importing all three eagerly would pull three
+        benchmark stacks into every run.
+        """
+        if not _skips:
+            return False
+        try:
+            spec = spec_fn()
+        except Exception:  # noqa: BLE001 - an unimportable benchmark is not a skip
+            return False
+        if _record_skip(spec, source) is None:
+            return False
+        _write_skips()
+        return True
+
+    # Written before the curated branches, each of which returns: the file is
+    # promised whether or not anything was excluded, and an empty list is the
+    # evidence that nothing was held back. Rewritten later as exclusions are
+    # recorded.
+    _write_skips()
+
     # HFT carries a real, output-verified intervention on its runner. Apply+prove
     # it through the rollback gate — the A/B runs on the active backend, so the
     # delta is measured even on a box without CUPTI. (Runs before the empty-trace
     # guard for that reason; attribution below is included only if kernels exist.)
     if workload in _HFT_INTERVENTION_WORKLOADS:
         applicator = getattr(runner, "applicator", None)
-        if applicator is not None:
-            return _hft_intervention_result(
+
+        def _hft_spec():
+            from gitm.benchmarks.hft.optimize import hft_intervention_spec
+
+            return hft_intervention_spec()
+
+        if applicator is not None and not _curated_skipped(_hft_spec, "hft"):
+            return _with_skips(_hft_intervention_result(
+                degradations=degradations,
                 run_dir=run_dir,
                 run_id=run_id,
                 workload=workload,
@@ -645,7 +1119,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 applicator=applicator,
                 started_ns=started_ns,
                 trace_path=trace_path,
-            )
+            ))
 
     # OpenFold/AF2 carries the bf16 intervention on its runner. Same pattern as
     # HFT: apply+prove through the rollback gate (measure() runs the fp32-vs-bf16
@@ -653,8 +1127,15 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # still runs on a box without CUPTI; attribution is included if kernels exist.
     if workload in _OPENFOLD_INTERVENTION_WORKLOADS:
         applicator = getattr(runner, "applicator", None)
-        if applicator is not None:
-            return _openfold_intervention_result(
+
+        def _openfold_spec():
+            from benchmarks.biotech.optimize import openfold_intervention_spec
+
+            return openfold_intervention_spec()
+
+        if applicator is not None and not _curated_skipped(_openfold_spec, "openfold"):
+            return _with_skips(_openfold_intervention_result(
+                degradations=degradations,
                 run_dir=run_dir,
                 run_id=run_id,
                 workload=workload,
@@ -663,7 +1144,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 applicator=applicator,
                 started_ns=started_ns,
                 trace_path=trace_path,
-            )
+            ))
 
     # Edge (kitti/nuscenes) carries the fp16 intervention on its runner. Same
     # pattern as HFT/AF2: apply+prove through the rollback gate (measure() runs
@@ -671,8 +1152,19 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # trace guard so the A/B still runs on a box without CUPTI.
     if workload in _EDGE_INTERVENTION_WORKLOADS:
         applicator = getattr(runner, "applicator", None)
-        if applicator is not None:
-            return _edge_intervention_result(
+
+        def _edge_spec():
+            from gitm.benchmarks.edge.optimize import edge_intervention_spec
+
+            # The same resolution _edge_intervention_result makes. Checking the
+            # module default instead meant the guard and the run disagreed about
+            # which lever this is: excluding the applicator's own lever did not
+            # stop it, and excluding the default one stopped a lever nobody named.
+            return getattr(applicator, "spec", None) or edge_intervention_spec()
+
+        if applicator is not None and not _curated_skipped(_edge_spec, "edge"):
+            return _with_skips(_edge_intervention_result(
+                degradations=degradations,
                 run_dir=run_dir,
                 run_id=run_id,
                 workload=workload,
@@ -681,17 +1173,25 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 applicator=applicator,
                 started_ns=started_ns,
                 trace_path=trace_path,
-            )
+            ))
 
     # Guard: if the tracer captured nothing (no GPU/shim, or the workload never
     # ran), do NOT proceed to attribution + emit claims — that fabricates a
     # result from an empty trace. Report no-data honestly instead.
     if trace.vendor == "none" or not trace.kernels():
-        diagnostic = runner_error or qual.diagnostic or (
+        why_empty = _why_no_kernels(runner_s, getattr(trace, "source", "none"))
+        diagnostic = runner_error or why_empty or qual.diagnostic or (
             "Tracer captured no GPU kernels. Either no GPU/CUPTI shim is present, "
             "or the workload did not run under the runtime."
         )
+        # Never "clean": a run that measured nothing must not read as one that
+        # measured everything without a fallback (L-4).
+        degradations.record(
+            TRACE_EMPTY, used="no trace: nothing was measured",
+            reason=diagnostic, severity=UNRELIABLE,
+            affects=(AFFECTS_RESIDUALS, AFFECTS_RANKING, AFFECTS_CLAIMS))
         return _no_data_result(
+            degradations=degradations,
             run_dir=run_dir,
             run_id=run_id,
             workload=workload,
@@ -707,6 +1207,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # honest measurement report computed from the actual captured kernels.
     if workload not in _LIBRARY_WORKLOADS:
         return _measurement_result(
+            degradations=degradations,
             run_dir=run_dir,
             run_id=run_id,
             workload=workload,
@@ -736,8 +1237,13 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # larger, so predicting a batch-16 step at the batch-1 default understates
     # expert traffic ~12x. Read the real concurrency off the sampled scheduler
     # rather than defaulting.
-    _batch = _batch_config_from_stats(sched_summary)
-    graph, family = _execution_graph_family(cfg.engine, _hw, _batch)
+    _batch, _batch_source = _batch_config_from_stats(sched_summary)
+    graph, family, graph_default_why = _execution_graph_basis(cfg.engine, _hw, _batch)
+    # The engine the floors are priced for, as it describes itself. A re-rank
+    # compares the running engine with this (see _floors_hold).
+    _priced_config = dict(getattr(cfg.engine, "gitm_llm_kwargs", None) or {})
+    _record_graph_basis(degradations, pctx=pctx, batch=_batch, batch_source=_batch_source,
+                        sched=sched_summary, graph_default_why=graph_default_why)
     is_moe = family != "dense"
     _graph_summary: dict[str, Any] = {
         "graph": "moe" if is_moe else "dense",
@@ -757,6 +1263,29 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 ("weight", "weight_dtype"), ("expert", "expert_dtype"), ("kv", "kv_dtype"))},
             has_unpriced_collectives=graph.has_unpriced_collectives,
         )
+    # What the graph was built from, beside what it is: a residual is only as
+    # good as the model, hardware and batch it was predicted for.
+    #
+    # The batch is stated outright rather than left to be read out of ``basis``.
+    # ``basis`` is built from degradations, and a batch read straight off the
+    # engine's running count is not a degradation — so on the one path where the
+    # batch is fully trustworthy the artifact said nothing about it at all, and a
+    # reader could not tell which batch priced the graph or where it came from.
+    # That is the path whose number you most want recorded when comparing two
+    # runs.
+    # Read off the graph rather than rebuilt from ``_batch``: every predict_*
+    # entry point does ``batch = batch or BatchConfig()`` and stores the result,
+    # so the graph holds the config it was actually priced with, defaults
+    # included. Reconstructing it here would be a second copy of that fallback,
+    # free to drift from the one that did the work.
+    _eff_batch = getattr(graph, "batch", None)
+    _graph_summary["batch"] = {
+        "batch": getattr(_eff_batch, "batch", None),
+        "kv_cache_len": getattr(_eff_batch, "kv_cache_len", None),
+        "source": _batch_source or "default",
+    }
+    _graph_summary["basis"] = [d.to_dict() for d in degradations
+                               if d.stage in (GRAPH_MODEL, GRAPH_HARDWARE, GRAPH_BATCH)]
     (run_dir / "predicted_graph.json").write_text(json.dumps(_graph_summary, indent=2))
 
     # Phase 2 — residuals + attribution
@@ -831,11 +1360,17 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # pctx was built earlier (Phase 1) so its hardware peak could feed predict_graph.
     # Relative/swept levers resolve against the live engine here, once, before
     # ranking. See expand_relative_candidates.
+    # Levers the operator excluded, applied before anything resolves them against
+    # the engine, and outside load_library so the exclusion covers this run only
+    # and the catalogue on disk stays the catalogue.
+    _catalogue = [s for s in load_library(workload=workload)
+                  if _record_skip(s, "catalogue") is None]
     library = [
         resolved
-        for s in load_library(workload=workload)
+        for s in _catalogue
         for resolved in expand_relative_candidates(s, cfg.engine)
     ]
+    _write_skips()
     policy = Policy(require_qualification_commit=qual.commit, skip_high_risk=not qual.commit,
                     use_history=use_history)
     # Read once per run, filtered to this box. A lever measured on another GPU is
@@ -848,13 +1383,43 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             "runs_read": prior_runs.runs_read,
             "filtered": prior_runs.filtered,
             "skipped": prior_runs.skipped,
+            "excluded": prior_runs.excluded,
             "levers": len(prior_runs.records),
             "gpu_sku": pctx.sku,
             "fingerprint": qual.fingerprint,
         }, indent=2))
+    # Where time is actually recoverable, per op, from the residuals already
+    # computed above. This is the first thing in selection that depends on the
+    # trace rather than on the catalogue: a lever whose gain comes from speeding
+    # up a region measured at its predicted floor is not a candidate, however
+    # well it scores.
+    #
+    # A floor is only usable here if it was priced for this run, which takes two
+    # things and not one:
+    #
+    # * the graph must be this model's. Against a default dense graph the floors
+    #   describe another model entirely.
+    # * the hardware peaks must have resolved. This one is the trap: the A100
+    #   fallback on a *faster* device predicts floors slower than the device
+    #   actually achieves, so observed comes in under predicted, every gap reads
+    #   zero, and the gate rejects the whole op-scoped catalogue on what looks
+    #   like a clean measurement. The hardware fallback is already recorded as
+    #   affecting residuals, and this gate consumes residuals.
+    #
+    # A defaulted *batch* is not in that list because it fails the other way: at
+    # batch 1 the floors are far too low, so everything reads as over its floor
+    # and nothing is filtered. Useless, but not wrong. Same for the kv_cache_len
+    # default, which understates the attention floor and so keeps attention
+    # levers rather than dropping them.
+    _floors_priced_for_this_run = (graph_default_why is None
+                                   and getattr(pctx, "peak", None) is not None)
+    _recoverable = recoverable_by_op(res) if _floors_priced_for_this_run else None
+    # Knob -> the cause observed in this run that argues for it (S-3).
+    _motivated = _motivation(sched_causes, coll_causes)
     ranked = select_interventions(trace, library, policy, top_n=cfg.top_n_interventions,
                                   ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
-                                  fingerprint=qual.fingerprint)
+                                  fingerprint=qual.fingerprint, recoverable=_recoverable,
+                                  motivated=_motivated)
     (run_dir / "ranked_candidates.json").write_text(
         json.dumps(
             [
@@ -862,12 +1427,45 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                     "name": c.spec.name,
                     "predicted_delta": c.predicted_delta,
                     "rejected_reason": c.rejected_reason,
+                    "motivated_by": c.motivated_by,
+                    "targets": [{"op": op, "recoverable_s": gap} for op, gap in c.targets],
                 }
                 for c in ranked
             ],
             indent=2,
         )
     )
+    # The gate's own input, saved beside what it decided. A lever dropped for
+    # "no_recoverable_time" is a claim about the trace, and the claim is only
+    # checkable if the measured gaps are written down next to it.
+    (run_dir / "recoverable_ops.json").write_text(
+        json.dumps(
+            {
+                "basis": ("per-kernel residuals against this model's graph"
+                          if _recoverable is not None else None),
+                "not_gated_because": (
+                    None if _recoverable is not None
+                    else "the predicted graph is a default, so its per-op floors "
+                         "describe another model" if graph_default_why is not None
+                    else "no GPU peaks resolved, so the floors were priced on the "
+                         "A100 fallback and a faster device reads as at its floor"),
+                "recoverable_s": _recoverable,
+            },
+            indent=2,
+        )
+    )
+    # Where the time is, and what the catalogue aims at it — from the same map the
+    # ranking gated and ordered on. The ops nothing names are the finding a run
+    # cannot otherwise report: time with no lever aimed at it.
+    _device_s = sum(max(0, k.end_ns - k.start_ns) for k in trace.kernels()) / 1e9
+    (run_dir / "targets.json").write_text(json.dumps(
+        targets_from_recoverable(_recoverable, library, device_s=_device_s)
+        if _recoverable is not None else
+        {"basis": None,
+         "not_targeted_because": "the floors were not priced for this run, so "
+                                 "candidates keep the catalogue's order",
+         "regions": [], "uncovered": []},
+        indent=2))
 
     # Phase 4 — apply with rollback gates.
     # With a live engine attached, each candidate runs the rollback-gated decode-
@@ -878,19 +1476,96 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # construction time. With no engine it is predict-only (DryRunApplicator):
     # candidates land in the report as unverified (measured_delta=None), never
     # claimed as won.
+    # The opening engine carried the tracer for the capture. Every A/B is between
+    # two engines built without it (K-1), so swap in an untraced baseline before
+    # the first one; otherwise the first A/B would compare a traced baseline with
+    # an untraced candidate and credit the candidate with the tracer's overhead.
+    # One extra engine build, once.
+    tracing_swaps: list[dict[str, Any]] = []
+    early_engine_lost: str | None = None
+    if cfg.engine is not None and getattr(cfg.engine, "gitm_traced", False):
+        untraced = getattr(cfg.engine, "gitm_untraced_rebuild_fn", None)
+        if callable(untraced):
+            new_engine, err = _swap_engine(cfg.engine, untraced)
+            tracing_swaps.append({"when": "before the first A/B", "to": "untraced",
+                                  "error": err})
+            if new_engine is None:
+                early_engine_lost = f"could not rebuild the baseline without the tracer: {err}"
+                degradations.record(
+                    ENGINE_LOST, used="no live A/B (predict-only)",
+                    reason=early_engine_lost, severity=APPROXIMATE,
+                    affects=(AFFECTS_CLAIMS,))
+                cfg.engine = None
+            else:
+                cfg.engine = new_engine
+
     live_restart_fn = getattr(cfg.engine, "gitm_restart_fn", None) if cfg.engine else None
+    _validation = max(1, int(cfg.validation if cfg.validation is not None
+                             else os.environ.get("GITM_VALIDATION", "2")))
+    _min_effect = float(os.environ.get("GITM_MIN_EFFECT", "0.01"))
+    noise_calibration: list[float] = []
+    calibration_lost: str | None = None
     if cfg.engine is not None:
+        # Serial wherever a baseline rebuild is available, rather than parallel
+        # by default. Parallel holds the baseline and the candidate at once, and
+        # at any realistic gpu_memory_utilization the second one cannot fit: it
+        # is what cost the MI355X run 27 of its 29 candidates.
+        _restart_mode, _restart_why = resolve_restart_mode(
+            cfg.engine, os.environ.get("GITM_RESTART_MODE"))
         applicator: Applicator = LiveEngineApplicator(
             cfg.engine,
-            throughput_fn=_engine_throughput_fn(cfg.engine, runner),
+            throughput_fn=_engine_throughput_fn(cfg.engine, runner, degradations),
             restart_fn=live_restart_fn,
             baseline_restart_fn=getattr(cfg.engine, "gitm_baseline_restart_fn", None),
-            restart_mode=os.environ.get("GITM_RESTART_MODE", "parallel"),
+            restart_mode=_restart_mode,
             reps=int(os.environ.get("GITM_AB_REPS", "1")),
             # Compatibility escape hatch for custom scheduling-classified knobs
             # that should still be measured through engine rebuild.
             force_restart=os.environ.get("GITM_KNOBS_VIA_RESTART") == "1",
+            # Keep a candidate only on a gain above the run's own noise floor,
+            # and above the smallest gain worth a change. Before a floor
+            # exists, a conservative stand-in.
+            noise_gate=True,
+            validation=_validation,
+            min_effect=_min_effect,
+            threshold_without_floor=_THRESHOLD_WITHOUT_FLOOR,
         )
+        (run_dir / "restart_mode.json").write_text(json.dumps({
+            "mode": _restart_mode,
+            "why": _restart_why,
+            "cannot_fit": applicator.restart_mode_warning,
+        }, indent=2))
+        # The run's own noise floor, before the first candidate is judged: the
+        # baseline measured against itself, rebuilt each time. Serial restart
+        # only (it needs a baseline rebuild), within the budget, and only with
+        # an engine-owned throughput probe: the fallback probe re-runs the
+        # opening runner and can measure only the original engine, so it cannot
+        # measure a rebuilt one. Otherwise the floor comes from later
+        # re-measurements and the stand-in threshold covers the start.
+        try:
+            if callable(getattr(cfg.engine, "gitm_throughput_fn", None)):
+                noise_calibration = applicator.calibrate(
+                    _validation, deadline_ns=started_ns + int(budget_s * 1e9))
+        except RestoreFailed as exc:
+            calibration_lost = f"could not rebuild the baseline while measuring noise: {exc}"
+            degradations.record(
+                ENGINE_LOST, used="no live A/B", reason=calibration_lost,
+                severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
+        if applicator.restart_mode_warning:
+            # Warned, not recorded as a degradation. A run-wide AFFECTS_AB entry
+            # would mark every candidate unreliable, including the hot-swapped
+            # ones that never reach a rebuild — excluding their perfectly good
+            # measurements from history and from the report's verified count.
+            # The condition only harms candidates that need a restart, and those
+            # already carry their own error when the rebuild is refused.
+            #
+            # Said once, at the start, because the alternative is learning it
+            # from an OOM traceback per candidate: how the last run spent 93% of
+            # its budget.
+            warnings.warn(
+                "gitm: most structural candidates will be refused in this run — "
+                + applicator.restart_mode_warning,
+                RuntimeWarning, stacklevel=2)
     else:
         applicator = DryRunApplicator()
 
@@ -914,6 +1589,33 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # it happens. EngineABResult lives on applicator.last_result and is
     # overwritten by the next candidate, so it has to be taken per-iteration.
     verification: list[VerificationRecord] = []
+    # Autoresearch's records as each lands, until the pass returns and they are
+    # folded into ``verification`` with the rest.
+    ar_live: list[VerificationRecord] = []
+
+    def _flush_verification() -> None:
+        """Write what has been measured so far (K-3).
+
+        The export used to be written once, at the end. A run that hung or was
+        killed lost every A/B it had already measured: the first Kimi run on
+        MI355X measured graph replay at about +15% and has no record of it. The
+        final write at the end of the run replaces this one with the full set,
+        so a run that finishes is unchanged.
+        """
+        records = verification + ar_live
+        if not records:
+            return
+        try:
+            write_verification(
+                records,
+                build_provenance(
+                    degradations=degradations, workload_id=workload,
+                    fingerprint=qual.fingerprint, run_id=run_id,
+                    started_at_ns=started_ns, trace_path=str(trace_path)),
+                run_dir / "verification.json", gpu_sku=pctx.sku)
+        except Exception as exc:  # noqa: BLE001 - a failed checkpoint must not end the run
+            warnings.warn(f"gitm: could not checkpoint verification.json: {exc}",
+                          RuntimeWarning, stacklevel=2)
     # Aggregate kernel-time residual for the report (was hardcoded 0.0). Same for
     # every claim in a run — it describes the run's gap vs the predicted graph.
     kt_residual = _agg_kt_residual(res)
@@ -925,7 +1627,43 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # applied or rejected, cannot return.
     queue = list(ranked)
     reranks: list[dict[str, Any]] = []
+    # Set when a candidate's rollback failed. From then on there is no baseline
+    # to measure against, so the run stops trying candidates and goes straight
+    # to writing up what it has.
+    engine_lost: str | None = early_engine_lost or calibration_lost
+    n_untried = 0
+    if engine_lost is not None and isinstance(applicator, LiveEngineApplicator):
+        # The engine was lost before the first candidate (a failed noise
+        # calibration): there is nothing to measure them against.
+        n_untried = sum(1 for x in queue if x.rejected_reason is None)
+        rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
+                        for x in queue if x.rejected_reason is not None)
+        queue = []
+
+    def _stop_at_budget() -> int:
+        """The queue left behind when the budget stops Phase 4, accounted for.
+
+        Without this the loop just broke out: the summary said nothing was left
+        untried while candidates were still queued (the first Kimi run that
+        finished stopped at its 2 h budget after two A/Bs and reported 0), and
+        candidates the gate had already rejected vanished from the report.
+        """
+        rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
+                        for x in queue if x.rejected_reason is not None)
+        left = sum(1 for x in queue if x.rejected_reason is None)
+        if left:
+            degradations.record(
+                BUDGET_SPENT, used="a Phase 4 that stopped at the budget",
+                reason=f"budget {cfg.budget} spent; {left} ranked candidate(s) not tried",
+                severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
+        return left
+
     while queue:
+        if time.time_ns() - started_ns >= int(budget_s * 1e9):
+            # The budget can run out before a candidate starts (the noise
+            # calibration spends it too): do not start an A/B it cannot afford.
+            n_untried = _stop_at_budget()
+            break
         c = queue.pop(0)
         if c.rejected_reason is not None:
             rejected.append(f"{c.spec.name} ({c.rejected_reason})")
@@ -941,33 +1679,42 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         # kwargs in place and a restart replaces the engine outright, so reading
         # them afterwards would report the candidate on both sides of the diff.
         baseline_cfg = dict(getattr(getattr(applicator, "engine", cfg.engine), "gitm_llm_kwargs", None) or {})
-        result = apply_intervention(c.spec, applicator, min_keep_delta=0.0)
+        with degradations.scope(c.spec.name):
+            result = apply_intervention(c.spec, applicator, min_keep_delta=0.0)
+        measured_under = degradations.measured_under(c.spec.name)
         ab = (
             getattr(applicator, "last_result", None)
             if result.measured_delta is not None
             else None
         )
-        if result.rolled_back:
+        # A candidate that failed before anything was measured (it did not build,
+        # or its apply raised) never ran. It is a rejection with its reason, not
+        # a claim with a measured delta of "—" and not a rollback (L-9). The
+        # report's own rule is "incomplete chain = no claim".
+        did_not_run = result.measured_delta is None and result.error is not None
+        if did_not_run:
+            rejected.append(f"{c.spec.name} (did not run: {result.error})")
+        elif result.rolled_back:
             rolled_back.append(c.spec.name)
         if ab is not None:
-            candidate_cfg = {**baseline_cfg, **(c.spec.knobs or {c.spec.knob: c.spec.value})}
+            # As the restart built it: a nested knob sits inside its argument.
+            candidate_cfg = {**baseline_cfg, **engine_kwargs(c.spec.knob_values, baseline_cfg)}
             verification.append(
                 build_record(
                     c.spec, ab, result,
                     baseline_config=baseline_cfg,
                     candidate_config=candidate_cfg,
+                    degradations=measured_under,
                 )
             )
+            _flush_verification()
         # Causal evidence: the measured A/B verdict when live, else the Granger
         # signal that motivated the candidate. The kept/rolled-back wording comes
         # from the authoritative ApplyResult (the real gate decision), not from
         # EngineABResult.kept (a measure-time delta>=0 indicator).
         if ab is not None:
-            outcome = "rolled back" if result.rolled_back else "kept"
-            causal_evidence = (
-                f"live A/B: {outcome} ({ab.speedup - 1.0:+.1%} decode throughput, via {ab.via}); "
-                f"baseline {ab.baseline_tps:.1f} → candidate {ab.candidate_tps:.1f} tok/s"
-            )
+            causal_evidence = _ab_evidence(ab, result.rolled_back, measured_under,
+                                           restore_failed=result.restore_failed)
         else:
             causal_evidence = ", ".join(
                 f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
@@ -978,37 +1725,115 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         if motivating is not None:
             channel, cause = motivating
             causal_evidence += f"; {channel}[{cause.signal}]: {cause.note}"
-        claims.append(
-            Claim(
-                summary=c.spec.summary,
-                residual_invariant="kernel_time",
-                residual_value=kt_residual,
-                causal_evidence=causal_evidence,
-                intervention_name=c.spec.name,
-                predicted_delta=c.predicted_delta,
-                # Display the TRUE measured delta (speedup-1); the gate uses the noise-adjusted
-                # return, so a within-noise gain reads as rolled back
-                # with its real (small) number, not a distorted one.
-                measured_delta=((ab.speedup - 1.0) if ab is not None else result.measured_delta),
-                rolled_back=result.rolled_back,
+        if not did_not_run:
+            claims.append(
+                Claim(
+                    summary=c.spec.summary,
+                    residual_invariant="kernel_time",
+                    residual_value=kt_residual,
+                    causal_evidence=causal_evidence,
+                    intervention_name=c.spec.name,
+                    predicted_delta=c.predicted_delta,
+                    # Display the TRUE measured delta (speedup-1); the gate uses the noise-adjusted
+                    # return, so a within-noise gain reads as rolled back
+                    # with its real (small) number, not a distorted one.
+                    measured_delta=((ab.speedup - 1.0) if ab is not None else result.measured_delta),
+                    rolled_back=result.rolled_back,
+                    restore_failed=result.restore_failed,
+                    unreliable_ab=unreliable_ab(measured_under) if ab is not None else [],
+                )
             )
-        )
+        if result.restore_failed:
+            engine_lost = result.error or f"restore failed after {c.spec.name}"
+            n_untried = sum(1 for x in queue if x.rejected_reason is None)
+            # What the gate rejected is a verdict that needed no engine, so it is
+            # still recorded. Breaking here without it left those candidates in
+            # neither the rejected list nor the untried count.
+            rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
+                            for x in queue if x.rejected_reason is not None)
+            # Approximate, not unreliable. The A/Bs measured before this one
+            # were taken against a sound baseline, and an unreliable mark here
+            # would exclude them from history along with everything else.
+            degradations.record(
+                ENGINE_LOST, used=f"a run that stopped after {c.spec.name}",
+                reason=f"{engine_lost}; {n_untried} ranked candidate(s) not tried",
+                severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
+            break
         if time.time_ns() - started_ns >= int(budget_s * 1e9):
+            n_untried = _stop_at_budget()
             break
 
         if cfg.rerank == "recapture" and queue:
             # After the gate has decided, so the tracing overhead never lands on
             # the A/B that decides keep or rollback.
             step = len(reranks) + 1
-            fresh, why = _recapture(
-                traces_dir(cfg.scratch) / f"{run_id}-rerank{step}.jsonl",
-                workload=workload, run_id=run_id, runner=runner)
+            rerank_path = traces_dir(cfg.scratch) / f"{run_id}-rerank{step}.jsonl"
+            # A/B engines carry no tracer (K-1), so a re-trace first swaps in a
+            # traced, eager build of the current configuration, then swaps back.
+            eng_now = getattr(applicator, "engine", None)
+            traced_fn = getattr(eng_now, "gitm_traced_rebuild_fn", None)
+            swap_err: str | None = None
+            if (eng_now is not None and injection.active_vendor() is not None
+                    and not getattr(eng_now, "gitm_traced", False) and callable(traced_fn)):
+                traced_engine, swap_err = _swap_engine(eng_now, traced_fn)
+                tracing_swaps.append({"when": f"re-trace {step}", "to": "traced",
+                                      "error": swap_err})
+                fresh, why, motivated_now, batch_now = None, swap_err, {}, None
+                if traced_engine is not None:
+                    applicator.engine = traced_engine
+                    fresh, why, motivated_now, batch_now = _recapture(
+                        rerank_path, workload=workload, run_id=run_id, runner=runner,
+                        engine=traced_engine)
+                    back, swap_err = _swap_engine(
+                        traced_engine, traced_engine.gitm_untraced_rebuild_fn)
+                    tracing_swaps.append({"when": f"after re-trace {step}",
+                                          "to": "untraced", "error": swap_err})
+                    if back is not None:
+                        applicator.engine = back
+                if swap_err is not None:
+                    engine_lost = f"could not swap engines for re-trace {step}: {swap_err}"
+                    n_untried = sum(1 for x in queue if x.rejected_reason is None)
+                    rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
+                                    for x in queue if x.rejected_reason is not None)
+                    degradations.record(
+                        ENGINE_LOST, used=f"a run that stopped at re-trace {step}",
+                        reason=f"{engine_lost}; {n_untried} ranked candidate(s) not tried",
+                        severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
+                    break
+            else:
+                fresh, why, motivated_now, batch_now = _recapture(
+                    rerank_path, workload=workload, run_id=run_id, runner=runner,
+                    engine=eng_now)
             was = [x.spec.name for x in queue]
+            fresh_recoverable: dict[str, float | None] | None = None
+            not_targeted: str | None = None
             if fresh is not None and fresh.kernels():
+                # Gated and ordered on the fresh trace's gaps, measured against
+                # ``graph`` — which was priced at the batch the run opened at.
+                # Only while the re-trace still runs at that batch: a kept lever
+                # can move it, and then an op could read as at (or over) a floor
+                # that no longer describes the running workload. Re-pricing needs
+                # a new graph, which this path does not build, so it neither gates
+                # nor orders on time above floor then, and says why. Coverage and
+                # causes are recomputed per trace either way.
+                if not _floors_priced_for_this_run:
+                    not_targeted = "the floors were not priced for this run"
+                elif (moved := _floors_hold(
+                        _batch, batch_now, _priced_config,
+                        dict(getattr(getattr(applicator, "engine", None),
+                                     "gitm_llm_kwargs", None) or {}))) is not None:
+                    not_targeted = moved
+                else:
+                    try:
+                        fresh_recoverable = recoverable_by_op(residuals(fresh, graph))
+                    except Exception as exc:
+                        not_targeted = f"residuals on the re-trace failed: {exc}"
+                _motivated = motivated_now
                 queue = select_interventions(
                     fresh, [x.spec for x in queue], policy, top_n=len(queue),
                     ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
-                    fingerprint=qual.fingerprint)
+                    fingerprint=qual.fingerprint, recoverable=fresh_recoverable,
+                    motivated=_motivated)
             now = [x.spec.name for x in queue]
             reranks.append({
                 "after": c.spec.name,
@@ -1018,13 +1843,28 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 "order_before": was,
                 "order_after": now,
                 "changed": was != now,
+                "causes": sorted(set(_motivated.values())),
+                "targeted": fresh_recoverable is not None,
+                "batch_priced": getattr(_batch, "batch", None),
+                "batch_observed": getattr(batch_now, "batch", None),
+                "not_targeted_because": not_targeted,
             })
             # The re-capture runs the workload, so it spends budget. Checked
             # again here because the check above ran before that spend: a
             # candidate cycle started on its strength could overrun by a whole
             # A/B on top of the trace.
             if time.time_ns() - started_ns >= int(budget_s * 1e9):
+                n_untried = _stop_at_budget()
                 break
+
+    if tracing_swaps:
+        # Which engines carried the tracer, and every swap between them. A reader
+        # comparing A/B numbers needs to know none of them was traced.
+        (run_dir / "tracing.json").write_text(json.dumps({
+            "traced": "the opening capture and each re-trace (eager)",
+            "ab_engines": "untraced",
+            "swaps": tracing_swaps,
+        }, indent=2))
 
     if reranks:
         # What the run re-decided, and on what. Without it a report says which
@@ -1034,10 +1874,17 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         }, indent=2))
 
     # Phase 4b - agentic autoresearch through the catalog gate/rollback path.
-    if time.time_ns() - started_ns < int(budget_s * 1e9):
+    if engine_lost is None and time.time_ns() - started_ns < int(budget_s * 1e9):
         proposer = FallbackProposer(EngineArgsProposer(), TableProposer())
 
         def _unenactable(spec: Any) -> str | None:
+            # The exclusion has to reach here too. Autoresearch proposes its own
+            # candidates rather than drawing from the catalogue, so a knob the
+            # operator excluded because it hangs the model would otherwise come
+            # straight back as a proposal.
+            why = _record_skip(spec, "autoresearch")
+            if why is not None:
+                return f"excluded by --skip-lever {why!r}"
             if (
                 cfg.engine is not None
                 and live_restart_fn is None
@@ -1062,6 +1909,21 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 return reason
             return None
 
+        def _checkpoint_ar(r: Any) -> None:
+            if r.ab_result is not None and r.apply_result is not None:
+                ar_live.append(build_record(
+                    r.spec, r.ab_result, r.apply_result,
+                    baseline_config=r.baseline_config or {},
+                    candidate_config=r.candidate_config or {},
+                    degradations=r.degradations))
+                _flush_verification()
+
+        # Autoresearch proposes guesses, many of them: a single A/B that clears
+        # the threshold by chance is likelier among twenty proposals than among
+        # five catalogue levers, so its candidates always get a second round.
+        _catalogue_validation = getattr(applicator, "validation", None)
+        if _catalogue_validation is not None:
+            applicator.validation = max(_catalogue_validation, 2)
         ar_run = autoresearch(
             trace,
             applicator=applicator,
@@ -1073,9 +1935,49 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             history=prior_runs,
             gpu_sku=pctx.sku,
             fingerprint=qual.fingerprint,
+            degradations=degradations,
+            # The same deadline Phase 4 stops on. Without it the pass ran every
+            # proposal regardless, and a 15-minute run took 36 (P2-7).
+            deadline_ns=started_ns + int(budget_s * 1e9),
+            on_result=_checkpoint_ar,
         )
+        if _catalogue_validation is not None:
+            applicator.validation = _catalogue_validation
     else:
+        # An empty result list reads the same as "searched and found nothing";
+        # say that the pass never ran, and why.
         ar_run = AutoresearchRun(bottleneck_class=classify_bottleneck(trace, res), results=[])
+        ar_run.degradations.append(Degradation(
+            AR_SKIPPED, used="no autoresearch pass",
+            reason=(f"engine lost in Phase 4: {engine_lost}" if engine_lost is not None
+                    else f"budget {cfg.budget} exhausted by Phase 4"),
+            severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,)))
+    degradations.extend(ar_run.degradations)
+    lost_in_ar = next((r for r in ar_run.results
+                       if r.apply_result is not None and r.apply_result.restore_failed), None)
+    if engine_lost is None and lost_in_ar is not None:
+        engine_lost = lost_in_ar.apply_error or f"restore failed after {lost_in_ar.spec.name}"
+        n_untried = ar_run.n_untried
+        degradations.record(
+            ENGINE_LOST, used=f"an autoresearch pass that stopped after {lost_in_ar.spec.name}",
+            reason=f"{engine_lost}; {n_untried} ranked candidate(s) not tried",
+            severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
+    elif ar_run.stopped_by == "budget":
+        n_untried += ar_run.n_untried
+        degradations.record(
+            AR_SKIPPED, used="an autoresearch pass stopped at the budget",
+            reason=(f"budget {cfg.budget} spent; {ar_run.n_untried} ranked "
+                    "candidate(s) not tried"),
+            severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
+    # Again, now that autoresearch has had its proposals vetoed: an exclusion
+    # that only stopped a proposal is still something the run held back, and a
+    # file written before that pass would report none of them.
+    _write_skips()
+
+    # A kept restart replaced the engine and released the one cfg.engine still
+    # points at: hand the caller the live engine, not a shut-down handle.
+    if cfg.engine is not None:
+        cfg.engine = getattr(applicator, "engine", cfg.engine)
 
     ar_granger_evidence = ", ".join(
         f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
@@ -1085,15 +1987,18 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         if not r.applicable:
             rejected.append(f"{r.spec.name} ({r.rejected_reason})")
             continue
+        if r.measured_delta is None and r.apply_error:
+            # Never ran (did not build, or its apply raised): a rejection, not a
+            # claim with no measurement (L-9).
+            rejected.append(f"{r.spec.name} (did not run: {r.apply_error})")
+            continue
         if r.rolled_back:
             rolled_back.append(r.spec.name)
         ar_ab = r.ab_result
+        ar_lost = r.apply_result is not None and r.apply_result.restore_failed
         if ar_ab is not None:
-            outcome = "rolled back" if r.rolled_back else "kept"
-            evidence = (
-                f"live A/B: {outcome} ({ar_ab.speedup - 1.0:+.1%} decode throughput, via {ar_ab.via}); "
-                f"baseline {ar_ab.baseline_tps:.1f} → candidate {ar_ab.candidate_tps:.1f} tok/s"
-            )
+            evidence = _ab_evidence(ar_ab, r.rolled_back, r.degradations,
+                                    restore_failed=ar_lost)
         else:
             evidence = ar_granger_evidence
         if r.measured_delta is None and r.apply_error:
@@ -1113,6 +2018,8 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 predicted_delta=r.predicted_delta,
                 measured_delta=true_delta,
                 rolled_back=r.rolled_back,
+                restore_failed=ar_lost,
+                unreliable_ab=unreliable_ab(r.degradations) if ar_ab is not None else [],
             )
         )
         if ar_ab is not None and r.apply_result is not None:
@@ -1121,6 +2028,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                     r.spec, ar_ab, r.apply_result,
                     baseline_config=r.baseline_config or {},
                     candidate_config=r.candidate_config or {},
+                    degradations=r.degradations,
                 )
             )
     (run_dir / "autoresearch.json").write_text(
@@ -1151,6 +2059,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                     }
                     for r in ar_run.results
                 ],
+                "degradations": [d.to_dict() for d in ar_run.degradations],
             },
             indent=2,
         )
@@ -1158,6 +2067,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
 
     # Phase 5 — stabilize + write report
     provenance = build_provenance(
+        degradations=degradations,
         workload_id=workload,
         fingerprint=qual.fingerprint,
         run_id=run_id,
@@ -1189,6 +2099,26 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     )
     _write_report(run_dir, report_md)
 
+    if isinstance(applicator, LiveEngineApplicator):
+        # The noise every keep was judged against: the A/A samples (the opening
+        # calibration, then each re-measurement of the same baseline on a fresh
+        # build), the floor they give, and the threshold that floor sets for one
+        # round and for this run's validation level.
+        _noise = applicator.noise
+        (run_dir / "noise_floor.json").write_text(json.dumps({
+            "validation": _validation,
+            "min_effect": _min_effect,
+            "threshold_without_floor": _THRESHOLD_WITHOUT_FLOOR,
+            "calibration_samples": noise_calibration,
+            "samples": _noise.samples,
+            "floor": _noise.floor,
+            "threshold": {
+                str(r): _noise.threshold(mean_noise_factor(r, rebuilt=True),
+                                         minimum=_min_effect,
+                                         without_floor=_THRESHOLD_WITHOUT_FLOOR)
+                for r in sorted({1, _validation})},
+        }, indent=2))
+
     summary = {
         "run_id": run_id,
         "workload": workload,
@@ -1198,10 +2128,29 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         "commit": qual.commit,
         "floor": qual.floor,
         "n_claims": len(claims),
+        # What a reader needs before trusting "status: ok" (P2-5): how many A/Bs
+        # produced a measurement at all, and how many of those were kept. "ok"
+        # still means the run completed; a live run that measured nothing makes
+        # `gitm run` exit non-zero.
+        "live": cfg.engine is not None,
+        "n_measured": sum(1 for c in claims if c.measured_delta is not None),
+        "n_kept": sum(1 for c in claims if c.measured_delta is not None
+                      and not c.rolled_back and not c.restore_failed),
         "n_rolled_back": len(rolled_back),
         "n_rejected": len(rejected),
         "bottleneck_class": ar_run.bottleneck_class,
         "n_autoresearch": len(ar_run.results),
+        # In the summary, not only the run dir: a reader comparing two runs needs
+        # to know one of them was not asked to try everything.
+        "n_skipped_levers": len(_excluded),
+        # Set when a rollback failed and the run stopped trying candidates. The
+        # report is still written; this is what says it is a partial one.
+        "engine_lost": engine_lost,
+        "n_untried": n_untried,
+        # How hard candidates were tested, and the noise they had to beat.
+        "validation": _validation,
+        "noise_floor": (applicator.noise.floor
+                        if isinstance(applicator, LiveEngineApplicator) else None),
         "scheduler_stats": asdict(sched_summary) if sched_stats.samples else None,
         "report_path": str(run_dir / "report.md"),
     }
@@ -1210,6 +2159,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
 
 def _measurement_result(
     *,
+    degradations: DegradationLog | None = None,
     run_dir: Path,
     run_id: str,
     workload: str,
@@ -1245,6 +2195,7 @@ def _measurement_result(
     )
 
     provenance = build_provenance(
+        degradations=degradations,
         workload_id=workload,
         fingerprint=qual.fingerprint,
         run_id=run_id,
@@ -1281,6 +2232,7 @@ def _measurement_result(
 
 def _hft_intervention_result(
     *,
+    degradations: DegradationLog | None = None,
     run_dir: Path,
     run_id: str,
     workload: str,
@@ -1383,6 +2335,7 @@ def _hft_intervention_result(
     )
 
     provenance = build_provenance(
+        degradations=degradations,
         workload_id=workload,
         fingerprint=qual.fingerprint,
         run_id=run_id,
@@ -1423,6 +2376,7 @@ def _hft_intervention_result(
 
 def _openfold_intervention_result(
     *,
+    degradations: DegradationLog | None = None,
     run_dir: Path,
     run_id: str,
     workload: str,
@@ -1520,6 +2474,7 @@ def _openfold_intervention_result(
     )
 
     provenance = build_provenance(
+        degradations=degradations,
         workload_id=workload,
         fingerprint=qual.fingerprint,
         run_id=run_id,
@@ -1560,6 +2515,7 @@ def _openfold_intervention_result(
 
 def _edge_intervention_result(
     *,
+    degradations: DegradationLog | None = None,
     run_dir: Path,
     run_id: str,
     workload: str,
@@ -1657,6 +2613,7 @@ def _edge_intervention_result(
     )
 
     provenance = build_provenance(
+        degradations=degradations,
         workload_id=workload,
         fingerprint=qual.fingerprint,
         run_id=run_id,
@@ -1695,8 +2652,55 @@ def _edge_intervention_result(
     return {"summary": summary, "report_md": report_md, "run_dir": str(run_dir)}
 
 
+#: A decode shorter than this can finish before the tracer flushes a buffer.
+_SHORT_WORKLOAD_S = 10.0
+
+
+def _why_no_kernels(runner_s: float | None, source: str = "none") -> str | None:
+    """Which of the empty-trace causes this was, when the evidence says (L-4).
+
+    They have opposite fixes, so the run says which: no tracer was configured;
+    one was configured but never loaded in any process; or it loaded and the
+    workload was too short for it to flush anything. ``None`` when none of these
+    is what the evidence shows, so the caller's general message stands.
+
+    ``source`` is how the capture traced (``trace.source``). Without injection
+    settings a capture can still trace in-process; if it did, the missing
+    settings are not the cause, and its own diagnostic says what is.
+    """
+    vendor = injection.active_vendor()
+    if vendor is None and source not in (None, "none"):
+        return None
+    if vendor is None:
+        # Without injection settings, capture falls back to an in-process tracer,
+        # which may be unavailable or fail to start; both leave source "none".
+        # Say only what is known: only a failed start leaves a warning behind.
+        return ("no injected tracer is configured (CUDA_INJECTION64_PATH on NVIDIA, "
+                "ROCP_TOOL_LIBRARIES on AMD), and the in-process fallback traced "
+                "nothing: it is unavailable here, or it failed to start, in which "
+                "case a 'trace capture disabled' warning says why. For gitm run, "
+                "export the injection path before starting the run, so the engine "
+                "loads it when it initialises the GPU")
+    try:
+        shards = injection.shard_paths()
+    except Exception:
+        return None
+    if not shards:
+        return (f"the {vendor} tracer is configured but no process loaded it: no trace "
+                "shard was written. It is read once, when a process initialises the "
+                "GPU, so it must be exported before the engine starts, and its "
+                "library path must exist")
+    if runner_s is not None and runner_s < _SHORT_WORKLOAD_S:
+        return (f"the tracer loaded ({len(shards)} shard(s) written) but the workload "
+                f"decoded for only {runner_s:.1f}s and finished before it flushed any "
+                "kernels. Raise GITM_VLLM_PROMPTS / GITM_VLLM_MAX_TOKENS (256 x 512 "
+                "traces on an RTX 4050)")
+    return None
+
+
 def _no_data_result(
     *,
+    degradations: DegradationLog | None = None,
     run_dir: Path,
     run_id: str,
     workload: str,
@@ -1711,6 +2715,7 @@ def _no_data_result(
     never ran. We emit zero claims rather than fabricating results from nothing.
     """
     provenance = build_provenance(
+        degradations=degradations,
         workload_id=workload,
         fingerprint=qual.fingerprint,
         run_id=run_id,

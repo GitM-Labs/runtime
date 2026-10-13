@@ -42,6 +42,21 @@ class KernelEvent(_TraceEventBase):
     # classify_op(). Never guessed or backfilled; only set by correlation.
     range_op: str | None = None
     range_layer: int | None = None
+    # CUDA-graph identity from the kernel record (CUPTI graphId/graphNodeId).
+    # None for a kernel launched outside a graph. A graph-launched kernel's
+    # correlation_id is the replay's one cudaGraphLaunch, so the range around
+    # that launch is a step-level label, not the op: it lands in launch_range,
+    # and range_op/range_layer stay None unless a capture-time graph node map
+    # names the node (docs/kernel_identity.md, "CUDA graphs").
+    graph_id: int | None = None
+    graph_node_id: int | None = None
+    launch_range: str | None = None
+    # Annotations on the identifying range (``L3/moe_routed#wave=2``).
+    range_attrs: dict[str, str] | None = None
+    # Which mechanism named the kernel (see gitm.distributed.correlate).
+    identity: Literal["range_id", "containment", "graph_node"] | None = None
+    # ROCm code-object symbol id; None on NVIDIA.
+    kernel_id: int | None = None
 
 
 class MemcpyEvent(_TraceEventBase):
@@ -49,6 +64,9 @@ class MemcpyEvent(_TraceEventBase):
     bytes: int
     src: Literal["host", "device", "unified"]
     dst: Literal["host", "device", "unified"]
+    # Range around the copy's issue: a step label that survives graph replay.
+    launch_range: str | None = None
+    graph_id: int | None = None
 
 
 class SyncEvent(_TraceEventBase):

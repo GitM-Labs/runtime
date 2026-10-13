@@ -23,6 +23,7 @@ them in the shell that launches the run; ``run_env()`` renders the exact pair.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -47,14 +48,33 @@ ENV_NVTX = "GITM_TRACE_NVTX"
 ENV_NVTX_INJECT = "NVTX_INJECTION64_PATH"
 ENV_SETTLE = "GITM_TRACE_SETTLE_S"
 
+#: Consumed by correlation, not decoded as events, and never windowed.
+CORRELATION_KINDS = ("marker", "runtime", "graph_node", "graph_exec")
+
 LIB_NAME = "libgitm_inject.so"
+
+#: Process settings a traced vLLM run needs on AMD, beyond the collector hook.
+#:
+#: vLLM forks ``EngineCore`` by default, and on ROCm the parent has usually
+#: initialised HIP by then. The forked child inherits that runtime without the
+#: rocprofiler tool attached, so it launches every kernel and records none: the
+#: run completes and the trace is empty (known problem P1-1, seen at TP=1 on
+#: MI355X). ``spawn`` starts the child fresh, and the tool is loaded again from
+#: ``ROCP_TOOL_LIBRARIES`` the way it was in the parent.
+#:
+#: Spawn re-imports ``__main__`` in the child, so the launching script must be
+#: importable and guarded. The ``gitm`` command is, so it sets this; an
+#: embedded caller is not known to be, so the vLLM factory only warns.
+AMD_PROCESS_ENV: dict[str, str] = {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"}
 
 # How long to wait, after the workload finishes, for in-flight CUPTI buffers in
 # other processes to land on disk. We cannot reach into the child to force a
 # flush, so the injected library flushes on a period (GITM_TRACE_FLUSH_MS, default
 # 100ms) and we wait out one period plus slack before merging. Too short and the
-# tail of the trace is silently missing.
-DEFAULT_SETTLE_S = 0.5
+# tail of the trace is silently missing. 0.5 s was the default, and real runs
+# (RTX 4050, MI355X) read the shards before they had landed; every working run
+# command exported 5. A few seconds per capture is cheap next to a lost trace.
+DEFAULT_SETTLE_S = 5.0
 
 
 def lib_path() -> Path:
@@ -130,15 +150,23 @@ def libcupti_path() -> Path | None:
 
 
 def detect_vendor() -> str:
-    """``"amd"`` on a ROCm box, else ``"nvidia"``.
+    """``"amd"`` or ``"nvidia"`` (:mod:`gitm.tracer.vendor`); ``GITM_VENDOR``
+    overrides. No evidence or a conflict keeps the NVIDIA default — the latter
+    with a warning."""
+    from gitm.tracer import vendor as _vendor
 
-    kfd topology is the ground truth for AMD GPUs and exists without any
-    library loaded; NVIDIA stays the default so a CPU-only dev box renders the
-    same env it always has.
-    """
-    from gitm.tracer import _rocm
-
-    return "amd" if _rocm.device_count() > 0 else "nvidia"
+    override = _vendor.env_vendor_override()
+    if override:
+        return override
+    c = _vendor.classify_host()
+    if c.conflict:
+        warnings.warn(
+            "GPU vendor is ambiguous on this host — rendering the NVIDIA trace env; "
+            "set GITM_VENDOR=amd|nvidia to choose.\n" + c.explain(),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return c.vendor or "nvidia"
 
 
 def run_env(
@@ -173,7 +201,7 @@ def run_env(
     """
     out = str(Path(out_path).resolve())
     if (vendor or detect_vendor()) == "amd":
-        env = {ENV_ROCP: str(rocm_lib_path()), ENV_OUT: out}
+        env = {ENV_ROCP: str(rocm_lib_path()), ENV_OUT: out, **AMD_PROCESS_ENV}
         if nvtx:
             env[ENV_NVTX] = "1"
             shim = _rocm_shim_path()
@@ -320,11 +348,14 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
     leaves a partial record, and losing the last kernel of a shard is a better
     outcome than failing the whole run.
     """
-    from gitm.tracer._cupti_decode import decode_records
+    from gitm.tracer._cupti_decode import decode_records_with_report
 
     records: list[dict] = []
     dropped_lines = 0
     collector_drops = 0
+    collectors: set[str] = set()
+    no_direct_dispatch = False
+    stamp_faults: dict[str, int] = {}
     for shard in shard_paths():
         try:
             text = shard.read_text(encoding="utf-8", errors="replace")
@@ -359,24 +390,29 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
             # They must NOT be windowed. A range that opens before the window
             # still encloses launches inside it, and pairing needs both halves;
             # dropping either end silently un-attributes everything it covered.
-            if rec.get("kind") in ("marker", "runtime"):
+            # Graph structure is written at engine start, before any window.
+            if rec.get("kind") in CORRELATION_KINDS:
                 records.append(rec)
                 continue
-            # In-band loss report from the ROCm collector (rocprofiler-sdk
-            # counts drops; CUPTI never told us). Not an event — surface it.
+            # In-band reports from the ROCm collector.
             if rec.get("kind") == "meta":
                 drops = rec.get("dropped_records")
                 if isinstance(drops, int):
                     collector_drops += drops
+                if rec.get("collector"):
+                    collectors.add(str(rec["collector"]))
+                if rec.get("identity") and rec.get("direct_dispatch") == 0:
+                    no_direct_dispatch = True
+                for key in ("graph_stamp_overflow", "graph_untracked_launch"):
+                    if isinstance(rec.get(key), int):
+                        stamp_faults[key] = stamp_faults.get(key, 0) + rec[key]
                 continue
 
-            ts = rec.get("start_ns")
-            if not isinstance(ts, int):
+            # The window is applied after decoding, not here: a graph replay that
+            # straddles it must be validated whole, or the duplicates or ordinal
+            # shift that would refuse it fall outside and the rest is trusted.
+            if not isinstance(rec.get("start_ns"), int):
                 dropped_lines += 1
-                continue
-            if start_ns is not None and ts < start_ns:
-                continue
-            if end_ns is not None and ts > end_ns:
                 continue
             records.append(rec)
 
@@ -395,12 +431,40 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
             RuntimeWarning,
             stacklevel=2,
         )
-    events = decode_records(records)
+    if len(collectors) > 1:
+        warnings.warn(
+            f"injected trace shards come from more than one collector "
+            f"({sorted(collectors)}); stale shards from another run are mixed in",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if no_direct_dispatch:
+        warnings.warn(
+            "injected trace identity: AMD_DIRECT_DISPATCH=0 — HIP submits graph "
+            "replays from a worker thread, where the ROCm collector cannot stamp "
+            "them; replayed kernels will be unnamed. Unset it for graph identity.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if stamp_faults:
+        warnings.warn(
+            f"injected trace coverage: the ROCm collector could not stamp graph "
+            f"identity on some replays ({stamp_faults}); those kernels keep "
+            "range_op=None and fall back to name classification",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    decoded, report = decode_records_with_report(records)
+    for problem in report.problems():
+        warnings.warn(f"injected trace identity: {problem}", RuntimeWarning, stacklevel=2)
+    events = [e for e in decoded
+              if (start_ns is None or e.start_ns >= start_ns)
+              and (end_ns is None or e.start_ns <= end_ns)]
     # Correlation records are consumed, not lost: decode_records folds them into
     # range_op/range_layer on the kernels. Counting them as dropped would report
     # millions of missing records on a correlated capture and read as data loss.
-    n_correlation = sum(1 for r in records if r.get("kind") in ("marker", "runtime"))
-    unmodeled = len(records) - n_correlation - len(events)
+    n_correlation = sum(1 for r in records if r.get("kind") in CORRELATION_KINDS)
+    unmodeled = len(records) - n_correlation - len(decoded)
     if unmodeled > 0:
         warnings.warn(
             f"injected trace coverage: dropped {unmodeled} unmodeled activity record(s)",
@@ -442,3 +506,37 @@ def clock_now() -> int | None:
 
         return _rocm.timestamp()
     return cupti_now()
+
+
+@contextlib.contextmanager
+def untraced_env(env=None):
+    """Run a block with this collector's injection removed from the environment.
+
+    For starting a process that must not load the tracer. vLLM's EngineCore and
+    workers inherit the environment when they start, so an engine built inside
+    this block runs without the collector, while the variables are back for the
+    next traced build as soon as the block exits.
+
+    Why an engine would not want it: on MI355X, rocprofiler-sdk's queue
+    interposition can deadlock against hipGraph replay (vLLM #56506, ROCm
+    #11623), and it is loaded into every process the tool is injected into,
+    traced window or not. An engine that is only A/B-measured is never traced,
+    so it has no reason to carry the interposition, or its overhead.
+    """
+    env = os.environ if env is None else env
+    from gitm.tracer._rocm import SHIM_NAME
+
+    saved = {k: env.pop(k) for k in (ENV_LIB, ENV_ROCP, ENV_NVTX_INJECT) if k in env}
+    preload = env.get("LD_PRELOAD")
+    if preload is not None:
+        kept = ":".join(p for p in preload.split(":") if p and Path(p).name != SHIM_NAME)
+        if kept:
+            env["LD_PRELOAD"] = kept
+        else:
+            del env["LD_PRELOAD"]
+    try:
+        yield
+    finally:
+        env.update(saved)
+        if preload is not None:
+            env["LD_PRELOAD"] = preload

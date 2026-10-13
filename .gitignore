@@ -32,6 +32,13 @@ vllm/
 *.qdrep
 !tests/fixtures/**/*.sqlite
 
+# Build output of the CUPTI shim. Compiled per machine against the local
+# driver's CUPTI, so it is never the same twice and never source. Nothing here
+# was ignored before, which left anyone who had built the shim carrying two
+# untracked binaries that any `git add -A` would sweep into their next commit.
+gitm/tracer/_cupti/*.so
+gitm/tracer/_cupti/*.dylib
+
 # Tooling
 .pytest_cache/
 .mypy_cache/

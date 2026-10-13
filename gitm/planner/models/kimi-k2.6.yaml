@@ -23,7 +23,11 @@ spec:
   expert_dtype: nvfp4
   # hf_quant_config.json kv_cache_quant_algo: FP8, served as
   # --kv-cache-dtype fp8. On dense MLA vLLM keeps the generic layout, which
-  # stores the whole 576-dim entry at one byte.
+  # stores the whole 576-dim entry at one byte. It is also the default: NVIDIA's
+  # published command passes no --kv-cache-dtype, and vLLM resolves 'auto' from
+  # this checkpoint's static fp8 kv_cache_scheme (engine/arg_utils.py:1567-1570,
+  # utils/torch_utils.py:262-342), with scale 1.0 since no k/v scales ship
+  # (docs/audits/kimi-k2.6.md, F1).
   kv_dtype: fp8
   kv_rope_dtype: fp8
   op_dtype_overrides:
@@ -43,7 +47,9 @@ provenance:
       detail: >
         595.19 GB summed over the 60 safetensors shards on the Hub (re-read
         2026-09-15 via the Hub tree API: 595.185 GB); model_weight_bytes
-        predicts 595.00 GB (-0.03%). NVFP4 (0.5 + 1/16) and int4 (0.5 + 2/32)
+        predicts 594.20 GB (-0.16%), the residual being the unmodelled 0.94 GB
+        vision tower. An earlier -0.03% came from the dense FFN being counted
+        at bytes-per-weight squared. NVFP4 (0.5 + 1/16) and int4 (0.5 + 2/32)
         are both 0.5625 B/weight, so K2.6 predicts the same footprint as K2.5.
     - claim: precision layout
       detail: >
@@ -59,6 +65,14 @@ provenance:
         FLASHMLA_SPARSE and FLASHINFER_MLA_SPARSE_SM120. Kimi's attention is
         dense, so --kv-cache-dtype fp8 keeps the generic layout: latent and
         RoPE key both at one byte.
+
+    - claim: NVFP4 execution per SKU
+      detail: >
+        Resolved by roofline.resolve_execution against vLLM v0.19.1. On
+        Blackwell the routed experts run TRT-LLM FP4 W4A4, with one act_quant
+        node per MoE layer ahead of the expert GEMM. On Hopper they run Marlin
+        W4A16 at the bf16 rate, streaming the stored 0.5625 B/weight with no
+        activation quantisation.
 
   estimated:
     - field: MLA absorption (attn_kv_b vs attn_out_proj width)
@@ -84,7 +98,5 @@ provenance:
     - The EAGLE3 draft model (lightseekorg/kimi-k2.6-eagle3-mla). With
       --spec-tokens the graph prices the target's 1+D verify rows per sequence,
       but none of the draft's own forward passes.
-    - NVFP4 W4A4 activation quantisation ahead of the routed experts. The
-      glm family emits act_quant only for fp8 GEMMs, so no node prices it here.
     - The vision tower (MoonViT, 27 layers, hidden 1152) and mm_projector, run
       data-parallel (--mm-encoder-tp-mode data). Text requests never enter them.

@@ -20,7 +20,9 @@ set a structural field that the running engine won't actually honor.
 
 from __future__ import annotations
 
+import json
 import os
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -320,3 +322,111 @@ def expand_relative_candidates(spec: InterventionSpec, engine: Any | None) -> li
         suffix = f"x{m:g}".replace(".", "_").replace("-", "neg")
         out.append(resolved.model_copy(update={"name": f"{spec.name}_{suffix}"}))
     return out
+
+
+# --- knobs vLLM takes nested inside another argument ---------------------------
+#
+# The catalogue names a lever by the setting it changes. vLLM does not always
+# take that setting as an argument of its own: speculative decoding is configured
+# through one JSON argument, ``speculative_config``. Passing
+# ``num_speculative_tokens`` at the top level is rejected by the engine
+# (``LLM(num_speculative_tokens=5)``) and by the server
+# (``vllm: error: unrecognized arguments: --num-speculative-tokens 5``), so the
+# top-ranked lever of every run and every sweep could never start (P2-1, L-3).
+#
+# One table, read by the three places a knob leaves gitm: the restart path's
+# engine kwargs, the server flags ``gitm propose`` emits, and ``gitm ingest``
+# reading those flags back to the lever.
+
+# The lever changes its one field and nothing else. A baseline that already
+# speculates keeps its method, draft model and lookup window, so the A/B differs
+# from it only in the token count; the n-gram method is filled in only when the
+# baseline does not speculate at all.
+
+#: knob -> (nested argument, field inside it, its type, fields filled in only if absent).
+_NESTED_KNOBS: dict[str, tuple[str, str, Callable[[Any], Any], dict[str, Any]]] = {
+    # n-gram drafting: vLLM fills in the lookup window itself when it is unset.
+    "num_speculative_tokens": ("speculative_config", "num_speculative_tokens", int,
+                               {"method": "ngram"}),
+}
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """A nested argument as a dict, whether it came as a dict or as the JSON a
+    server flag carries. Anything unreadable counts as unset."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _nested_value(knob: str, value: Any, current: Any) -> dict[str, Any]:
+    _arg, field, cast, defaults = _NESTED_KNOBS[knob]
+    return {**defaults, **_as_dict(current), field: cast(value)}
+
+
+def engine_kwargs(values: dict[str, Any],
+                  base: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """``{knob: value}`` as the keyword arguments ``LLM()`` accepts, to update
+    ``base`` (the engine's current kwargs) with. A nested knob is merged into
+    the argument ``base`` already has, not put in place of it."""
+    out: dict[str, Any] = {}
+    for knob, value in values.items():
+        nested = _NESTED_KNOBS.get(knob)
+        if nested is None:
+            out[knob] = value
+            continue
+        arg = nested[0]
+        current = out[arg] if arg in out else (base or {}).get(arg)
+        out[arg] = _nested_value(knob, value, current)
+    return out
+
+
+def server_arg(knob: str, value: Any, current: Any = None) -> tuple[str, Any]:
+    """``(flag, value)`` that sets ``knob`` on ``vllm serve``. ``current`` is the
+    value the baseline already passes for that flag, which a nested knob is
+    merged into."""
+    nested = _NESTED_KNOBS.get(knob)
+    if nested is None:
+        return "--" + knob.replace("_", "-"), value
+    merged = _nested_value(knob, value, current)
+    return "--" + nested[0].replace("_", "-"), json.dumps(merged, separators=(",", ":"))
+
+
+def same_server_value(a: Any, b: Any) -> bool:
+    """Whether two values of one server flag set the same thing. A JSON-valued
+    flag (``--speculative-config``) is compared as what it parses to, so the
+    same config spaced or ordered differently is not a change."""
+    if a == b:
+        return True
+    try:
+        return isinstance(a, str) and isinstance(b, str) and json.loads(a) == json.loads(b)
+    except ValueError:
+        return False
+
+
+def knob_from_server_arg(name: str, value: Any, baseline: Any = None) -> tuple[str, Any]:
+    """The catalogue ``(knob, value)`` a server argument sets; the inverse of
+    :func:`server_arg`. ``name`` is the flag without dashes, in snake case, and
+    ``baseline`` is what the baseline passed for the same flag.
+
+    A nested argument is read as the knob only when it is exactly what
+    :func:`server_arg` builds from ``baseline``: the baseline's config with the
+    knob's field changed. A config that also changed the method or anything else
+    is not this lever, and crediting the lever with it would file a method change
+    as evidence about a token count. Anything else comes back unchanged."""
+    for knob, (arg, field, _cast, _defaults) in _NESTED_KNOBS.items():
+        if name != arg:
+            continue
+        got = _as_dict(value)
+        if got.get(field) is None or (baseline is not None and got == _as_dict(baseline)):
+            continue    # no setting, or the baseline's own: nothing was changed
+        try:
+            built = _nested_value(knob, got[field], baseline)
+        except (TypeError, ValueError):
+            continue
+        if got == built:
+            return knob, got[field]
+    return name, value

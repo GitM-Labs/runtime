@@ -105,36 +105,34 @@ def doubly_robust_ate(y: np.ndarray, t: np.ndarray, X: np.ndarray) -> tuple[floa
     return ate, se
 
 
-def attribute_dr(residuals: Residuals, graph: Graph, *, band: float = _KT_BAND) -> RankedHypotheses:
+def attribute_dr(residuals: Residuals, graph: Graph, *, band: float = _KT_BAND,
+                 stratify: tuple[str, ...] = ()) -> RankedHypotheses:
     """Doubly-robust ranking of cause→effect pairs, as ``RankedHypotheses``.
 
     Mirrors :func:`gitm.optimizer.attribution.attribute` so the loop can run both
     and compare. p_value is a 2-sided normal approximation from the ATE z-score;
-    notes carry the signed ATE for the report.
+    notes carry the signed ATE for the report. ``stratify`` as in
+    :func:`gitm.optimizer.attribution.attribute`.
     """
-    series: dict[str, list[float]] = {}
-    for kr in residuals.per_kernel:
-        series.setdefault(kr.op, []).append(kr.r_kt)
+    from gitm.optimizer.attribution import aligned_pairs
+    from gitm.optimizer.monitor import residual_series
+
+    series = residual_series(residuals, stratify)
 
     ops = [op for op, v in series.items() if len(v) >= 4]
     if len(ops) < 2:
         return RankedHypotheses(hypotheses=[])
-    n = min(len(series[op]) for op in ops)
-    pos = np.arange(n, dtype=float)
-
     effects: list[DREffect] = []
-    for cause in ops:
+    for cause, effect, n in aligned_pairs(series, ops):
+        pos = np.arange(n, dtype=float)
         t = (np.abs(np.asarray(series[cause][:n])) > band).astype(float)
         n_t = int(t.sum())
         if n_t < _MIN_GROUP or (n - n_t) < _MIN_GROUP:
             continue  # too few anomalies to support a doubly-robust estimate
-        for effect in ops:
-            if effect == cause:
-                continue
-            y = np.asarray(series[effect][:n], dtype=float)
-            ate, se = doubly_robust_ate(y, t, pos)
-            z = ate / se if se not in (0.0, float("inf")) else 0.0
-            effects.append(DREffect(cause, effect, ate, se, z, int(t.sum())))
+        y = np.asarray(series[effect][:n], dtype=float)
+        ate, se = doubly_robust_ate(y, t, pos)
+        z = ate / se if se not in (0.0, float("inf")) else 0.0
+        effects.append(DREffect(cause, effect, ate, se, z, int(t.sum())))
 
     # Rank by |z| (effect size over uncertainty) descending.
     effects.sort(key=lambda d: abs(d.z), reverse=True)

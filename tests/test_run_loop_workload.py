@@ -19,7 +19,7 @@ from .conftest import make_kernel, make_trace
 EMPTY_DIGEST = "4f53cda18c2baa0c"
 
 
-def test_no_data_guard_does_not_fabricate_claims(tmp_path: Path):
+def test_no_data_guard_does_not_fabricate_claims(tmp_path: Path, without_vllm):
     """No GPU/shim and no registered runner → honest no-data, zero claims."""
     from gitm import optimize
 
@@ -140,7 +140,8 @@ def test_runner_workload_id_empty_string_falls_back_to_default(tmp_path, capture
     assert captured_workload_id["workload_id"] == "vllm-decode"
 
 
-def test_no_runner_and_no_explicit_workload_uses_default(tmp_path, captured_workload_id):
+def test_no_runner_and_no_explicit_workload_uses_default(tmp_path, captured_workload_id,
+                                                         without_vllm):
     """With nothing to read from at all (no runner, no cfg.workload, no
     cfg.engine), the simplest path still resolves to the hardcoded default —
     the relabeling guard must not require a runner to be present. Relies on
@@ -252,7 +253,7 @@ def test_vllm_workload_still_uses_intervention_path(tmp_path: Path, monkeypatch)
     assert result["summary"]["mode"] == "intervention"
 
 
-def test_vllm_loop_runs_autoresearch(tmp_path: Path, monkeypatch):
+def test_vllm_loop_runs_autoresearch(tmp_path: Path, monkeypatch, without_vllm):
     """The vllm path runs agentic autoresearch: it classifies the bottleneck via
     trace telemetry (the serialized same-stream "paged_attention" kernels are
     also roofline-predicted memory-bound at batch=1, so classification is
@@ -376,3 +377,42 @@ def test_vllm_decode_factory_returns_wired_runner(monkeypatch):
     # The restart hook rebuilds a fresh engine with the structural knob applied.
     rebuilt = engine.gitm_restart_fn(engine, {"kv_cache_dtype": "fp8"})
     assert rebuilt is not engine and rebuilt.kwargs["kv_cache_dtype"] == "fp8"
+
+
+def test_vllm_engine_shutdown_keeps_global_state_while_another_engine_is_live(monkeypatch):
+    """Parallel restart holds two engines in one process. Releasing one must not
+    tear down the process-global distributed state the other still runs on —
+    only the last engine out does."""
+    import sys
+    import types
+
+    from gitm.scheduler.loop import LoopConfig
+    from gitm.workloads import get_factory
+
+    destroyed: list[str] = []
+    ps = types.ModuleType("vllm.distributed.parallel_state")
+    ps.destroy_model_parallel = lambda: destroyed.append("model_parallel")
+    ps.destroy_distributed_environment = lambda: destroyed.append("distributed_env")
+    dist_pkg = types.ModuleType("vllm.distributed")
+    dist_pkg.parallel_state = ps
+
+    class _LLM:
+        def __init__(self, model, **kwargs):
+            self.kwargs = kwargs
+
+    fake = types.ModuleType("vllm")
+    fake.LLM = _LLM
+    fake.SamplingParams = lambda **kw: types.SimpleNamespace(**kw)
+    fake.distributed = dist_pkg
+    monkeypatch.setitem(sys.modules, "vllm", fake)
+    monkeypatch.setitem(sys.modules, "vllm.distributed", dist_pkg)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", ps)
+    monkeypatch.delenv("GITM_VLLM_SYNTHETIC", raising=False)
+
+    baseline = get_factory("vllm-decode")(LoopConfig(workload="vllm-decode")).engine
+    candidate = baseline.gitm_restart_fn(baseline, {"kv_cache_dtype": "fp8"})
+
+    candidate.gitm_shutdown_fn(candidate)  # rollback: baseline still live
+    assert destroyed == []
+    baseline.gitm_shutdown_fn(baseline)  # last engine out
+    assert destroyed == ["model_parallel", "distributed_env"]
