@@ -55,9 +55,10 @@ The terminal state is decided by rules applied **in this order**:
 2. a known-effect control failed for this operating point, or `max_cost_usd` was set with no rate to enforce it → `invalid`
 3. the budget (wall clock, accelerator time or dollars) ran out before the protocol finished → `inconclusive`
 4. too few samples; a missing primary metric, correctness score or latency metric; or a zero, negative or non-finite metric → `invalid`
-5. the correctness gate or any latency gate failed → `regressed`
-6. the interval lies entirely above 0 → `improved`; entirely below 0 → `regressed`
-7. otherwise → `inconclusive`
+5. the correctness gate failed → `invalid` (decided with Tarun, Oct 12: a correctness failure may be a broken engine rather than a worse change, e.g. vLLM 0.29.0's fp8 prefill head drop at TP8, so it is not logged as a result; effect and interval are still reported)
+6. any latency gate failed → `regressed`
+7. the interval lies entirely above 0 → `improved`; entirely below 0 → `regressed`
+8. otherwise → `inconclusive`
 
 The candidate stays applied **only** on `improved`; every other state restores
 the baseline snapshot.
@@ -83,13 +84,15 @@ the baseline snapshot.
 
 ## Open questions for the working session
 
-1. **Correctness failure → `regressed`, or `invalid`?** The draft says `regressed`
-   (the candidate is worse). Tarun, what tolerance is right for precision changes?
+1. ~~**Correctness failure → `regressed`, or `invalid`?**~~ **Decided (Tarun, Oct 12): `invalid`.**
+   Still open: Tarun's `min_score` for GSM8K + needle (`eval_score`); v1 uses
+   token agreement ≥ 0.99.
 2. **Budget exhausted → `inconclusive`?** Or should the budget gate refuse the
    run up front from an estimated cost (Oct 19 scope)?
 3. **Warmup after every switch.** This is right for restart-applied knobs but
    costs a model reload per switch on MI355X. Is `ABBA` (half the switches) the
-   default, or is the engine rebuilt per sample anyway?
+   default, or is the engine rebuilt per sample anyway? (Tarun, Oct 12: ABBA,
+   since `kv_cache_dtype` needs a restart.)
 4. **Latency gates on the mean over reps**, or on each rep's p95?
 5. **Sequential stopping rules**: needed for v1, or is `fixed_n` enough until
    the noise floor is known?

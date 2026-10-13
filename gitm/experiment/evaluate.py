@@ -24,9 +24,13 @@ The terminal state is decided by fixed rules, applied in this order:
    protocol finished → ``inconclusive``
 4. too few samples, the primary metric or a correctness score is missing, or a
    metric is zero, negative or non-finite → ``invalid``
-5. the correctness gate or any latency gate failed → ``regressed``
-6. the interval lies entirely above 0 → ``improved``; entirely below 0 → ``regressed``
-7. otherwise → ``inconclusive``
+5. the correctness gate failed → ``invalid``: the candidate did not serve the
+   same model, so its speed is not comparable. It may be a worse change or a
+   broken engine (e.g. vLLM 0.29.0's fp8 prefill head drop at TP8), and the
+   data cannot tell which; the effect and interval are still reported.
+6. any latency gate failed → ``regressed``
+7. the interval lies entirely above 0 → ``improved``; entirely below 0 → ``regressed``
+8. otherwise → ``inconclusive``
 
 Wall clock and cost cover the whole run: sampler time plus the snapshot, apply
 and restore calls between arms, which on a served engine are model reloads.
@@ -334,7 +338,8 @@ def _decide(
                  claim_rejected=hi < contract.hypothesis.reject_if_effect_below)
 
     if correctness.status == "fail":
-        return "regressed", "correctness gate failed", extra
+        return ("invalid", f"correctness gate failed ({correctness.detail}); a candidate that "
+                "does not serve the same outputs has no comparable performance", extra)
     failed = [r.name for r in latency if r.status == "fail"]
     if failed:
         return "regressed", f"latency gate failed: {', '.join(failed)}", extra

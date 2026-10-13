@@ -165,9 +165,12 @@ def test_small_real_gain_rejects_the_claim():
     assert v.claim_rejected is True  # promised at least 3%, delivered ~1%
 
 
-def test_correctness_failure_is_regressed_even_if_faster():
+def test_correctness_failure_is_invalid_even_if_faster():
     v, config = _run(effect=0.10, correctness=0.90)
-    assert v.state == "regressed" and v.correctness.status == "fail"
+    assert v.state == "invalid" and v.correctness.status == "fail"
+    assert "correctness gate failed" in v.reason
+    # The speed result is still reported, just not used as a verdict.
+    assert v.effect == pytest.approx(0.10, abs=0.02) and v.interval[0] > 0
     assert config["kv_cache_dtype"] == "auto"
 
 
@@ -370,3 +373,15 @@ def test_cli_malformed_yaml_does_not_stop_the_batch(capsys, tmp_path):
     assert cli_main(["validate", str(bad), str(FIXTURE)]) == 1
     out = capsys.readouterr().out
     assert f"FAIL {bad}" in out and f"ok   {FIXTURE}" in out
+
+
+# --- real contracts ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path", sorted((Path(__file__).parents[1] / "experiments" / "contracts").glob("*.yaml")),
+    ids=lambda p: p.name,
+)
+def test_registered_contracts_validate(path):
+    c = load_contract(path)
+    assert c.sha256()
