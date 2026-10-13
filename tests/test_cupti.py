@@ -105,6 +105,35 @@ def test_decode_sync_types(sync_type, kind):
     assert ev.sync_kind == kind
 
 
+# --- decode: pid ------------------------------------------------------------
+
+
+_PID_RECS = {
+    "kernel": lambda: _kernel_rec(),
+    "memcpy": lambda: {
+        "kind": "memcpy", "copy_kind": 1, "bytes": 4, "start_ns": 10, "end_ns": 20,
+        "device_id": 0, "context_id": 1, "stream_id": 3, "correlation_id": 5,
+    },
+    "sync": lambda: {
+        "kind": "sync", "sync_type": 3, "start_ns": 5, "end_ns": 9, "device_id": 0,
+        "context_id": 1, "stream_id": 2, "correlation_id": 0,
+    },
+}
+
+
+@pytest.mark.parametrize("kind", ["kernel", "memcpy", "sync"])
+def test_decode_keeps_pid_for_every_kind(kind):
+    """The shard reader stamps ``pid`` on every record; memcpy and sync used to
+    drop it, so only kernels could be partitioned by process."""
+    from gitm.tracer._cupti_decode import decode_record
+
+    rec = _PID_RECS[kind]()
+    assert decode_record(rec).pid is None
+    ev = decode_record({**rec, "pid": 4242})
+    assert ev.kind == kind
+    assert ev.pid == 4242
+
+
 # --- decode: batch ----------------------------------------------------------
 
 
@@ -234,3 +263,35 @@ def test_cupti_backend_drives_capture_with_fake_shim(monkeypatch, tmp_path):
     lines = out.read_text().strip().splitlines()
     assert len(lines) == 2  # header + 1 kernel event
     assert json.loads(lines[1])["name"] == "hot_kernel"
+
+
+# --- decode: context and the collector's own kinds ---------------------------
+
+
+def test_decode_keeps_context_id_and_raw_kinds():
+    from gitm.tracer._cupti_decode import decode_record
+
+    k = decode_record({"kind": "kernel", "name": "k", "start_ns": 0, "end_ns": 5, "stream_id": 7,
+                       "device_id": 0, "context_id": 3, "grid": [1, 1, 1], "block": [1, 1, 1]})
+    m = decode_record({"kind": "memcpy", "start_ns": 0, "end_ns": 5, "stream_id": 7,
+                       "device_id": 0, "bytes": 8, "copy_kind": 2, "context_id": 3})
+    waits = [decode_record({"kind": "sync", "start_ns": 0, "end_ns": 5, "sync_type": t,
+                            "context_id": 3}) for t in (2, 3)]
+    assert (k.context_id, m.context_id, waits[0].context_id) == (3, 3, 3)
+    assert (m.src, m.dst) == ("device", "host")
+    # Both fold to sync_kind "stream"; the raw type keeps them apart.
+    assert [w.sync_kind for w in waits] == ["stream", "stream"]
+    assert [w.sync_type for w in waits] == [2, 3]
+
+
+def test_decode_without_context_or_kinds_leaves_them_unset():
+    import warnings
+
+    from gitm.tracer._cupti_decode import decode_record
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = decode_record({"kind": "memcpy", "start_ns": 0, "end_ns": 5, "stream_id": 7,
+                           "device_id": 0, "bytes": 8})
+        s = decode_record({"kind": "sync", "start_ns": 0, "end_ns": 5})
+    assert (m.context_id, s.context_id, s.sync_type) == (None, None, None)

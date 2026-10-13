@@ -21,6 +21,9 @@ class _TraceEventBase(BaseModel):
     device_id: int
     correlation_id: int | None = None
     pid: int | None = None
+    # The CUDA context the record came from, when the collector reports one. Streams
+    # are numbered per context, so two contexts can each have a stream 7.
+    context_id: int | None = None
 
 
 class KernelEvent(_TraceEventBase):
@@ -72,6 +75,9 @@ class MemcpyEvent(_TraceEventBase):
 class SyncEvent(_TraceEventBase):
     kind: Literal["sync"] = "sync"
     sync_kind: Literal["stream", "event", "device"]
+    # The collector's own type (CUpti_ActivitySynchronizationType). sync_kind folds
+    # STREAM_WAIT_EVENT and STREAM_SYNCHRONIZE together; this keeps them apart.
+    sync_type: int | None = None
 
 
 TraceEvent = KernelEvent | MemcpyEvent | SyncEvent
