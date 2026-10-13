@@ -233,7 +233,7 @@ e8() {
   manifest e8 I "$LEVER"
   # Validity gate, as P1 runs it: an incoherent arm is restored to B before any
   # timed run. It does not judge accuracy; that is the spec's correctness gate.
-  python -m gitm.optimizer.separation sanity --base-url "$EP" --model "$MODEL" --out "$D/sanity.json" \
+  timeout 900 python -m gitm.optimizer.separation sanity --base-url "$EP" --model "$MODEL" --out "$D/sanity.json" \
     || { log "!!! e8 validity gate failed under $LEVER, restoring arm B"; bash "$SCRIPTS/arm.sh" B; exit 1; }
   capture_window "$D/cap_after" 190 & CAPPID=$!; sleep 3
   guide "$D/guidellm_after.json" "$HEADLINE_C" "$prompt" "$output" 180
