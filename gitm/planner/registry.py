@@ -234,6 +234,8 @@ def _load(model: str) -> tuple[Any, str, str]:
     else:
         entry = load_entry(model)
     if entry is not None:
+        if entry.get("execution_status") == "static_only":
+            raise ValueError(f"{model}: checkpoint evidence only; planner integration pending")
         prov = entry.get("provenance", {})
         est = [e.get("field") for e in prov.get("estimated", [])]
         note = f"catalogue; fitted fields: {est or 'none'}"
