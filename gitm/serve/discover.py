@@ -88,6 +88,13 @@ def is_vllm_server(cmdline: list[str]) -> bool:
         return False
     if any(p.search(cmdline[0]) for p in _VLLM_PATTERNS) and "serve" in cmdline[1:3]:
         return True
+    # A pip console script carries a shebang, so the kernel runs the interpreter
+    # and /proc shows [python, .../bin/vllm, serve, ...]: `vllm` is argv[1]. That
+    # is how `vllm serve` is normally started, and checking argv[0] alone made
+    # `capture attach --list` report no server at all.
+    if (len(cmdline) > 1 and _PYTHON.search(cmdline[0])
+            and _VLLM_PATTERNS[0].search(cmdline[1]) and cmdline[2:3] == ["serve"]):
+        return True
     return any(p.search(joined) for p in _VLLM_PATTERNS[1:])
 
 

@@ -38,6 +38,7 @@ from typing import Any
 from gitm.optimizer.history import EXPORT_NAME
 from gitm.optimizer.report import Provenance
 from gitm.optimizer.verification_export import VerificationRecord, write_verification
+from gitm.optimizer.vllm_knobs import knob_from_server_arg, same_server_value
 from gitm.serve.discover import vllm_argv_start, vllm_launch_argv
 
 __all__ = [
@@ -191,7 +192,8 @@ def realises(value: Any, spec_value: Any) -> bool:
     return str(value).strip().lower() == str(spec_value).strip().lower()
 
 
-def resolve_lever(knob: str, value: Any, library: Iterable[Any]) -> Any | None:
+def resolve_lever(knob: str, value: Any, library: Iterable[Any],
+                  baseline_value: Any = None) -> Any | None:
     """The catalog entry this flag change corresponds to, or ``None``.
 
     Ranking looks a record up by ``spec.name``, so a name invented from the flag
@@ -208,8 +210,13 @@ def resolve_lever(knob: str, value: Any, library: Iterable[Any]) -> Any | None:
     lever that exists only as the absence of ``--enforce-eager`` — is reachable
     at all. Removing a valued flag restores a server default this module does
     not know, so there is no lever to name and it resolves to ``None``.
+
+    ``baseline_value`` is what the baseline passed for the same flag. A nested
+    argument (``--speculative-config '{...}'``) names the knob inside it only if
+    the candidate changed that knob and nothing else beside it.
     """
     knob_name = knob.lstrip("-").replace("-", "_")
+    knob_name, value = knob_from_server_arg(knob_name, value, baseline_value)
     matches = [s for s in library if s.knob == knob_name]
     if value is None:
         return next((s for s in matches if isinstance(s.value, bool) and not s.value), None)
@@ -455,8 +462,11 @@ def knob_difference(
                 for _, flag, value in parse_flags(c.serve_argv, booleans=booleans)
                 if flag not in LAUNCH_ONLY_FLAGS}
 
+    # A JSON-valued flag is compared as what it parses to: the same config
+    # written differently is no change, and reading it as one credits a lever
+    # with an A/B that changed nothing.
     base, cand = flags(baseline), flags(candidate)
-    moved = {k: v for k, v in cand.items() if base.get(k) != v}
+    moved = {k: v for k, v in cand.items() if not same_server_value(base.get(k), v)}
     moved.update({k: None for k in base if k not in cand})
     return moved
 
@@ -519,7 +529,9 @@ def compare(
             "credited to one lever")
 
     knob, value = next(iter(knobs.items()))
-    spec = resolve_lever(knob, value, library)
+    base_flags = {flag: v for _, flag, v in parse_flags(
+        baseline.serve_argv, booleans=boolean_flags(library))}
+    spec = resolve_lever(knob, value, library, base_flags.get(knob))
     if spec is None:
         ran = f"removing {knob}" if value is None else f"setting {knob}={value}"
         raise CaptureError(

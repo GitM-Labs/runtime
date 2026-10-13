@@ -51,6 +51,12 @@ class KernelEvent(_TraceEventBase):
     graph_id: int | None = None
     graph_node_id: int | None = None
     launch_range: str | None = None
+    # Annotations on the identifying range (``L3/moe_routed#wave=2``).
+    range_attrs: dict[str, str] | None = None
+    # Which mechanism named the kernel (see gitm.distributed.correlate).
+    identity: Literal["range_id", "containment", "graph_node"] | None = None
+    # ROCm code-object symbol id; None on NVIDIA.
+    kernel_id: int | None = None
 
 
 class MemcpyEvent(_TraceEventBase):
@@ -58,6 +64,9 @@ class MemcpyEvent(_TraceEventBase):
     bytes: int
     src: Literal["host", "device", "unified"]
     dst: Literal["host", "device", "unified"]
+    # Range around the copy's issue: a step label that survives graph replay.
+    launch_range: str | None = None
+    graph_id: int | None = None
 
 
 class SyncEvent(_TraceEventBase):

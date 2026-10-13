@@ -34,8 +34,9 @@ is a separate decision with a separate answer.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from gitm.kernels.spec import InterventionSpec
 from gitm.optimizer.deviation_table import (
@@ -45,7 +46,8 @@ from gitm.optimizer.deviation_table import (
     rank_by_recoverable,
 )
 
-__all__ = ["Target", "levers_for", "levers_naming", "targets", "render_targets"]
+__all__ = ["Target", "levers_for", "levers_naming", "ops_aimed_at", "targets",
+           "targets_from_recoverable", "render_targets"]
 
 
 @dataclass(frozen=True)
@@ -67,20 +69,30 @@ class Target:
         return not self.levers
 
 
-def levers_naming(op: str, library: Iterable[InterventionSpec]) -> list[InterventionSpec]:
-    """Levers that name ``op`` in their declared scope.
+def ops_aimed_at(spec: InterventionSpec) -> tuple[str, ...]:
+    """The ops ``spec`` aims at: the canonical ops it names in its declared scope.
+
+    The one definition of the lever↔op join. It is made from three sides: from a
+    deviation row (:func:`levers_for`), from the per-kernel residuals in the
+    ranking's floor gate and its ordering
+    (:func:`gitm.agents.policy.select_interventions`), and in the run's
+    ``targets.json`` (:func:`targets_from_recoverable`). Each used to spell it
+    out for itself, and the docstring here claimed they shared it when the gate
+    did not.
 
     Op identity only — no substring fallback. A lever earns an op by naming the
     one the graph and the classifier agree on, and a coincidental substring is
-    how an untargeted lever gets tagged as targeted.
-
-    Split out from :func:`levers_for` because the same join is now made from two
-    different sides: from a deviation row here, and from the per-kernel residuals
-    in :func:`gitm.agents.policy.select_interventions`, which has no table. One
-    definition, so the two cannot drift into disagreeing about what "aims at"
-    means.
+    how an untargeted lever gets tagged as targeted. A whole-step lever aims at
+    no op: it reshapes the step, and naming ops would not make it targeted.
     """
-    return [s for s in library if op in s.applies_to_kernels]
+    if spec.whole_step:
+        return ()
+    return tuple(spec.applies_to_kernels)
+
+
+def levers_naming(op: str, library: Iterable[InterventionSpec]) -> list[InterventionSpec]:
+    """Levers that name ``op`` in their declared scope (:func:`ops_aimed_at`)."""
+    return [s for s in library if op in ops_aimed_at(s)]
 
 
 def levers_for(row: DeviationRow, library: Iterable[InterventionSpec]) -> list[InterventionSpec]:
@@ -113,6 +125,62 @@ def targets(
         for r in rank_by_recoverable(rows, top=top, phase=phase, bound=bound,
                                      min_share=min_share)
     ]
+
+
+def targets_from_recoverable(
+    recoverable: Mapping[str, float | None],
+    library: Iterable[InterventionSpec],
+    *,
+    device_s: float,
+    top: int = 10,
+) -> dict[str, Any]:
+    """Where this run's time is recoverable, and what aims at it, for ``targets.json``.
+
+    Built from :func:`gitm.optimizer.monitor.recoverable_by_op`, the same map the
+    ranking gates and orders on, rather than from a deviation table. The table
+    reaches the same quantity by scaling a one-step floor by a step count that a
+    trace cannot supply, and two derivations of one fact are two answers that can
+    disagree. This is the one the ranking used, so it is the one written down.
+
+    Per op, most recoverable first:
+
+    * ``levers`` — levers whose gain comes from making this op faster
+      (``recovers_kernel_time``). These are the ones the ranking orders by it.
+    * ``also_named_by`` — levers that name the op but work some other way, e.g.
+      through cache capacity. Touching the op is not a claim on its time.
+
+    ``uncovered`` lists every op with recoverable time that no lever names, past
+    the ``top`` cutoff as well: time
+    the catalogue has nothing aimed at. Whole-step levers still apply to them,
+    which is why it says "aimed at" and not "can affect".
+
+    An op judged unjudgeable (``None``) is listed apart, not ranked: it may be over
+    its floor, and nothing says by how much.
+    """
+    library = list(library)
+    losing = sorted(((op, gap) for op, gap in recoverable.items() if gap),
+                    key=lambda kv: (-kv[1], kv[0]))
+    rows = losing[:top]
+    out = []
+    for op, gap in rows:
+        naming = levers_naming(op, library)
+        out.append({
+            "op": op,
+            "recoverable_s": gap,
+            "share_of_device": (gap / device_s) if device_s > 0 else None,
+            "levers": [s.name for s in naming if s.recovers_kernel_time],
+            "also_named_by": [s.name for s in naming if not s.recovers_kernel_time],
+        })
+    return {
+        "basis": "per-kernel residuals against this model's graph",
+        "device_s": device_s,
+        "regions": out,
+        # Over every op losing time, not only the ``top`` listed above: an op past
+        # the cutoff with nothing aimed at it is still a gap in the catalogue.
+        "uncovered": [op for op, _ in losing if not levers_naming(op, library)],
+        "unjudgeable": sorted(op for op, gap in recoverable.items() if gap is None),
+        "whole_step_levers": sorted(s.name for s in library if s.whole_step),
+    }
 
 
 def render_targets(found: list[Target]) -> str:
