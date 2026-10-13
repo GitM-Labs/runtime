@@ -693,3 +693,40 @@ def test_an_arm_removing_a_flag_keeps_the_checkpoint_that_follows_it():
     arms, _ = plan_arms(base, [lever], booleans=boolean_flags(LIB))
     assert arms[0].serve_argv == ("vllm", "serve", "/ckpt/kimi",
                                   "--served-model-name", "kimi")
+
+
+def test_a_changed_drafting_method_is_not_credited_to_the_token_count_lever(tmp_path):
+    """The speculative lever changes the token count. An arm that moved the
+    baseline from n-gram to eagle at the same count measured a method change,
+    and filing that under the token-count lever is evidence for something
+    nobody ran."""
+    ngram = '{"method":"ngram","num_speculative_tokens":2}'
+    base = read_capture(_arm(tmp_path, "b", argv=[*BASE_ARGV, "--speculative-config", ngram]))
+    eagle = read_capture(_arm(tmp_path, "c", argv=[
+        *BASE_ARGV, "--speculative-config",
+        '{"method":"eagle","model":"d","num_speculative_tokens":5}']))
+    with pytest.raises(CaptureError, match="no catalog entry"):
+        compare(base, eagle, library=LIB)
+
+    # The token count alone, on the baseline's own method, is the lever.
+    count = read_capture(_arm(tmp_path, "d", argv=[
+        *BASE_ARGV, "--speculative-config", '{"method":"ngram","num_speculative_tokens":5}']))
+    assert compare(base, count, library=LIB).intervention_name == "speculative_decode_ngram_5"
+
+
+def test_the_same_speculative_config_written_differently_is_no_intervention(tmp_path):
+    """Spacing or key order is not a change. Read as one, the unchanged token
+    count would be filed as a measured A/B of the token-count lever."""
+    base = read_capture(_arm(tmp_path, "b", argv=[
+        *BASE_ARGV, "--speculative-config", '{"method":"ngram","num_speculative_tokens":5}']))
+    cand = read_capture(_arm(tmp_path, "c", argv=[
+        *BASE_ARGV, "--speculative-config",
+        '{"num_speculative_tokens": 5, "method": "ngram"}']))
+    with pytest.raises(CaptureError, match="same server flags"):
+        compare(base, cand, library=LIB)
+    # And the inverse refuses it on its own, whoever calls it.
+    from gitm.optimizer.vllm_knobs import knob_from_server_arg
+    assert knob_from_server_arg("speculative_config", '{"num_speculative_tokens": 5, '
+                                '"method": "ngram"}',
+                                '{"method":"ngram","num_speculative_tokens":5}')[0] == \
+        "speculative_config"

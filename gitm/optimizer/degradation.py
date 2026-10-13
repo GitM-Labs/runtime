@@ -68,6 +68,12 @@ AR_SKIPPED = "autoresearch.skipped"
 #: trying candidates. What was measured before it stands; what was queued after
 #: it was never tried.
 ENGINE_LOST = "engine.lost"
+#: The run's budget ran out with ranked candidates still queued. What was
+#: measured stands; the rest was never tried, which is not the same as losing.
+BUDGET_SPENT = "budget.spent"
+#: The trace held no kernels, so nothing was measured. Unreliable by
+#: definition: without it a run that measured nothing summarised as clean.
+TRACE_EMPTY = "trace.empty"
 
 # Artifacts a degradation can rest under. ``ab`` is the one history keys on.
 AFFECTS_RESIDUALS = "residuals"

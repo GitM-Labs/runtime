@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from gitm.optimizer.metrics import HardwarePeak
@@ -194,6 +195,10 @@ class PlannerContext:
     peak: HardwarePeak | None
     sku: str | None
     num_gpus: int
+    #: How the SKU was found, or what each source said when it was not. Read by
+    #: the graph.hardware degradation, so a run that falls back to A100 peaks
+    #: says which detection failed and how (L-18), instead of naming NVML alone.
+    sku_source: str = ""
 
 
 def _query_nvml() -> tuple[str | None, int | None]:
@@ -233,6 +238,8 @@ def _query_torch() -> tuple[str | None, int | None]:
     ``device_count`` is read before ``get_device_name`` so a box with the
     runtime but no visible device returns ``(None, 0)`` instead of raising.
     """
+    global _torch_probe_error
+    _torch_probe_error = None
     try:
         import torch
 
@@ -240,8 +247,24 @@ def _query_torch() -> tuple[str | None, int | None]:
         if n <= 0:
             return None, 0
         return str(torch.cuda.get_device_name(0)), n
-    except Exception:
+    except Exception as exc:
+        # Kept for the report: "the probe raised X" and "no device" have
+        # different fixes, and the returned (None, None) cannot tell them apart.
+        _torch_probe_error = f"{type(exc).__name__}: {exc}"
         return None, None
+
+
+#: The exception the last torch probe raised, if it raised.
+_torch_probe_error: str | None = None
+
+
+def _torch_note(name: str | None, count: int | None) -> str:
+    """What the torch probe said, in words, for ``PlannerContext.sku_source``."""
+    if name is not None:
+        return f"torch reported {name!r}"
+    if count == 0:
+        return "torch saw no device (device_count=0)"
+    return f"torch probe failed ({_torch_probe_error or 'torch unavailable'})"
 
 
 def _engine_world_size(engine: Any) -> int | None:
@@ -263,6 +286,90 @@ def _engine_world_size(engine: Any) -> int | None:
 
     val = engine_config_value(engine, "parallel_config", "world_size")
     return int(val) if isinstance(val, int) and not isinstance(val, bool) and val > 0 else None
+
+
+#: One directory per kfd node, CPU sockets included. Tests point it at a fake tree.
+_KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
+
+_AMD_PCI_VENDOR = 0x1002
+
+#: PCI device id -> name as libdrm's ``data/amdgpu.ids`` (mesa/drm b97cbde1)
+#: spells it, which is where ROCm takes its marketing names from. MI350X and
+#: MI355X are both gfx950, so only the device id tells them apart. 0x74A2 and
+#: 0x74B6 are left out (libdrm names them by revision, which kfd does not
+#: expose), as are the "HF" ids.
+_AMD_DEVICE_NAMES: dict[int, str] = {
+    # gfx90a (CDNA2)
+    0x7408: "AMD Instinct MI250X",
+    0x740C: "AMD Instinct MI250X / MI250",
+    0x740F: "AMD Instinct MI210",
+    0x7410: "AMD Instinct MI210 VF",
+    # gfx942 (CDNA3)
+    0x74A0: "AMD Instinct MI300A",
+    0x74A1: "AMD Instinct MI300X",
+    0x74A5: "AMD Instinct MI325X",
+    0x74B5: "AMD Instinct MI300X VF",
+    0x74B9: "AMD Instinct MI325X VF",
+    # gfx950 (CDNA4)
+    0x75A0: "AMD Instinct MI350X",
+    0x75A3: "AMD Instinct MI355X",
+    0x75A8: "AMD Instinct MI350P",
+    0x75B0: "AMD Instinct MI350X VF",
+    0x75B3: "AMD Instinct MI355X VF",
+    0x75B8: "AMD Instinct MI350P VF",
+}
+
+
+def _kfd_properties(node: Path) -> dict[str, int]:
+    """A kfd node's ``properties`` file: one ``name value`` line each, decimal."""
+    props: dict[str, int] = {}
+    for line in (node / "properties").read_text().splitlines():
+        key, _, value = line.partition(" ")
+        if value.isdigit():
+            props[key] = int(value)
+    return props
+
+
+def _gfx_name(version: int) -> str:
+    """90500 -> "gfx950". Minor and stepping are hex: 90010 -> "gfx90a"."""
+    return f"gfx{version // 10000}{version // 100 % 100:x}{version % 100:x}"
+
+
+def _query_amd() -> tuple[str | None, int | None]:
+    """(device name, count) from the kfd topology, the fallback after torch.
+
+    A node is a GPU iff its ``gpu_id`` is non-zero. An unlisted device id is
+    named ``"AMD gfx950 device id 30127"``, decimal so it cannot spell a
+    ``_PEAKS`` key the way hex ``0xa100`` would. The count is every GPU node
+    the process can read (EPERM outside the container's device cgroup), with
+    ``ROCR_VISIBLE_DEVICES`` not applied. ``(None, None)`` without kfd,
+    ``(None, 0)`` with kfd and no GPU node.
+    """
+    try:
+        if not _KFD_NODES.is_dir():
+            return None, None
+        # Numeric order: node "10" after node "2".
+        nodes = sorted(_KFD_NODES.iterdir(), key=lambda p: (len(p.name), p.name))
+    except OSError:
+        return None, None
+    gpus = []
+    for node in nodes:
+        try:
+            if (node / "gpu_id").read_text().strip() in ("", "0"):
+                continue
+            gpus.append(_kfd_properties(node))
+        except (OSError, UnicodeDecodeError):
+            continue
+    if not gpus:
+        return None, 0
+    first = gpus[0]
+    if first.get("vendor_id") != _AMD_PCI_VENDOR:
+        return None, len(gpus)
+    device = first.get("device_id", 0)
+    name = _AMD_DEVICE_NAMES.get(device)
+    if name is None:
+        name = f"AMD {_gfx_name(first.get('gfx_target_version', 0))} device id {device}"
+    return name, len(gpus)
 
 
 def peak_for_sku(sku: str | None) -> HardwarePeak | None:
@@ -375,11 +482,43 @@ def build_planner_context(
     need_sku = env_sku is None and nvml_name is None
     need_count = world is None and nvml_count is None
     torch_name = torch_count = None
+    torch_why = "torch not asked"
     if need_sku or need_count:
         torch_name, torch_count = _query_torch()
+        torch_why = _torch_note(torch_name, torch_count)
 
-    sku = env_sku or nvml_name or torch_name
-    n = world or nvml_count or torch_count or 1
+    # kfd is read when no override is set and no name so far has a peak, or
+    # when nothing has counted the box. A torch name alone does not settle it:
+    # ROCm torch can say "AMD Radeon Graphics", or "", which prices nothing.
+    counts = (world, nvml_count, torch_count)
+    priced = any(peak_for_sku(name) for name in (nvml_name, torch_name))
+    amd_name = amd_count = None
+    if (env_sku is None and not priced) or all(c is None for c in counts):
+        amd_name, amd_count = _query_amd()
+
+    # The override, then the first name with a peak. Among the rest kfd's table
+    # name comes first: it is the same on every run, so history keys the box
+    # once however torch spelled it.
+    names = (nvml_name, torch_name, amd_name)
+    amd_listed = amd_name if amd_name in _AMD_DEVICE_NAMES.values() else None
+    sku = (
+        env_sku
+        or next((x for x in names if peak_for_sku(x)), None)
+        or next((x for x in (amd_listed, *names) if x), None)
+    )
+    if env_sku is not None:
+        sku_source = "GITM_GPU_SKU"
+    elif sku is not None and sku == nvml_name:
+        sku_source = "NVML"
+    elif sku is not None and sku == torch_name:
+        sku_source = torch_why
+    elif sku is not None:
+        sku_source = "kfd topology"
+    else:
+        kfd_why = "no kfd topology" if amd_count is None else f"kfd saw {amd_count} GPU node(s)"
+        sku_source = f"GITM_GPU_SKU unset; NVML gave no name; {torch_why}; {kfd_why}"
+    # torch's 0 (every device masked) is an answer kfd must not overrule.
+    n = next((c for c in (*counts, amd_count) if c is not None), None) or 1
     peak = peak_for_sku(sku)
     dtype = _engine_dtype(engine)
     kv_len = _engine_kv_len(engine)
@@ -393,4 +532,4 @@ def build_planner_context(
         has_collective=n > 1,
         has_interconnect=n > 1,  # refined later by NVLink/IB probe
     )
-    return PlannerContext(gate=gate, peak=peak, sku=sku, num_gpus=n)
+    return PlannerContext(gate=gate, peak=peak, sku=sku, num_gpus=n, sku_source=sku_source)

@@ -93,6 +93,14 @@ def _parser() -> argparse.ArgumentParser:
              "and re-ranks what is left against it; 'off' keeps the opening order.",
     )
     run.add_argument(
+        "--validation", type=int, default=None, metavar="N",
+        help="How hard a candidate is tested before it is kept (default 2, or "
+             "GITM_VALIDATION). The baseline is first measured against itself N "
+             "times to get this run's noise floor, and each candidate must beat "
+             "that noise averaged over N paired A/B rounds. Autoresearch always "
+             "uses at least 2.",
+    )
+    run.add_argument(
         "--skip-lever", action="append", metavar="PATTERN", default=None,
         help="Do not try this lever. Matches its name or the knob it sets, with "
              "shell globs and ignoring case (e.g. 'speculative*' or "
@@ -801,6 +809,7 @@ def main(argv: list[str] | None = None) -> int:
             use_history=_resolve_use_history(args),
             rerank=args.rerank,
             skip_levers=args.skip_lever,
+            validation=args.validation,
         )
         summary = result.get("summary", {})
         if args.report is not None:
@@ -812,6 +821,13 @@ def main(argv: list[str] | None = None) -> int:
         # CUPTI shim, or the workload never ran) instead of seeing a fake pass.
         if summary.get("status") == "no_data":
             return 3
+        if summary.get("live") and summary.get("n_measured") == 0:
+            # A live run that finished without measuring a single A/B is not a
+            # success, whatever "status" says (P2-5). Every candidate failed to
+            # build, was rejected, or the budget ran out first.
+            print("gitm run: completed, but no candidate was measured; see the "
+                  "report's rejected list", file=sys.stderr)
+            return 6
         if summary.get("engine_lost"):
             # The report is complete for what was tried, but the run stopped
             # early with the engine in an unknown state. A job that exits 0 here

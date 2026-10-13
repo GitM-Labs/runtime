@@ -339,3 +339,27 @@ def test_the_cli_offers_exactly_the_modes_the_loop_knows(tmp_path):
                   .choices["run"]._actions if a.dest == "rerank")
 
     assert tuple(action.choices) == RERANK_MODES
+
+
+def test_a_rerank_reads_the_causes_the_retrace_shows(tmp_path, captures, monkeypatch):
+    """A kept lever can relieve the pressure that motivated the next one. The
+    re-trace samples the scheduler again, and the re-rank uses what it shows
+    now, not the opening capture's causes."""
+    from gitm.optimizer.scheduler_attribution import SchedulerCause
+
+    calls: list[int] = []
+
+    def causes(_summary):
+        calls.append(1)
+        if len(calls) > 1:
+            return []      # pressure gone by the re-trace
+        return [SchedulerCause(signal="kv_cache_preemption", effect="e", severity=0.9,
+                               note="n", motivates_knobs=["max_num_seqs"])]
+
+    monkeypatch.setattr(loop, "scheduler_causes", causes)
+    _run(tmp_path, rerank="recapture")
+    doc = _rerank_doc(tmp_path)
+
+    assert len(calls) > 1, "the re-trace did not re-read the scheduler"
+    recaptured = [s for s in doc["steps"] if s["recaptured"]]
+    assert recaptured and all(s["causes"] == [] for s in recaptured)

@@ -361,7 +361,258 @@ def test_phase4_still_records_what_the_gate_rejected(tmp_path, monkeypatch):
     out = loop.run_loop(loop.LoopConfig(budget="30s", scratch=str(tmp_path),
                                         workload_runner=_Runner()))
     assert out["summary"]["n_untried"] == 1   # c
-    assert out["summary"]["n_rejected"] == 2  # b, d
+    # b and d (the gate), and a, which never ran: its apply and restore both failed.
+    assert out["summary"]["n_rejected"] == 3
+
+
+def test_autoresearch_stops_at_the_budget(monkeypatch):
+    """P2-7. Phase 4 stops between candidates when the budget is spent, but
+    autoresearch ran every proposal regardless: a 15-minute run took 36."""
+    import gitm.agents.autoresearch as ar
+    from gitm.agents.policy import RankedCandidate
+
+    specs = [_spec(f"knob_{i}", 1) for i in range(5)]
+    monkeypatch.setattr(ar, "select_interventions", lambda *a, **kw: [
+        RankedCandidate(spec=s, predicted_delta=0.05) for s in specs])
+
+    class _Proposer:
+        def propose(self, cls, target_op=None):
+            return specs
+
+    clock = {"now": 0}
+    applied = []
+
+    def apply_and_tick(spec, applicator, **kw):
+        applied.append(spec.name)
+        clock["now"] += 10          # each candidate costs 10 units of wall time
+        return ApplyResult(True, rolled_back=True, measured_delta=-0.01)
+
+    monkeypatch.setattr(ar, "apply_intervention", apply_and_tick)
+    monkeypatch.setattr(ar.time, "time_ns", lambda: clock["now"])
+    seen = []
+    run = ar.autoresearch(_trace(), applicator=object(), proposer=_Proposer(),
+                          deadline_ns=25, on_result=seen.append)
+
+    assert applied == ["knob_0", "knob_1", "knob_2"]   # the third starts at t=20 < 25
+    assert run.stopped_by == "budget" and run.n_untried == 2
+    assert [r.spec.name for r in seen] == applied       # each result reported as it landed
+
+
+def test_a_candidate_that_never_ran_is_rejected_not_claimed(tmp_path, monkeypatch):
+    """L-9. A build that failed got a Claims row with a measured delta of '—'."""
+    from gitm.agents.policy import RankedCandidate
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield _trace(run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "select_interventions", lambda *a, **kw: [
+        RankedCandidate(spec=_spec("a", 1), predicted_delta=0.05)])
+    monkeypatch.setattr(loop, "apply_intervention", lambda *a, **kw: ApplyResult(
+        False, rolled_back=True, measured_delta=None,
+        error="apply failed, restored: candidate failed to build"))
+
+    out = loop.run_loop(loop.LoopConfig(budget="30s", scratch=str(tmp_path),
+                                        workload_runner=_Runner()))
+    report = (Path(out["run_dir"]) / "report.md").read_text()
+    s = out["summary"]
+    assert s["n_measured"] == 0 and s["n_rolled_back"] == 0
+    assert "did not run: apply failed" in report
+    assert "| `a` |" not in report          # no Claims-table row for it
+
+
+def test_a_run_stopped_by_its_budget_counts_what_it_never_tried(tmp_path, monkeypatch):
+    """The first Kimi run to finish stopped at its 2 h budget after two A/Bs and
+    reported n_untried 0 with candidates still queued."""
+    from gitm.agents.policy import RankedCandidate
+    from gitm.optimizer.degradation import BUDGET_SPENT
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield _trace(run_id or "r")
+
+    clock = {"now": 0}
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop.time, "time_ns", lambda: clock["now"])
+    monkeypatch.setattr(loop, "select_interventions", lambda *a, **kw: [
+        RankedCandidate(spec=_spec("a", 1), predicted_delta=0.05),
+        RankedCandidate(spec=_spec("b", 1), predicted_delta=0.05),
+        RankedCandidate(spec=_spec("c", 1), predicted_delta=0.05),
+        RankedCandidate(spec=_spec("d", 1), predicted_delta=0.0, rejected_reason="gate")])
+
+    def apply_spends_the_budget(spec, applicator, **kw):
+        clock["now"] += 60 * 10**9          # each A/B costs a minute of a 30 s budget
+        return ApplyResult(True, rolled_back=True, measured_delta=-0.01)
+
+    monkeypatch.setattr(loop, "apply_intervention", apply_spends_the_budget)
+    out = loop.run_loop(loop.LoopConfig(budget="30s", scratch=str(tmp_path),
+                                        workload_runner=_Runner()))
+    s = out["summary"]
+    assert s["n_untried"] == 2                       # b and c were queued, never tried
+    assert BUDGET_SPENT in s["degradations"]["approximate"]
+    report = (Path(out["run_dir"]) / "report.md").read_text()
+    assert "d (gate)" in report                      # the gate's rejection is still reported
+
+
+def test_the_headline_does_not_sum_independent_ab_deltas():
+    """L-10. '13 verified claims, aggregate +324.6%' added up deltas from
+    separate A/Bs that never ran together."""
+    from gitm.optimizer.report import Claim, _default_summary
+
+    def claim(name, d):
+        return Claim(summary="s", residual_invariant="kernel_time", residual_value=0.0,
+                     causal_evidence="e", intervention_name=name,
+                     predicted_delta=0.05, measured_delta=d)
+
+    text = _default_summary([claim("a", 0.03), claim("b", 0.10), claim("c", 0.02)])
+    assert "+10.0% (b)" in text and "aggregate" not in text and "+15.0%" not in text
+
+
+def test_a_run_killed_mid_way_keeps_the_ab_it_had_measured(tmp_path, monkeypatch):
+    """K-3. The export was written once, at the end; the first Kimi run on
+    MI355X hung after measuring a candidate and kept nothing."""
+    from gitm.agents.policy import RankedCandidate
+    from gitm.optimizer.apply import EngineABResult
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield _trace(run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "select_interventions", lambda *a, **kw: [
+        RankedCandidate(spec=_spec("a", 1), predicted_delta=0.05),
+        RankedCandidate(spec=_spec("b", 1), predicted_delta=0.05)])
+    monkeypatch.setattr(loop.DryRunApplicator, "last_result", EngineABResult(
+        knob="a", value=1, baseline_tps=100.0, candidate_tps=110.0, speedup=1.1,
+        kept=True), raising=False)
+
+    class Killed(BaseException):
+        """Stands in for the run being killed while the second candidate hangs."""
+
+    calls = {"n": 0}
+
+    def apply_then_die(spec, applicator, **kw):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise Killed
+        return ApplyResult(True, rolled_back=False, measured_delta=0.1)
+
+    monkeypatch.setattr(loop, "apply_intervention", apply_then_die)
+    with pytest.raises(Killed):
+        loop.run_loop(loop.LoopConfig(budget="30s", scratch=str(tmp_path),
+                                      workload_runner=_Runner()))
+
+    exports = list(Path(tmp_path).glob("runs/*/verification.json"))
+    assert len(exports) == 1, "nothing was written before the run died"
+    names = [r["intervention_name"] for r in json.loads(exports[0].read_text())["results"]]
+    assert names == ["a"]
+
+
+# --------------------------------------------------------------------------- #
+# K-2: a hung engine call is killed at its deadline                            #
+# --------------------------------------------------------------------------- #
+def test_a_hung_engine_call_is_killed_and_raises(monkeypatch):
+    """The first Kimi run sat in a collective deadlock until killed by hand."""
+    import threading
+    import time
+
+    from gitm import workloads
+    from gitm.optimizer.apply import EngineTimeout
+
+    killed = threading.Event()
+    monkeypatch.setattr(workloads, "_kill_engine_processes",
+                        lambda pids: (killed.set(), [4242])[1])
+
+    def hung_decode():
+        # Stands in for generate() blocked in a deadlock: it returns only when
+        # its engine dies, and then raises, as vLLM's client does.
+        killed.wait(5)
+        raise RuntimeError("EngineCore died")
+
+    t0 = time.monotonic()
+    with pytest.raises(EngineTimeout, match="ran past 0.2s"):
+        workloads._with_watchdog(hung_decode, what="decode", timeout_s=0.2, pids=lambda: {4242})
+    assert time.monotonic() - t0 < 3
+
+
+def test_a_hang_with_nothing_to_kill_is_abandoned_at_the_deadline(monkeypatch):
+    """A build can stall before its engine process exists, so killing frees
+    nothing. The watchdog then stops waiting for the call instead of hanging."""
+    import signal
+    import time
+
+    from gitm import workloads
+    from gitm.optimizer.apply import EngineTimeout
+
+    monkeypatch.setattr(workloads, "_WATCHDOG_GRACE_S", 0.2)
+    before = signal.getsignal(signal.SIGUSR1)
+
+    t0 = time.monotonic()
+    with pytest.raises(EngineTimeout, match="abandoned"):
+        workloads._with_watchdog(lambda: time.sleep(30), what="build", timeout_s=0.2,
+                                 pids=lambda: set())
+    assert time.monotonic() - t0 < 5
+    assert signal.getsignal(signal.SIGUSR1) == before      # handler put back
+
+
+def test_a_call_that_finishes_in_time_is_left_alone(monkeypatch):
+    from gitm import workloads
+
+    monkeypatch.setattr(workloads, "_kill_engine_processes",
+                        lambda pids: pytest.fail("killed a call that finished"))
+    assert workloads._with_watchdog(lambda: 7, what="decode", timeout_s=5,
+                                    pids=lambda: {1}) == 7
+
+
+def test_timeouts_come_from_the_environment(monkeypatch):
+    from gitm import workloads
+
+    monkeypatch.setenv("GITM_DECODE_TIMEOUT_S", "0")
+    assert workloads._timeout_s("GITM_DECODE_TIMEOUT_S", 1800.0) is None    # off
+    monkeypatch.setenv("GITM_DECODE_TIMEOUT_S", "90")
+    assert workloads._timeout_s("GITM_DECODE_TIMEOUT_S", 1800.0) == 90.0
+    monkeypatch.delenv("GITM_DECODE_TIMEOUT_S")
+    assert workloads._timeout_s("GITM_DECODE_TIMEOUT_S", 1800.0) == 1800.0
+
+
+def test_a_baseline_that_times_out_means_the_engine_is_lost():
+    """A killed baseline leaves nothing to measure the next candidate against."""
+    from gitm.optimizer.apply import EngineTimeout
+
+    class _HungBaseline:
+        def snapshot(self):
+            raise EngineTimeout("A/B decode ran past 1800s; its engine was killed")
+
+    res = apply_intervention(_spec(), _HungBaseline(), min_keep_delta=0.0)
+    assert res.restore_failed and not res.applied
+    assert "baseline timed out" in res.error
+
+
+def test_a_candidate_whose_decode_times_out_is_rolled_back():
+    """Serial mode: the candidate's engine was killed; the baseline is rebuilt."""
+    from gitm.optimizer.apply import EngineTimeout
+
+    restored = _Engine(100.0)
+
+    def tps(e):
+        if e is not restored and getattr(e, "_candidate", False):
+            raise EngineTimeout("A/B decode ran past 1800s; its engine was killed")
+        return e._tps
+
+    def build_candidate(_old, _values):
+        cand = _Engine(100.0)
+        cand._candidate = True
+        return cand
+
+    app = LiveEngineApplicator(_Engine(100.0), throughput_fn=tps, restart_fn=build_candidate,
+                               baseline_restart_fn=lambda _old: restored, restart_mode="serial")
+    res = apply_intervention(_spec(), app, min_keep_delta=0.0)
+    assert res.rolled_back and not res.restore_failed
+    assert "ran past" in res.error and app.engine is restored
 
 
 def test_shutdown_does_not_repeat_a_working_gitm_shutdown_fn():
