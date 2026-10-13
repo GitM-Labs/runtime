@@ -548,8 +548,10 @@ def _phase(run: Path, arm: str, phase: str, concurrency: int,
             continue
         try:
             w = window_stat(read_kernels(traces[-1]))
-        except (OSError, ValueError, KeyError, TypeError) as e:
-            # A capture cut off mid-write: drop the window, keep the run.
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError,
+                RecursionError) as e:
+            # A capture cut off mid-write, or JSON of the wrong shape: drop the window,
+            # keep the run.
             dropped.append(f"{where}: unreadable trace ({type(e).__name__}: {e})")
             continue
         if w.launch_s is None or w.launches < MIN_LAUNCHES:
@@ -562,7 +564,10 @@ def _phase(run: Path, arm: str, phase: str, concurrency: int,
         elif _read_json(g) is None:
             problems.append("guidellm.json unreadable")
         else:
-            p50, p95 = _itl_ms(g), _itl_ms(g, "p95")
+            try:
+                p50, p95 = _itl_ms(g), _itl_ms(g, "p95")
+            except (AttributeError, TypeError, IndexError, KeyError):
+                p50 = p95 = math.nan  # valid JSON that is not a GuideLLM result
             if p50 is None or p95 is None:
                 problems.append("ITL p50/p95 not found in guidellm.json")
             elif not (_positive(p50) and _positive(p95)):
@@ -832,7 +837,7 @@ def main(argv: list[str] | None = None) -> int:
     sa.add_argument("--out", required=True)
     an = sub.add_parser("analyze", help="Run the pre-registered decision on a run directory.")
     an.add_argument("run")
-    an.add_argument("--n-layers", type=int, default=None)
+    an.add_argument("--n-layers", type=int, default=61)
     an.add_argument("--concurrency", type=int, default=16)
     args = ap.parse_args(argv)
 
@@ -855,7 +860,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no P1 run at {run}: expected {run}/p1/traced/{{base1,cand,base2}}; "
               "pass the run root that p1_separation.sh wrote", file=sys.stderr)
         return 2
-    report = analyze(run, n_layers=61 if args.n_layers is None else args.n_layers,
+    report = analyze(run, n_layers=args.n_layers,
                      concurrency=args.concurrency)
     out = run / "p1" / "decision.json"
     try:
