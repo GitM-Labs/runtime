@@ -294,7 +294,7 @@ def _lever(name: str) -> dict[str, Any]:
         except Exception:  # noqa: BLE001 - an unreadable library must not lose a fired row
             _LIBRARY_REVIEW = {}
     review = _LIBRARY_REVIEW.get(name, "not found in library")
-    if review is not None and not isinstance(review, (str, int, float, bool)):
+    if review is not None and not isinstance(review, str | int | float | bool):
         review = str(review)
     return {"name": name, "review": review, "note": "applicability not checked"}
 
