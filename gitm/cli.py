@@ -206,6 +206,13 @@ def _parser() -> argparse.ArgumentParser:
     ))
 
 
+    inv = sub.add_parser(
+        "inventory",
+        help="Pinned checkpoint inventory: add, sync, and check for revision/artifact drift.",
+        add_help=False,
+    )
+    inv.add_argument("inventory_args", nargs=argparse.REMAINDER)
+
     add_deviate_arguments(sub.add_parser(
         "deviate",
         help="Subtract a predicted graph from a captured trace.",
@@ -752,6 +759,13 @@ def main(argv: list[str] | None = None) -> int:
     if argv[:1] == ["capture"] and "--" in argv:
         i = argv.index("--")
         argv, serve_argv = argv[:i], argv[i + 1:]
+
+    # `inventory` owns its own parser. argparse's REMAINDER cannot start with a
+    # flag, so `gitm inventory --file X check` would be rejected as unrecognised.
+    if argv[:1] == ["inventory"]:
+        from gitm.planner.inventory import main as inventory_main
+
+        return inventory_main(argv[1:])
 
     args = _parser().parse_args(argv)
 
