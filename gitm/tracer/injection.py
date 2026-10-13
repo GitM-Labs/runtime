@@ -337,7 +337,25 @@ def settle() -> None:
 
 
 def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[TraceEvent]:
+    """The events of :func:`read_shards_with_loss`, without the loss count."""
+    return read_shards_with_loss(start_ns, end_ns)[0]
+
+
+def read_shards_with_loss(
+    start_ns: int | None = None, end_ns: int | None = None
+) -> tuple[list[TraceEvent], int | None]:
     """Merge every shard into one decoded, time-sorted event list.
+
+    The second value is how many records are known to be lost: the collectors' own
+    dropped-record counts plus shard lines that could not be read back. It is ``-1``
+    when records are known to be lost and nothing says how many: a collector reported
+    a failed buffer or write, a shard was unreadable, or a process died without
+    writing its final line. It is ``None`` when the loss is not known either way,
+    which is not zero: there is no shard, a count could not be placed in a window,
+    or a shard carries no count from this window (an older library, or a process
+    whose buffers had not reached it). Records still in a collector's buffer when
+    the shards were read are not in the count.
+
     ``start_ns``/``end_ns`` bound the window in the CUPTI clock domain (see
     ``gitm_cupti_timestamp``), not wall-clock. Records outside it are dropped: the
     injected library is loaded for the process's entire lifetime, so without this
@@ -356,10 +374,16 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
     collectors: set[str] = set()
     no_direct_dispatch = False
     stamp_faults: dict[str, int] = {}
-    for shard in shard_paths():
+    shards = shard_paths()
+    # No shard at all is a collector that never loaded, not a capture with no loss.
+    loss_known = bool(shards)
+    lost_uncounted = False  # records are known to be lost, and nothing says how many
+    for shard in shards:
+        counted = final = False
         try:
             text = shard.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
+            lost_uncounted = True
             warnings.warn(
                 f"injected trace shard unreadable ({shard}: {type(exc).__name__}: {exc}); "
                 "capture coverage is incomplete",
@@ -394,11 +418,35 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
             if rec.get("kind") in CORRELATION_KINDS:
                 records.append(rec)
                 continue
-            # In-band reports from the ROCm collector.
+            # In-band reports from the collectors. A line with a count or a final
+            # marker is a loss report, one per armed buffer; the rest describe the
+            # collector and carry no stamp.
             if rec.get("kind") == "meta":
-                drops = rec.get("dropped_records")
-                if isinstance(drops, int):
-                    collector_drops += drops
+                if "dropped_records" in rec or rec.get("final") is True:
+                    stamp = rec.get("timestamp_ns")
+                    drops = rec.get("dropped_records")
+                    if (stamp is None and start_ns is not None) or (stamp is not None and (
+                        not isinstance(stamp, int) or isinstance(stamp, bool) or stamp <= 0
+                    )):
+                        # No stamp, or the collector's clock read failed (it stamps
+                        # 0): which window the report belongs to is not known.
+                        loss_known = False
+                    elif start_ns is not None and stamp is not None and stamp < start_ns:
+                        # A live process appends to one shard across captures: this
+                        # is an earlier one's. A report after the window's end can
+                        # still be for records inside it.
+                        pass
+                    elif rec.get("final") is True:
+                        final = True  # the process exited in order, after its last flush
+                    elif isinstance(drops, int) and not isinstance(drops, bool) and drops >= 0:
+                        collector_drops += drops
+                        counted = True
+                    elif isinstance(drops, int) and not isinstance(drops, bool):
+                        # Negative: a buffer walk or shard write failed, or CUPTI
+                        # would not give its count. Records went missing uncounted.
+                        lost_uncounted = counted = True
+                    else:
+                        loss_known = False  # not a count at all
                 if rec.get("collector"):
                     collectors.add(str(rec["collector"]))
                 if rec.get("identity") and rec.get("direct_dispatch") == 0:
@@ -415,6 +463,15 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
                 dropped_lines += 1
                 continue
             records.append(rec)
+        if not counted:
+            # No count from this window: an older library, or a process whose
+            # buffers had not reached its shard. Silence is not zero loss.
+            loss_known = False
+        pid = _shard_pid(shard)
+        if not final and pid is not None and not _pid_alive(pid):
+            # Died without an orderly exit: its last buffers never reached the shard,
+            # whatever did. (A killed process not yet reaped still reads as alive.)
+            lost_uncounted = True
 
     if dropped_lines:
         warnings.warn(
@@ -471,7 +528,9 @@ def read_shards(start_ns: int | None = None, end_ns: int | None = None) -> list[
             RuntimeWarning,
             stacklevel=2,
         )
-    return events
+    # A record the decoder has no model for is as lost to a reader as a dropped one.
+    lost = collector_drops + dropped_lines + max(unmodeled, 0)
+    return events, (-1 if lost_uncounted else lost if loss_known else None)
 
 
 def cupti_now() -> int | None:

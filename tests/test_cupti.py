@@ -295,3 +295,24 @@ def test_decode_without_context_or_kinds_leaves_them_unset():
                            "device_id": 0, "bytes": 8})
         s = decode_record({"kind": "sync", "start_ns": 0, "end_ns": 5})
     assert (m.context_id, s.context_id, s.sync_type) == (None, None, None)
+
+
+@pytest.mark.parametrize("shim_value, expected", [(0, 0), (4, 4), (-1, None), (None, None)])
+def test_backend_drop_count_reaches_the_trace_header(monkeypatch, tmp_path, shim_value, expected):
+    """A shim built before it counted, or a CUPTI that would not say, is unknown, never zero."""
+    import importlib
+
+    import gitm.tracer.cupti as cupti_mod
+
+    capture_mod = importlib.import_module("gitm.tracer.capture")
+    fake = _FakeShim([_kernel_rec()])
+    if shim_value is not None:
+        fake.dropped = lambda: shim_value
+    monkeypatch.setattr(cupti_mod, "load_shim", lambda: fake)
+    monkeypatch.setattr(capture_mod, "_backend", lambda: cupti_mod.CuptiBackend())
+    monkeypatch.setattr(capture_mod.injection, "active_vendor", lambda: None)
+    out = tmp_path / "trace.jsonl"
+    with capture_mod.capture(out, workload_id="w") as trace:
+        pass
+    assert trace.dropped_records == expected
+    assert json.loads(out.read_text().splitlines()[0])["_header"]["dropped_records"] == expected

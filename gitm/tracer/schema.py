@@ -103,6 +103,10 @@ class Trace(BaseModel):
     # Provenance of the event plane. Default "cupti" preserves every existing
     # capture/test construction; importers set nsys-import / torch-import.
     source: Literal["cupti", "rocprof", "nsys-import", "torch-import", "none"] = "cupti"
+    # Records known to be lost between the device and this trace; -1 when some were
+    # lost and nothing says how many. None means the collector did not count, which
+    # is not zero; imported traces are always None.
+    dropped_records: int | None = None
 
     def kernels(self) -> list[KernelEvent]:
         # Duck-type on ``kind`` so importers can store slotted lightweight
