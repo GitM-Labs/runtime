@@ -172,6 +172,7 @@ def test_an_unidentified_gpu_says_what_each_source_returned(monkeypatch):
     monkeypatch.delenv("GITM_GPU_SKU", raising=False)
     monkeypatch.setattr(ctx, "_query_nvml", lambda: (None, None))
     monkeypatch.setattr(ctx, "_query_torch", lambda: (None, 0))
+    monkeypatch.setattr(ctx, "_query_amd", lambda: (None, None))
     p = ctx.build_planner_context(None)
     assert p.sku is None
     assert "NVML gave no name" in p.sku_source and "device_count=0" in p.sku_source
