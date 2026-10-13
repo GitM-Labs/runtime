@@ -9,7 +9,7 @@ invariants so attribution doesn't need per-invariant logic.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -38,6 +38,8 @@ class KernelResidual:
     #: a resolved ``layer`` means this residual was measured against an interval
     #: rather than a point — see :func:`residuals`.
     n_classes: int = 1
+    #: gitm.tracer.kernel_attributes, filled only ``with_attributes``.
+    attrs: dict[str, str] = field(default_factory=dict)
 
     @property
     def interval_based(self) -> bool:
@@ -84,7 +86,7 @@ def _interval_residual(obs: float, lo: float, hi: float) -> float:
     return 0.0
 
 
-def residuals(trace: Trace, graph: Graph) -> Residuals:
+def residuals(trace: Trace, graph: Graph, *, with_attributes: bool = False) -> Residuals:
     """Pair observed kernels to predicted nodes by op identity, not position.
 
     The old ordinal pairing matched a handful of early kernels against unrelated
@@ -119,7 +121,15 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
 
     The third case degrades to the first the moment NVTX ranges land, with no
     change here.
+
+    ``with_attributes`` fills :attr:`KernelResidual.attrs` so attribution can
+    stratify; off by default because op-only attribution never reads it.
     """
+    index = None
+    if with_attributes:
+        from gitm.tracer.kernel_attributes import AttributeIndex
+
+        index = AttributeIndex.from_graph(graph)
     obs = trace.kernels()
     pred = graph.nodes
 
@@ -197,6 +207,7 @@ def residuals(trace: Trace, graph: Graph) -> Residuals:
             KernelResidual(
                 op=op, layer=layer, r_kt=r_kt, r_mt=r_mt,
                 t_obs_s=t_obs, t_pred_s=t_pred, bound=bound, n_classes=len(cls),
+                attrs=index.attributes(ok, op) if index is not None else {},
             )
         )
 
@@ -246,6 +257,24 @@ def recoverable_by_op(res: Residuals) -> dict[str, float | None]:
     return out
 
 
+def residual_series(res: Residuals, stratify: tuple[str, ...] = ()) -> dict[str, list[float]]:
+    """``r_kt`` per op — or per attribute stratum of each op — in trace order."""
+    from gitm.tracer.kernel_attributes import stratum
+
+    series: dict[str, list[float]] = {}
+    for kr in res.per_kernel:
+        series.setdefault(stratum(kr.op, kr.attrs, stratify), []).append(kr.r_kt)
+    return series
+
+
+def recoverable_by(res: Residuals, stratify: tuple[str, ...] = ()) -> dict[str, float | None]:
+    """:func:`recoverable_by_op` per attribute stratum (``stratify=()``: per op)."""
+    from gitm.tracer.kernel_attributes import stratum
+
+    return recoverable_by_op(Residuals(per_kernel=[
+        replace(r, op=stratum(r.op, r.attrs, stratify)) for r in res.per_kernel]))
+
+
 def _serialized_fraction(obs: list[KernelEvent]) -> float:
     """Fraction of adjacent kernel pairs that executed serialized.
 
@@ -272,6 +301,7 @@ def check_invariants(
     invariants: tuple[Invariant, ...] = INVARIANTS,
     *,
     multi_basis: bool = True,
+    stratify: tuple[str, ...] = (),
 ) -> list[Violation]:
     """Emit a Violation per out-of-band residual.
 
@@ -280,7 +310,12 @@ def check_invariants(
     :mod:`gitm.optimizer.multibasis`) or systematic for its op (median residual
     over band). This suppresses single-basis noise without dropping systematic
     shifts. Memory-traffic and stream-concurrency use the direct band check.
+
+    ``stratify`` judges "systematic" per attribute stratum rather than per op;
+    violations still name the op.
     """
+    from gitm.tracer.kernel_attributes import stratum
+
     out: list[Violation] = []
     inv_kt = next((i for i in invariants if i.id == "kernel_time"), None)
     inv_mt = next((i for i in invariants if i.id == "memory_traffic"), None)
@@ -289,9 +324,7 @@ def check_invariants(
     # Kernel-time confirmed-anomaly set: multi-basis transient ∪ systematic shift.
     confirmed: set[tuple[str, int]] | None = None
     if multi_basis and inv_kt is not None:
-        series_by_op: dict[str, list[float]] = {}
-        for kr in residuals_.per_kernel:
-            series_by_op.setdefault(kr.op, []).append(kr.r_kt)
+        series_by_op = residual_series(residuals_, stratify)
         confirmed = confirmed_positions(series_by_op)
         for op, vals in series_by_op.items():
             if abs(float(np.median(vals))) > inv_kt.band_width:  # systematic
@@ -299,11 +332,12 @@ def check_invariants(
 
     op_idx: dict[str, int] = {}
     for kr in residuals_.per_kernel:
-        i = op_idx.get(kr.op, 0)
-        op_idx[kr.op] = i + 1
+        key = stratum(kr.op, kr.attrs, stratify)
+        i = op_idx.get(key, 0)
+        op_idx[key] = i + 1
 
         if inv_kt is not None and abs(kr.r_kt) > inv_kt.band_width:
-            if confirmed is None or (kr.op, i) in confirmed:
+            if confirmed is None or (key, i) in confirmed:
                 out.append(
                     Violation(
                         invariant="kernel_time",

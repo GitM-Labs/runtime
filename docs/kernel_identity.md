@@ -260,3 +260,21 @@ same thread. vLLM's per-step H2D input preparation and D2H sampled-token copy ru
 outside the graph. That makes them likely step boundaries that survive graph
 replay when kernel ranges don't. This is a candidate time-series label alongside
 `launch_range`, still to be measured.
+
+## Status after the ROCm port (2026-10-07)
+
+See `docs/rocm_correlation.md`. Landed for both vendors:
+
+- unwindowed `graph_node`/`graph_exec` in `read_shards`;
+- the attribute side table (`gitm.tracer.kernel_attributes`, with `#k=v`
+  range annotations as the dynamic carrier);
+- memcpy `launch_range`;
+- the CUPTI capture-time node map: `cupti_core.c` subscribes to the NVTX domain
+  and to RESOURCE `GRAPHNODE_CREATED`/`CLONED`, skipping nodes
+  `cudaGraphInstantiate` creates.
+
+Per-layer projection needs vLLM's hooks to run during capture: no torch.compile
+(see `docs/rocm_correlation.md`, "When there is anything to project"). Compiled
+against CUDA 12 and 13 headers (`scripts/check_collectors.py --vendor
+nvidia`); not yet run on a GPU. The first check there is
+`test_replayed_kernels_take_their_capture_range_end_to_end`.

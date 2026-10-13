@@ -11,7 +11,12 @@ from unittest.mock import Mock
 
 import pytest
 
-from gitm.health.collective import HealthResult, detect_gpus, run_collective_health
+from gitm.health.collective import (
+    HealthResult,
+    _detect_in_process,
+    detect_gpus,
+    run_collective_health,
+)
 
 
 def test_detects_nvidia(monkeypatch):
@@ -20,7 +25,7 @@ def test_detects_nvidia(monkeypatch):
         version=SimpleNamespace(hip=None),
     )
     monkeypatch.setitem(sys.modules, "torch", torch)
-    assert detect_gpus() == ("nvidia", 4)
+    assert _detect_in_process() == ("nvidia", 4)
 
 
 def test_detects_amd(monkeypatch):
@@ -29,11 +34,11 @@ def test_detects_amd(monkeypatch):
         version=SimpleNamespace(hip="6.3"),
     )
     monkeypatch.setitem(sys.modules, "torch", torch)
-    assert detect_gpus() == ("amd", 8)
+    assert _detect_in_process() == ("amd", 8)
 
 
 def test_skips_when_fewer_than_two_gpus(monkeypatch):
-    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda: ("none", 0))
+    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda **_k: ("none", 0))
     result = run_collective_health()
     assert result.ok
     assert result.status == "skipped"
@@ -55,7 +60,7 @@ def test_allreduce_runs_across_all_visible_gpus(monkeypatch):
             Path(seen["cmd"][-1]).write_text(json.dumps({"ok": True}))
             return "", ""
 
-    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda: ("nvidia", 4))
+    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda **_k: ("nvidia", 4))
     monkeypatch.setattr("gitm.health.collective.subprocess.Popen", Proc)
 
     result = run_collective_health(timeout_s=5)
@@ -77,7 +82,7 @@ def test_wrong_result_fails(monkeypatch):
             self.result_path.write_text(json.dumps({"ok": False}))
             return "", ""
 
-    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda: ("amd", 2))
+    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda **_k: ("amd", 2))
     monkeypatch.setattr("gitm.health.collective.subprocess.Popen", Proc)
     result = run_collective_health()
     assert not result.ok
@@ -87,7 +92,7 @@ def test_wrong_result_fails(monkeypatch):
 def test_timeout_kills_torchrun_process_group(monkeypatch):
     proc = Mock(pid=123, returncode=None)
     proc.communicate.side_effect = subprocess.TimeoutExpired("torchrun", 1)
-    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda: ("nvidia", 2))
+    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda **_k: ("nvidia", 2))
     monkeypatch.setattr("gitm.health.collective.subprocess.Popen", lambda *a, **k: proc)
     killpg = Mock()
     monkeypatch.setattr("gitm.health.collective.os.killpg", killpg)
@@ -103,7 +108,7 @@ def test_timeout_kills_torchrun_process_group(monkeypatch):
 def test_keyboard_interrupt_kills_torchrun_process_group(monkeypatch):
     proc = Mock(pid=123, returncode=None)
     proc.communicate.side_effect = KeyboardInterrupt()
-    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda: ("nvidia", 2))
+    monkeypatch.setattr("gitm.health.collective.detect_gpus", lambda **_k: ("nvidia", 2))
     monkeypatch.setattr("gitm.health.collective.subprocess.Popen", lambda *a, **k: proc)
     killpg = Mock()
     monkeypatch.setattr("gitm.health.collective.os.killpg", killpg)
@@ -133,3 +138,48 @@ def test_loop_aborts_before_factory_on_health_failure(tmp_path: Path, monkeypatc
     assert "unreachable GPU" in out["summary"]["diagnostic"]
     health = Path(out["summary"]["report_path"]).parent / "collective_health.json"
     assert json.loads(health.read_text())["status"] == "fail"
+
+
+def test_detection_never_touches_cuda_in_this_process(monkeypatch):
+    """vLLM forks its EngineCore on NVIDIA; a CUDA runtime initialised here
+    first makes that fork unusable. The question goes to a child process."""
+    def poisoned():
+        raise AssertionError("asked torch in the engine's own process")
+
+    torch = SimpleNamespace(cuda=SimpleNamespace(is_available=poisoned, device_count=poisoned),
+                            version=SimpleNamespace(hip=None))
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return SimpleNamespace(stdout='["nvidia", 2]\n', returncode=0)
+
+    monkeypatch.setattr("gitm.health.collective.subprocess.run", fake_run)
+    assert detect_gpus() == ("nvidia", 2)
+    assert "_detect_in_process" in seen["cmd"][-1]
+
+
+def test_a_child_that_fails_reads_as_no_gpus(monkeypatch):
+    monkeypatch.setattr("gitm.health.collective.subprocess.run",
+                        lambda *a, **k: SimpleNamespace(stdout="", returncode=1))
+    assert detect_gpus() == ("none", 0)
+
+
+def test_a_child_that_prints_then_fails_reads_as_no_gpus(monkeypatch):
+    """A result printed before a failing exit is not trusted."""
+    monkeypatch.setattr("gitm.health.collective.subprocess.run",
+                        lambda *a, **k: SimpleNamespace(stdout='["nvidia", 4]\n', returncode=1))
+    assert detect_gpus() == ("none", 0)
+
+
+def test_detection_gets_the_callers_timeout(monkeypatch):
+    seen = {}
+
+    def fake_detect(timeout_s=60.0):
+        seen["timeout"] = timeout_s
+        return "none", 0
+
+    monkeypatch.setattr("gitm.health.collective.detect_gpus", fake_detect)
+    run_collective_health(timeout_s=1.0)
+    assert seen["timeout"] == 1.0

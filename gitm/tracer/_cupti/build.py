@@ -109,6 +109,15 @@ def _cupti_include(cuda: Path | None) -> Path | None:
         if (c / "cupti.h").exists():
             return c
     return None
+def _nvtx_include(cuda: Path | None) -> Path | None:
+    """Where ``nvtx3/`` lives, for the capture-time node map. A toolkit ships it
+    beside cuda_runtime.h; a pip install puts it in its own wheel. Absent, the
+    collector builds without the map."""
+    cands = [cuda / "include", cuda / "targets/x86_64-linux/include"] if cuda else []
+    cands += [base / "nvtx/include" for base in _nvidia_wheel_bases()]
+    return next((c for c in cands if (c / "nvtx3/nvToolsExt.h").exists()), None)
+
+
 def _cudart(cuda: Path | None) -> tuple[Path | None, Path | None]:
     """cuda_runtime.h include (must carry ``crt/``) + libcudart dir."""
     inc = lib = None
@@ -161,6 +170,7 @@ def _compile(sources: list[Path], out: Path, extra_includes: list[str], label: s
         f"-I{HERE}",
         f"-I{cupti_inc}",
         f"-I{cudart_inc}",
+        *[f"-I{i}" for i in [_nvtx_include(_cuda_home())] if i],
         *[str(s) for s in sources],
         f"-L{cupti_lib}",
         f"-L{cudart_lib}",

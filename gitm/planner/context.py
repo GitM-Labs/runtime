@@ -195,6 +195,10 @@ class PlannerContext:
     peak: HardwarePeak | None
     sku: str | None
     num_gpus: int
+    #: How the SKU was found, or what each source said when it was not. Read by
+    #: the graph.hardware degradation, so a run that falls back to A100 peaks
+    #: says which detection failed and how (L-18), instead of naming NVML alone.
+    sku_source: str = ""
 
 
 def _query_nvml() -> tuple[str | None, int | None]:
@@ -234,6 +238,8 @@ def _query_torch() -> tuple[str | None, int | None]:
     ``device_count`` is read before ``get_device_name`` so a box with the
     runtime but no visible device returns ``(None, 0)`` instead of raising.
     """
+    global _torch_probe_error
+    _torch_probe_error = None
     try:
         import torch
 
@@ -241,8 +247,24 @@ def _query_torch() -> tuple[str | None, int | None]:
         if n <= 0:
             return None, 0
         return str(torch.cuda.get_device_name(0)), n
-    except Exception:
+    except Exception as exc:
+        # Kept for the report: "the probe raised X" and "no device" have
+        # different fixes, and the returned (None, None) cannot tell them apart.
+        _torch_probe_error = f"{type(exc).__name__}: {exc}"
         return None, None
+
+
+#: The exception the last torch probe raised, if it raised.
+_torch_probe_error: str | None = None
+
+
+def _torch_note(name: str | None, count: int | None) -> str:
+    """What the torch probe said, in words, for ``PlannerContext.sku_source``."""
+    if name is not None:
+        return f"torch reported {name!r}"
+    if count == 0:
+        return "torch saw no device (device_count=0)"
+    return f"torch probe failed ({_torch_probe_error or 'torch unavailable'})"
 
 
 def _engine_world_size(engine: Any) -> int | None:
@@ -460,8 +482,10 @@ def build_planner_context(
     need_sku = env_sku is None and nvml_name is None
     need_count = world is None and nvml_count is None
     torch_name = torch_count = None
+    torch_why = "torch not asked"
     if need_sku or need_count:
         torch_name, torch_count = _query_torch()
+        torch_why = _torch_note(torch_name, torch_count)
 
     # kfd is read when no override is set and no name so far has a peak, or
     # when nothing has counted the box. A torch name alone does not settle it:
@@ -482,6 +506,17 @@ def build_planner_context(
         or next((x for x in names if peak_for_sku(x)), None)
         or next((x for x in (amd_listed, *names) if x), None)
     )
+    if env_sku is not None:
+        sku_source = "GITM_GPU_SKU"
+    elif sku is not None and sku == nvml_name:
+        sku_source = "NVML"
+    elif sku is not None and sku == torch_name:
+        sku_source = torch_why
+    elif sku is not None:
+        sku_source = "kfd topology"
+    else:
+        kfd_why = "no kfd topology" if amd_count is None else f"kfd saw {amd_count} GPU node(s)"
+        sku_source = f"GITM_GPU_SKU unset; NVML gave no name; {torch_why}; {kfd_why}"
     # torch's 0 (every device masked) is an answer kfd must not overrule.
     n = next((c for c in (*counts, amd_count) if c is not None), None) or 1
     peak = peak_for_sku(sku)
@@ -497,4 +532,4 @@ def build_planner_context(
         has_collective=n > 1,
         has_interconnect=n > 1,  # refined later by NVLink/IB probe
     )
-    return PlannerContext(gate=gate, peak=peak, sku=sku, num_gpus=n)
+    return PlannerContext(gate=gate, peak=peak, sku=sku, num_gpus=n, sku_source=sku_source)
