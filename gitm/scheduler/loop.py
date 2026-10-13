@@ -103,6 +103,34 @@ from gitm.workloads import WorkloadRunner, get_factory, sync_device
 #: range earlier runs saw on any setup.
 _THRESHOLD_WITHOUT_FLOOR = 0.02
 
+#: A re-trace that cannot change the order is skipped (see _retrace_skip_reason),
+#: but never this many times in a row: a kept lever can create pressure the run
+#: did not show before, and only a re-trace would see it.
+_RETRACE_ANYWAY_EVERY = 3
+
+
+def _retrace_skip_reason(queue: list[Any], *, floors_priced: bool,
+                         causes_seen: bool) -> str | None:
+    """Why a re-trace could not change the order of what is left, or ``None``.
+
+    A re-trace re-orders on three things: time above floor per op (only with
+    floors priced for this run), the scheduler and collective causes it
+    re-samples, and coverage, how much of the fresh trace each op-scoped lever
+    touches. With no priced floors, no cause seen so far, and only whole-step
+    levers left (coverage 1.0 for every one), none of the three can move, and
+    the re-trace costs two engine builds and a capture for nothing: about 23
+    minutes per candidate on Kimi K2.5 at TP=8.
+    """
+    if floors_priced or causes_seen:
+        return None
+    live = [x for x in queue if x.rejected_reason is None]
+    if any(not x.spec.whole_step and x.spec.applies_to_kernels for x in live):
+        return None
+    return ("the floors were not priced for this run, no scheduler or collective "
+            "cause has been observed, and every candidate left is whole-step, so a "
+            "re-trace could not change their order")
+
+
 _BUDGET_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd])\s*$")
 
 # Workloads the predicted graph + intervention library actually model. Anything
@@ -1632,6 +1660,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # to writing up what it has.
     engine_lost: str | None = early_engine_lost or calibration_lost
     n_untried = 0
+    # Whether any scheduler or collective cause has fired so far this run, and
+    # how many re-traces in a row were skipped (see _retrace_skip_reason).
+    causes_seen = bool(_motivated)
+    retrace_skips = 0
     if engine_lost is not None and isinstance(applicator, LiveEngineApplicator):
         # The engine was lost before the first candidate (a failed noise
         # calibration): there is nothing to measure them against.
@@ -1764,6 +1796,29 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             break
 
         if cfg.rerank == "recapture" and queue:
+            skip = (_retrace_skip_reason(queue, floors_priced=_floors_priced_for_this_run,
+                                         causes_seen=causes_seen)
+                    if retrace_skips < _RETRACE_ANYWAY_EVERY - 1 else None)
+            if skip is not None:
+                retrace_skips += 1
+                order = [x.spec.name for x in queue]
+                reranks.append({
+                    "after": c.spec.name,
+                    "measured_delta": result.measured_delta,
+                    "recaptured": False,
+                    "skipped": skip,
+                    "error": None,
+                    "order_before": order,
+                    "order_after": order,
+                    "changed": False,
+                    "causes": sorted(set(_motivated.values())),
+                    "targeted": False,
+                    "batch_priced": getattr(_batch, "batch", None),
+                    "batch_observed": None,
+                    "not_targeted_because": None,
+                })
+                continue
+            retrace_skips = 0
             # After the gate has decided, so the tracing overhead never lands on
             # the A/B that decides keep or rollback.
             step = len(reranks) + 1
@@ -1849,6 +1904,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 "batch_observed": getattr(batch_now, "batch", None),
                 "not_targeted_because": not_targeted,
             })
+            causes_seen = causes_seen or bool(_motivated)
             # The re-capture runs the workload, so it spends budget. Checked
             # again here because the check above ran before that spend: a
             # candidate cycle started on its strength could overrun by a whole
