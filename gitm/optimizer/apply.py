@@ -412,6 +412,9 @@ class NoiseFloor:
     """
 
     samples: list[float] = field(default_factory=list)
+    #: Baseline measurements left out because they were not the first on their
+    #: build (see ``LiveEngineApplicator._note_baseline``).
+    skipped_not_fresh: int = 0
 
     @property
     def floor(self) -> float | None:
@@ -658,6 +661,11 @@ class LiveEngineApplicator:
         noise: NoiseFloor | None = None,
     ) -> None:
         self.engine = engine
+        # True from the moment an engine is built until it is first measured.
+        # The first measurement on a build is the only one that counts for an
+        # A/A sample; see _note_baseline. The engine handed in is unmeasured.
+        self._unmeasured_build = True
+        self._last_measure_fresh = False
         self._tps = throughput_fn
         # The engine's own hook is the fallback, so a caller handing over an
         # engine gitm built need not re-pass what is already on it. One effective
@@ -739,6 +747,8 @@ class LiveEngineApplicator:
         stdev is 0.0 for a single rep → the noise band is 0 and keep falls back to
         ``delta > 0``, i.e. reps=1 behaves exactly as before reps were added.
         """
+        self._last_measure_fresh = self._unmeasured_build
+        self._unmeasured_build = False
         samples = [self._tps(self.engine) for _ in range(self._reps)]
         mean = sum(samples) / len(samples)
         if len(samples) < 2:
@@ -760,13 +770,23 @@ class LiveEngineApplicator:
 
     def _note_baseline(self, tps: float) -> None:
         """Record a baseline measurement, and the A/A sample it makes with the
-        previous one when both are the same configuration on different builds."""
-        engine_id = id(self.engine)
+        previous one: the same configuration, each measured first on its build.
+
+        Only a build's first measurement counts. A second measurement of the
+        same engine is not comparable with a fresh one: on a laptop on battery
+        the first decode after a rebuild (after the GPU had cooled through it)
+        ran 4-5% faster than the next, and pairing the two made that heat
+        effect read as build-to-build noise, multiplying the floor by seven.
+        Two first measurements on separate builds of the same configuration
+        are exactly an A/A pair, which is what the opening calibration takes.
+        """
+        if not self._last_measure_fresh:
+            self.noise.skipped_not_fresh += 1
+            return
         last = self._last_baseline
-        if (last is not None and last[0] == self._generation and last[1] != engine_id
-                and last[2] > 0 and tps > 0):
+        if last is not None and last[0] == self._generation and last[2] > 0 and tps > 0:
             self.noise.samples.append(tps / last[2] - 1.0)
-        self._last_baseline = (self._generation, engine_id, tps)
+        self._last_baseline = (self._generation, id(self.engine), tps)
 
     def calibrate(self, pairs: int, *, deadline_ns: int | None = None) -> list[float]:
         """Measure the baseline ``pairs + 1`` times, rebuilding it in between, so
@@ -875,6 +895,7 @@ class LiveEngineApplicator:
                 f"restart_fn produced no engine for knob(s) {', '.join(values)}"
             )
         self.engine = new_engine
+        self._unmeasured_build = True
         self._activate(new_engine)
         if self._restart_mode != "serial":
             self._prev = ("restart", old_engine)
@@ -891,6 +912,8 @@ class LiveEngineApplicator:
             _, old_engine = self._prev
             self._shutdown(self.engine)  # drop the candidate engine we built
             self.engine = old_engine
+            # Not a build: the baseline that was already measured comes back.
+            self._unmeasured_build = False
             self._activate(old_engine)
         elif tag == "serial_restart":
             _, restore_baseline = self._prev
@@ -921,6 +944,7 @@ class LiveEngineApplicator:
         self._prev = None
         try:
             self.engine = restore_baseline()
+            self._unmeasured_build = True
         except Exception as exc:
             # The baseline was already shut down: hold nothing rather than a
             # dead handle the loop would pass back to the caller as live.
@@ -1175,6 +1199,7 @@ class LiveEngineApplicator:
             self._prev = ("baseline_running",)
             raise
         self.engine = new_engine
+        self._unmeasured_build = True
         self._activate(new_engine)
 
 

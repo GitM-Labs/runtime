@@ -2111,6 +2111,9 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             "threshold_without_floor": _THRESHOLD_WITHOUT_FLOOR,
             "calibration_samples": noise_calibration,
             "samples": _noise.samples,
+            # Baseline measurements left out of the samples because they were a
+            # second measurement on an engine, not the first after its build.
+            "skipped_not_fresh": _noise.skipped_not_fresh,
             "floor": _noise.floor,
             "threshold": {
                 str(r): _noise.threshold(mean_noise_factor(r, rebuilt=True),

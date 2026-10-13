@@ -403,3 +403,52 @@ def test_a_parallel_baseline_that_dies_mid_validation_is_a_lost_engine():
         apply_mod.parallel_restart_fits = orig
     assert res.restore_failed and not res.rolled_back
     assert app.engine is not base and "A" in released
+
+
+def test_only_first_measurements_on_a_build_make_aa_samples():
+    """On a laptop on battery the first decode after a rebuild ran 4-5% faster
+    than the next one on the same engine. Pairing a second measurement with a
+    fresh one read that as noise and multiplied the floor by seven."""
+    box = _Box([1000.0, 1000.0, 1000.0, 1000.0, 1000.0],
+               candidate=[1003.0, 1003.0, 1003.0, 1003.0])
+    seen: dict[int, int] = {}
+
+    def tps(e):
+        seen[id(e)] = seen.get(id(e), 0) + 1
+        return e.tps * (1.0 if seen[id(e)] == 1 else 0.95)   # warm engines run slower
+
+    app = LiveEngineApplicator(
+        box.build("A"), throughput_fn=tps,
+        restart_fn=lambda _o, _v: box.build("B"),
+        baseline_restart_fn=lambda _o: box.build("A"),
+        restart_mode="serial", noise_gate=True, validation=2, min_effect=0.01,
+        threshold_without_floor=0.02)
+    app.calibrate(1)
+    apply_intervention(_spec(), app)        # round 2 rebuilds A: fresh
+    apply_intervention(_spec(), app)        # its snapshot re-measures that A: not fresh
+    # Every sample compares two fresh 1000s, so the floor is 0, not ~5%.
+    assert app.noise.samples and all(abs(d) < 1e-9 for d in app.noise.samples)
+    assert app.noise.skipped_not_fresh >= 1
+
+
+def test_a_baseline_brought_back_in_parallel_mode_is_not_fresh():
+    """A parallel rollback makes the already-measured baseline current again:
+    no build happened, so its next measurement is not an A/A sample."""
+    base = type("E", (), {"tps": 1000.0})()
+    cand = type("E", (), {"tps": 900.0})()
+    app = LiveEngineApplicator(
+        base, throughput_fn=lambda e: e.tps, restart_fn=lambda _o, _v: cand,
+        restart_mode="parallel", noise_gate=True, min_effect=0.01,
+        threshold_without_floor=0.02)
+    from gitm.optimizer import apply as apply_mod
+
+    orig = apply_mod.parallel_restart_fits
+    apply_mod.parallel_restart_fits = lambda *_a, **_k: (True, "")
+    try:
+        res = apply_intervention(_spec(), app)           # -10%: rolled back
+    finally:
+        apply_mod.parallel_restart_fits = orig
+    assert res.rolled_back and app.engine is base
+    app.snapshot()
+    assert app._last_measure_fresh is False
+    assert app.noise.samples == [] and app.noise.skipped_not_fresh == 1
