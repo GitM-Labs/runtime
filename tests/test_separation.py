@@ -475,3 +475,31 @@ def test_wrong_shaped_json_drops_the_window_not_the_analysis(tmp_path, monkeypat
     assert "cand/L2048_r1: unreadable trace" in joined
     assert "cand/L4096_r2: " in joined and "cand/L8192_r3: " in joined
     assert report["decision"]["outcome"] == "multiplicative", report["decision"]["reasons"]
+
+
+def test_write_atomic_does_not_follow_a_planted_temp_symlink(tmp_path):
+    import os
+
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep")
+    out = tmp_path / "decision.json"
+    (tmp_path / f"decision.json.{os.getpid()}.tmp").symlink_to(victim)
+    sep._write_atomic(out, "{}")
+    assert victim.read_text() == "keep"
+    assert out.read_text() == "{}" and not out.is_symlink()
+
+
+def test_strict_json_and_atomic_cleanup(tmp_path, monkeypatch):
+    import os
+
+    from gitm.optimizer import metrics
+
+    got = metrics._strict_json({"a": float("nan"), "c": {1.5},
+                                "b": (float("inf"), np.float64("nan"), np.int64(3))})
+    assert got == {"a": None, "b": [None, None, 3], "c": [1.5]} and type(got["b"][2]) is int
+    out = tmp_path / "witness.json"
+    out.write_text("old")
+    monkeypatch.setattr(os, "replace", lambda *a: (_ for _ in ()).throw(OSError("full")))
+    with pytest.raises(OSError):
+        metrics._write_atomic(out, "new")
+    assert out.read_text() == "old" and [p.name for p in tmp_path.iterdir()] == ["witness.json"]

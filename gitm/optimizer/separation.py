@@ -26,7 +26,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import re
 import statistics
 import sys
@@ -40,6 +39,7 @@ from scipy import optimize, stats
 
 from gitm.optimizer.deviation import classify_op
 from gitm.optimizer.mechanism_fixtures import fit_affine
+from gitm.optimizer.metrics import _strict_json, _write_atomic
 from gitm.serve.metrics import parse_prometheus
 
 # ── pre-registered constants (docs/experiments/p1_fp8_kv_separation.md §4) ──
@@ -279,19 +279,6 @@ def _noise(s: Sweep, pts: Sequence[str]) -> tuple[np.ndarray, int]:
 
 def _positive(v) -> bool:
     return isinstance(v, int | float) and not isinstance(v, bool) and math.isfinite(v) and v > 0
-
-
-def _strict_json(value):
-    """A copy that strict JSON can carry: non-finite floats become ``None``."""
-    if isinstance(value, Mapping):
-        return {k: _strict_json(v) for k, v in value.items()}
-    if isinstance(value, list | tuple | set | frozenset):
-        return [_strict_json(v) for v in value]
-    if isinstance(value, np.generic):
-        value = value.item()
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    return value
 
 
 def _outside(ci: tuple[float, float], lo: float, hi: float) -> bool:
@@ -813,17 +800,6 @@ def sanity(base_url: str, out: Path, model: str) -> list[str]:
             failures.append(f"prompt {i}: degenerate output ({len(set(toks))} distinct tokens)")
     out.write_text(json.dumps({"failures": failures, "outputs": rows}, indent=2))
     return failures
-
-
-def _write_atomic(path: Path, text: str) -> None:
-    """Write beside ``path`` and rename into place, so a reader never sees half a file."""
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
 
 
 def main(argv: list[str] | None = None) -> int:

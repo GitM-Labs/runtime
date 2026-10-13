@@ -23,8 +23,12 @@ busy" (high HFU) vs "the GPU is doing useful work" (high MFU) separable.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+import math
+import os
+import tempfile
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -241,3 +245,39 @@ def compute_metrics(
         mbu=mbu,
         recompute_fraction=recompute_fraction,
     )
+
+
+def _strict_json(value):
+    """A copy that strict JSON can carry: non-finite floats become ``None``."""
+    if isinstance(value, Mapping):
+        return {k: _strict_json(v) for k, v in value.items()}
+    if isinstance(value, list | tuple | set | frozenset):
+        return [_strict_json(v) for v in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Write beside ``path`` and rename into place, so a reader never sees half a file.
+
+    The temporary file is created exclusively under a random name: a guessable name
+    would follow a symlink planted in a shared run directory.
+    """
+    fh = tempfile.NamedTemporaryFile("w", dir=path.parent, prefix=path.name + ".",
+                                     suffix=".tmp", delete=False, encoding="utf-8")
+    try:
+        with fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+            # The exclusive temp file is 0600; give it the mode a plain write would have.
+            umask = os.umask(0)
+            os.umask(umask)
+            os.fchmod(fh.fileno(), 0o666 & ~umask)
+        os.replace(fh.name, path)
+    except BaseException:
+        Path(fh.name).unlink(missing_ok=True)
+        raise
