@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -107,6 +108,7 @@ def resolve_config_path(
     environ: dict[str, str] | None = None,
     *,
     cache_root: Path | None = None,
+    revision: str | None = None,
 ) -> Path | None:
     """Locate the ``config.json`` for ``model_ref`` — a local path or a hub id.
 
@@ -129,6 +131,25 @@ def resolve_config_path(
     snapshots = repo_dir / "snapshots"
     if not snapshots.is_dir():
         return None
+    if revision is not None:
+        # Hugging Face stores branch/tag names under refs/, which point to a
+        # snapshot hash. Resolve that ref rather than inspecting a different
+        # (possibly newer) cached snapshot. DeepSeek V3.2 still requires the
+        # launch argument itself to be an immutable hash below.
+        snapshot_revision = revision
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+            if ("\\" in revision or any(part in ("", ".", "..")
+                                     for part in revision.split("/"))):
+                return None
+            ref = repo_dir / "refs" / revision
+            try:
+                snapshot_revision = ref.read_text().strip()
+            except OSError:
+                return None
+            if not re.fullmatch(r"[0-9a-fA-F]{40}", snapshot_revision):
+                return None
+        pinned = snapshots / snapshot_revision / "config.json"
+        return pinned if pinned.is_file() else None
     configs = [s / "config.json" for s in snapshots.iterdir() if (s / "config.json").is_file()]
     if not configs:
         return None
@@ -280,6 +301,7 @@ class LiveSpec:
     source_path: Path
     model_ref: str
     applied_overrides: dict[str, Any] = field(default_factory=dict)
+    checkpoint_evidence: dict[str, Any] = field(default_factory=dict)
     family: str = "sparse_moe"
     ok: bool = True
 
@@ -329,7 +351,13 @@ def live_moe_spec(
     if environ is None:
         environ = discover.read_environ(target.pid, proc) or {}
 
-    cfg_path = resolve_config_path(model_ref, environ, cache_root=cache_root)
+    from gitm.serve.vllm import _arg_of
+
+    requested_revision = _arg_of(target.cmdline, "--revision")
+    cfg_path = resolve_config_path(
+        model_ref, environ, cache_root=cache_root,
+        revision=requested_revision if requested_revision else None,
+    )
     if cfg_path is None:
         return LiveSpecError(
             reason=(
@@ -364,7 +392,35 @@ def live_moe_spec(
             model_ref=model_ref,
         )
 
-    if family in ("hybrid", "glm_moe_dsa"):
+    checkpoint_evidence: dict[str, Any] = {}
+    from gitm.planner.glm_graph import is_deepseek_v32_config
+
+    if is_deepseek_v32_config(cfg):
+        from gitm.planner.checkpoint_evidence import (
+            revision_from_snapshot,
+            verify_deepseek_checkpoint,
+        )
+        from gitm.planner.model_catalogue import load_spec
+
+        try:
+            revision = revision_from_snapshot(cfg_path)
+            # A Hub ID with no immutable launch revision could have loaded a
+            # different cached snapshot before this inspection. A local snapshot
+            # path itself supplies its immutable identity.
+            local_ref = Path(model_ref).is_dir() or Path(model_ref).is_file()
+            if not local_ref and not requested_revision:
+                raise ValueError("hub model launch needs an explicit immutable --revision")
+            if requested_revision and requested_revision.lower() != revision.lower():
+                raise ValueError("loaded snapshot differs from --revision")
+            checkpoint_evidence = verify_deepseek_checkpoint(
+                cfg_path, cfg_path.with_name("model.safetensors.index.json"),
+                revision=revision,
+            )
+            spec = load_spec("deepseek-v3.2")
+        except (OSError, ValueError, KeyError) as e:
+            return LiveSpecError(reason=f"DeepSeek V3.2 static verification failed: {e}",
+                                 model_ref=model_ref)
+    elif family in ("hybrid", "glm_moe_dsa"):
         from gitm.planner.registry import spec_from_hf_config as _family_spec
 
         try:
@@ -410,5 +466,6 @@ def live_moe_spec(
         source_path=cfg_path,
         model_ref=model_ref,
         applied_overrides=overrides,
+        checkpoint_evidence=checkpoint_evidence,
         family=family,
     )
