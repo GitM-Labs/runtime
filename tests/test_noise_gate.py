@@ -426,11 +426,10 @@ def test_only_first_measurements_on_a_build_make_aa_samples():
     fresh one read that as noise and multiplied the floor by seven."""
     box = _Box([1000.0] * 8,
                candidate=[1003.0, 1003.0, 1003.0, 1003.0])
-    seen: dict[int, int] = {}
-
     def tps(e):
-        seen[id(e)] = seen.get(id(e), 0) + 1
-        return e.tps * (1.0 if seen[id(e)] == 1 else 0.95)   # warm engines run slower
+        # Counted on the engine, not by id(): a released engine's id is reused.
+        e.measured = getattr(e, "measured", 0) + 1
+        return e.tps * (1.0 if e.measured == 1 else 0.95)    # warm engines run slower
 
     app = LiveEngineApplicator(
         box.build("A"), throughput_fn=tps,
