@@ -20,7 +20,9 @@ dependencies = [
     "jinja2>=3.1",
     "pyyaml>=6.0",
     "numpy>=1.26",
+    "scipy>=1.11",
     "statsmodels>=0.14",
+    "scipy>=1.11",  # t quantiles for experiment verdict intervals (gitm/experiment)
 ]
 
 [project.optional-dependencies]
@@ -84,6 +86,9 @@ addopts = "-q"
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# Retain supplied analysis artifacts byte-for-byte. Project code and its tests
+# remain linted; these historical source copies are not maintained runtime code.
+extend-exclude = ["docs/cross-architecture/sources/arshia"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "B", "UP"]

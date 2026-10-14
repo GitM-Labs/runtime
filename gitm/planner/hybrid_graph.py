@@ -12,6 +12,7 @@ from gitm.planner.roofline import (
     HardwareSpec,
     ShardingConfig,
     distinct_experts,
+    kv_elem_bytes,
     roofline,
     weight_bytes,
 )
@@ -209,6 +210,34 @@ class HybridMoEModelSpec:
     #: and therefore hashable — a ``dict`` field makes ``hash(spec)`` raise.
     op_dtype_overrides: tuple[tuple[str, str], ...] = ()
 
+    #: Explicit convolution geometry/storage. Unset preserves the legacy fitted
+    #: conv_dim and shared state dtype; setting these does not select KDA lowering.
+    linear_conv_channels: int | None = None
+    linear_conv_state_dtype: str | None = None
+
+    def __post_init__(self):
+        if self.linear_conv_channels is not None and (
+            type(self.linear_conv_channels) is not int or self.linear_conv_channels <= 0
+        ):
+            raise ValueError('linear_conv_channels must be a positive integer')
+        if self.linear_conv_state_dtype is not None:
+            _ = self.conv_state_element_bytes  # validate only the new opt-in field
+
+    @property
+    def conv_channels(self) -> int:
+        return self.conv_dim if self.linear_conv_channels is None else self.linear_conv_channels
+
+    @property
+    def conv_state_element_bytes(self) -> float:
+        if self.linear_conv_state_dtype is None:
+            return weight_bytes(self.ssm_state_dtype)
+        widths = {'bf16': 2.0, 'bfloat16': 2.0, 'fp16': 2.0, 'float16': 2.0,
+                  'fp32': 4.0, 'float32': 4.0}
+        dtype = self.linear_conv_state_dtype
+        if not isinstance(dtype, str) or dtype.removeprefix('torch.').lower() not in widths:
+            raise ValueError('unsupported linear_conv_state_dtype')
+        return widths[dtype.removeprefix('torch.').lower()]
+
     # ── derived shapes ───────────────────────────────────────────────────────
 
     def layer_kind(self, layer: int) -> str:
@@ -390,13 +419,16 @@ class HybridMoEModelSpec:
         A causal depthwise convolution of width ``k`` needs the previous ``k-1``
         inputs per channel.
         """
-        return self.conv_dim * max(0, self.linear_conv_kernel_dim - 1)
+        return self.conv_channels * max(0, self.linear_conv_kernel_dim - 1)
 
     @property
     def linear_state_bytes_per_layer(self) -> float:
         """Bytes of recurrent + convolution state per sequence, per linear layer."""
         sw = weight_bytes(self.ssm_state_dtype)
-        return (self.recurrent_state_elems + self.conv_state_elems) * sw
+        # Retain the exact old arithmetic when no independent dtype is supplied.
+        if self.linear_conv_state_dtype is None:
+            return (self.recurrent_state_elems + self.conv_state_elems) * sw
+        return self.recurrent_state_elems * sw + self.conv_state_elems * self.conv_state_element_bytes
 
     @property
     def linear_state_bytes_per_sequence(self) -> float:
@@ -448,7 +480,7 @@ def kv_bytes_per_token(spec: HybridMoEModelSpec) -> float:
     model: 9 full-attention layers grow with context and 39 windowed ones do
     not, giving ``11,520 x S + 12.78M`` elements rather than a rate 4x higher.
     """
-    kw = weight_bytes(spec.kv_dtype)
+    kw = kv_elem_bytes(spec.kv_dtype)
     return sum(
         spec.kv_entry_elems(i) * kw
         for i in range(spec.n_layers)
@@ -467,7 +499,7 @@ def kv_fixed_bytes_per_sequence(spec: HybridMoEModelSpec) -> float:
     Zero for a checkpoint with no windowed layers, which is every checkpoint this
     family carried before MiMo.
     """
-    kw = weight_bytes(spec.kv_dtype)
+    kw = kv_elem_bytes(spec.kv_dtype)
     return sum(
         spec.attention_window(i) * spec.kv_entry_elems(i) * kw
         for i in range(spec.n_layers)
@@ -484,7 +516,7 @@ def attention_page_bytes(spec: HybridMoEModelSpec, block_size: int) -> float:
     from the config is the cheapest available check that the state arithmetic in
     this module is right.
     """
-    return block_size * 2.0 * spec.kv_dim * weight_bytes(spec.kv_dtype)
+    return block_size * 2.0 * spec.kv_dim * kv_elem_bytes(spec.kv_dtype)
 
 
 def mamba_page_bytes(spec: HybridMoEModelSpec) -> float:
@@ -607,7 +639,7 @@ def _emit_full_attention(
         "attn_qnorm_rope_insert",
         3.0 * normed + 6.0 * roped,
         2.0 * normed * aw + 2.0 * roped * aw
-        + rows * kv_heads * (head_dim + v_head_dim) * weight_bytes(spec.kv_dtype),
+        + rows * kv_heads * (head_dim + v_head_dim) * kv_elem_bytes(spec.kv_dtype),
         spec.act_dtype,
     )
 
@@ -615,7 +647,7 @@ def _emit_full_attention(
     # chunk, linear at decode. Traffic follows the cached entries read, which is
     # what makes a wide step amortise cache reads across many queries and is the
     # reason prefill flips this node from memory-bound to compute-bound.
-    kw = weight_bytes(spec.kv_dtype)
+    kw = kv_elem_bytes(spec.kv_dtype)
     # QK contracts over ``head_dim``; PV contracts over ``v_head_dim``. Equal
     # unless the checkpoint splits them.
     qk = 2.0 * qk_pairs * heads * head_dim
@@ -668,14 +700,16 @@ def _emit_linear_attention(
     # read and written every step. Both terms are small; it is emitted separately
     # because a distinct kernel runs (``causal_conv1d_update``) and folding it
     # into the recurrent node would leave that kernel unattributable.
-    conv_ch = spec.conv_dim // max(1, tp)
+    if spec.linear_conv_channels is not None and spec.conv_channels % max(1, tp):
+        raise ValueError('convolution channels must divide tensor parallelism')
+    conv_ch = spec.conv_channels // max(1, tp)
     conv_state = conv_ch * max(0, spec.linear_conv_kernel_dim - 1)
     add(
         "linattn_conv",
         2.0 * rows * conv_ch * spec.linear_conv_kernel_dim,
-        2.0 * sequences * conv_state * sw + 2.0 * rows * conv_ch * aw,
+        2.0 * sequences * conv_state * spec.conv_state_element_bytes + 2.0 * rows * conv_ch * aw,
         spec.act_dtype,
-        estimated=True,  # conv_dim is fitted; see HybridMoEModelSpec.conv_dim
+        estimated=True,  # explicit geometry does not validate the physical lowering
     )
 
     # The delta-rule state update. **This is the node that makes the family
@@ -1255,6 +1289,8 @@ def spec_from_hf_config(
         # constant, so a differently-shaped sibling scales with it instead of
         # silently inheriting the width that happened to fit Qwen3.6.
         conv_dim=n_value_heads * value_head_dim,
+        linear_conv_channels=text.get("linear_conv_channels"),
+        linear_conv_state_dtype=text.get("linear_conv_state_dtype"),
         v_head_dim=_opt_int("v_head_dim"),
         sliding_window=window,
         swa_num_kv_heads=_opt_int("swa_num_key_value_heads"),

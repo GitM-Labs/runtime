@@ -1,0 +1,172 @@
+{
+  "planner_pin": {
+    "repository": "https://github.com/GitM-Labs/runtime",
+    "sha": "05abd11b866bdabe2619b5f289db52d647eb55ad",
+    "checked": "2026-10-06",
+    "method": "read-only HTTPS archive; no Git operations"
+  },
+  "scope": "local review adapter calling real roofline and Graph; no production tiered support",
+  "families": [
+    {
+      "family": "Trainium2",
+      "evidence": "source-derived documented copy example",
+      "terms": {
+        "chip_hbm": {
+          "bytes": 131072.0,
+          "time_s": 4.369066666666667e-08,
+          "kind": "service_lower_bound",
+          "source": "AWS v2.31.1 reports 2.9 and 3.0TB/s; fastest reported peak envelope"
+        },
+        "core_sbuf": {
+          "bytes": 131072.0,
+          "time_s": null,
+          "kind": "unknown",
+          "source": "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.31.1/nki/guides/architecture/trainium2_arch.html"
+        },
+        "core_dma": {
+          "bytes": 131072.0,
+          "time_s": null,
+          "kind": "unknown",
+          "source": "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.31.1/nki/guides/architecture/trainium2_arch.html"
+        }
+      },
+      "whole_region_time_s": null,
+      "aggregate_capacity_passes": true
+    },
+    {
+      "family": "SN40L",
+      "evidence": "source-derived flow with scenario-selected byte counts",
+      "activation_terms": {
+        "socket_ddr": {
+          "bytes": 64000000.0,
+          "time_s": 0.00064,
+          "kind": "conditional_service_time",
+          "source": "Arshia P-DDR-BW preferred scenario"
+        },
+        "socket_hbm": {
+          "bytes": 64000000.0,
+          "time_s": 4e-05,
+          "kind": "conditional_service_time",
+          "source": "Arshia P-HBM-BW preferred scenario"
+        },
+        "activation_engine": {
+          "bytes": 64000000.0,
+          "time_s": null,
+          "kind": "unknown",
+          "source": "https://arxiv.org/html/2405.07518v2"
+        }
+      },
+      "consumer_terms": {
+        "socket_hbm": {
+          "bytes": 640000000.0,
+          "time_s": 0.0004,
+          "kind": "conditional_service_time",
+          "source": "Arshia P-HBM-BW preferred scenario"
+        }
+      },
+      "whole_region_time_s": null,
+      "aggregate_capacity_passes": true
+    }
+  ],
+  "checks": [
+    {
+      "name": "Trainium copy conserved at both endpoints and DMA",
+      "passed": true
+    },
+    {
+      "name": "Trainium tile passes aggregate SBUF capacity only",
+      "passed": true
+    },
+    {
+      "name": "Trainium unknown DMA remains unknown",
+      "passed": true
+    },
+    {
+      "name": "SN40L backing source charged once",
+      "passed": true
+    },
+    {
+      "name": "SN40L reuse charged at HBM",
+      "passed": true
+    },
+    {
+      "name": "SN40L activation engine remains unknown",
+      "passed": true
+    },
+    {
+      "name": "SN40L scenario passes aggregate HBM capacity only",
+      "passed": true
+    },
+    {
+      "name": "SRAM lower rate produces upper ideal service time",
+      "passed": true
+    },
+    {
+      "name": "Read and write share aggregate resource",
+      "passed": true
+    },
+    {
+      "name": "Overlapping buffers rejected",
+      "passed": true
+    },
+    {
+      "name": "Adjacent half-open lifetimes fit",
+      "passed": true
+    },
+    {
+      "name": "Reject invalid demand -1.0",
+      "passed": true
+    },
+    {
+      "name": "Reject invalid demand nan",
+      "passed": true
+    },
+    {
+      "name": "Real Graph dependency chain retains 1.2ms synthetic activation",
+      "passed": true
+    },
+    {
+      "name": "Legacy roofline equation unchanged",
+      "passed": true
+    }
+  ],
+  "passed": 15,
+  "v32_current_comparison": [
+    {
+      "context": 8192,
+      "current_family": "sparse_moe",
+      "current_bytes": 77980985596.0,
+      "conditional_ledger_bytes": 4513476756.0,
+      "glm_candidate_bytes": 4403953981.75,
+      "candidate_node_count": 1273,
+      "current_has_unpriced_collectives": true
+    },
+    {
+      "context": 131072,
+      "current_family": "sparse_moe",
+      "current_bytes": 702215317756.0,
+      "conditional_ledger_bytes": 5502906516.0,
+      "glm_candidate_bytes": 6322848061.75,
+      "candidate_node_count": 1273,
+      "current_has_unpriced_collectives": true
+    }
+  ],
+  "k3_flag_fields_present_in_hybrid": {
+    "q_lora_rank": false,
+    "kv_lora_rank": false,
+    "qk_nope_head_dim": false,
+    "qk_rope_head_dim": false,
+    "mla_use_nope": false,
+    "mla_cache_elems_per_token": false,
+    "linear_conv_channels": false,
+    "linear_conv_state_dtype": false,
+    "routed_expert_hidden_size": false,
+    "latent_moe_use_norm": false,
+    "moe_router_activation_func": false,
+    "topk_method": false,
+    "expert_dtype": false,
+    "expert_group_size": false,
+    "expert_scale_dtype": false
+  },
+  "remaining_scope": "No measured residual, compiled mapping, production integration, or catalogue-wide compatibility claim"
+}

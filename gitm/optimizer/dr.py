@@ -129,22 +129,25 @@ def doubly_robust_ate(
     return ate, se
 
 
-def attribute_dr(residuals: Residuals, graph: Graph, *, band: float = _KT_BAND) -> RankedHypotheses:
+def attribute_dr(residuals: Residuals, graph: Graph, *, band: float = _KT_BAND,
+                 stratify: tuple[str, ...] = ()) -> RankedHypotheses:
     """Doubly-robust ranking of cause→effect pairs, as ``RankedHypotheses``.
 
     Mirrors :func:`gitm.optimizer.attribution.attribute` so the loop can run both
     and compare. p_value is a 2-sided normal approximation from the ATE z-score;
-    notes carry the signed ATE for the report.
+    notes carry the signed ATE for the report. ``stratify`` as in
+    :func:`gitm.optimizer.attribution.attribute`.
 
     The result carries the same record as Granger's: ``status``, pairs attempted,
     completed (an estimate exists) and degraded (the estimate needed a fallback or
     raised a warning; ``degraded`` on the hypothesis and in its note), fallbacks
     and errors under ``failures`` and fit warnings under ``warnings``.
     """
+    from gitm.optimizer.attribution import aligned_pairs
+    from gitm.optimizer.monitor import residual_series
+
     min_obs = 4
-    series: dict[str, list[float]] = {}
-    for kr in residuals.per_kernel:
-        series.setdefault(kr.op, []).append(kr.r_kt)
+    series = residual_series(residuals, stratify)
     out = RankedHypotheses(hypotheses=[], min_obs=min_obs)
     try:
         import statsmodels.api  # noqa: F401  (used by doubly_robust_ate)
@@ -167,12 +170,13 @@ def attribute_dr(residuals: Residuals, graph: Graph, *, band: float = _KT_BAND) 
         out.status = AnalysisStatus.INSUFFICIENT_DATA
         out.reason = f"fewer than 2 ops with at least {min_obs} samples"
         return out
-    n = min(len(series[op]) for op in ops)
-    out.n_obs_used = n
-    pos = np.arange(n, dtype=float)
 
     effects: list[tuple[DREffect, bool]] = []
-    for cause in ops:
+    tried_causes: set[str] = set()
+    n_aligned = 0
+    for cause, effect, n in aligned_pairs(series, ops):
+        n_aligned += 1
+        pos = np.arange(n, dtype=float)
         t = (np.abs(np.asarray(series[cause][:n])) > band).astype(float)
         n_t = int(t.sum())
         if n_t < _MIN_GROUP or (n - n_t) < _MIN_GROUP:
@@ -180,37 +184,42 @@ def attribute_dr(residuals: Residuals, graph: Graph, *, band: float = _KT_BAND) 
             # on record so "ok, N/N pairs" is read against what was left out.
             out.skipped_causes[cause] = n_t
             continue
-        for effect in ops:
-            if effect == cause:
-                continue
-            out.pairs_attempted += 1
-            y = np.asarray(series[effect][:n], dtype=float)
-            diag: dict = {}
-            try:
-                ate, se = doubly_robust_ate(y, t, pos, diag=diag)
-            except Exception as exc:  # one pair's failure keeps the others' results
-                out.record_failure(type(exc).__name__, exc)
-                continue
-            # Recorded before the estimate is judged, so a rejected pair keeps
-            # the fit problems that explain it.
-            for kind, message in diag["fallbacks"]:
-                out.record_failure(kind, message)
-            for category, message in diag["warnings"]:
-                out.record_warning(category.__name__, message)
-            # A zero-variance fit gives an infinite or NaN estimate; it is a
-            # failed pair, never a ranked one.
-            if not (math.isfinite(ate) and math.isfinite(se) and se > 0):
-                out.record_failure("nonfinite_estimate", f"ate={ate}, se={se}")
-                continue
-            clean = not diag["fallbacks"] and not any(degrading(c) for c, _ in diag["warnings"])
-            out.pairs_completed += 1
-            out.pairs_degraded += not clean
-            z = ate / se
-            effects.append((DREffect(cause, effect, ate, se, z, int(t.sum())), clean))
+        tried_causes.add(cause)
+        out.pairs_attempted += 1
+        out.n_obs_used = n if out.n_obs_used is None else min(out.n_obs_used, n)
+        y = np.asarray(series[effect][:n], dtype=float)
+        diag: dict = {}
+        try:
+            ate, se = doubly_robust_ate(y, t, pos, diag=diag)
+        except Exception as exc:  # one pair's failure keeps the others' results
+            out.record_failure(type(exc).__name__, exc)
+            continue
+        # Recorded before the estimate is judged, so a rejected pair keeps
+        # the fit problems that explain it.
+        for kind, message in diag["fallbacks"]:
+            out.record_failure(kind, message)
+        for category, message in diag["warnings"]:
+            out.record_warning(category.__name__, message)
+        # A zero-variance fit gives an infinite or NaN estimate; it is a
+        # failed pair, never a ranked one.
+        if not (math.isfinite(ate) and math.isfinite(se) and se > 0):
+            out.record_failure("nonfinite_estimate", f"ate={ate}, se={se}")
+            continue
+        clean = not diag["fallbacks"] and not any(degrading(c) for c, _ in diag["warnings"])
+        out.pairs_completed += 1
+        out.pairs_degraded += not clean
+        z = ate / se
+        effects.append((DREffect(cause, effect, ate, se, z, int(t.sum())), clean))
 
+    # Pairs align at their own length, so a cause can be skipped against one
+    # effect and tried against another; only causes never tried stay listed.
+    for cause in tried_causes:
+        out.skipped_causes.pop(cause, None)
+    out.pairs_incomparable = len(ops) * (len(ops) - 1) - n_aligned
     if out.pairs_attempted == 0:
         out.status = AnalysisStatus.INSUFFICIENT_DATA
         out.reason = (
+            "no two ops have comparable launch counts" if n_aligned == 0 else
             f"no op had at least {_MIN_GROUP} out-of-band and {_MIN_GROUP} in-band samples"
         )
         return out

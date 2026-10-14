@@ -29,9 +29,12 @@ Two things are deliberate:
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from gitm.optimizer.degradation import AB_UNITS, ab_unit
 
 if TYPE_CHECKING:
     from gitm.kernels.spec import InterventionSpec
@@ -82,6 +85,22 @@ class VerificationRecord:
 
     baseline_config: dict[str, Any] = field(default_factory=dict)
     candidate_config: dict[str, Any] = field(default_factory=dict)
+    #: The A/B-affecting degradations this comparison was measured under: the
+    #: run's own and those recorded during this candidate's A/B, never another
+    #: candidate's. History judges each record by these, not by the run.
+    degradations: list[dict[str, Any]] = field(default_factory=list)
+    #: What ``baseline_tps`` / ``candidate_tps`` count, from this record's own
+    #: degradations: another record's fallback says nothing about this one.
+    unit: str = "tokens/sec"
+    #: ``[baseline_tps, candidate_tps]`` per validation round. One entry is a
+    #: single A/B; ``speedup`` is the mean of the rounds' ratios.
+    rounds: list[list[float]] = field(default_factory=list)
+    #: The mean gain this candidate had to beat to be kept, and the A/A noise
+    #: floor it came from (``None``: no A/A sample yet, a stand-in was used).
+    #: Records from before validation existed carry neither, which is how a
+    #: reader tells a keep at ">= 0" from a keep above measured noise.
+    threshold: float | None = None
+    noise_floor: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -94,6 +113,7 @@ def build_record(
     *,
     baseline_config: dict[str, Any] | None = None,
     candidate_config: dict[str, Any] | None = None,
+    degradations: Iterable[Any] = (),
 ) -> VerificationRecord:
     """Assemble one record from a live A/B and its gate decision.
 
@@ -101,6 +121,7 @@ def build_record(
     kwargs are mutated in place by a hot-swap and replaced entirely by a
     restart, so reading them afterwards yields the candidate on both sides.
     """
+    degradations = [d if isinstance(d, dict) else d.to_dict() for d in degradations]
     return VerificationRecord(
         intervention_name=spec.name,
         summary=spec.summary,
@@ -117,10 +138,16 @@ def build_record(
         agreement_band=max(ab.rel_std, MIN_NOISE_BAND),
         significant=ab.significant,
         # The gate decides, not the measurement — see the module docstring.
-        kept=not apply_result.rolled_back,
+        kept=apply_result.kept,
         via=ab.via,
         baseline_config=dict(baseline_config or {}),
         candidate_config=dict(candidate_config or {}),
+        degradations=degradations,
+        unit=AB_UNITS[ab_unit(degradations)][2],
+        rounds=[list(r) for r in (getattr(ab, "rounds", None)
+                                  or ((ab.baseline_tps, ab.candidate_tps),))],
+        threshold=getattr(ab, "threshold", None),
+        noise_floor=getattr(ab, "noise_floor", None),
     )
 
 
@@ -148,7 +175,14 @@ def build_export(
     *,
     gpu_sku: str | None = None,
 ) -> dict[str, Any]:
-    """The full export document: provenance + environment + every comparison."""
+    """The full export document: provenance + environment + every comparison.
+
+    The run's degradations travel in ``provenance`` for the reader. Each record
+    also carries the ones it was measured under, and that is what the history
+    reader judges it by. A probe that timed workload runs rather than tokens
+    changes what ``metric`` says was measured.
+    """
+    degradations = list(getattr(provenance, "degradations", None) or [])
     return {
         "schema": SCHEMA,
         "provenance": {
@@ -157,17 +191,38 @@ def build_export(
             "run_id": provenance.run_id,
             "git_sha": provenance.git_sha,
             "gitm_version": provenance.gitm_version,
+            "degradations": degradations,
         },
         "environment": _environment(gpu_sku),
         "protocol": {
-            "metric": "decode throughput (tokens/sec)",
+            # Per record, because a harness-converted comparison measures
+            # requests/sec over a serving window and derives ``kept`` from the
+            # number rather than from a rollback gate, and because a live probe
+            # that could not count tokens measured something else and says so
+            # in the record's ``unit``. One blanket description over all of them
+            # would misstate the units for some.
+            "metric": "per record: see `via` and `unit` — 'hot-swap'/'restart' are "
+                      "decode throughput (tokens/sec) under the rollback gate, unless "
+                      "`unit` names what the probe counted instead (runs/sec, "
+                      "decode_steps/sec, events/sec); 'harness' is serving "
+                      "throughput in requests/sec (`unit` says whether it is goodput), "
+                      "kept derived from the measured delta",
             "reps": "each side benchmarked `reps` times; std is the sample stdev",
             "agreement_band": (
                 "relative band around our numbers within which a re-measurement "
                 f"agrees; floored at {MIN_NOISE_BAND:.0%} because a single-rep A/B "
                 "reports zero scatter"
             ),
-            "kept": "decided by the rollback gate (min_keep_delta), not by delta >= 0",
+            # Same split as `metric`: the gate is what decides `kept` for a
+            # run this process supervised, and there is no gate behind a
+            # harness arm — it ran standalone on a cluster, so there was
+            # nothing to roll back and the measured delta is the whole
+            # decision. Saying "the gate decided" over both would claim a
+            # provenance half these records do not have.
+            "kept": "per record: see `via` — 'hot-swap'/'restart' are decided by "
+                    "the rollback gate (min_keep_delta), not by delta >= 0; "
+                    "'harness' has no gate behind it and is decided by the "
+                    "measured delta clearing `agreement_band`",
         },
         "results": [r.to_dict() for r in records],
     }

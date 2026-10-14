@@ -90,9 +90,20 @@ def test_eligibility_boundary_at_3_lags_plus_2():
 
 def test_series_lengths_and_truncation_are_recorded():
     rng = np.random.default_rng(2)
+    hyps = attribute(_residuals({"a": rng.normal(size=95), "b": rng.normal(size=100)}), None)
+    assert hyps.series_lengths == {"a": 95, "b": 100}
+    assert hyps.n_obs_used == 95
+    assert hyps.pairs_incomparable == 0
+
+
+def test_pairs_with_incomparable_launch_counts_are_counted_not_dropped():
+    rng = np.random.default_rng(2)
     hyps = attribute(_residuals({"a": rng.normal(size=8), "b": rng.normal(size=100)}), None)
-    assert hyps.series_lengths == {"a": 8, "b": 100}
-    assert hyps.n_obs_used == 8
+    assert hyps.status is AnalysisStatus.INSUFFICIENT_DATA
+    assert hyps.pairs_attempted == 0
+    assert hyps.pairs_incomparable == 2
+    assert hyps.summary()["pairs_incomparable"] == 2
+    assert granger_evidence(hyps) == "Granger not run: no two ops have comparable launch counts"
 
 
 def test_all_pairs_raising_typeerror_is_failed_with_the_message(monkeypatch):

@@ -51,7 +51,9 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("collective", ("nccl", "all_reduce", "allreduce", "reduce_scatter", "reducescatter",
                     "all_gather", "allgather", "custom_ar", "cross_device", "one_shot",
                     "two_shot", "all_to_all", "alltoall", "dispatch_combine")),
-    ("moe", ("moe", "expert", "topk_softmax", "grouped_gemm", "group_gemm",
+    # AMD: AITER's router kernels (`topksoftmax_*`, `moeTopK`).
+    ("moe", ("moe", "expert", "topk_softmax", "topksoftmax", "moetopk", "grouped_gemm",
+             "group_gemm",
              "groupedgemm", "gather_scatter", "sort_tokens", "routing", "router")),
     # Speculative decoding: drafting scaffolding and rejection sampling.
     #
@@ -124,7 +126,12 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # a visible finding, whereas this silently inflated a bucket that gets
     # trusted. Its actual attention kernels are named for what they do, so they
     # are matched by name below.
-    ("attention", ("flash_fwd", "flash_attn", "flashattn", "fmha", "paged_attention",
+    # AMD: AITER MLA decode / paged-attention asm kernels; both vendors: vLLM's
+    # Triton decode attention.
+    ("attention", ("mla_dec", "mla_a16", "mla_a8", "mla_reduce", "mla_stage",
+                   "pa_a16w", "pa_a8w", "pa_bf16", "pa_fp8", "pa_decode",
+                   "_fwd_grouped_kernel_stage", "_fwd_kernel_stage",
+                   "flash_fwd", "flash_attn", "flashattn", "fmha", "paged_attention",
                    "paged_attn", "attention", "attn_score", "splitkv", "merge_attn",
                    "mha_fwd", "cutlass_mla", "flash_mla", "mla_sparse", "sparse_mla",
                    "indexer", "lightning_index", "batchprefill", "batchdecode",
@@ -138,7 +145,8 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # reported 3.6%. Worse, the family was *split*: the `..._splitK_...`
     # variants matched "splitk" and classified, so one kernel family landed in
     # two buckets by accident of naming.
-    ("gemm", ("gemm", "cutlass", "sgemm", "hgemm", "s16816", "s161616", "matmul",
+    # "cijk_": Tensile's prefix on every hipBLASLt/rocBLAS GEMM — the AMD nvjet.
+    ("gemm", ("gemm", "cijk_", "cutlass", "sgemm", "hgemm", "s16816", "s161616", "matmul",
               "cublas", "marlin", "machete", "scaled_mm", "wgrad", "tensorop",
               "gemv", "splitk", "nvjet", "xmma")),
     ("quant", ("quant", "dequant", "scaled_fp8", "per_token_group", "awq", "gptq",

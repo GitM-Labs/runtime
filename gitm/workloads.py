@@ -27,8 +27,11 @@ makes the autonomous loop observe a real workload.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import socket
+import time
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -543,6 +546,236 @@ def _openfold_factory(cfg: LoopConfig) -> WorkloadRunner:
     )
     return run
 
+#: What vLLM names the processes that hold the model. ``EngineCore`` for a
+#: single engine, ``EngineCore_DP{n}`` under data parallelism
+#: (vllm/v1/engine/utils.py). Matching on the name keeps this to vLLM's own
+#: workers: a run has other children, and reaping one of those to free a GPU
+#: would be a cure worse than the disease.
+ENGINE_WORKER_PREFIX = "EngineCore"
+
+
+def _warn_release(step: str, exc: Exception) -> None:
+    warnings.warn(f"engine release step {step!r} failed: {exc}", RuntimeWarning, stacklevel=3)
+
+
+def _shutdown_timeout() -> float:
+    """Seconds to wait for workers before forcing them, from the environment.
+
+    A bad value warns and falls back rather than raising: this is read on the
+    teardown path, and an exception there would skip the cleanup entirely.
+    """
+    raw = os.environ.get("GITM_SHUTDOWN_TIMEOUT_S")
+    if not raw:
+        return 30.0
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        warnings.warn(
+            f"GITM_SHUTDOWN_TIMEOUT_S={raw!r} is not a number; waiting 30s for "
+            "engine workers instead", RuntimeWarning, stacklevel=2)
+        return 30.0
+
+
+def _timeout_s(var: str, default: float) -> float | None:
+    """A watchdog limit from the environment, in seconds; ``None`` disables it."""
+    raw = os.environ.get(var)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        warnings.warn(f"{var}={raw!r} is not a number; using {default:g}s",
+                      RuntimeWarning, stacklevel=2)
+        return default
+    return None if value <= 0 else value
+
+
+def _kill_engine_processes(pids: set[int]) -> list[int]:
+    """Kill these engine processes and everything under them. Returns what was killed.
+
+    The tree, not only the EngineCore: at TP>1 the GPU workers are its children,
+    and a worker left behind keeps its device memory.
+    """
+    killed: list[int] = []
+    try:
+        import psutil
+    except ImportError:  # vLLM depends on psutil; this is a last resort
+        import signal
+
+        for pid in pids:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+                killed.append(pid)
+        return killed
+    for pid in pids:
+        try:
+            root = psutil.Process(pid)
+            tree = [*root.children(recursive=True), root]
+        except psutil.Error:
+            continue
+        for proc in tree:
+            with contextlib.suppress(psutil.Error):
+                proc.kill()
+                killed.append(proc.pid)
+    return killed
+
+
+#: After the watchdog kills the engine, how long the blocked call gets to notice
+#: before the watchdog stops waiting for it.
+_WATCHDOG_GRACE_S = 60.0
+
+
+def _with_watchdog(fn: Callable[[], Any], *, what: str, timeout_s: float | None,
+                   pids: Callable[[], set[int]]) -> Any:
+    """``fn()``, killing the engine's processes if it runs past ``timeout_s`` (K-2).
+
+    Engine builds and decodes are blocking calls in this process, and a collective
+    deadlock inside them never returns: the first Kimi run on MI355X sat for 20
+    minutes until it was killed by hand, and lost the run. The watchdog kills the
+    engine's processes at the deadline; vLLM then raises in the blocked call
+    (its client notices the engine died), and that surfaces here as
+    :class:`~gitm.optimizer.apply.EngineTimeout`, which the apply path treats as
+    a failed candidate, or as a lost engine for a baseline.
+
+    Killing is not always enough: a build can stall before its engine process
+    exists, or in this process, and then there is nothing to kill. So if the call
+    is still blocked :data:`_WATCHDOG_GRACE_S` after the kill, the watchdog
+    interrupts it with a signal and raises ``EngineTimeout`` regardless. That
+    needs a signal handler, so it is only available on the main thread; off it,
+    the kill is all the watchdog can do.
+    """
+    from gitm.optimizer.apply import EngineTimeout
+
+    if timeout_s is None:
+        return fn()
+    import signal
+    import threading
+
+    done = threading.Event()
+    fired: list[int] = []
+    why = f"{what} ran past {timeout_s:g}s; its engine was killed"
+
+    def _interrupt(_signum: int, _frame: Any) -> None:
+        if not done.is_set():
+            raise EngineTimeout(f"{what} ran past {timeout_s:g}s and did not return "
+                                "after its engine was killed; abandoned")
+
+    main = threading.current_thread() is threading.main_thread()
+    previous = signal.signal(signal.SIGUSR1, _interrupt) if main else None
+    main_id = threading.get_ident()
+    # Held while the signal is sent and while the call is marked finished, so the
+    # signal can never arrive after the handler is put back: under the default
+    # handler SIGUSR1 terminates the process, and the run with it.
+    handler_lock = threading.Lock()
+
+    def _watch() -> None:
+        if done.wait(timeout_s):
+            return
+        fired.extend(_kill_engine_processes(pids()) or [-1])
+        if main and not done.wait(_WATCHDOG_GRACE_S):
+            with handler_lock:
+                if not done.is_set():
+                    signal.pthread_kill(main_id, signal.SIGUSR1)
+
+    watcher = threading.Thread(target=_watch, name=f"gitm-watchdog:{what}", daemon=True)
+    watcher.start()
+    try:
+        result = fn()
+    except EngineTimeout:
+        raise
+    except Exception as exc:
+        if fired:
+            raise EngineTimeout(why) from exc
+        raise
+    finally:
+        with handler_lock:
+            done.set()
+        if main:
+            signal.signal(signal.SIGUSR1, signal.SIG_DFL if previous is None else previous)
+    if fired:
+        raise EngineTimeout(why)
+    return result
+
+
+def engine_worker_pids() -> set[int]:
+    """PIDs of vLLM engine-core processes that are children of this one.
+
+    Sampled around an engine build so each engine can be told which workers are
+    *its* own. The name alone cannot do that: in parallel restart mode the
+    baseline and the candidate are up at the same time and their workers are
+    named identically, so a name-matched sweep during the candidate's teardown
+    would take the baseline's down with it — and the restore path then
+    reactivates a baseline engine whose workers are gone.
+    """
+    import multiprocessing as mp
+
+    return {p.pid for p in mp.active_children()
+            if (p.name or "").startswith(ENGINE_WORKER_PREFIX) and p.pid}
+
+
+def reap_engine_workers(pids: set[int] | None, timeout_s: float = 30.0) -> list[str]:
+    """Wait for *these* engine-core workers to exit. Returns what had to be forced.
+
+    The model lives in those processes, not in this one. ``VLLM_ENABLE_V1_MULTIPROCESSING``
+    defaults on, so the weights and the KV cache are held by a child, and until
+    that child is gone its GPU memory is gone with it — the next engine build
+    then reports ``Free memory 0.0/287.98 GiB`` and the run ends there.
+
+    Calling ``shutdown()`` is not the same as the memory coming back, which is
+    why this waits instead of trusting the call. vLLM's ``MPClient.shutdown``
+    no-ops when its finalizer has already run, and gitm's teardown stops at the
+    first ``shutdown`` attribute it finds, which may not be the one that owns the
+    workers. Either way the call returns and the processes are still up.
+
+    Escalation is deliberate and ordered: wait, then ``terminate``, then
+    ``kill``. Terminating a worker mid-CUDA-teardown is not free, but it is
+    bounded, and the alternative is a run that cannot rebuild a baseline and
+    loses everything it had left to measure.
+
+    ``pids`` is what makes that safe. It comes from
+    :func:`engine_worker_pids` sampled around the build, so only the engine
+    being shut down loses its workers.
+    """
+    import multiprocessing as mp
+
+    if not pids:
+        # Either this engine ran its core in-process, or its workers are not
+        # multiprocessing children of ours. Nothing here can be attributed to
+        # it, and reaping by name instead would be reaping somebody else's.
+        return []
+
+    # active_children() also joins any child that has already exited, so this
+    # clears the finished ones before deciding who is late.
+    workers = [p for p in mp.active_children() if p.pid in pids]
+    if not workers:
+        return []
+
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    for proc in workers:
+        proc.join(max(0.0, deadline - time.monotonic()))
+
+    forced: list[str] = []
+    for proc in workers:
+        if not proc.is_alive():
+            continue
+        how = "terminate"
+        try:
+            proc.terminate()
+            proc.join(5.0)
+            if proc.is_alive():
+                how = "kill"
+                proc.kill()
+                proc.join(2.0)
+        except Exception as exc:  # noqa: BLE001 - a worker we cannot signal is
+            # still worth naming; swallowing it would report a clean teardown.
+            forced.append(f"{proc.name} (pid {proc.pid}): {how} failed: {exc}")
+            continue
+        forced.append(
+            f"{proc.name} (pid {proc.pid}): did not exit within {timeout_s:.0f}s, "
+            f"{how}d" + ("" if not proc.is_alive() else " and still alive"))
+    return forced
+
+
 @register("vllm-decode")
 def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     """Launch a vLLM decode job inside the tracer capture window.
@@ -553,12 +786,22 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
 
     Reads its config from the environment:
         GITM_VLLM_MODEL       HF model id (default facebook/opt-125m)
-        GITM_VLLM_PROMPTS     number of prompts to decode (default 64)
-        GITM_VLLM_MAX_TOKENS  tokens to generate per prompt (default 128)
+        GITM_VLLM_PROMPTS     number of prompts to decode (default 256)
+        GITM_VLLM_MAX_TOKENS  tokens to generate per prompt (default 512).
+                              The old 64 x 128 decoded in ~1.4 s on an RTX 4050
+                              and finished before the tracer flushed anything
+                              (L-4); 256 x 512 traces there and on MI355X.
         GITM_VLLM_KV_DTYPE    kv_cache_dtype for the engine (e.g. "fp8"); unset
                               -> vLLM's "auto". Lets a serial A/B build each leg
                               directly in its dtype, one engine per process, so
                               each can use the full GITM_VLLM_GPU_MEM budget.
+        GITM_BUILD_TIMEOUT_S  seconds an engine build may take before the watchdog
+                              kills it and the candidate fails (default 3600; 0 off)
+        GITM_DECODE_TIMEOUT_S seconds a decode may take before the watchdog kills
+                              the engine (default 1800; 0 off)
+        GITM_SHUTDOWN_TIMEOUT_S  seconds an engine shutdown waits for its
+                              EngineCore/TP worker processes to exit before
+                              killing the stragglers (default 30)
         GITM_VLLM_SYNTHETIC   "1" -> CPU-only decode stand-in instead of vLLM
                               (exercises the wire/registry path with no GPU or
                               vLLM; produces no GPU kernels)
@@ -580,13 +823,34 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     empty-trace guard reports "no-data" rather than fabricating a result.
     """
     model = os.environ.get("GITM_VLLM_MODEL", "facebook/opt-125m")
-    n_prompts = int(os.environ.get("GITM_VLLM_PROMPTS", "64"))
-    max_tokens = int(os.environ.get("GITM_VLLM_MAX_TOKENS", "128"))
+    n_prompts = int(os.environ.get("GITM_VLLM_PROMPTS", "256"))
+    max_tokens = int(os.environ.get("GITM_VLLM_MAX_TOKENS", "512"))
 
     if os.environ.get("GITM_VLLM_SYNTHETIC") == "1":
         return _vllm_synthetic_runner(n_prompts, max_tokens)
 
     import time
+
+    from gitm.optimizer.vllm_knobs import engine_kwargs
+    from gitm.tracer import injection
+
+    # Spawn is what gives a ROCm EngineCore its profiler back (P1-1), but it is
+    # only safe where the entry point is known to survive being re-imported, and
+    # that is not something this factory can establish: a script that exists as
+    # a file can still start the workload at top level, and every spawned worker
+    # would then start it again. So the `gitm run` and `capture serve` commands
+    # choose it, and an embedded caller on AMD that has not is told what that
+    # costs rather than switched over.
+    if (injection.active_vendor() == "amd"
+            and "VLLM_WORKER_MULTIPROC_METHOD" not in os.environ):
+        import warnings
+
+        warnings.warn(
+            "gitm: vLLM's workers will start with fork. On ROCm a forked "
+            "EngineCore records no kernels at TP=1. The gitm command sets "
+            "VLLM_WORKER_MULTIPROC_METHOD=spawn; an embedded caller should set it "
+            "too, from a script whose work runs under `if __name__ == \"__main__\":`.",
+            RuntimeWarning, stacklevel=2)
 
     from vllm import LLM, SamplingParams
 
@@ -595,6 +859,16 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     # while GITM_RESTART_MODE=serial releases the baseline before candidate build.
     _gpu_mem = os.environ.get("GITM_VLLM_GPU_MEM")
     _base_kwargs: dict[str, Any] = {}
+    # Ask the engine to keep its statistics. ``LLM()`` injects
+    # ``disable_log_stats=True`` whenever the caller does not pass it
+    # (vllm/entrypoints/llm.py), which switches off two things gitm reads: the
+    # scheduler's ``make_stats()``, which returns ``None`` outright when stats
+    # are off, and the per-request ``RequestStateStats`` that carry arrival and
+    # first-token timestamps. Without them the decode batch falls back to 1 and
+    # every residual is measured against a ceiling ~30x under the floor, and
+    # TTFT/TPOT come back empty. Set before GITM_VLLM_EXTRA_JSON is merged, so a
+    # run that wants the overhead gone can still say so.
+    _base_kwargs["disable_log_stats"] = False
     if _gpu_mem is not None:
         _base_kwargs["gpu_memory_utilization"] = float(_gpu_mem)
     # Optional KV-cache dtype (GITM_VLLM_KV_DTYPE, e.g. "fp8"). Lets the baseline
@@ -645,8 +919,12 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         _base_kwargs.update(extra)
 
     engine_ref: dict[str, Any] = {}
+    # ids of engines built and not yet shut down. In parallel restart mode two
+    # are live at once, sharing this process's distributed state.
+    live_engines: set[int] = set()
 
     def _shutdown_engine(engine: Any) -> None:
+        live_engines.discard(id(engine))
         if engine_ref.get("engine") is engine:
             engine_ref["engine"] = None
         try:
@@ -670,34 +948,67 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
             if callable(obj):
                 try:
                     obj()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _warn_release(path, exc)
                 break
 
-        try:
-            from vllm.distributed.parallel_state import (
-                destroy_distributed_environment,
-                destroy_model_parallel,
-            )
+        # Process-global teardown only once no engine needs it: in parallel mode
+        # the baseline (or a kept winner) is still live and would lose it.
+        if not live_engines:
+            try:
+                from vllm.distributed.parallel_state import (
+                    destroy_distributed_environment,
+                    destroy_model_parallel,
+                )
+            except ImportError:
+                pass
+            else:
+                try:
+                    destroy_model_parallel()
+                    destroy_distributed_environment()
+                except Exception as exc:
+                    _warn_release("destroy vllm distributed state", exc)
 
-            destroy_model_parallel()
-            destroy_distributed_environment()
-        except Exception:
-            pass
-
-        try:
-            import torch.distributed as dist
-
-            if dist.is_available() and dist.is_initialized():
-                dist.destroy_process_group()
-        except Exception:
-            pass
+            try:
+                import torch.distributed as dist
+            except ImportError:
+                pass
+            else:
+                try:
+                    if dist.is_available() and dist.is_initialized():
+                        dist.destroy_process_group()
+                except Exception as exc:
+                    _warn_release("destroy_process_group", exc)
 
         for attr in ("llm_engine", "engine"):
             try:
                 delattr(engine, attr)
             except Exception:
                 pass
+
+        # Before the allocator cleanup below, which only touches this process.
+        # The device memory belongs to the workers, so nothing is free until
+        # they are gone.
+        #
+        # The timeout is resolved outside the try. Parsing it inside meant a
+        # typo'd GITM_SHUTDOWN_TIMEOUT_S raised, the handler set `forced` to
+        # empty, and the whole reap was skipped silently — the teardown this
+        # exists to perform, disabled by a bad environment variable with no
+        # warning.
+        try:
+            forced = reap_engine_workers(
+                getattr(engine, "gitm_worker_pids", None), _shutdown_timeout())
+        except Exception as exc:  # noqa: BLE001 - teardown must not raise into
+            # the run, but a reap that could not run is not a clean teardown.
+            forced = [f"worker cleanup failed: {exc}"]
+        if forced:
+            # Warned, not swallowed: a worker that needed killing is how a later
+            # baseline rebuild comes to fail, and tracing that back from
+            # "Free memory 0.0" is most of a day.
+            warnings.warn(
+                "gitm had to force vLLM engine workers down during teardown; "
+                "GPU memory may still be settling: " + "; ".join(forced),
+                RuntimeWarning, stacklevel=2)
 
         try:
             import gc
@@ -708,8 +1019,10 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
-        except Exception:
+        except ImportError:
             pass
+        except Exception as exc:
+            _warn_release("cuda cache release", exc)
 
     def _activate_engine(engine: Any) -> None:
         engine_ref["engine"] = engine
@@ -718,14 +1031,36 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         except NameError:
             pass
 
-    def _build_engine(kwargs: dict[str, Any]) -> Any:
-        engine = LLM(model=model, **kwargs)
+    # Whether this run is traced at all. Only engines that are actually traced
+    # carry the collector (K-1): the opening engine, and a re-trace's engine. A
+    # candidate or baseline that is only A/B-measured is built without it.
+    tracing = injection.active_vendor() is not None
+    # The loop's hooks, attached to every engine built here rather than only the
+    # first: the loop may swap in a rebuilt baseline and read them off that.
+    hooks: dict[str, Any] = {}
+
+    def _build_engine(kwargs: dict[str, Any], *, traced: bool = False) -> Any:
+        # Sampled either side of the build so this engine knows which workers
+        # are its own. In parallel restart mode two engines are up at once and
+        # their workers share a name, so ownership is the only thing that keeps
+        # a candidate's teardown from taking the baseline's workers with it.
+        before = engine_worker_pids()
+        with contextlib.nullcontext() if traced else injection.untraced_env():
+            engine = _with_watchdog(
+                lambda: LLM(model=model, **kwargs), what="engine build",
+                timeout_s=_timeout_s("GITM_BUILD_TIMEOUT_S", 3600.0),
+                pids=lambda: engine_worker_pids() - before)
+        engine.gitm_worker_pids = engine_worker_pids() - before
+        live_engines.add(id(engine))
         engine.gitm_llm_kwargs = dict(kwargs)
+        engine.gitm_traced = traced and tracing
         engine.gitm_shutdown_fn = _shutdown_engine
         engine.gitm_activate_fn = _activate_engine
+        for name, fn in hooks.items():
+            setattr(engine, name, fn)
         return engine
 
-    llm = _build_engine(dict(_base_kwargs))
+    llm = _build_engine(dict(_base_kwargs), traced=True)
     _activate_engine(llm)
     prompts = [f"Benchmark decode prompt {i}." for i in range(n_prompts)]
     params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
@@ -734,7 +1069,10 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         active = engine_ref.get("engine")
         if active is None:
             raise RuntimeError("vLLM engine is not active")
-        outputs = active.generate(prompts, params)
+        outputs = _with_watchdog(
+            lambda: active.generate(prompts, params), what="decode",
+            timeout_s=_timeout_s("GITM_DECODE_TIMEOUT_S", 1800.0),
+            pids=lambda: set(getattr(active, "gitm_worker_pids", ()) or ()))
         produced = sum(len(o.outputs[0].token_ids) for o in outputs)
         sync_device()
         # Per-request lifecycle alongside the token count: the loop turns these
@@ -757,7 +1095,10 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         original runner, which cannot measure a restarted engine.)
         """
         t0 = time.perf_counter()
-        outs = eng.generate(prompts, params)
+        outs = _with_watchdog(
+            lambda: eng.generate(prompts, params), what="A/B decode",
+            timeout_s=_timeout_s("GITM_DECODE_TIMEOUT_S", 1800.0),
+            pids=lambda: set(getattr(eng, "gitm_worker_pids", ()) or ()))
         toks = sum(len(o.outputs[0].token_ids) for o in outs)
         sync_device()
         return toks / max(time.perf_counter() - t0, 1e-9)
@@ -779,7 +1120,9 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         never a silent no-op.
         """
         kwargs = dict(getattr(_old_engine, "gitm_llm_kwargs", _base_kwargs))
-        kwargs.update(knob_values)
+        # Through vllm_knobs: a nested knob (speculative decoding) is not an
+        # argument LLM() accepts on its own.
+        kwargs.update(engine_kwargs(knob_values, kwargs))
         # Give each restarted engine a fresh distributed port so V1 init does not
         # collide with any prior in-process engine state.
         os.environ["VLLM_PORT"] = str(_free_port())
@@ -813,6 +1156,19 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         kwargs = dict(getattr(old_engine, "gitm_llm_kwargs", _base_kwargs))
         return _build_engine(kwargs)
 
+    def _traced_rebuild(old_engine: Any) -> Any:
+        """The current configuration, rebuilt with the collector, for a re-trace.
+
+        Forced eager. Graph replay hides decode kernels from the tracer (L-19),
+        and on MI355X the collector's queue interposition can deadlock against
+        it. ``gitm_llm_kwargs`` keeps the configuration as it was, so a rebuild
+        from this engine does not inherit the forced eager mode.
+        """
+        kwargs = dict(getattr(old_engine, "gitm_llm_kwargs", _base_kwargs))
+        engine = _build_engine({**kwargs, "enforce_eager": True}, traced=True)
+        engine.gitm_llm_kwargs = kwargs
+        return engine
+
     # Expose the live engine + its A/B hooks so the loop can (a) sample scheduler
     # stats and (b) run the Phase-4 decode-throughput A/B on it. ``run.engine`` is
     # picked up as ``cfg.engine``; the loop reads ``gitm_throughput_fn`` /
@@ -823,9 +1179,15 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     # ``.applicator`` convention the hft/edge/openfold factories use.
     run.engine = llm
     run.workload_id = "vllm-decode"
-    llm.gitm_throughput_fn = _throughput
-    llm.gitm_restart_fn = _restart
-    llm.gitm_baseline_restart_fn = _baseline_restart
+    hooks.update(
+        gitm_throughput_fn=_throughput,
+        gitm_restart_fn=_restart,
+        gitm_baseline_restart_fn=_baseline_restart,
+        gitm_traced_rebuild_fn=_traced_rebuild,
+        gitm_untraced_rebuild_fn=_baseline_restart,
+    )
+    for name, fn in hooks.items():
+        setattr(llm, name, fn)
     return run
 
 def _vllm_synthetic_runner(n_prompts: int, max_tokens: int) -> WorkloadRunner:

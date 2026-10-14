@@ -6,9 +6,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
+from gitm.kernels.library import parse_skips
 from gitm.scheduler import LoopConfig, run_loop
 
 
@@ -22,6 +23,8 @@ def optimize(
     workload_runner: Callable[[], dict[str, Any]] | None = None,
     use_history: bool | None = None,
     rerank: str = "off",
+    skip_levers: str | Iterable[str] | None = None,
+    validation: int | None = None,
 ) -> dict[str, Any]:
     """Run the autonomous 24-hour optimization loop and return a report.
 
@@ -42,10 +45,26 @@ def optimize(
     ``"recapture"`` traces the workload again after each applied candidate and
     re-ranks what is left against it.
 
+    ``skip_levers`` excludes levers from this run by name or knob, with shell
+    globs, as a list or a comma-separated string. Merged with the
+    ``GITM_SKIP_LEVERS`` environment variable. A lever can hang a model rather
+    than merely regress it, and until now the only way past one was to edit the
+    catalogue.
+
+    ``validation`` is how hard a candidate is tested before it is kept: the
+    baseline is first measured against itself that many times (rebuilt each
+    time) for this run's noise floor, and each candidate must beat that noise
+    averaged over that many paired A/B rounds. ``None`` reads
+    ``GITM_VALIDATION``, else 2.
+
     ``workload_runner`` optionally supplies an explicit zero-arg callable that
     launches the workload's GPU work; it runs inside the capture window. When
     omitted, the loop resolves ``workload`` against the registry in
     :mod:`gitm.workloads`.
+
+    An engine the run built itself (neither ``engine`` nor ``workload_runner``
+    passed) is released before this returns; one that came from the caller
+    stays the caller's to release.
     """
     cfg = LoopConfig(
         engine=engine,
@@ -56,5 +75,19 @@ def optimize(
         workload_runner=workload_runner,
         use_history=use_history,
         rerank=rerank,
+        validation=validation,
+        skip_levers=parse_skips(skip_levers),
     )
-    return run_loop(cfg)
+    try:
+        return run_loop(cfg)
+    finally:
+        if engine is None and workload_runner is None and cfg.engine is not None:
+            # The workload built this engine (the loop hands back whichever one
+            # is live at the end), so nobody else will release it. Left
+            # running, vLLM's spawned workers keep the interpreter from exiting:
+            # the first Kimi K2.5 run at TP=8 sat in futex waits after writing
+            # its report, holding all eight GPUs, until it was killed.
+            from gitm.optimizer.apply import LiveEngineApplicator
+
+            LiveEngineApplicator._shutdown(cfg.engine)
+            cfg.engine = None

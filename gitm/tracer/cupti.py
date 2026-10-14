@@ -40,4 +40,8 @@ class CuptiBackend:
 
     def stop(self) -> list[TraceEvent]:
         records = self._shim.stop()
+        # After stop(), whose flush delivers the last buffers. A shim built before
+        # it counted, or a CUPTI that would not say, leaves the count unknown.
+        dropped = int(self._shim.dropped()) if hasattr(self._shim, "dropped") else -1
+        self.dropped_records = dropped if dropped >= 0 else None
         return decode_records(records)

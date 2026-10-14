@@ -279,3 +279,13 @@ class MetricsSampler:
             for s in self.samples:
                 fh.write(json.dumps(s))
                 fh.write("\n")
+
+
+def fmt_ms(seconds: float | None, decimals: int = 1) -> str:
+    """``seconds`` as milliseconds for a summary line, or ``n/a``.
+
+    ``None`` means the value was not measured: an empty server histogram, a
+    window with no completed requests. Printed as ``0.0 ms`` it read as
+    instantaneous, which is the opposite of what is known.
+    """
+    return "n/a" if seconds is None else f"{seconds * 1e3:.{decimals}f} ms"

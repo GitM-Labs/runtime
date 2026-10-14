@@ -1,0 +1,188 @@
+# zai-org/GLM-5.3-Flash — Glm5NextForConditionalGeneration; text model glm5_next_text:
+# KDA linear attention + MLA with a DeepSeek Sparse Attention indexer + MoE.
+# Source: https://huggingface.co/zai-org/GLM-5.3-Flash/blob/eb9eb208eb0d988989d07a6a12d0fdeb5f52574a/config.json
+# Read from config.json, model.safetensors.index.json and the safetensors header
+# of model-00002-of-00062 at that revision, plus huggingface/transformers
+# models/glm5_next at 7cd73d9df0c14b151c684b708a9f27d8d0349dfe (the model repo
+# ships no modeling code) — no traces.
+#
+# Family note: NO family fits. 34 of 45 layers are KDA linear attention — a
+# fixed recurrent state and no KV cache — and 11 are MLA with an indexer.
+# `hybrid` has the linear layers but GQA, not MLA; `glm_moe_dsa` has MLA, the
+# indexer, per-op precision and MTP but no linear layers. This entry takes
+# `glm_moe_dsa`, because the precision split and the 11 MLA layers are the
+# larger terms, and prices every layer as MLA. The known cost of that choice is
+# under unmodelled; see docs/glm-5.3-flash/DESIGN-NOTE.md for the full ledger.
+
+name: zai-org/GLM-5.3-Flash
+family: glm_moe_dsa
+description: >
+  45 layers, hidden 4096, 320.76B total / 16.74B active per token (re-derived;
+  the vendor says ~18B). 34 KDA linear-attention layers and 11 MLA layers
+  (3, 7, ..., 43) with a DSA indexer that pools 4 keys into one and selects
+  top-2048. First 3 layers dense FFN, layers 3-44 MoE (288 experts, sigmoid
+  top-8, one shared). One MTP layer. mHC with 4 residual streams. FP8 e4m3
+  128x128 blocks for experts, dense FFN and four MLA projections; KDA,
+  kv_b_proj, indexer, router, embeddings and lm_head bf16. Vision tower out of
+  scope for a text decode step.
+
+spec:
+  hidden: 4096
+  n_layers: 45
+  vocab: 154880
+
+  # MLA attention, on the 11 MLA layers only. qk_rope_head_dim is 0 and
+  # kv_a_proj_with_mqa is [512, 4096] in the header — no decoupled RoPE key, so
+  # the cached entry is the 512-wide latent alone. head_dim 0 in the config is
+  # not a width; qk_nope_head_dim (256) is. num_key_value_heads 64 is the usual
+  # MLA red herring: one latent per token is shared across all 64 query heads.
+  n_heads: 64
+  q_lora_rank: 1536
+  kv_lora_rank: 512
+  qk_nope_head_dim: 256
+  qk_rope_head_dim: 0
+  v_head_dim: 256
+
+  # DeepSeek Sparse Attention indexer. config.json lists indexer_types as 45 x
+  # 'full', but the weight map carries indexer tensors on exactly the 11 MLA
+  # layers (and the MTP layer) and on no KDA layer. Taking the config at its word
+  # would price 34 indexers that do not exist, so this schedule follows the
+  # weight map: 'full' on MLA layers, 'shared' (no weights, no index keys) on KDA.
+  index_n_heads: 32
+  index_head_dim: 128
+  index_topk: 2048
+  indexer_types: [
+    shared, shared, shared, full, shared, shared, shared, full, shared, shared,
+    shared, full, shared, shared, shared, full, shared, shared, shared, full,
+    shared, shared, shared, full, shared, shared, shared, full, shared, shared,
+    shared, full, shared, shared, shared, full, shared, shared, shared, full,
+    shared, shared, shared, full, shared,
+  ]
+
+  # Mixture of experts. moe_intermediate_size 2048 per expert; layers 0-2 are
+  # dense FFN (intermediate_size 12288) with no router or experts — the weight
+  # map shows experts on 3..44 and the MTP layer only.
+  n_routed_experts: 288
+  n_shared_experts: 1
+  num_experts_per_tok: 8
+  moe_intermediate_size: 2048
+  intermediate_size: 12288
+  first_k_dense_replace: 3
+  mlp_layer_types: [
+    dense, dense, dense, sparse, sparse, sparse, sparse, sparse, sparse, sparse,
+    sparse, sparse, sparse, sparse, sparse, sparse, sparse, sparse, sparse, sparse,
+    sparse, sparse, sparse, sparse, sparse, sparse, sparse, sparse, sparse, sparse,
+    sparse, sparse, sparse, sparse, sparse, sparse, sparse, sparse, sparse, sparse,
+    sparse, sparse, sparse, sparse, sparse,
+  ]
+  routed_scaling_factor: 2.5
+
+  # Multi-token prediction. One MTP layer (layers.45); the vLLM recipe runs it
+  # 5 deep. index_share_for_mtp_iteration is true, yet layer 45 ships its own
+  # indexer (14.9 MB bf16) — the opposite of GLM-5.2, whose MTP block carries
+  # none. Stated as the config says; see provenance.estimated.
+  num_nextn_predict_layers: 1
+  index_share_for_mtp_iteration: true
+
+  # Precision, read from the shard header rather than the quantization_config.
+  # F8_E4M3 with F32 weight_scale_inv (128x128): experts, dense FFN and the MLA
+  # q_a/q_b/kv_a/o projections. Everything the overrides list is bf16 on disk.
+  weight_dtype: fp8
+  expert_dtype: fp8
+  kv_dtype: fp8                     # vLLM recipe --kv-cache-dtype fp8, not the checkpoint
+  kv_rope_dtype: bf16               # moot here: qk_rope_head_dim is 0
+  act_dtype: bf16
+  op_dtype_overrides:
+    - [attn_index_proj, bf16]       # whole indexer is BF16 in the header
+    - [attn_kv_b, bf16]             # kv_b_proj BF16 [32768, 512], no scale tensor
+    - [embed_tokens, bf16]
+    - [lm_head, bf16]               # untied: tie_word_embeddings false, 1.27 GB lm_head ships
+    - [mtp_eh_proj, bf16]
+    - [moe_router, fp32]            # moe_router_dtype float32; stored bf16, cast at run time
+
+provenance:
+  verified:
+    - claim: stored bytes close exactly against total_size
+      detail: >
+        model.safetensors.index.json total_size is 328,326,771,576 B across 62
+        shards. Shapes and dtypes from the shard 00002 header, applied per layer
+        kind, plus the vision tower from config.json, sum to 328,326,771,576 B:
+        residual 0 B. The same reading reproduces the tensor count (76,108) and
+        the weight_scale_inv count (37,338). The vLLM recipe's "about 306 GiB"
+        is 305.78 GiB. Ledger in the design note, section 2.
+    - claim: the layer schedule is 34 KDA + 11 MLA, 0-indexed
+      detail: >
+        layer_types and linear_attn_config agree: KDA where i % 4 != 3, MLA at
+        3, 7, ..., 43. The weight map agrees — self_attn.A_log on 34 layers,
+        kv_b_proj on 12 (the 11 plus MTP layer 45). Unlike Kimi K3 these lists
+        are 0-indexed.
+    - claim: precision per tensor kind is read from a real header
+      detail: >
+        Shard 00002 header. F8_E4M3 + F32 weight_scale_inv: routed and shared
+        experts, dense FFN gate/up/down, MLA q_a_proj, q_b_proj,
+        kv_a_proj_with_mqa, o_proj. BF16: all KDA projections and convs,
+        kv_b_proj, the whole indexer, mlp.gate.weight, hc_*_fn, norms. F32:
+        A_log, dt_bias, e_score_correction_bias, hc_*_base, hc_*_scale.
+    - claim: model_weight_bytes on this entry, and what the gap is made of
+      detail: >
+        321,562,118,171 B (-2.06% against total_size). The -6,764,653,405 B
+        breaks down exactly: KDA priced as MLA (-5.372 GB), the vision tower
+        (-1.127 GB), kv_b_proj and mHC/norm/MTP terms (-0.366 GB), the router
+        at fp32 over bf16 on disk (+0.101 GB), and +110,619 B from a planner
+        defect — glm_graph.py prices the dense FFN at ww twice (lines 366 and
+        399). Design note section 3.
+
+  estimated:
+    - field: kv_dtype
+      value: fp8
+      detail: >
+        A deployment choice from the vLLM recipe (`--kv-cache-dtype fp8`), not
+        from the checkpoint, which declares no KV scheme.
+    - field: moe_router precision
+      value: fp32
+      detail: >
+        moe_router_dtype float32, and modeling_glm5_next.py casts weight and
+        input to fp32 before the router GEMM. The weight is stored bf16
+        [288, 4096], so weight bytes here are 101.4 MB high. Follows the
+        glm-5.2-fp8 precedent.
+    - field: index_share_for_mtp_iteration
+      value: true, as config.json states
+      detail: >
+        Layer 45 ships its own indexer tensors, which contradicts sharing, and
+        the cited code never reads the key. Whether the engine runs the MTP
+        indexer is UNVERIFIED.
+    - field: MLA absorption (attn_kv_b vs attn_out_proj width)
+      value: unabsorbed — kv_b runs as its own GEMM, o_proj narrow
+      detail: >
+        Same reading as glm-5.2-fp8. An absorbing engine drops attn_kv_b and
+        widens attn_out_proj; resident weights do not change.
+
+  open:
+    - question: engine version, parallelism, GPU type
+      detail: >
+        UNVERIFIED. The vLLM recipe (vLLM 0.29.0+) runs TP4 on a GB200 tray
+        with fp8 KV and MTP D=5.
+    - question: index key cache layout
+      detail: >
+        modeling_glm5_next.py caches 257 bf16 channels per token per indexer
+        layer (key 128, compress gate 128, valid flag 1) and re-pools every
+        step. An engine may cache pooled fp8 keys instead; the two readings
+        differ ~16x in index bytes at long context.
+    - question: KDA state under MTP verify
+      detail: >
+        Rolling back a recurrent state after rejected drafts needs per-position
+        checkpoints or recompute. Engine behaviour UNVERIFIED.
+
+  unmodelled:
+    - KDA linear attention on 34 layers, priced here as MLA with a shared index.
+      The latent KV rate comes out 45/11 = 4.09x too high, and the fixed KDA
+      state (34 x 64 x 128 x 128 fp32 = 142.6 MB per sequence) is absent.
+    - IndexPool. The family scans S raw index keys; the model scores S/4 pooled
+      keys and expands 512 pools back to 2048 tokens plus a tail of up to 3.
+    - mHC. Four 4096-wide residual streams, two [24, 16384] projections and 20
+      Sinkhorn iterations per layer; 71.5 MB of weights with norms, activation
+      traffic not priced.
+    - The vision tower (24 blocks, hidden 1024) and merger, 1.127 GB bf16. A
+      text decode step never enters it.
+    - MTP eh_proj weight bytes. The family prices eh_proj in the graph but not
+      in model_weight_bytes.

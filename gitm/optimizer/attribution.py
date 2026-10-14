@@ -65,6 +65,27 @@ def degrading(warning_category: type[Warning]) -> bool:
     return not issubclass(warning_category, _API_WARNINGS)
 
 
+#: Series are aligned by position, which only pairs like with like at the same
+#: launch cardinality: two per-layer ops yes, a per-layer op and lm_head (once a
+#: step) no. The tolerance absorbs a window's partial edge steps and refused
+#: replays; truncating every series to the shortest — the old behaviour — let a
+#: once-per-step op starve every per-layer pair.
+CARDINALITY_TOLERANCE = 0.9
+
+
+def comparable(n_a: int, n_b: int, tolerance: float = CARDINALITY_TOLERANCE) -> bool:
+    lo, hi = sorted((n_a, n_b))
+    return hi > 0 and lo / hi >= tolerance
+
+
+def aligned_pairs(series: dict[str, list[float]], ops: list[str]):
+    """``(cause, effect, n)`` for every comparable ordered pair, n = shorter length."""
+    for cause in ops:
+        for effect in ops:
+            if cause != effect and comparable(len(series[cause]), len(series[effect])):
+                yield cause, effect, min(len(series[cause]), len(series[effect]))
+
+
 @dataclass
 class Hypothesis:
     cause_op: str
@@ -94,7 +115,11 @@ class RankedHypotheses:
     min_obs: int | None = None
     series_lengths: dict[str, int] = field(default_factory=dict)
     excluded_ops: dict[str, int] = field(default_factory=dict)
+    #: The shortest series a pair was tested on (pairs use their own length).
     n_obs_used: int | None = None
+    #: Ordered pairs not tested: their launch counts differ too much to align
+    #: by position (see :func:`aligned_pairs`).
+    pairs_incomparable: int = 0
     #: Why an INSUFFICIENT_DATA result had nothing to test, when set.
     reason: str | None = None
     #: Ops never tried as a cause, with the count that ruled them out (DR: the
@@ -142,6 +167,7 @@ class RankedHypotheses:
             "pairs_attempted": self.pairs_attempted,
             "pairs_completed": self.pairs_completed,
             "pairs_degraded": self.pairs_degraded,
+            "pairs_incomparable": self.pairs_incomparable,
             "failures": dict(self.failures),
             "first_errors": dict(self.first_errors),
             "warnings": dict(self.warnings),
@@ -215,6 +241,8 @@ def attribute(
     residuals: Residuals,
     graph: Graph,
     max_lag: int = 2,
+    *,
+    stratify: tuple[str, ...] = (),
 ) -> RankedHypotheses:
     """Granger tests over every ordered op pair, ranked by p-value, with a run record.
 
@@ -222,7 +250,12 @@ def attribute(
     Granger F-test on the residual series. The ranking is exploratory (see the
     module docstring): it is written to the run's JSON, not used as a cause in
     claims or to choose interventions. The returned record says what ran.
+
+    ``stratify`` splits each op's series by side-table attributes (residuals
+    computed ``with_attributes``); hypothesis ops are then stratum labels.
     """
+    from gitm.optimizer.monitor import residual_series
+
     # The test's regression with a constant needs more than 3*max_lag + 1
     # observations; shorter series always raise "Insufficient observations".
     min_obs = 3 * max_lag + 2
@@ -240,10 +273,9 @@ def attribute(
     # redirecting stdout, which is process-global and unsafe across threads.
     kwargs = {"verbose": False} if "verbose" in inspect.signature(grangercausalitytests).parameters else {}
 
-    # Group residuals by op into series in launch order (not per engine step).
-    series: dict[str, list[float]] = {}
-    for kr in residuals.per_kernel:
-        series.setdefault(kr.op, []).append(kr.r_kt)
+    # Group residuals by op (or stratum) into series in launch order (not per
+    # engine step).
+    series = residual_series(residuals, stratify)
     out.series_lengths = {op: len(vals) for op, vals in series.items()}
     out.excluded_ops = {op: n for op, n in out.series_lengths.items() if n < min_obs}
 
@@ -253,43 +285,45 @@ def attribute(
         out.reason = f"fewer than 2 ops with at least {min_obs} samples"
         return out
 
-    n = min(len(series[op]) for op in ops)
-    out.n_obs_used = n
-    for cause in ops:
-        for effect in ops:
-            if cause == effect:
-                continue
-            out.pairs_attempted += 1
-            arr = np.column_stack([np.asarray(series[effect][:n]), np.asarray(series[cause][:n])])
-            # Scoped to one pair so the record never grows with the number of pairs.
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                # Our own verbose=False, not a problem with the data.
-                warnings.filterwarnings("ignore", message="verbose is deprecated",
-                                        category=FutureWarning)
-                try:
-                    result = grangercausalitytests(arr, maxlag=max_lag, **kwargs)
-                    pvals = [float(result[lag][0]["ssr_ftest"][1]) for lag in range(1, max_lag + 1)]
-                except Exception as exc:  # statsmodels raises many types; each is counted by name
-                    out.record_failure(type(exc).__name__, exc)
-                    pvals = None
-            degraded = False
-            for w in caught:
-                out.record_warning(w.category.__name__, w.message)
-                degraded = degraded or degrading(w.category)
-            if pvals is None:
-                continue
-            # min() would skip a NaN in any position but the first; check every lag.
-            if not all(math.isfinite(p) and 0.0 <= p <= 1.0 for p in pvals):
-                out.record_failure("nan_pvalue", f"p-values {pvals}")
-                continue
-            out.pairs_completed += 1
-            out.pairs_degraded += degraded
-            direction = "+ slower" if np.mean(series[cause]) > 0 else "- faster"
-            out.hypotheses.append(
-                Hypothesis(cause_op=cause, effect_op=effect, p_value=min(pvals),
-                           direction=direction, degraded=degraded)
-            )
+    for cause, effect, n in aligned_pairs(series, ops):
+        out.pairs_attempted += 1
+        out.n_obs_used = n if out.n_obs_used is None else min(out.n_obs_used, n)
+        arr = np.column_stack([np.asarray(series[effect][:n]), np.asarray(series[cause][:n])])
+        # Scoped to one pair so the record never grows with the number of pairs.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            # Our own verbose=False, not a problem with the data.
+            warnings.filterwarnings("ignore", message="verbose is deprecated",
+                                    category=FutureWarning)
+            try:
+                result = grangercausalitytests(arr, maxlag=max_lag, **kwargs)
+                pvals = [float(result[lag][0]["ssr_ftest"][1]) for lag in range(1, max_lag + 1)]
+            except Exception as exc:  # statsmodels raises many types; each is counted by name
+                out.record_failure(type(exc).__name__, exc)
+                pvals = None
+        degraded = False
+        for w in caught:
+            out.record_warning(w.category.__name__, w.message)
+            degraded = degraded or degrading(w.category)
+        if pvals is None:
+            continue
+        # min() would skip a NaN in any position but the first; check every lag.
+        if not all(math.isfinite(p) and 0.0 <= p <= 1.0 for p in pvals):
+            out.record_failure("nan_pvalue", f"p-values {pvals}")
+            continue
+        out.pairs_completed += 1
+        out.pairs_degraded += degraded
+        direction = "+ slower" if np.mean(series[cause]) > 0 else "- faster"
+        out.hypotheses.append(
+            Hypothesis(cause_op=cause, effect_op=effect, p_value=min(pvals),
+                       direction=direction, degraded=degraded)
+        )
+
+    out.pairs_incomparable = len(ops) * (len(ops) - 1) - out.pairs_attempted
+    if out.pairs_attempted == 0:
+        out.status = AnalysisStatus.INSUFFICIENT_DATA
+        out.reason = "no two ops have comparable launch counts"
+        return out
 
     out.rank(lambda h: h.p_value)
     out.finalize_status()
@@ -329,6 +363,8 @@ def granger_evidence(hyps: RankedHypotheses, pairs_in: str = "residuals.json") -
                 f"(pip install -c constraints.txt statsmodels)")
     if status is AnalysisStatus.INSUFFICIENT_DATA:
         n_ok = len(hyps.series_lengths) - len(hyps.excluded_ops)
+        if n_ok >= 2:
+            return f"Granger not run: {hyps.reason}"
         return f"Granger not run: {n_ok} ops had ≥ {hyps.min_obs} samples, need 2"
     if status is AnalysisStatus.FAILED:
         # The most common failure, the same one the hint is chosen from.

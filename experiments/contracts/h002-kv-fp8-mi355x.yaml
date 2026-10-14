@@ -1,0 +1,76 @@
+# H-002 (Tarun): fp8 KV cache on Kimi K2.5, 8x MI355X, rag 4096/512, c=64.
+# The Harness v1 run. Submitted by Tarun 2026-10-12; rewritten into the contract
+# by Isaiah. Changes from Tarun's draft, each for a measured reason:
+#   - primary metric is GuideLLM's itl_ms_p50 (the noise floor in #168 measured
+#     this exact point with GuideLLM; CV 0.24%)
+#   - latency gate is ITL p95, not TTFT p95: TTFT p50 swung ~12% CV between
+#     identical runs, so a 5% TTFT gate would pass or fail by chance
+#   - 3 reps, not 5: 3 reps/arm resolves ~0.6% on ITL, far under the expected
+#     7%; each arm switch costs ~11 min of model reload
+#   - engine args are the loop pod's real launch flags, tracer OFF in both arms
+#     (the ROCm tracer hangs vLLM under this load, see #168)
+# Known: vLLM 0.29.0 drops heads in fp8 prefill at TP8 (vllm#60907), so the
+# correctness gate is expected to fail on the current image. Per Tarun (open
+# question 1), that is reported as invalid, not regressed.
+schema_version: gitm.experiment.contract/v1
+candidate_id: h002-kv-cache-fp8-mi355x
+hypothesis:
+  id: H-002
+  submitter: tarun
+  claim: fp8 KV cache lowers median ITL for Kimi K2.5 at the rag 4096/512 c=64 point on 8x MI355X, TP8
+  mechanism: >-
+    Decode attention reads MLA's latent KV every step; fp8 halves those bytes.
+    At vLLM 0.29.0 / AITER 0.1.19 the fp8 arm also runs query concat+quant, the
+    8-to-16 head pad, split-KV partial writes and a reduce, which eat part of it.
+    The band assumes 0.55 efficiency for the bf16 kernel (not yet measured).
+  expected_effect: {mean: 0.0708, lo: -0.0197, hi: 0.1632}
+  reject_if_effect_below: 0.0
+intervention:
+  kv_cache_dtype: fp8
+primary_metric:
+  name: itl_ms_p50
+  unit: ms
+  direction: lower_is_better
+workload:
+  trace_id: guidellm-synthetic-rag-4096-512
+  source: guidellm 0.8.1 synthetic_text, prompt_tokens=4096, output_tokens=512, concurrent profile
+  operating_point: mi355x/rag-4096-512/c64
+  max_concurrency: 64
+  duration_s: 180
+baseline:
+  label: A
+  engine_args:
+    tensor_parallel_size: 8
+    gpu_memory_utilization: 0.92
+    max_num_batched_tokens: 8192
+    max_num_seqs: 256
+    kv_cache_dtype: auto
+candidate:
+  label: A+fp8kv
+  engine_args:
+    tensor_parallel_size: 8
+    gpu_memory_utilization: 0.92
+    max_num_batched_tokens: 8192
+    max_num_seqs: 256
+    kv_cache_dtype: fp8
+budget:
+  # ~4 reloads x ~11 min + 10 runs x ~3 min (6 kept, 4 warmup) is ~80 min;
+  # 3 h leaves room for one slow reload or a slow market admission.
+  max_wall_clock_s: 10800
+  max_accelerator_s: 86400
+correctness_gate:
+  # v1: token agreement vs bf16 on fixed greedy prompts. Tarun's gate is
+  # GSM8K + needle (eval_score); that lands after Oct 15.
+  method: token_agreement
+  reference: bf16 baseline greedy outputs, captured at run start
+  min_score: 0.99
+latency_gates:
+  - {metric: itl_ms_p95, max_regression: 0.05}
+protocol:
+  repetitions: 3
+  # One 180 s run discarded after every arm switch: cold kernels run ~24% slow.
+  warmup_reps: 1
+  comparison_order: ABBA
+  pairing: paired
+  alpha: 0.05
+noise_floor_ref: "#168 mi355x/rag-4096-512/c64 arm A, within-session, 2026-10-12"
