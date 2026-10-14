@@ -168,7 +168,10 @@ def attribute_dr(residuals: Residuals, graph: Graph, *, band: float = _KT_BAND,
     ops = [op for op in series if op not in out.excluded_ops]
     if len(ops) < 2:
         out.status = AnalysisStatus.INSUFFICIENT_DATA
-        out.reason = f"fewer than 2 ops with at least {min_obs} samples"
+        nonfinite = sorted(op for op, n in out.excluded_ops.items() if n >= min_obs)
+        out.reason = (f"fewer than 2 ops with at least {min_obs} finite samples "
+                      f"({', '.join(nonfinite)} left out for non-finite residuals)"
+                      if nonfinite else f"fewer than 2 ops with at least {min_obs} samples")
         return out
 
     effects: list[tuple[DREffect, bool]] = []

@@ -396,6 +396,12 @@ def _kernel_records(path: str | Path, *, pid: int | None, device: int | None,
                 continue
             if d.get("kind") != "kernel":
                 continue
+            # Checked before the pid/device filter: a string pid never equals
+            # the one asked for, and would be filtered out uncounted.
+            if not all(isinstance(d.get(k), int | None) and not isinstance(d.get(k), bool)
+                       for k in ("pid", "device_id")):
+                _skip("bad_fields")
+                continue
             if pid is not None and d.get("pid") != pid:
                 continue
             if device is not None and d.get("device_id") != device:
@@ -405,9 +411,7 @@ def _kernel_records(path: str | Path, *, pid: int | None, device: int | None,
                     or isinstance(start, bool) or isinstance(end, bool) or end <= start):
                 _skip("bad_timestamps")
                 continue
-            if (not all(isinstance(d.get(k), str | None) for k in ("name", "range_op"))
-                    or not all(isinstance(d.get(k), int | None) and not isinstance(d.get(k), bool)
-                               for k in ("pid", "device_id"))):
+            if not all(isinstance(d.get(k), str | None) for k in ("name", "range_op")):
                 _skip("bad_fields")
                 continue
             yield d, start, end

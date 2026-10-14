@@ -179,6 +179,16 @@ def test_an_op_with_nan_residuals_is_left_out_on_record():
     assert all(np.isfinite(h.p_value) for h in ranked.hypotheses)
 
 
+def test_a_nan_op_that_leaves_one_op_says_so_in_the_reason():
+    rng = np.random.default_rng(3)
+    a, b = rng.normal(0, 0.05, 40), rng.normal(0, 0.05, 40)
+    b[7] = np.nan
+    ranked = attribute_dr(_residuals({"A": a, "B": b}), None)
+    assert ranked.status is AnalysisStatus.INSUFFICIENT_DATA
+    assert ranked.reason == ("fewer than 2 ops with at least 4 finite samples "
+                             "(B left out for non-finite residuals)")
+
+
 def test_a_rejected_estimate_keeps_its_fit_diagnostics(monkeypatch):
     import gitm.optimizer.dr as dr
 

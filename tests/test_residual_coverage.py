@@ -277,6 +277,25 @@ def test_reader_counts_bad_bytes_types_and_boolean_timestamps(tmp_path):
     assert skipped == {"bad_encoding": 1, "bad_fields": 2, "bad_timestamps": 1}
 
 
+def test_a_bad_pid_is_counted_when_filtering_by_pid_or_device(tmp_path):
+    import json
+
+    from gitm.optimizer.deviation import stream_observed
+
+    p = tmp_path / "t.jsonl"
+    rows = [json.dumps({"kind": "kernel", "name": "k", "start_ns": 0, "end_ns": 50,
+                        "pid": "7", "device_id": 0}),
+            json.dumps({"kind": "kernel", "name": "k", "start_ns": 0, "end_ns": 50,
+                        "pid": 7, "device_id": "0"}),
+            json.dumps({"kind": "kernel", "name": "k", "start_ns": 0, "end_ns": 50,
+                        "pid": 8, "device_id": 0})]  # another pid: filtered, not unreadable
+    p.write_text("\n".join(rows) + "\n")
+    for kwargs in ({"pid": 7}, {"device": 0}):
+        skipped: dict[str, int] = {}
+        stream_observed(p, skipped=skipped, **kwargs)
+        assert skipped == {"bad_fields": 2}, kwargs
+
+
 def test_a_rejected_record_is_not_a_phase_anchor(tmp_path):
     from gitm.optimizer.deviation import phase_anchors
 
