@@ -13,6 +13,10 @@ gitm inventory sync                                                             
 gitm inventory check [--offline] [--strict] [--json]
 ```
 
+An installed copy has no `deploy/` next to it: pass `--repo-root <checkout>` (the directory
+holding `deploy/`). Without it the commands stop with exit 2 rather than read "no
+deployments" and erase the recorded consumers.
+
 * **Add a checkpoint** with `add`; there is no schema to change. It resolves the ref
   to a commit SHA, hashes the files (LFS shards from the tree API, no download;
   small files fetched and tied to their git blob id), and reads the declared

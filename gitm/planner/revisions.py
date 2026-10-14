@@ -102,9 +102,16 @@ class HubSource:
         self.token = token if token is not None else os.environ.get("HF_TOKEN")
         self.timeout = timeout
 
+    def _same_origin(self, url: str) -> bool:
+        """Same scheme and host as the configured endpoint. A downgrade to http, or a
+        different host, is a different origin."""
+        a, b = urllib.parse.urlsplit(url), urllib.parse.urlsplit(self.endpoint)
+        return (a.scheme, a.netloc) == (b.scheme, b.netloc)
+
     def _open(self, url: str):
         req = urllib.request.Request(url, headers={"User-Agent": "gitm-inventory"})
-        if self.token:
+        # Only to the endpoint it was configured for; never to a URL the server handed us.
+        if self.token and self._same_origin(url):
             req.add_unredirected_header("Authorization", f"Bearer {self.token}")
         last: Exception | None = None
         for attempt in range(3):
@@ -144,7 +151,11 @@ class HubSource:
                 else:
                     out.append(Artifact(e["path"], int(e["size"]), git_oid=e["oid"]))
             m = re.search(r'<([^>]+)>;\s*rel="next"', link)
-            url = m.group(1) if m else None
+            url = urllib.parse.urljoin(url, m.group(1)) if m else None
+            if url and not self._same_origin(url):
+                raise SourceError(
+                    f"{repo}@{revision[:12]}: the hub's next-page link leaves {self.endpoint}; refusing to follow it"
+                )
         return out
 
     def fetch(self, repo: str, revision: str, path: str) -> bytes:

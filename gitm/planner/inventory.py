@@ -149,6 +149,21 @@ def validate(data: dict[str, Any]) -> list[str]:
         for key in _REQUIRED:
             if key not in rec:
                 problems.append(f"{name}: missing {key}")
+        for key in ("catalogue", "quantization", "artifacts"):
+            if key in rec and not isinstance(rec[key], dict):
+                problems.append(f"{name}: {key} must be a mapping, got {type(rec[key]).__name__}")
+        if isinstance(rec.get("catalogue"), dict) and "status" not in rec["catalogue"]:
+            problems.append(f"{name}: catalogue needs a status")
+        if "tracked_ref" in rec and not isinstance(rec["tracked_ref"], str):
+            problems.append(f"{name}: tracked_ref must be a string")
+        artifacts = rec.get("artifacts") if isinstance(rec.get("artifacts"), dict) else {}
+        files = artifacts.get("files")
+        if files is not None and not (isinstance(files, dict) and all(isinstance(f, dict) for f in files.values())):
+            problems.append(f"{name}: artifacts.files must map each path to a mapping")
+        if "include" in artifacts and not isinstance(artifacts["include"], list):
+            problems.append(f"{name}: artifacts.include must be a list")
+        if "consumers" in rec and not isinstance(rec["consumers"], list):
+            problems.append(f"{name}: consumers must be a list")
         if rec.get("id") in seen_ids:
             problems.append(f"{name}: duplicate id")
         seen_ids.add(rec.get("id"))
@@ -171,11 +186,11 @@ def validate(data: dict[str, Any]) -> list[str]:
         if status == "verified":
             if rev == UNVERIFIED:
                 problems.append(f"{name}: verified, but revision is {UNVERIFIED}")
-            if not (rec.get("artifacts") or {}).get("files"):
+            if not files:
                 problems.append(f"{name}: verified, but no artifact hashes are recorded")
         if status == "unverified" and rev != UNVERIFIED:
             problems.append(f"{name}: revision is pinned but verification_status is unverified")
-        for c in rec.get("consumers") or []:
+        for c in rec.get("consumers") if isinstance(rec.get("consumers"), list) else []:
             r = c.get("revision") if isinstance(c, dict) else None
             if not isinstance(c, dict) or not isinstance(c.get("manifest"), str):
                 problems.append(f"{name}: each consumer needs a manifest path")
@@ -223,9 +238,11 @@ class DeploymentRef:
 
 
 _COMMENT = re.compile(r"^\s*#.*$", re.MULTILINE)
-_SERVE = re.compile(r"""\b(?:vllm|sglang)\s+serve\s+(?!-)([^\s\\"']+)""")
-_MODEL_FLAG = re.compile(r"""--model(?:-path)?(?:=|\s+)([^\s\\"']+)""")
-_REVISION_FLAG = re.compile(r"""--revision(?:=|\s+)([^\s\\"']+)""")
+# An argument may be quoted (`vllm serve "org/name"`, `--revision='<sha>'`): accept one
+# opening quote; the capture still stops at the closing one.
+_SERVE = re.compile(r"""\b(?:vllm|sglang)\s+serve\s+(?!-)["']?([^\s\\"']+)""")
+_MODEL_FLAG = re.compile(r"""--model(?:-path)?(?:=|\s+)["']?([^\s\\"']+)""")
+_REVISION_FLAG = re.compile(r"""--revision(?:=|\s+)["']?([^\s\\"']+)""")
 _ENV_PAIR = re.compile(r"""-\s*name:\s*(\w+)\s*\n\s*value:\s*["']?([^\s"'#]+)""")
 _VAR = re.compile(r"\$\((\w+)\)")
 
@@ -423,6 +440,13 @@ def check(
     if any(f.kind == "schema" for f in rep.findings):
         return rep
 
+    if not Path(deploy_dir).is_dir():
+        rep.unreachable = True
+        rep.add("error", "no-deployments", str(deploy_dir),
+                "no deploy/ directory here, so no deployment can be compared; "
+                "pass --repo-root <checkout of the repository>")
+        return rep
+
     family = data["family"]
     records = data["checkpoints"]
 
@@ -514,6 +538,9 @@ def _render(rep: Report) -> str:
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="gitm inventory", description=__doc__.split("\n\n")[0])
     p.add_argument("--file", type=Path, default=DEFAULT_INVENTORY, help="Inventory YAML (default: Kimi).")
+    p.add_argument("--repo-root", type=Path, default=_REPO_ROOT,
+                   help="Checkout whose deploy/ holds the manifests (default: the checkout this "
+                        "module runs from; required for an installed copy).")
     sub = p.add_subparsers(dest="action", required=True)
     add = sub.add_parser("add", help="Pin a repository to a commit, hash it, and record it (needs network).")
     add.add_argument("repository", help="owner/name on the hub.")
@@ -529,12 +556,33 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+def _load_or_report(path: Path) -> dict[str, Any] | None:
+    """The inventory, or ``None`` after saying why not. A file that cannot be read is
+    "could not check" (exit 2); exit 1 is reserved for drift."""
+    try:
+        return load(path)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        print(f"cannot read inventory {path}: {exc}", file=sys.stderr)
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     path: Path = args.file
+    repo_root: Path = Path(args.repo_root)
+    deploy_dir = repo_root / "deploy"
+
+    # Before reading or writing anything: with no deploy/ the scan finds nothing, and
+    # `sync` would read that as "every deployment is gone" and delete the consumers.
+    if not deploy_dir.is_dir():
+        print(f"no deploy/ directory under {repo_root}; pass --repo-root <checkout>", file=sys.stderr)
+        return 2
 
     if args.action == "check":
-        rep = check(load(path), None if args.offline else HubSource())
+        data = _load_or_report(path)
+        if data is None:
+            return 2
+        rep = check(data, None if args.offline else HubSource(), deploy_dir=deploy_dir, repo_root=repo_root)
         if args.as_json:
             print(json.dumps([f.__dict__ for f in rep.findings], indent=2))
         else:
@@ -542,12 +590,14 @@ def main(argv: list[str] | None = None) -> int:
         return rep.exit_code(args.strict)
 
     if args.action == "sync":
-        data = load(path)
+        data = _load_or_report(path)
+        if data is None:
+            return 2
         problems = validate(data)
         if problems:
             print("\n".join(problems), file=sys.stderr)
             return 2
-        changed = sync(data, scan_deployments())
+        changed = sync(data, scan_deployments(deploy_dir, repo_root))
         if changed:
             dump(data, path)
         print("\n".join(changed) if changed else "already in sync")
@@ -555,10 +605,16 @@ def main(argv: list[str] | None = None) -> int:
 
     # add
     source = HubSource()
-    data = load(path) if path.exists() else {
+    data = _load_or_report(path) if path.exists() else {
         "schema_version": SCHEMA_VERSION, "family": args.family or "", "checkpoints": [],
     }
-    if not data["family"]:
+    if data is None:
+        return 2
+    problems = validate(data) if data.get("checkpoints") else []
+    if problems:
+        print("\n".join(problems), file=sys.stderr)
+        return 2
+    if not data.get("family"):
         print("a new inventory needs --family", file=sys.stderr)
         return 2
     existing = next((r for r in data["checkpoints"] if r["repository"].lower() == args.repository.lower()), None)
@@ -571,8 +627,9 @@ def main(argv: list[str] | None = None) -> int:
     if existing is None:
         data["checkpoints"].append(rec)
     else:
-        data["checkpoints"][data["checkpoints"].index(existing)] = rec
-    sync(data, scan_deployments())
+        existing.update(rec)  # fresh facts win; keys this tool does not own survive
+        rec = existing
+    sync(data, scan_deployments(deploy_dir, repo_root))
     problems = validate(data)
     if problems:
         print("\n".join(problems), file=sys.stderr)
