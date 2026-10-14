@@ -484,6 +484,39 @@ def test_a_candidate_starts_only_if_the_budget_left_covers_one():
     assert why is not None and "50 min" in why
 
 
+def test_the_run_releases_an_engine_it_built_and_only_that(monkeypatch):
+    """Left running, vLLM's spawned TP workers keep ``gitm run`` from exiting
+    after it has written its report."""
+    import gitm.api as api
+
+    released: list[str] = []
+    monkeypatch.setattr(LiveEngineApplicator, "_shutdown",
+                        staticmethod(lambda e: released.append(e)))
+
+    def fake_loop(cfg):
+        cfg.engine = cfg.engine or "built-by-the-workload"
+        return {}
+
+    monkeypatch.setattr(api, "run_loop", fake_loop)
+    api.optimize(workload="vllm-decode")
+    assert released == ["built-by-the-workload"]
+
+    released.clear()
+    api.optimize("the-callers-engine")
+    api.optimize(workload_runner=lambda: {})            # the runner's engine: not ours
+    assert released == []
+
+    def failing_loop(cfg):
+        cfg.engine = "built-by-the-workload"
+        raise RuntimeError("the loop failed")
+
+    released.clear()
+    monkeypatch.setattr(api, "run_loop", failing_loop)
+    with pytest.raises(RuntimeError):
+        api.optimize(workload="vllm-decode")
+    assert released == ["built-by-the-workload"]
+
+
 def test_an_engine_a_retrace_swaps_in_is_a_fresh_build():
     """A re-trace replaces the running baseline with a traced build and then an
     untraced one. That engine is new, so its first measurement pairs with the
