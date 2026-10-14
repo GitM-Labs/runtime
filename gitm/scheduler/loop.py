@@ -131,6 +131,29 @@ def _retrace_skip_reason(queue: list[Any], *, floors_priced: bool,
             "re-trace could not change their order")
 
 
+def _next_cycle_overruns(elapsed_s: float, budget_s: float,
+                         cycle_s: list[float]) -> str | None:
+    """Why the next candidate should not start, or ``None`` if it fits.
+
+    ``cycle_s`` holds how long each candidate this run measured took, from the
+    start of its A/B to the end of its re-trace. Checking only that the budget
+    is not yet spent starts a candidate with a minute left: the first Kimi K2.5
+    run on MI355X started its last one 35 s before a 5 h budget ended and
+    overran by 19 minutes. So a candidate starts only if the time left covers
+    the mean of the ones before it. The first has nothing to go by, and starts
+    whenever the budget is not spent.
+    """
+    left = budget_s - elapsed_s
+    if left <= 0:
+        return "spent"
+    if cycle_s:
+        mean = sum(cycle_s) / len(cycle_s)
+        if left < mean:
+            return (f"{left / 60:.0f} min left, and a candidate has taken "
+                    f"{mean / 60:.0f} min on average")
+    return None
+
+
 _BUDGET_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd])\s*$")
 
 # Workloads the predicted graph + intervention library actually model. Anything
@@ -1672,7 +1695,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                         for x in queue if x.rejected_reason is not None)
         queue = []
 
-    def _stop_at_budget() -> int:
+    def _stop_at_budget(why: str = "spent") -> int:
         """The queue left behind when the budget stops Phase 4, accounted for.
 
         Without this the loop just broke out: the summary said nothing was left
@@ -1686,15 +1709,25 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         if left:
             degradations.record(
                 BUDGET_SPENT, used="a Phase 4 that stopped at the budget",
-                reason=f"budget {cfg.budget} spent; {left} ranked candidate(s) not tried",
+                reason=f"budget {cfg.budget} {why}; {left} ranked candidate(s) not tried",
                 severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
         return left
 
+    # How long each measured candidate took, A/B and re-trace together, for
+    # _next_cycle_overruns; and when the one in progress started.
+    cycle_s: list[float] = []
+    cycle_started_ns: int | None = None
     while queue:
-        if time.time_ns() - started_ns >= int(budget_s * 1e9):
+        if cycle_started_ns is not None:
+            cycle_s.append((time.time_ns() - cycle_started_ns) / 1e9)
+            cycle_started_ns = None
+        overrun = _next_cycle_overruns((time.time_ns() - started_ns) / 1e9, budget_s, cycle_s)
+        if overrun is not None:
             # The budget can run out before a candidate starts (the noise
-            # calibration spends it too): do not start an A/B it cannot afford.
-            n_untried = _stop_at_budget()
+            # calibration spends it too), or be too short for one to finish:
+            # do not start an A/B it cannot afford.
+            n_untried = _stop_at_budget(overrun if overrun == "spent"
+                                        else f"would be overrun ({overrun})")
             break
         c = queue.pop(0)
         if c.rejected_reason is not None:
@@ -1707,6 +1740,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         if cfg.engine is not None and live_restart_fn is None and _has_structural_knob(c.spec):
             rejected.append(f"{c.spec.name} (structural knob: needs engine restart, no restart_fn)")
             continue
+        cycle_started_ns = time.time_ns()
         # Snapshot the engine config BEFORE the apply: a hot-swap mutates these
         # kwargs in place and a restart replaces the engine outright, so reading
         # them afterwards would report the candidate on both sides of the diff.

@@ -469,6 +469,21 @@ def test_a_baseline_brought_back_in_parallel_mode_is_not_fresh():
     assert app.noise.samples == [] and app.noise.skipped_not_fresh == 1
 
 
+# --------------------------------------------------------------------------- #
+# the budget and the engine at exit                                           #
+# --------------------------------------------------------------------------- #
+def test_a_candidate_starts_only_if_the_budget_left_covers_one():
+    """The first Kimi run started its last candidate 35 s before a 5 h budget
+    ended and overran it by 19 minutes."""
+    from gitm.scheduler.loop import _next_cycle_overruns
+
+    assert _next_cycle_overruns(100.0, 3600.0, []) is None       # nothing to go by yet
+    assert _next_cycle_overruns(3600.0, 3600.0, []) == "spent"
+    assert _next_cycle_overruns(3000.0, 3600.0, [300.0, 500.0]) is None
+    why = _next_cycle_overruns(17965.0, 18000.0, [2700.0, 3300.0])
+    assert why is not None and "50 min" in why
+
+
 def test_an_engine_a_retrace_swaps_in_is_a_fresh_build():
     """A re-trace replaces the running baseline with a traced build and then an
     untraced one. That engine is new, so its first measurement pairs with the
