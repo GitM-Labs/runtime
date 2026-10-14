@@ -91,3 +91,7 @@ The optional local calculator now represents named resources, directed transfers
 ## Narrow partial gap fixes on October 11
 
 See [partial gap fixes](partial-gap-fixes.md). These extend explicit storage expression only. They do not make K3 loadable, fix V3.2 detection, infer a vendor cache layout or fabricate a spatial schedule. Historical probe outputs remain tied to their original baseline; the current K3 reconciliation is regenerated after the new fields.
+
+## October 13 current main reconciliation
+
+The local branch now incorporates main at `12dd8b4002125447777dcb2ea20f9cd5fa772032`; see the [reconciliation record](reconciliation-2026-10-13.md). Upstream GPU discovery/reporting changes are retained. The full local suite passes (2400 passed, 6 skipped) and the 14 legacy comparisons remain unchanged. Medha's related PR #176 supplies proposed V3.2 work but is not merged into this branch; CF-07 is not closed by its existence. Current review, publication and deployment-evidence boundaries remain unchanged.

@@ -40,3 +40,7 @@ The CF-08 storage representation gap is resolved in local code, while its deploy
 ## Local commits authorized October 13
 
 Ishaan explicitly requested local commits. Five logical commits record reporting semantics, backend reporting, tiered memory, independent state/cache storage and the mission documents. Commit messages distinguish agent-written work from independent human verification, which is not claimed. The code hashes match the recorded 512-test snapshot and the 14-case compatibility record; tests were not rerun solely to create commits. Pushing, PR creation, external messages, maintainer acceptance and shared register adoption remain pending and are not implied by this authorization.
+
+## Reconciliation and broader verification
+
+The October 13 reconciliation onto current main preserved the five prepared changes. Full local verification now reports 2400 passed and 6 skipped, with zero failures, plus pinned Ruff 0.12.11 and 14 unchanged legacy comparisons. The [reconciliation record](reconciliation-2026-10-13.md) states platform and skip boundaries. This supplements the earlier selected suite. It does not establish GitHub CI, new device measurements or current maintainer acceptance. A local reconciliation commit records the refresh and source-artifact lint configuration.

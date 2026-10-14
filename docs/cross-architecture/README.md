@@ -50,3 +50,7 @@ Local integration does not establish a shared live register, maintainer acceptan
 The local branch `ishaan/cross-architecture-ceilings` separates result semantics, the pinned backend report, named memory-resource accounting, independent state/cache storage, and mission documents with source evidence. Commit messages describe what changed, why and verification scope. Code and authored documents are agent-written; the original K3 and Arshia sources are unchanged. Human authorization to commit does not claim independent verification or maintainer acceptance.
 
 The 18 Python files in the prepared change set were checked against the recorded 512-test verification snapshot before committing. No test suite was rerun for this documentation and commit operation. Earlier review archives remain historical snapshots and were not rewritten.
+
+## Reconciled with current main
+
+On October 13 the branch was rebased onto `12dd8b4002125447777dcb2ea20f9cd5fa772032`. All five commits replayed without conflicts. The full local Python 3.12 suite passes with 2400 passed and 6 skipped; all 14 legacy comparisons match. Ruff 0.12.11 passes, excluding only the unchanged Arshia source-artifact directory. See [reconciliation record](reconciliation-2026-10-13.md) for scope, skipped cases and the preview of related PR #176. The earlier 512-case result remains historical, not additional coverage.

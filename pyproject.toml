@@ -85,6 +85,9 @@ addopts = "-q"
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# Retain supplied analysis artifacts byte-for-byte. Project code and its tests
+# remain linted; these historical source copies are not maintained runtime code.
+extend-exclude = ["docs/cross-architecture/sources/arshia"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "B", "UP"]
