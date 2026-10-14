@@ -31,8 +31,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
-from typing import Iterable, Mapping, Protocol
+from typing import Protocol
 
 _COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 
