@@ -234,9 +234,13 @@ def _load(model: str) -> tuple[Any, str, str]:
     else:
         entry = load_entry(model)
     if entry is not None:
+        if entry.get("execution_status") == "static_only":
+            raise ValueError(f"{model}: checkpoint evidence only; planner integration pending")
         prov = entry.get("provenance", {})
         est = [e.get("field") for e in prov.get("estimated", [])]
         note = f"catalogue; fitted fields: {est or 'none'}"
+        if entry.get("checkpoint"):
+            note += "; STATIC_CHECKPOINT_ONLY; UNVERIFIED: engine, deployment, traffic, trace"
         return load_spec(model), entry["family"], note
 
     # No entry: read the checkpoint itself, from a config.json path or from the
@@ -494,6 +498,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({
             "model": getattr(spec, "name", None),
             "family": family,
+            "provenance": note,
             "hardware": hw.name,
             "sharding": {"tp": args.tp, "ep": args.ep, "dp": args.dp},
             "batch": {"batch": args.batch, "kv_cache_len": args.kv_len,

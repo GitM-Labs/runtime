@@ -82,6 +82,22 @@ def test_resolves_from_hf_cache_honouring_environ(tmp_path):
     assert got == snap / "config.json"
 
 
+def test_named_revision_uses_hub_ref_without_losing_existing_model(tmp_path):
+    hub = tmp_path / "hub"
+    repo = hub / "models--org--Model"
+    revision = "a" * 40
+    snap = repo / "snapshots" / revision
+    _write_config(snap, _deepseek_cfg())
+    (repo / "refs").mkdir()
+    (repo / "refs" / "main").write_text(revision)
+    assert mc.resolve_config_path("org/Model", cache_root=hub, revision="main") == snap / "config.json"
+    assert mc.resolve_config_path("org/Model", cache_root=hub, revision="../snapshots") is None
+    r = mc.live_moe_spec(_target(["vllm", "serve", "org/Model", "--revision", "main"]),
+                         environ={}, cache_root=hub)
+    assert isinstance(r, mc.LiveSpec)
+    assert r.family == "sparse_moe"
+
+
 def test_unresolvable_ref_returns_none(tmp_path):
     assert mc.resolve_config_path("org/Missing", {"HF_HUB_CACHE": str(tmp_path)}) is None
     assert mc.resolve_config_path(None) is None

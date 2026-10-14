@@ -1,0 +1,49 @@
+# Static preflight template. This is not an engagement deployment or a passed gate.
+schema: gitm.deepseek.deployment/v1
+checkpoint:
+  repository: deepseek-ai/DeepSeek-V3.2
+  revision: a7e62ac04ecb2c0a54d736dc46601c5606cf10a6
+  config_sha256: c7fa8b191e9936d8e6a57d864baab82b792fae16a116416cdd3a75ba76bc5af1
+  index_sha256: 2a150b2af4aba7b037edc9fdba70f3b41abf758ee926279e7701d954298f9884
+  static_evidence: gitm/planner/models/deepseek-v3.2.evidence.json
+  engagement_match: UNVERIFIED
+engine:
+  source_repository: UNVERIFIED
+  source_revision: UNVERIFIED
+  image_digest: UNVERIFIED
+  launch_argv: UNVERIFIED
+  environment: UNVERIFIED
+  kv_cache_layout: UNVERIFIED
+  mla_backend: UNVERIFIED
+  expert_backend_padding: UNVERIFIED
+hardware:
+  sku: UNVERIFIED
+  topology: UNVERIFIED
+parallelism:
+  tp: UNVERIFIED
+  ep: UNVERIFIED
+  dp: UNVERIFIED
+traffic:
+  manifest_sha256: UNVERIFIED
+  source_kind: UNVERIFIED
+  replay_argv: UNVERIFIED
+  expected_input_tokens: UNVERIFIED
+  expected_output_tokens: UNVERIFIED
+telemetry:
+  collector_contract: UNVERIFIED
+  expected_ranks: UNVERIFIED
+  qualification_gate: UNVERIFIED
+planner:
+  catalogue_entry: deepseek-v3.2
+  graph_sha256: UNVERIFIED
+  ceiling_sha256: UNVERIFIED
+commands:
+  bring_up: UNVERIFIED
+  capture: UNVERIFIED
+  tear_down: UNVERIFIED
+privacy:
+  customer_derived_values:
+    - traffic manifest and source trace
+    - engagement deployment endpoint and credentials
+    - customer request contents and telemetry artifacts
+  storage_reference: UNVERIFIED
