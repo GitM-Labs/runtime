@@ -1,6 +1,6 @@
 # DeepSeek V3.2 planner design note — static evidence, open execution contract
 
-**Review state:** static checkpoint audit reproduced; engine, target deployment, hardware, traffic, and qualified observation `UNVERIFIED`. Rahul has not signed a technical gate and Zhu's verifier has not accepted this bundle. The catalogue graph is an exploratory structural prediction until those gates are satisfied.
+**Review state:** static checkpoint audit reproduced; engine, target deployment, hardware, traffic, and qualified observation `UNVERIFIED`. The planner reviewer has not signed a technical gate and the evidence verifier has not accepted this bundle. The catalogue graph is an exploratory structural prediction until those gates are satisfied.
 
 ## 1. Pin and reproduction
 
@@ -57,11 +57,11 @@ The planner's cached MLA entry has **512 latent + 64 RoPE elements** per token p
 
 The catalogue loads and `model_catalogue.predict('deepseek-v3.2')` builds prefill/decode graph regions and TP/EP collectives. Raw `deepseek_v32` config dispatch now recognizes this family but refuses a config-only prediction, since that file alone lacks the indexer schedule. The live serve path checks a pinned snapshot's config/index first and uses the catalogue spec only when they match. This is the production route, with `checkpoint_evidence` and its `UNVERIFIED` engine/deployment fields carried into attach output. The attach result labels the resulting floor **exploratory**.
 
-The graph still models unabsorbed MLA, an FP32 router execution hypothesis, no expert-capacity padding, and a particular MTP selection path. Those are not checkpoint facts. A BF16 `indexer.weights_proj` lives beside FP8 `wq_b` and `wk`: storage is accounted separately, while mixed runtime kernel traffic and peak selection need pinned engine evidence and, if necessary, Ishaan's schema change. Exact temporary traffic and accumulation precision are likewise `UNVERIFIED`.
+The graph still models unabsorbed MLA, an FP32 router execution hypothesis, no expert-capacity padding, and a particular MTP selection path. Those are not checkpoint facts. A BF16 `indexer.weights_proj` lives beside FP8 `wq_b` and `wk`: storage is accounted separately, while mixed runtime kernel traffic and peak selection need pinned engine evidence and, if necessary, the schema owner's schema change. Exact temporary traffic and accumulation precision are likewise `UNVERIFIED`.
 
 ## 4. Topology and execution tests
 
-`ShardingConfig(tp, ep, dp)` models per-rank work, with EP within the TP group. Tests check that TP8/EP8 changes memory and emits all-to-all, while an invalid TP7 fails the head-divisibility check; these are **scenarios**, not the engagement topology. The actual rank map, GPU SKU, padding, collective backend and engine revision must come from Adit/Collin. Changing the pinned revision, config dimensions, quantization recipe or tensor schedule fails static verification; the workload contract rejects a changed checkpoint pin and an incompatible topology.
+`ShardingConfig(tp, ep, dp)` models per-rank work, with EP within the TP group. Tests check that TP8/EP8 changes memory and emits all-to-all, while an invalid TP7 fails the head-divisibility check; these are **scenarios**, not the engagement topology. The actual rank map, GPU SKU, padding, collective backend and engine revision must come from the hardware owner/the serving owner. Changing the pinned revision, config dimensions, quantization recipe or tensor schedule fails static verification; the workload contract rejects a changed checkpoint pin and an incompatible topology.
 
 Run the CPU-only checks:
 
@@ -77,11 +77,11 @@ The second command currently exits with unresolved field blockers. That is expec
 
 | Decision | Required input / reviewer |
 |---|---|
-| Does this checkpoint match the engagement? | Collin's served checkpoint identity; Zhu's verifier agreement |
-| What operations actually execute? | Engine source commit/image, all flags/defaults, backend/kernel selection and padding; Rahul reviews the graph consequence |
-| What fits on each rank? | Adit's GPU/rank/TP/EP/DP deployment manifest and engine placement behavior |
+| Does this checkpoint match the engagement? | the serving owner's served checkpoint identity; the evidence verifier agreement |
+| What operations actually execute? | Engine source commit/image, all flags/defaults, backend/kernel selection and padding; the planner reviewer reviews the graph consequence |
+| What fits on each rank? | the hardware owner's GPU/rank/TP/EP/DP deployment manifest and engine placement behavior |
 | What workload was measured? | Private traffic manifest, replay command and reconciled request/token identity |
-| Is the observation admissible? | Nathan's multi-rank qualification result, including deliberate mismatch/missing-rank rejection |
+| Is the observation admissible? | the qualification owner's multi-rank qualification result, including deliberate mismatch/missing-rank rejection |
 | Do predicted and observed regions agree? | Kernel/transfer/collective mapping, interval predictions, observed variance, unmatched-work residuals and contradiction fix |
 
 See `GAP-MAP.md` for each boundary and `deployment-contract.yaml` for machine-readable unknowns. No customer-facing timing claim follows from this static design note alone.

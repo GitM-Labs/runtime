@@ -71,7 +71,7 @@ def coverage(contract_path: Path, *, config_path: Path | None = None,
             "detail": f"{len(blockers)} unresolved fields", "blockers": blockers,
         },
         "qualified_trace": {"status": "UNVERIFIED",
-                            "detail": "Nathan's gate result and matched run not supplied"},
+                            "detail": "the qualification gate result and matched run not supplied"},
     }
 
 
