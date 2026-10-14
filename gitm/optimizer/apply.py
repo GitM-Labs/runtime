@@ -415,6 +415,10 @@ class NoiseFloor:
     #: Baseline measurements left out because they were not the first on their
     #: build (see ``LiveEngineApplicator._note_baseline``).
     skipped_not_fresh: int = 0
+    #: The calibration's warm-up pair, left out of ``samples``: the first rebuilt
+    #: baseline against the engine running when calibration began (see
+    #: ``LiveEngineApplicator.calibrate``). Kept so a cold start stays visible.
+    warmup: float | None = None
 
     @property
     def floor(self) -> float | None:
@@ -789,8 +793,16 @@ class LiveEngineApplicator:
         self._last_baseline = (self._generation, id(self.engine), tps)
 
     def calibrate(self, pairs: int, *, deadline_ns: int | None = None) -> list[float]:
-        """Measure the baseline ``pairs + 1`` times, rebuilding it in between, so
-        the first candidate is judged against a measured noise floor.
+        """Measure the baseline against itself, rebuilt each time, for ``pairs``
+        A/A samples, so the first candidate is judged against a measured floor.
+
+        The engine running when calibration begins is measured as a warm-up and
+        left out of the floor, so ``pairs`` samples cost ``pairs + 1`` rebuilds.
+        It is the first engine after the opening capture, and on Kimi K2.5
+        (MI355X, TP=8) it decoded at 1110 tok/s where every later build of the
+        same configuration ran at 1380-1470: one 24.8% sample, and an RMS floor
+        of 8.9% that rejected a +5% CUDA-graph win against a 25% bar. Its pair
+        is recorded as ``noise.warmup``.
 
         Serial restart only: it needs ``baseline_restart_fn``. Stops early at
         ``deadline_ns``. Returns the A/A samples it added. A rebuild or a
@@ -800,15 +812,19 @@ class LiveEngineApplicator:
         if pairs < 1 or self._baseline_restart_fn is None or self._restart_mode != "serial":
             return []
         before = len(self.noise.samples)
-        self._note_baseline(self._bench_baseline())
-        for _ in range(pairs):
+        warm = self._bench_baseline()
+        self._last_baseline = None          # nothing pairs with the warm-up
+        for i in range(pairs + 1):
             if deadline_ns is not None and time.time_ns() >= deadline_ns:
                 break
             old = self.engine
             self._shutdown(old)
             self._rebuild_baseline(lambda old=old: self._baseline_restart_fn(old),
                                    "calibrating the noise floor")
-            self._note_baseline(self._bench_baseline())
+            tps = self._bench_baseline()
+            if i == 0 and warm > 0 and tps > 0:
+                self.noise.warmup = tps / warm - 1.0
+            self._note_baseline(tps)
         return self.noise.samples[before:]
 
     def _bench_baseline(self) -> float:

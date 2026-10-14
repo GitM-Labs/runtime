@@ -96,11 +96,26 @@ def test_rounds_that_share_a_build_shrink_the_noise_less_than_root_n():
 # calibration and free A/A samples                                            #
 # --------------------------------------------------------------------------- #
 def test_calibration_measures_the_baseline_against_itself_rebuilt():
-    box = _Box([1000.0, 1004.0, 998.0])
+    box = _Box([990.0, 1000.0, 1004.0, 998.0])
     app = box.applicator()
     samples = app.calibrate(2)
-    assert box.built == ["A", "A", "A"]                 # N + 1 builds for N pairs
+    assert box.built == ["A", "A", "A", "A"]            # the warm-up, then N + 1 rebuilds
     assert samples == pytest.approx([0.004, 998 / 1004 - 1])
+    assert app.noise.warmup == pytest.approx(1000 / 990 - 1)
+
+
+def test_a_cold_first_engine_does_not_set_the_floor():
+    """Kimi K2.5 on MI355X: the first engine after the opening capture decoded
+    at 1110 tok/s, every later build at about 1400. Paired, that one 24.8%
+    sample made the RMS floor 8.9% and rejected a +5% win against a 25% bar."""
+    box = _Box([1109.69, 1385.49, 1424.68, 1387.71])
+    app = box.applicator()
+    app.calibrate(2)
+    assert app.noise.warmup == pytest.approx(0.2485, abs=1e-3)
+    assert app.noise.floor < 0.03
+    bar = app.noise.threshold(mean_noise_factor(2, rebuilt=True),
+                              minimum=0.01, without_floor=0.02)
+    assert bar < 0.05                                   # the +5.0% graph-replay win clears it
 
 
 def test_a_rollback_rebuild_adds_an_aa_sample_for_free():
@@ -409,7 +424,7 @@ def test_only_first_measurements_on_a_build_make_aa_samples():
     """On a laptop on battery the first decode after a rebuild ran 4-5% faster
     than the next one on the same engine. Pairing a second measurement with a
     fresh one read that as noise and multiplied the floor by seven."""
-    box = _Box([1000.0, 1000.0, 1000.0, 1000.0, 1000.0],
+    box = _Box([1000.0] * 8,
                candidate=[1003.0, 1003.0, 1003.0, 1003.0])
     seen: dict[int, int] = {}
 

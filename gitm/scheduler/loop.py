@@ -2170,6 +2170,9 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             # Baseline measurements left out of the samples because they were a
             # second measurement on an engine, not the first after its build.
             "skipped_not_fresh": _noise.skipped_not_fresh,
+            # The calibration's warm-up pair: the first rebuilt baseline against
+            # the engine running before it, left out of the floor.
+            "warmup_sample": _noise.warmup,
             "floor": _noise.floor,
             "threshold": {
                 str(r): _noise.threshold(mean_noise_factor(r, rebuilt=True),

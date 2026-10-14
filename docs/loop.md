@@ -195,7 +195,7 @@ Only one engine is ever on the GPU. Parallel mode, where both are resident, is u
 4. Lost time is used again only while the engine still has the settings the floors were priced for, and runs within 10% of the priced batch. Otherwise the floors describe a different engine, and the step records why it didn't use them.
 
 **The keep rule: beat this run's own noise** (`--validation N`, default 2, or `GITM_VALIDATION`).
-1. **The run measures its noise.** Before the first candidate, the baseline is measured N + 1 times, rebuilt each time. Each pair is an A/A sample: the same configuration on two builds. Every later re-measurement of the same baseline on a fresh build (after a rollback, or between rounds) adds another sample. The floor is the RMS of the samples. Calibration runs only with an engine-owned throughput probe, and within the budget.
+1. **The run measures its noise.** Before the first candidate, the baseline is measured N + 2 times: the running engine, then N + 1 rebuilds. The first measurement is a warm-up and is left out: on Kimi K2.5 the first engine after the opening capture decoded 25% slower than every later build of the same configuration, and that one sample set the floor. Each later pair is an A/A sample: the same configuration on two builds. Every later re-measurement of the same baseline on a fresh build (after a rollback, or between rounds) adds another sample. The floor is the RMS of the samples. Calibration runs only with an engine-owned throughput probe, and within the budget.
 2. **Each candidate gets up to N paired rounds.** The order alternates (A then B, then B then A), so drift within a round cancels, and each extra round costs one build because the running engine is measured again. A clear loss stops after round 1. Hot-swapped and parallel-restart candidates get their rounds too, measured in place.
 3. **It's kept only if the mean of the rounds' B/A ratios beats `max(2 × floor × factor, minimum effect)`:**
    - the factor is the exact noise of that mean, since neighbouring rounds share a build (two rounds give 0.87, not 1/√2);
@@ -285,7 +285,7 @@ Useful switches:
   - a candidate that reaches round 2 and loses costs two;
   - a clear loss stops after round 1 and costs two, the candidate plus the baseline rebuilt by the rollback.
 
-  The run also spends N + 1 baseline builds measuring its noise first. On Kimi K2.5 at TP=8, where a build takes minutes, plan on roughly one candidate an hour, or use `--validation 1` for a quicker, noisier pass.
+  The run also spends N + 2 baseline builds measuring its noise first (the running engine, as the warm-up, then N + 1 rebuilds). On Kimi K2.5 at TP=8, where a build takes minutes, plan on roughly one candidate an hour, or use `--validation 1` for a quicker, noisier pass.
 - **The cluster round is manual.** The arms `gitm propose` writes have to be turned into harness jobs, launched and collected by hand. Each arm has one traffic point, and `gitm ingest` reads throughput only.
 - **Engine settings aren't priced.** The predicted graph depends on the model, the GPU and the batch, never on tensor parallelism, KV-cache dtype or quantization settings. Production extras like a speculative draft model aren't modelled either.
 - **Attribution beyond residuals isn't acted on.** Granger and doubly-robust results are reported, but they don't affect the ranking.
