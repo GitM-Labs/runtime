@@ -1,0 +1,46 @@
+# CPU-only bootstrap check for job.yaml: same image, no GPU, never bids.
+# Run it after creating the ConfigMap, before applying the Job:
+#
+#   kubectl apply -f preflight.yaml
+#   kubectl logs -f rocm-correlation-preflight     # ends PREFLIGHT-OK
+#   kubectl delete pod rocm-correlation-preflight
+#
+# rocTX needs no GPU, so the marker path (torch push -> roctx shim ->
+# rocprofiler-sdk -> collector) is checked here too. `vllm serve --help` is
+# not: it refuses to start without a device, so the flags are read from source.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rocm-correlation-preflight
+  namespace: default
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  containers:
+    - name: preflight
+      image: vllm/vllm-openai-rocm@sha256:e5e47f6aaab675c252c381f0dac237b31b10d87bb74d092b07fb4065efd7f5a1
+      command: ["/bin/bash", "-lc"]
+      args:
+        - |
+          set -euxo pipefail
+          pip install -q https://github.com/GitM-Labs/runtime/archive/a36bb4ff5423c4c145e57afc523656b1a573fc47.tar.gz
+          python -m gitm.tracer._rocm.build
+          cd /tmp && python -c "import importlib.util as u; s=u.spec_from_file_location('smoke','/smoke/smoke.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
+          V=$(python -c 'import vllm,os; print(os.path.dirname(vllm.__file__))')
+          python -c "import vllm; print('vllm', vllm.__version__)"
+          grep -q -- '--enable-layerwise-nvtx-tracing' $V/engine/arg_utils.py
+          grep -q 'VLLM_USE_V2_MODEL_RUNNER' $V/envs.py
+          grep -q '_register_layerwise_nvtx_hooks()' $V/v1/worker/gpu_model_runner.py
+          # The marker path, end to end, in an armed window.
+          out=/tmp/probe/t.jsonl; mkdir -p /tmp/probe; touch $out.arm
+          env $(python -c "from gitm.tracer import injection as i; print(' '.join(f'{k}={v}' for k, v in i.run_env('$out', nvtx=True, vendor='amd').items()))") \
+            python -c "import torch; torch.cuda.nvtx.range_push('L0/preflight'); torch.cuda.nvtx.range_pop()"
+          grep -h '"kind":"marker","name":"L0/preflight"' $out.*
+          echo PREFLIGHT-OK
+      resources:
+        requests: { cpu: "2", memory: 8Gi }
+      volumeMounts:
+        - { name: smoke, mountPath: /smoke }
+  volumes:
+    - name: smoke
+      configMap: { name: rocm-correlation-smoke }

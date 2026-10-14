@@ -1,0 +1,82 @@
+# MI355X smoke of the ROCm correlation port (#164): checklist items 1-4 of
+# docs/rocm_correlation.md "On hardware", on a small model, on one node. The
+# check itself is smoke.py, mounted from a ConfigMap:
+#
+#   kubectl create configmap rocm-correlation-smoke --from-file=smoke.py
+#   kubectl apply -f job.yaml
+#   kubectl logs -f job/rocm-correlation-smoke
+#   kubectl delete job rocm-correlation-smoke     # frees the node
+#
+# Same digest-pinned image as kimi-traced.yaml, so the collector builds
+# against the rocprofiler-sdk that loads it. The code comes from GitHub at a
+# pinned commit (an archive tarball, so the image needs no git), not the
+# shared-volume wheel; bump the URL to test another commit. preflight.yaml
+# runs the same bootstrap on the CPU worker first, without bidding for a node.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rocm-correlation-smoke
+  namespace: default
+  labels:
+    kueue.x-k8s.io/queue-name: default
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200      # cap the bill if anything hangs
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: { app: rocm-correlation-smoke }
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      tolerations:
+        - key: amd.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        supplementalGroups: [44, 110]   # video/render for /dev/kfd, /dev/dri
+      containers:
+        - name: smoke
+          image: vllm/vllm-openai-rocm@sha256:e5e47f6aaab675c252c381f0dac237b31b10d87bb74d092b07fb4065efd7f5a1
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              pip install -q https://github.com/GitM-Labs/runtime/archive/a36bb4ff5423c4c145e57afc523656b1a573fc47.tar.gz
+              python -m gitm.tracer._rocm.build
+              rc=0
+              python /smoke/smoke.py || rc=$?
+              # results outlive the node
+              dest=/mnt/shared/gitm/rocm-correlation-smoke/$(date -u +%Y%m%dT%H%M%SZ)
+              mkdir -p "$dest" && cp -r /scratch/. "$dest"/ && echo "artifacts: $dest" || true
+              if [ "$rc" -ne 0 ]; then
+                for f in /scratch/vllm_*.log; do echo "--- tail $f"; tail -40 "$f"; done
+              fi
+              exit "$rc"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_HOME
+              value: /mnt/shared/hf-cache
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef: { name: hf-token-secret, key: token, optional: true }
+            - name: SMOKE_OUT
+              value: /scratch
+          resources:
+            limits:
+              amd.com/gpu: 8      # whole node; the model uses one
+          volumeMounts:
+            - { name: smoke, mountPath: /smoke }
+            - { name: scratch, mountPath: /scratch }
+            - { name: shared, mountPath: /mnt/shared }
+            - { name: dshm, mountPath: /dev/shm }
+      volumes:
+        - name: smoke
+          configMap: { name: rocm-correlation-smoke }
+        - name: scratch
+          emptyDir: {}
+        - name: shared
+          hostPath: { path: /mnt/shared }
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: 16Gi }
