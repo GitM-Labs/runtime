@@ -1,0 +1,154 @@
+# moonshotai/Kimi-K3, pinned at f831ab66814297da540d832a5235f8e904f29d06.
+# Sources: config.json, model.safetensors.index.json, configuration_kimi_k3.py,
+# and modeling_kimi_linear.py from that exact Hugging Face revision.
+#
+# I checked this against GitM runtime main at
+# d9d8e6c02000dd08dd5f5d690baadd786031153f. Its current hybrid schema does not
+# cover MLA in a hybrid schedule, latent-width experts, MXFP4 expert storage,
+# or separate convolution and recurrent-state dtypes. I kept the real K3 fields
+# below and marked the schema gaps instead of substituting effective dimensions.
+
+name: moonshotai/Kimi-K3
+family: hybrid
+description: >
+  93-layer hybrid Kimi Delta Attention and MLA model. Layers 0-2 are KDA,
+  then one MLA follows each group of three KDA layers; layer 92 is an extra
+  terminal MLA layer. Layer 0 has a dense SiTU MLP. Layers 1-92 use latent MoE
+  with 896 routed experts, sigmoid top-16 routing, and two shared experts.
+  Routed expert matrices alone use compressed-tensors mxfp4-pack-quantized;
+  ignored modules remain BF16. Vision tower is resident but idle for text-only
+  decode. No MTP layers are present.
+
+spec:
+  hidden: 7168
+  n_layers: 93
+  vocab: 163840
+
+  # MLA, present on 24 layers. num_key_value_heads=96 is retained verbatim,
+  # but it is not a GQA cache width. The decode cache is one 512-element MLA
+  # latent plus one 64-element RoPE key per token per MLA layer.
+  n_heads: 96
+  num_kv_heads: 96
+  head_dim: 192
+  v_head_dim: 128
+  partial_rotary_factor: 0.3333333333333333
+  attn_output_gate: true
+  q_lora_rank: 1536                    # schema gap; see design note
+  kv_lora_rank: 512                    # schema gap; see design note
+  qk_nope_head_dim: 128                # schema gap; see design note
+  qk_rope_head_dim: 64                 # schema gap; see design note
+  mla_use_nope: true                   # schema gap; see design note
+  mla_cache_elems_per_token: 576       # schema gap; see design note
+
+  # Kimi Delta Attention, present on 69 layers.
+  linear_num_key_heads: 96
+  linear_num_value_heads: 96
+  linear_key_head_dim: 128
+  linear_value_head_dim: 128
+  linear_conv_kernel_dim: 4
+  linear_conv_channels: 36864          # q + k + v; schema gap
+  linear_conv_state_dtype: bf16        # schema gap
+  ssm_state_dtype: fp32
+  conv_dim: 36864
+
+  # Latent MoE. Experts operate at routed_expert_hidden_size=3584, not hidden.
+  num_experts: 896
+  num_experts_per_tok: 16
+  moe_intermediate_size: 3072
+  shared_expert_intermediate_size: 6144
+  routed_expert_hidden_size: 3584       # schema gap
+  latent_moe_use_norm: true             # schema gap
+  dense_intermediate_size: 33792
+  dense_layers: [0]
+  routed_scaling_factor: 1.0
+  moe_router_activation_func: sigmoid   # schema gap
+  topk_method: noaux_tc                 # schema gap
+
+  # The checkpoint lists layer numbers one-based. configuration_kimi_k3.py
+  # tests `(layer_idx + 1) in kda_layers`, producing this zero-based schedule.
+  # It does not tile at the end because layers 91 and 92 are both MLA.
+  layer_types: [
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    linear_attention, linear_attention, linear_attention, full_attention,
+    full_attention,
+  ]
+  full_attention_interval: 4
+  mtp_num_hidden_layers: 0
+
+  # Storage and runtime precision. The checkpoint's quantization ignore list
+  # excludes self_attn, shared_experts, the dense MLP, lm_head, vision_tower,
+  # and mm_projector. On the pinned H200 recipe, Marlin consumes MXFP4 expert
+  # weights with BF16 activations.
+  weight_dtype: bf16
+  expert_dtype: mxfp4-pack-quantized    # schema gap
+  expert_group_size: 32                 # schema gap
+  expert_scale_dtype: torch.uint8       # schema gap
+  kv_dtype: bf16
+  act_dtype: bf16
+  op_dtype_overrides:
+    - [moe_router, fp32]
+    - [linattn_recurrent_state, fp32]
+    - [linattn_conv_state, bf16]
+
+provenance:
+  verified:
+    - claim: exact hybrid schedule is 69 KDA plus 24 MLA layers
+      detail: >
+        The config's one-based kda_layers and full_attn_layers partition all 93
+        layers. The index independently shows self_attn.A_log only on the 69
+        KDA layers and self_attn.kv_a_proj_with_mqa only on the 24 MLA layers.
+    - claim: layer 0 is dense and layers 1-92 are latent MoE
+      detail: >
+        first_k_dense_replace is 1. The tensor map has mlp.{gate,up,down}_proj
+        only on layer 0 and block_sparse_moe.experts.* plus
+        routed_expert_{down,up}_proj on every later layer.
+    - claim: checkpoint storage is 1,560,860,324,864 bytes
+      detail: >
+        model.safetensors.index.json metadata.total_size. Routed experts contain
+        2,722,740,830,208 logical weights: 1,361,370,415,104 bytes of packed
+        4-bit payload plus 85,085,650,944 bytes of one-byte group-32 scales.
+    - claim: no MTP head ships in this checkpoint
+      detail: >
+        num_nextn_predict_layers is 0 and the weight map contains no MTP or
+        nextn module tensors.
+
+  estimated:
+    - field: all_reduces_per_layer
+      value: 1 attention reduction plus engine-dependent MoE communication
+      detail: >
+        SGLang can fuse o_proj with a symmetric-memory all-reduce and can select
+        several EP dispatchers. Kernel and collective count must therefore be
+        read from the pinned engine path, not inferred from the checkpoint.
+
+  open:
+    - question: extend the current GitM hybrid schema before running this YAML
+      detail: >
+        Required additions are MLA cache/projection fields, latent expert width,
+        mxfp4 expert byte accounting, and a convolution-state dtype separate
+        from recurrent-state dtype. Until then, manual figures in DESIGN-NOTE.md
+        are authoritative.
+
+  unmodelled:
+    - The 27-layer vision tower and multimodal projector are resident weight
+      bytes but execute no kernels for the baseline text-only decode step.

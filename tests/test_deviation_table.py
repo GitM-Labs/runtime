@@ -203,7 +203,8 @@ def test_phase_is_unknown_rather_than_guessed_without_anchors(tmp_path):
 # floors                                                                       #
 # --------------------------------------------------------------------------- #
 def test_a_graph_without_steps_refuses_rather_than_comparing_one_step_to_a_window(tmp_path):
-    """`gitm deviate --as-json` has this bug live: pred * (steps or 1), no warning."""
+    """The strict form of what ``gitm deviate --json`` does: that path states no
+    floor rather than an unscaled one, this one refuses to build the table."""
     import pytest
 
     p = _trace(tmp_path / "t.jsonl", [("fused_moe_kernel", 1000, 10)])

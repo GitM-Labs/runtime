@@ -620,8 +620,11 @@ def test_spec_tokens_prices_the_verify_rows(tmp_path, capsys):
     from gitm.optimizer.deviation import main
 
     p = _write_trace(tmp_path / "t.jsonl", [("fused_moe_kernel", 1000, 4)])
+    # --steps 1 because this synthetic capture really is one step: without it the
+    # payload now states no floor at all rather than an unscaled one, so there is
+    # nothing to compare.
     base = [str(p), "--model", "qwen3.6-35b-a3b", "--gpu", "H200",
-            "--batch", "8", "--kv-len", "1024", "--json"]
+            "--batch", "8", "--kv-len", "1024", "--json", "--steps", "1"]
     main(base)
     plain = json.loads(capsys.readouterr().out)
     main(base + ["--spec-tokens", "3"])

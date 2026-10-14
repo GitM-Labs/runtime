@@ -1,0 +1,2447 @@
+{
+  "generated_by": "scripts/search_space/feasible_kimi_mi355x.py",
+  "git_commit": "60511c126498cd63a6be408d699d967b92a24cbb",
+  "baseline": {
+    "model": {
+      "catalogue_entry": "kimi-k2.5",
+      "catalogue_file": "gitm/planner/models/kimi-k2.5.yaml",
+      "hf_repo": "moonshotai/Kimi-K2.5",
+      "revision": null,
+      "revision_source": "not pinned: deploy/k8s/mi355x-kimi-loop.yaml serves the hub default at launch; no MANIFEST from run_loop.sh is committed"
+    },
+    "engine": {
+      "name": "vLLM (ROCm)",
+      "image": "vllm/vllm-openai-rocm@sha256:e5e47f6aaab675c252c381f0dac237b31b10d87bb74d092b07fb4065efd7f5a1",
+      "version": null,
+      "version_source": "image digest pinned in deploy/k8s/mi355x-kimi-loop.yaml; the vllm.__version__ is only written to MANIFEST at run time (scripts/kimi_loop/run_loop.sh) and none is committed"
+    },
+    "topology": {
+      "gpu_sku": "AMD Instinct MI355X",
+      "gpus": 8,
+      "nodes": 1,
+      "peaks_source": "gitm/planner/context.py _PEAKS/_QUANT_PEAKS/_INTERCONNECT['MI355X']"
+    },
+    "parallelism": {
+      "tensor_parallel_size": 8,
+      "pipeline_parallel_size": 1,
+      "data_parallel_size": 1,
+      "enable_expert_parallel": false,
+      "source": "--tensor-parallel-size 8, no PP/DP/EP flags (deploy/k8s/mi355x-kimi-loop.yaml)"
+    },
+    "launch": {
+      "command": [
+        "vllm",
+        "serve",
+        "moonshotai/Kimi-K2.5",
+        "--trust-remote-code",
+        "--tensor-parallel-size",
+        "8",
+        "--gpu-memory-utilization",
+        "0.92",
+        "--max-num-batched-tokens",
+        "8192",
+        "--max-num-seqs",
+        "256",
+        "--tool-call-parser",
+        "kimi_k2",
+        "--enable-auto-tool-choice",
+        "--reasoning-parser",
+        "kimi_k2"
+      ],
+      "env": {
+        "VLLM_ROCM_USE_AITER": "1"
+      },
+      "source": "deploy/k8s/mi355x-kimi-loop.yaml"
+    },
+    "traffic": {
+      "regime": "rag",
+      "prompt_tokens": 4096,
+      "output_tokens": 512,
+      "source": "scripts/kimi_loop/run_loop.sh LENGTH_CONFIGS / predict_sweep.py HEADLINE_C"
+    },
+    "batch": {
+      "concurrency": 64,
+      "decode_batch_modeled": 64,
+      "max_num_seqs": 256,
+      "max_num_batched_tokens": 8192
+    },
+    "context": {
+      "kv_len_modeled": 4352,
+      "kv_len_rule": "prompt + output/2 (scripts/kimi_loop/predict_sweep.py kv_mid)",
+      "max_model_len": 262144,
+      "max_model_len_source": "no --max-model-len flag; vLLM defaults to max_position_embeddings (kimi-k2.5.yaml)"
+    },
+    "precision": {
+      "weights": "bf16",
+      "routed_experts": "int4 (compressed-tensors W4A16)",
+      "kv_cache": "bf16 (kv_cache_dtype auto)",
+      "activations": "bf16",
+      "source": "gitm/planner/models/kimi-k2.5.yaml; no --kv-cache-dtype flag"
+    },
+    "loop": {
+      "workload": "vllm-decode",
+      "top_n_interventions": 5,
+      "restart_fn_available": true,
+      "restart_fn_source": "gitm/workloads.py vllm-decode factory sets llm.gitm_restart_fn",
+      "history": null,
+      "history_source": "no committed run history for this box; select_interventions is called with history=None"
+    }
+  },
+  "engine_state": {
+    "scheduler_config.max_num_seqs": {
+      "value": 256,
+      "source": "flag --max-num-seqs"
+    },
+    "scheduler_config.max_num_batched_tokens": {
+      "value": 8192,
+      "source": "flag --max-num-batched-tokens"
+    },
+    "scheduler_config.chunked_prefill_enabled": {
+      "value": true,
+      "source": "vLLM V1 default (unverified for image)"
+    },
+    "scheduler_config.async_scheduling": {
+      "value": false,
+      "source": "vLLM default (unverified for image)"
+    },
+    "scheduler_config.policy": {
+      "value": "fcfs",
+      "source": "vLLM default"
+    },
+    "scheduler_config.enable_dbo": {
+      "value": false,
+      "source": "vLLM default: no --enable-dbo flag"
+    },
+    "cache_config.gpu_memory_utilization": {
+      "value": 0.92,
+      "source": "flag --gpu-memory-utilization"
+    },
+    "cache_config.cache_dtype": {
+      "value": "auto",
+      "source": "vLLM default: no --kv-cache-dtype flag"
+    },
+    "cache_config.enable_prefix_caching": {
+      "value": true,
+      "source": "vLLM V1 default (unverified for image)"
+    },
+    "cache_config.swap_space_bytes": {
+      "value": 4294967296,
+      "source": "vLLM default swap_space=4 GiB (unverified)"
+    },
+    "model_config.enforce_eager": {
+      "value": false,
+      "source": "vLLM default: no --enforce-eager flag"
+    },
+    "model_config.max_model_len": {
+      "value": 262144,
+      "source": "max_position_embeddings (catalogue)"
+    },
+    "model_config.dtype": {
+      "value": "bfloat16",
+      "source": "checkpoint torch_dtype (catalogue)"
+    },
+    "model_config.quantization": {
+      "value": "compressed-tensors",
+      "source": "checkpoint quantization_config"
+    },
+    "parallel_config.tensor_parallel_size": {
+      "value": 8,
+      "source": "flag --tensor-parallel-size"
+    },
+    "parallel_config.pipeline_parallel_size": {
+      "value": 1,
+      "source": "vLLM default"
+    },
+    "parallel_config.data_parallel_size": {
+      "value": 1,
+      "source": "vLLM default"
+    },
+    "parallel_config.enable_expert_parallel": {
+      "value": false,
+      "source": "vLLM default: no --enable-expert-parallel"
+    },
+    "parallel_config.enable_eplb": {
+      "value": false,
+      "source": "vLLM default"
+    },
+    "parallel_config.disable_custom_all_reduce": {
+      "value": false,
+      "source": "vLLM default"
+    },
+    "parallel_config.distributed_executor_backend": {
+      "value": "mp",
+      "source": "vLLM default for single node"
+    }
+  },
+  "engine_state_unknown": {
+    "cache_config.block_size": "ROCm MLA backends pick their own block size; not recorded",
+    "model_config.max_seq_len_to_capture": "renamed/removed across vLLM versions; version unpinned",
+    "model_config.moe_backend": "not an EngineArgs field on every version; AITER MoE via env",
+    "speculative_config": "absent: no --speculative-config flag"
+  },
+  "gate_context": {
+    "workload": "vllm-decode",
+    "dtype": "bf16",
+    "hardware": "AMD Instinct MI355X",
+    "kv_cache_len": 262144,
+    "num_gpus": 8,
+    "has_collective": true,
+    "has_interconnect": true
+  },
+  "standin_trace": {
+    "source": "predict_glm_graph(kimi-k2.5, MI355X, batch=64, kv=4352, tp=8)",
+    "kernels": 1037,
+    "step_ms": 11.017183,
+    "trace_source_field": "none"
+  },
+  "qualification": {
+    "commit": true,
+    "diagnostic": ""
+  },
+  "policy": {
+    "require_qualification_commit": true,
+    "skip_high_risk": false,
+    "code": "gitm/scheduler/loop.py:727"
+  },
+  "autoresearch": {
+    "bottleneck_class": "memory_bound",
+    "target_op": "mlp_gate_up",
+    "target_note": "stand-in residuals are zero by construction (trace == prediction), so the largest-residual target op carries no signal",
+    "max_abs_residual_r_kt": 7.4760765550324e-05,
+    "classify_scores": {
+      "memory": 3.571623215550283,
+      "serialized_concurrency": 1.527027027027027,
+      "threshold": 1.0,
+      "code": "gitm/agents/autoresearch.py classify_bottleneck"
+    },
+    "proposals": 0,
+    "proposal_names": [],
+    "proposals_per_class": {
+      "idle_stall": [],
+      "memory_bound": [],
+      "compute_bound": [
+        "autoresearch:compute_bound:compilation_config=2",
+        "autoresearch:compute_bound:compilation_config=3"
+      ]
+    },
+    "proposer": "FallbackProposer(EngineArgsProposer(), TableProposer())"
+  },
+  "sweep_expansion": [
+    {
+      "entry": "max_num_batched_tokens_dynamic",
+      "grid": [
+        0.5,
+        2.0,
+        4.0
+      ],
+      "grid_points": 3,
+      "emitted": [
+        "max_num_batched_tokens_dynamic_x0_5",
+        "max_num_batched_tokens_dynamic_x2",
+        "max_num_batched_tokens_dynamic_x4"
+      ],
+      "values": [
+        4096,
+        16384,
+        32768
+      ],
+      "collapsed": 0
+    },
+    {
+      "entry": "max_num_seqs_dynamic",
+      "grid": [
+        0.5,
+        2.0,
+        4.0
+      ],
+      "grid_points": 3,
+      "emitted": [
+        "max_num_seqs_dynamic_x0_5",
+        "max_num_seqs_dynamic_x2",
+        "max_num_seqs_dynamic_x4"
+      ],
+      "values": [
+        128,
+        512,
+        1024
+      ],
+      "collapsed": 0
+    },
+    {
+      "entry": "swap_space_dynamic",
+      "grid": [
+        0.5,
+        2.0,
+        4.0
+      ],
+      "grid_points": 3,
+      "emitted": [
+        "swap_space_dynamic_x0_5",
+        "swap_space_dynamic_x2",
+        "swap_space_dynamic_x4"
+      ],
+      "values": [
+        2147483648,
+        8589934592,
+        17179869184
+      ],
+      "collapsed": 0
+    },
+    {
+      "entry": "gpu_memory_utilization_dynamic",
+      "grid": [
+        0.95,
+        1.03,
+        1.1
+      ],
+      "grid_points": 3,
+      "emitted": [
+        "gpu_memory_utilization_dynamic_x0_95",
+        "gpu_memory_utilization_dynamic_x1_03",
+        "gpu_memory_utilization_dynamic_x1_1"
+      ],
+      "values": [
+        0.874,
+        0.9476000000000001,
+        0.97
+      ],
+      "collapsed": 0
+    },
+    {
+      "entry": "max_seq_len_to_capture_dynamic",
+      "grid": [
+        0.5,
+        2.0,
+        4.0
+      ],
+      "grid_points": 3,
+      "emitted": [
+        "max_seq_len_to_capture_dynamic_x0_5"
+      ],
+      "values": [
+        8192
+      ],
+      "collapsed": 2
+    }
+  ],
+  "counts": {
+    "library_entries_total": 28,
+    "library_entries_scoped": 25,
+    "library_candidates_raw": 36,
+    "autoresearch_candidates_raw": 0
+  },
+  "funnel": [
+    {
+      "stage": "raw",
+      "candidates": 36,
+      "distinct_points": 36,
+      "knobs": 28,
+      "bits": 32,
+      "joint_configs": {
+        "unconstrained": 4294967296,
+        "feasible": 3221225472,
+        "dependency_violating": 1073741824
+      },
+      "by_source": {
+        "library": 36
+      }
+    },
+    {
+      "stage": "after_validity",
+      "candidates": 33,
+      "distinct_points": 33,
+      "knobs": 25,
+      "bits": 29,
+      "joint_configs": {
+        "unconstrained": 536870912,
+        "feasible": 402653184,
+        "dependency_violating": 134217728
+      },
+      "by_source": {
+        "library": 33
+      }
+    },
+    {
+      "stage": "after_prerequisites",
+      "candidates": 32,
+      "distinct_points": 32,
+      "knobs": 24,
+      "bits": 28,
+      "joint_configs": {
+        "unconstrained": 268435456,
+        "feasible": 268435456,
+        "dependency_violating": 0
+      },
+      "by_source": {
+        "library": 32
+      }
+    },
+    {
+      "stage": "after_hardware",
+      "candidates": 27,
+      "distinct_points": 27,
+      "knobs": 19,
+      "bits": 23,
+      "joint_configs": {
+        "unconstrained": 8388608,
+        "feasible": 8388608,
+        "dependency_violating": 0
+      },
+      "by_source": {
+        "library": 27
+      }
+    },
+    {
+      "stage": "after_mutual_dependency",
+      "candidates": 27,
+      "distinct_points": 27,
+      "knobs": 19,
+      "bits": 23,
+      "joint_configs": {
+        "unconstrained": 8388608,
+        "feasible": 8388608,
+        "dependency_violating": 0
+      },
+      "by_source": {
+        "library": 27
+      }
+    },
+    {
+      "stage": "after_deployment",
+      "candidates": 27,
+      "distinct_points": 27,
+      "knobs": 19,
+      "bits": 23,
+      "joint_configs": {
+        "unconstrained": 8388608,
+        "feasible": 8388608,
+        "dependency_violating": 0
+      },
+      "by_source": {
+        "library": 27
+      }
+    },
+    {
+      "stage": "after_applicability_safety",
+      "candidates": 25,
+      "distinct_points": 25,
+      "knobs": 17,
+      "bits": 21,
+      "joint_configs": {
+        "unconstrained": 2097152,
+        "feasible": 2097152,
+        "dependency_violating": 0
+      },
+      "by_source": {
+        "library": 25
+      }
+    },
+    {
+      "stage": "after_ranking",
+      "candidates": 5,
+      "distinct_points": 5,
+      "knobs": 4,
+      "bits": 5,
+      "joint_configs": {
+        "unconstrained": 24,
+        "feasible": 24,
+        "dependency_violating": 0
+      },
+      "by_source": {
+        "library": 5
+      }
+    }
+  ],
+  "consistency_checks": [
+    {
+      "stage": "after_validity",
+      "candidate_gap": 3,
+      "point_gap": 3,
+      "bit_gap": 3,
+      "gap_difference": 0,
+      "explained_by_swept_knobs": 0,
+      "fully_removed_swept_knobs": [],
+      "partial_swept_removals": [],
+      "partial_removals_allowed": false,
+      "ok": true
+    },
+    {
+      "stage": "after_prerequisites",
+      "candidate_gap": 1,
+      "point_gap": 1,
+      "bit_gap": 1,
+      "gap_difference": 0,
+      "explained_by_swept_knobs": 0,
+      "fully_removed_swept_knobs": [],
+      "partial_swept_removals": [],
+      "partial_removals_allowed": false,
+      "ok": true
+    },
+    {
+      "stage": "after_hardware",
+      "candidate_gap": 5,
+      "point_gap": 5,
+      "bit_gap": 5,
+      "gap_difference": 0,
+      "explained_by_swept_knobs": 0,
+      "fully_removed_swept_knobs": [],
+      "partial_swept_removals": [],
+      "partial_removals_allowed": false,
+      "ok": true
+    },
+    {
+      "stage": "after_mutual_dependency",
+      "candidate_gap": 0,
+      "point_gap": 0,
+      "bit_gap": 0,
+      "gap_difference": 0,
+      "explained_by_swept_knobs": 0,
+      "fully_removed_swept_knobs": [],
+      "partial_swept_removals": [],
+      "partial_removals_allowed": false,
+      "ok": true
+    },
+    {
+      "stage": "after_deployment",
+      "candidate_gap": 0,
+      "point_gap": 0,
+      "bit_gap": 0,
+      "gap_difference": 0,
+      "explained_by_swept_knobs": 0,
+      "fully_removed_swept_knobs": [],
+      "partial_swept_removals": [],
+      "partial_removals_allowed": false,
+      "ok": true
+    },
+    {
+      "stage": "after_applicability_safety",
+      "candidate_gap": 2,
+      "point_gap": 2,
+      "bit_gap": 2,
+      "gap_difference": 0,
+      "explained_by_swept_knobs": 0,
+      "fully_removed_swept_knobs": [],
+      "partial_swept_removals": [],
+      "partial_removals_allowed": false,
+      "ok": true
+    },
+    {
+      "stage": "after_ranking",
+      "candidate_gap": 20,
+      "point_gap": 20,
+      "bit_gap": 16,
+      "gap_difference": 4,
+      "explained_by_swept_knobs": 4,
+      "fully_removed_swept_knobs": [
+        "max_num_seqs",
+        "swap_space",
+        "gpu_memory_utilization"
+      ],
+      "partial_swept_removals": [
+        {
+          "knob": "max_num_batched_tokens",
+          "before": 3,
+          "after": 2
+        }
+      ],
+      "partial_removals_allowed": true,
+      "ok": true
+    }
+  ],
+  "consistency_ok": true,
+  "independent": {
+    "validity": {
+      "rejected": 3,
+      "rejected_only_by_this_rule": 0,
+      "names": [
+        "edge_fp16_autocast",
+        "edge_frame_batching",
+        "hft_top_of_book_fewer_scans"
+      ]
+    },
+    "prerequisites": {
+      "rejected": 1,
+      "rejected_only_by_this_rule": 0,
+      "names": [
+        "enable_eplb"
+      ]
+    },
+    "hardware": {
+      "rejected": 5,
+      "rejected_only_by_this_rule": 0,
+      "names": [
+        "attention_backend_flashinfer",
+        "enable_expert_parallel",
+        "kv_cache_dtype_fp8",
+        "pipeline_parallel_size_2",
+        "tensor_parallel_size_2"
+      ]
+    },
+    "mutual_dependency": {
+      "rejected": 1,
+      "rejected_only_by_this_rule": 0,
+      "names": [
+        "enable_eplb"
+      ]
+    },
+    "deployment": {
+      "rejected": 0,
+      "rejected_only_by_this_rule": 0,
+      "names": []
+    },
+    "applicability": {
+      "rejected": 10,
+      "rejected_only_by_this_rule": 2,
+      "names": [
+        "attention_backend_flashinfer",
+        "edge_fp16_autocast",
+        "edge_frame_batching",
+        "enable_expert_parallel",
+        "hft_top_of_book_fewer_scans",
+        "kv_cache_block_size_16",
+        "kv_cache_dtype_fp8",
+        "moe_backend_deep_gemm",
+        "pipeline_parallel_size_2",
+        "tensor_parallel_size_2"
+      ]
+    },
+    "safety": {
+      "rejected": 0,
+      "rejected_only_by_this_rule": 0,
+      "names": []
+    }
+  },
+  "independent_overlaps": {
+    "validity&applicability": 3,
+    "prerequisites&mutual_dependency": 1,
+    "hardware&applicability": 5
+  },
+  "rejection_ranking_dedup": {
+    "rejected_before_ranking": 11,
+    "cut_by_ranking": 20,
+    "dedup": {
+      "sweep_point_collapse": {
+        "pool": "grid points of swept library entries (value_multiplier_grid), before expansion",
+        "pool_size": 15,
+        "collapsed": 2,
+        "code": "gitm/optimizer/vllm_knobs.py expand_relative_candidates (seen_values)",
+        "by_entry": {
+          "max_seq_len_to_capture_dynamic": 2
+        }
+      },
+      "proposer_catalog_exclusion": {
+        "pool": "EngineArgsProposer knob surface on this box (all classes)",
+        "vllm_importable": false,
+        "pool_size": 3,
+        "surface": [
+          "cpu_offload_gb",
+          "preemption_mode",
+          "compilation_config"
+        ],
+        "excluded_as_catalog": 2,
+        "excluded_knobs": [
+          "cpu_offload_gb",
+          "preemption_mode"
+        ],
+        "searchable_after_exclusion": [
+          "compilation_config"
+        ],
+        "emitted_for_this_class": [],
+        "code": "gitm/agents/autoresearch.py _ProposerBase._searchable (k.name not in self._catalog)"
+      },
+      "cross_source_duplicates": {
+        "pool": "raw library candidates + autoresearch proposals, keyed by (knob, value)",
+        "pool_size": 36,
+        "duplicates": 0,
+        "points": {}
+      },
+      "baseline_equal": {
+        "pool": "applicability+safety gate survivors",
+        "pool_size": 25,
+        "equal_to_baseline": 3,
+        "levers": {
+          "enable_chunked_prefill": "baseline already runs enable_chunked_prefill=True",
+          "enable_prefix_caching": "baseline already runs enable_prefix_caching=True",
+          "cuda_graphs_enable": "baseline already runs enforce_eager=False"
+        },
+        "note": "informational on main: the loop does not skip these; they would be applied and measured as a no-op A/B"
+      }
+    },
+    "note": "three separate numbers from separate pools; they are not additive"
+  },
+  "phase3_top_n_on_main": [
+    {
+      "name": "speculative_decode_ngram_5",
+      "predicted_delta": 0.02852123995761893,
+      "coverage": 0.23767699964682443,
+      "gate_rejected": null,
+      "phase4_veto_on_main": null,
+      "prerequisite_veto_not_applied_to_library_on_main": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "zero_or_negative_delta": false
+    },
+    {
+      "name": "cuda_graphs_enable",
+      "predicted_delta": 0.0213909299682142,
+      "coverage": 0.23767699964682443,
+      "gate_rejected": null,
+      "phase4_veto_on_main": null,
+      "prerequisite_veto_not_applied_to_library_on_main": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": "baseline already runs enforce_eager=False",
+      "zero_or_negative_delta": false
+    },
+    {
+      "name": "enable_chunked_prefill",
+      "predicted_delta": 0.019014159971745954,
+      "coverage": 0.23767699964682443,
+      "gate_rejected": null,
+      "phase4_veto_on_main": null,
+      "prerequisite_veto_not_applied_to_library_on_main": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": "baseline already runs enable_chunked_prefill=True",
+      "zero_or_negative_delta": false
+    },
+    {
+      "name": "max_num_batched_tokens_dynamic_x0_5",
+      "predicted_delta": 0.011883849982341222,
+      "coverage": 0.23767699964682443,
+      "gate_rejected": null,
+      "phase4_veto_on_main": null,
+      "prerequisite_veto_not_applied_to_library_on_main": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "zero_or_negative_delta": false
+    },
+    {
+      "name": "max_num_batched_tokens_dynamic_x2",
+      "predicted_delta": 0.011883849982341222,
+      "coverage": 0.23767699964682443,
+      "gate_rejected": null,
+      "phase4_veto_on_main": null,
+      "prerequisite_veto_not_applied_to_library_on_main": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "zero_or_negative_delta": false
+    }
+  ],
+  "coverage": {
+    "ops": [
+      {
+        "op": "moe_routed",
+        "classify_op": "moe_routed",
+        "share": 0.5997994224113369,
+        "covered_by_gate_survivors": []
+      },
+      {
+        "op": "attn_score_value",
+        "classify_op": "attn_score_value",
+        "share": 0.22207019707306305,
+        "covered_by_gate_survivors": [
+          "max_num_batched_tokens_dynamic_x0_5",
+          "max_num_batched_tokens_dynamic_x2",
+          "max_num_batched_tokens_dynamic_x4",
+          "max_num_seqs_dynamic_x0_5",
+          "max_num_seqs_dynamic_x2",
+          "max_num_seqs_dynamic_x4",
+          "swap_space_dynamic_x0_5",
+          "swap_space_dynamic_x2",
+          "swap_space_dynamic_x4",
+          "gpu_memory_utilization_dynamic_x0_95",
+          "gpu_memory_utilization_dynamic_x1_03",
+          "gpu_memory_utilization_dynamic_x1_1",
+          "cpu_offload_gb_4",
+          "preemption_mode_swap",
+          "async_scheduling",
+          "enable_chunked_prefill",
+          "speculative_decode_ngram_5",
+          "scheduling_policy_priority",
+          "cuda_graphs_enable",
+          "max_seq_len_to_capture_dynamic_x0_5",
+          "enable_dbo"
+        ]
+      },
+      {
+        "op": "rms_norm",
+        "classify_op": "rms_norm",
+        "share": 0.02232875681560341,
+        "covered_by_gate_survivors": []
+      },
+      {
+        "op": "moe_router",
+        "classify_op": "moe_router",
+        "share": 0.021784152990832594,
+        "covered_by_gate_survivors": []
+      },
+      {
+        "op": "attn_q_a",
+        "classify_op": null,
+        "share": 0.016012441655911498,
+        "covered_by_gate_survivors": []
+      },
+      {
+        "op": "attn_q_b",
+        "classify_op": null,
+        "share": 0.011073611103673235,
+        "covered_by_gate_survivors": []
+      },
+      {
+        "op": "attn_kv_a",
+        "classify_op": null,
+        "share": 0.011073611103673235,
+        "covered_by_gate_survivors": []
+      },
+      {
+        "op": "attn_kv_b",
+        "classify_op": null,
+        "share": 0.011073611103673235,
+        "covered_by_gate_survivors": []
+      },
+      {
+        "op": "attn_qnorm_rope_insert",
+        "classify_op": "attn_qnorm_rope_insert",
+        "share": 0.011073611103673235,
+        "covered_by_gate_survivors": []
+      },
+      {
+        "op": "attn_out_proj",
+        "classify_op": "attn_out_proj",
+        "share": 0.011073611103673235,
+        "covered_by_gate_survivors": [
+          "max_num_batched_tokens_dynamic_x0_5",
+          "max_num_batched_tokens_dynamic_x2",
+          "max_num_batched_tokens_dynamic_x4",
+          "max_num_seqs_dynamic_x0_5",
+          "max_num_seqs_dynamic_x2",
+          "max_num_seqs_dynamic_x4",
+          "gpu_memory_utilization_dynamic_x0_95",
+          "gpu_memory_utilization_dynamic_x1_03",
+          "gpu_memory_utilization_dynamic_x1_1",
+          "async_scheduling",
+          "enable_chunked_prefill",
+          "speculative_decode_ngram_5",
+          "scheduling_policy_priority",
+          "quantization_awq",
+          "cuda_graphs_enable",
+          "max_seq_len_to_capture_dynamic_x0_5",
+          "enable_dbo"
+        ]
+      },
+      {
+        "op": "tp_all_reduce_attn",
+        "classify_op": "tp_all_reduce",
+        "share": 0.011073611103673235,
+        "covered_by_gate_survivors": []
+      },
+      {
+        "op": "tp_all_reduce_mlp",
+        "classify_op": "tp_all_reduce",
+        "share": 0.011073611103673235,
+        "covered_by_gate_survivors": []
+      },
+      {
+        "op": "moe_shared",
+        "classify_op": "moe_shared",
+        "share": 0.010892076495416297,
+        "covered_by_gate_survivors": []
+      },
+      {
+        "op": "moe_permute",
+        "classify_op": "moe_permute",
+        "share": 0.010892076495416297,
+        "covered_by_gate_survivors": []
+      },
+      {
+        "op": "moe_combine",
+        "classify_op": "moe_combine",
+        "share": 0.010892076495416297,
+        "covered_by_gate_survivors": []
+      },
+      {
+        "op": "lm_head",
+        "classify_op": "lm_head",
+        "share": 0.003371369977243729,
+        "covered_by_gate_survivors": [
+          "max_num_batched_tokens_dynamic_x0_5",
+          "max_num_batched_tokens_dynamic_x2",
+          "max_num_batched_tokens_dynamic_x4",
+          "max_num_seqs_dynamic_x0_5",
+          "max_num_seqs_dynamic_x2",
+          "max_num_seqs_dynamic_x4",
+          "gpu_memory_utilization_dynamic_x0_95",
+          "gpu_memory_utilization_dynamic_x1_03",
+          "gpu_memory_utilization_dynamic_x1_1",
+          "async_scheduling",
+          "enable_chunked_prefill",
+          "speculative_decode_ngram_5",
+          "scheduling_policy_priority",
+          "quantization_awq",
+          "cuda_graphs_enable",
+          "max_seq_len_to_capture_dynamic_x0_5",
+          "enable_dbo"
+        ]
+      },
+      {
+        "op": "logits_all_gather",
+        "classify_op": "tp_all_reduce",
+        "share": 0.0030987957629459366,
+        "covered_by_gate_survivors": []
+      },
+      {
+        "op": "mlp_gate_up",
+        "classify_op": "mlp_gate_up",
+        "share": 0.000773337431174557,
+        "covered_by_gate_survivors": [
+          "max_num_batched_tokens_dynamic_x0_5",
+          "max_num_batched_tokens_dynamic_x2",
+          "max_num_batched_tokens_dynamic_x4",
+          "max_num_seqs_dynamic_x0_5",
+          "max_num_seqs_dynamic_x2",
+          "max_num_seqs_dynamic_x4",
+          "gpu_memory_utilization_dynamic_x0_95",
+          "gpu_memory_utilization_dynamic_x1_03",
+          "gpu_memory_utilization_dynamic_x1_1",
+          "async_scheduling",
+          "enable_chunked_prefill",
+          "speculative_decode_ngram_5",
+          "scheduling_policy_priority",
+          "quantization_awq",
+          "cuda_graphs_enable",
+          "max_seq_len_to_capture_dynamic_x0_5",
+          "enable_dbo"
+        ]
+      },
+      {
+        "op": "mlp_down",
+        "classify_op": "mlp_down",
+        "share": 0.0003884840616698479,
+        "covered_by_gate_survivors": [
+          "max_num_batched_tokens_dynamic_x0_5",
+          "max_num_batched_tokens_dynamic_x2",
+          "max_num_batched_tokens_dynamic_x4",
+          "max_num_seqs_dynamic_x0_5",
+          "max_num_seqs_dynamic_x2",
+          "max_num_seqs_dynamic_x4",
+          "gpu_memory_utilization_dynamic_x0_95",
+          "gpu_memory_utilization_dynamic_x1_03",
+          "gpu_memory_utilization_dynamic_x1_1",
+          "async_scheduling",
+          "enable_chunked_prefill",
+          "speculative_decode_ngram_5",
+          "scheduling_policy_priority",
+          "quantization_awq",
+          "cuda_graphs_enable",
+          "max_seq_len_to_capture_dynamic_x0_5",
+          "enable_dbo"
+        ]
+      },
+      {
+        "op": "embed_tokens",
+        "classify_op": "embed_tokens",
+        "share": 0.00018153460825693827,
+        "covered_by_gate_survivors": []
+      }
+    ],
+    "uncovered_share_by_gate_survivors": 0.7623230003531756,
+    "moe_share": 0.6542598048884184,
+    "moe_levers": [
+      {
+        "name": "moe_backend_deep_gemm",
+        "applies_to_kernels": [
+          "mlp_gate_up",
+          "mlp_down"
+        ],
+        "coverage": 0.001161821492844405,
+        "status": "applicability: not_applicable: dtype 'bf16' not in ['fp8']"
+      },
+      {
+        "name": "enable_expert_parallel",
+        "applies_to_kernels": [
+          "mlp_gate_up",
+          "mlp_down"
+        ],
+        "coverage": 0.001161821492844405,
+        "status": "hardware: Hardware 'AMD Instinct MI355X' matches none of ['A100', 'H100', 'H200']"
+      },
+      {
+        "name": "enable_eplb",
+        "applies_to_kernels": [
+          "mlp_gate_up",
+          "mlp_down"
+        ],
+        "coverage": 0.001161821492844405,
+        "status": "prerequisites: prerequisite 'enable_expert_parallel' not enabled on this engine"
+      }
+    ],
+    "gate_survivor_coverage": {
+      "max_num_batched_tokens_dynamic_x0_5": 0.23767699964682443,
+      "max_num_batched_tokens_dynamic_x2": 0.23767699964682443,
+      "max_num_batched_tokens_dynamic_x4": 0.23767699964682443,
+      "max_num_seqs_dynamic_x0_5": 0.23767699964682443,
+      "max_num_seqs_dynamic_x2": 0.23767699964682443,
+      "max_num_seqs_dynamic_x4": 0.23767699964682443,
+      "swap_space_dynamic_x0_5": 0.22207019707306305,
+      "swap_space_dynamic_x2": 0.22207019707306305,
+      "swap_space_dynamic_x4": 0.22207019707306305,
+      "gpu_memory_utilization_dynamic_x0_95": 0.23767699964682443,
+      "gpu_memory_utilization_dynamic_x1_03": 0.23767699964682443,
+      "gpu_memory_utilization_dynamic_x1_1": 0.23767699964682443,
+      "cpu_offload_gb_4": 0.22207019707306305,
+      "preemption_mode_swap": 0.22207019707306305,
+      "async_scheduling": 0.23767699964682443,
+      "enable_chunked_prefill": 0.23767699964682443,
+      "enable_prefix_caching": 0.0,
+      "speculative_decode_ngram_5": 0.23767699964682443,
+      "scheduling_policy_priority": 0.23767699964682443,
+      "disable_custom_all_reduce": 0.0,
+      "quantization_awq": 0.01560680257376137,
+      "cuda_graphs_enable": 0.23767699964682443,
+      "max_seq_len_to_capture_dynamic_x0_5": 0.23767699964682443,
+      "distributed_executor_ray": 0.0,
+      "enable_dbo": 0.23767699964682443
+    }
+  },
+  "sensitivity": {
+    "other_qualification_value": {
+      "policy": {
+        "require_qualification_commit": false,
+        "skip_high_risk": true
+      },
+      "gate_rejected_after_deployment_stage": [
+        "distributed_executor_ray",
+        "kv_cache_block_size_16",
+        "moe_backend_deep_gemm",
+        "quantization_awq",
+        "speculative_decode_ngram_5"
+      ],
+      "phase3_top_n": [
+        {
+          "name": "cuda_graphs_enable",
+          "predicted_delta": 0.0213909299682142,
+          "baseline_equal": "baseline already runs enforce_eager=False"
+        },
+        {
+          "name": "enable_chunked_prefill",
+          "predicted_delta": 0.019014159971745954,
+          "baseline_equal": "baseline already runs enable_chunked_prefill=True"
+        },
+        {
+          "name": "max_num_batched_tokens_dynamic_x0_5",
+          "predicted_delta": 0.011883849982341222,
+          "baseline_equal": null
+        },
+        {
+          "name": "max_num_batched_tokens_dynamic_x2",
+          "predicted_delta": 0.011883849982341222,
+          "baseline_equal": null
+        },
+        {
+          "name": "max_num_batched_tokens_dynamic_x4",
+          "predicted_delta": 0.011883849982341222,
+          "baseline_equal": null
+        }
+      ]
+    },
+    "no_restart_fn_additionally_vetoed": 36
+  },
+  "candidates": [
+    {
+      "name": "kv_cache_block_size_16",
+      "source": "library",
+      "entry": "kv_cache_block_size_16",
+      "knob_values": {
+        "block_size": 16
+      },
+      "knob_kind": {
+        "block_size": "structural"
+      },
+      "in_knob_taxonomy": {
+        "block_size": true
+      },
+      "applies_to_kernels": [
+        "attn_score_value"
+      ],
+      "expected_delta_mean": 0.05,
+      "coverage": 0.22207019707306305,
+      "predicted_delta": 0.011103509853653153,
+      "safety_tier": "low_risk",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": "not_applicable: kv_cache_len 262144 > max 4096",
+        "safety": null
+      },
+      "gate_sequential": "not_applicable: kv_cache_len 262144 > max 4096",
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "kv_cache_dtype_fp8",
+      "source": "library",
+      "entry": "kv_cache_dtype_fp8",
+      "knob_values": {
+        "kv_cache_dtype": "fp8"
+      },
+      "knob_kind": {
+        "kv_cache_dtype": "structural"
+      },
+      "in_knob_taxonomy": {
+        "kv_cache_dtype": true
+      },
+      "applies_to_kernels": [
+        "attn_score_value"
+      ],
+      "expected_delta_mean": 0.06,
+      "coverage": 0.22207019707306305,
+      "predicted_delta": 0.013324211824383782,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": "Hardware 'AMD Instinct MI355X' matches none of ['A100', 'H100', 'L40S']",
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": "not_applicable: Hardware 'AMD Instinct MI355X' matches none of ['A100', 'H100', 'L40S']",
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "max_num_batched_tokens_dynamic_x0_5",
+      "source": "library",
+      "entry": "max_num_batched_tokens_dynamic",
+      "knob_values": {
+        "max_num_batched_tokens": 4096
+      },
+      "knob_kind": {
+        "max_num_batched_tokens": "structural"
+      },
+      "in_knob_taxonomy": {
+        "max_num_batched_tokens": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.05,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.011883849982341222,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": true,
+      "survives": true
+    },
+    {
+      "name": "max_num_batched_tokens_dynamic_x2",
+      "source": "library",
+      "entry": "max_num_batched_tokens_dynamic",
+      "knob_values": {
+        "max_num_batched_tokens": 16384
+      },
+      "knob_kind": {
+        "max_num_batched_tokens": "structural"
+      },
+      "in_knob_taxonomy": {
+        "max_num_batched_tokens": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.05,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.011883849982341222,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": true,
+      "survives": true
+    },
+    {
+      "name": "max_num_batched_tokens_dynamic_x4",
+      "source": "library",
+      "entry": "max_num_batched_tokens_dynamic",
+      "knob_values": {
+        "max_num_batched_tokens": 32768
+      },
+      "knob_kind": {
+        "max_num_batched_tokens": "structural"
+      },
+      "in_knob_taxonomy": {
+        "max_num_batched_tokens": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.05,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.011883849982341222,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "max_num_seqs_dynamic_x0_5",
+      "source": "library",
+      "entry": "max_num_seqs_dynamic",
+      "knob_values": {
+        "max_num_seqs": 128
+      },
+      "knob_kind": {
+        "max_num_seqs": "structural"
+      },
+      "in_knob_taxonomy": {
+        "max_num_seqs": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.04,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.009507079985872977,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "max_num_seqs_dynamic_x2",
+      "source": "library",
+      "entry": "max_num_seqs_dynamic",
+      "knob_values": {
+        "max_num_seqs": 512
+      },
+      "knob_kind": {
+        "max_num_seqs": "structural"
+      },
+      "in_knob_taxonomy": {
+        "max_num_seqs": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.04,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.009507079985872977,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "max_num_seqs_dynamic_x4",
+      "source": "library",
+      "entry": "max_num_seqs_dynamic",
+      "knob_values": {
+        "max_num_seqs": 1024
+      },
+      "knob_kind": {
+        "max_num_seqs": "structural"
+      },
+      "in_knob_taxonomy": {
+        "max_num_seqs": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.04,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.009507079985872977,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "swap_space_dynamic_x0_5",
+      "source": "library",
+      "entry": "swap_space_dynamic",
+      "knob_values": {
+        "swap_space": 2147483648
+      },
+      "knob_kind": {
+        "swap_space": "structural"
+      },
+      "in_knob_taxonomy": {
+        "swap_space": true
+      },
+      "applies_to_kernels": [
+        "attn_score_value"
+      ],
+      "expected_delta_mean": 0.03,
+      "coverage": 0.22207019707306305,
+      "predicted_delta": 0.006662105912191891,
+      "safety_tier": "low_risk",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "swap_space_dynamic_x2",
+      "source": "library",
+      "entry": "swap_space_dynamic",
+      "knob_values": {
+        "swap_space": 8589934592
+      },
+      "knob_kind": {
+        "swap_space": "structural"
+      },
+      "in_knob_taxonomy": {
+        "swap_space": true
+      },
+      "applies_to_kernels": [
+        "attn_score_value"
+      ],
+      "expected_delta_mean": 0.03,
+      "coverage": 0.22207019707306305,
+      "predicted_delta": 0.006662105912191891,
+      "safety_tier": "low_risk",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "swap_space_dynamic_x4",
+      "source": "library",
+      "entry": "swap_space_dynamic",
+      "knob_values": {
+        "swap_space": 17179869184
+      },
+      "knob_kind": {
+        "swap_space": "structural"
+      },
+      "in_knob_taxonomy": {
+        "swap_space": true
+      },
+      "applies_to_kernels": [
+        "attn_score_value"
+      ],
+      "expected_delta_mean": 0.03,
+      "coverage": 0.22207019707306305,
+      "predicted_delta": 0.006662105912191891,
+      "safety_tier": "low_risk",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "gpu_memory_utilization_dynamic_x0_95",
+      "source": "library",
+      "entry": "gpu_memory_utilization_dynamic",
+      "knob_values": {
+        "gpu_memory_utilization": 0.874
+      },
+      "knob_kind": {
+        "gpu_memory_utilization": "structural"
+      },
+      "in_knob_taxonomy": {
+        "gpu_memory_utilization": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.04,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.009507079985872977,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "gpu_memory_utilization_dynamic_x1_03",
+      "source": "library",
+      "entry": "gpu_memory_utilization_dynamic",
+      "knob_values": {
+        "gpu_memory_utilization": 0.9476000000000001
+      },
+      "knob_kind": {
+        "gpu_memory_utilization": "structural"
+      },
+      "in_knob_taxonomy": {
+        "gpu_memory_utilization": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.04,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.009507079985872977,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "gpu_memory_utilization_dynamic_x1_1",
+      "source": "library",
+      "entry": "gpu_memory_utilization_dynamic",
+      "knob_values": {
+        "gpu_memory_utilization": 0.97
+      },
+      "knob_kind": {
+        "gpu_memory_utilization": "structural"
+      },
+      "in_knob_taxonomy": {
+        "gpu_memory_utilization": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.04,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.009507079985872977,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "cpu_offload_gb_4",
+      "source": "library",
+      "entry": "cpu_offload_gb_4",
+      "knob_values": {
+        "cpu_offload_gb": 4
+      },
+      "knob_kind": {
+        "cpu_offload_gb": "structural"
+      },
+      "in_knob_taxonomy": {
+        "cpu_offload_gb": false
+      },
+      "applies_to_kernels": [
+        "attn_score_value"
+      ],
+      "expected_delta_mean": 0.04,
+      "coverage": 0.22207019707306305,
+      "predicted_delta": 0.008882807882922523,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "preemption_mode_swap",
+      "source": "library",
+      "entry": "preemption_mode_swap",
+      "knob_values": {
+        "preemption_mode": "swap"
+      },
+      "knob_kind": {
+        "preemption_mode": "structural"
+      },
+      "in_knob_taxonomy": {
+        "preemption_mode": false
+      },
+      "applies_to_kernels": [
+        "attn_score_value"
+      ],
+      "expected_delta_mean": 0.03,
+      "coverage": 0.22207019707306305,
+      "predicted_delta": 0.006662105912191891,
+      "safety_tier": "low_risk",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "async_scheduling",
+      "source": "library",
+      "entry": "async_scheduling",
+      "knob_values": {
+        "async_scheduling": true
+      },
+      "knob_kind": {
+        "async_scheduling": "structural"
+      },
+      "in_knob_taxonomy": {
+        "async_scheduling": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.02,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.0047535399929364884,
+      "safety_tier": "low_risk",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "enable_chunked_prefill",
+      "source": "library",
+      "entry": "enable_chunked_prefill",
+      "knob_values": {
+        "enable_chunked_prefill": true
+      },
+      "knob_kind": {
+        "enable_chunked_prefill": "structural"
+      },
+      "in_knob_taxonomy": {
+        "enable_chunked_prefill": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.08,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.019014159971745954,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": "baseline already runs enable_chunked_prefill=True",
+      "ranked_top_n": true,
+      "survives": true
+    },
+    {
+      "name": "enable_prefix_caching",
+      "source": "library",
+      "entry": "enable_prefix_caching",
+      "knob_values": {
+        "enable_prefix_caching": true
+      },
+      "knob_kind": {
+        "enable_prefix_caching": "structural"
+      },
+      "in_knob_taxonomy": {
+        "enable_prefix_caching": true
+      },
+      "applies_to_kernels": [],
+      "expected_delta_mean": 0.1,
+      "coverage": 0.0,
+      "predicted_delta": 0.0,
+      "safety_tier": "low_risk",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": "baseline already runs enable_prefix_caching=True",
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "speculative_decode_ngram_5",
+      "source": "library",
+      "entry": "speculative_decode_ngram_5",
+      "knob_values": {
+        "num_speculative_tokens": 5
+      },
+      "knob_kind": {
+        "num_speculative_tokens": "structural"
+      },
+      "in_knob_taxonomy": {
+        "num_speculative_tokens": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.12,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.02852123995761893,
+      "safety_tier": "high_risk",
+      "requires_qualification_commit": true,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": true,
+      "survives": true
+    },
+    {
+      "name": "scheduling_policy_priority",
+      "source": "library",
+      "entry": "scheduling_policy_priority",
+      "knob_values": {
+        "scheduling_policy": "priority"
+      },
+      "knob_kind": {
+        "scheduling_policy": "structural"
+      },
+      "in_knob_taxonomy": {
+        "scheduling_policy": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.03,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.007130309989404732,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "attention_backend_flashinfer",
+      "source": "library",
+      "entry": "attention_backend_flashinfer",
+      "knob_values": {
+        "VLLM_ATTENTION_BACKEND": "FLASHINFER"
+      },
+      "knob_kind": {
+        "VLLM_ATTENTION_BACKEND": "structural"
+      },
+      "in_knob_taxonomy": {
+        "VLLM_ATTENTION_BACKEND": true
+      },
+      "applies_to_kernels": [
+        "attn_score_value"
+      ],
+      "expected_delta_mean": 0.07,
+      "coverage": 0.22207019707306305,
+      "predicted_delta": 0.015544913795114416,
+      "safety_tier": "high_risk",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": "Hardware 'AMD Instinct MI355X' matches none of ['A100', 'H100']",
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": "not_applicable: Hardware 'AMD Instinct MI355X' matches none of ['A100', 'H100']",
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "disable_custom_all_reduce",
+      "source": "library",
+      "entry": "disable_custom_all_reduce",
+      "knob_values": {
+        "disable_custom_all_reduce": true
+      },
+      "knob_kind": {
+        "disable_custom_all_reduce": "structural"
+      },
+      "in_knob_taxonomy": {
+        "disable_custom_all_reduce": true
+      },
+      "applies_to_kernels": [],
+      "expected_delta_mean": 0.02,
+      "coverage": 0.0,
+      "predicted_delta": 0.0,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "tensor_parallel_size_2",
+      "source": "library",
+      "entry": "tensor_parallel_size_2",
+      "knob_values": {
+        "tensor_parallel_size": 2
+      },
+      "knob_kind": {
+        "tensor_parallel_size": "structural"
+      },
+      "in_knob_taxonomy": {
+        "tensor_parallel_size": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.0,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.0,
+      "safety_tier": "high_risk",
+      "requires_qualification_commit": true,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": "Hardware 'AMD Instinct MI355X' matches none of ['A100', 'H100']",
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": "not_applicable: Hardware 'AMD Instinct MI355X' matches none of ['A100', 'H100']",
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "quantization_awq",
+      "source": "library",
+      "entry": "quantization_awq",
+      "knob_values": {
+        "quantization": "awq"
+      },
+      "knob_kind": {
+        "quantization": "structural"
+      },
+      "in_knob_taxonomy": {
+        "quantization": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.1,
+      "coverage": 0.01560680257376137,
+      "predicted_delta": 0.001560680257376137,
+      "safety_tier": "high_risk",
+      "requires_qualification_commit": true,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "cuda_graphs_enable",
+      "source": "library",
+      "entry": "cuda_graphs_enable",
+      "knob_values": {
+        "enforce_eager": false
+      },
+      "knob_kind": {
+        "enforce_eager": "structural"
+      },
+      "in_knob_taxonomy": {
+        "enforce_eager": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.09,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.0213909299682142,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": "baseline already runs enforce_eager=False",
+      "ranked_top_n": true,
+      "survives": true
+    },
+    {
+      "name": "max_seq_len_to_capture_dynamic_x0_5",
+      "source": "library",
+      "entry": "max_seq_len_to_capture_dynamic",
+      "knob_values": {
+        "max_seq_len_to_capture": 8192
+      },
+      "knob_kind": {
+        "max_seq_len_to_capture": "structural"
+      },
+      "in_knob_taxonomy": {
+        "max_seq_len_to_capture": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.04,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.009507079985872977,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "pipeline_parallel_size_2",
+      "source": "library",
+      "entry": "pipeline_parallel_size_2",
+      "knob_values": {
+        "pipeline_parallel_size": 2
+      },
+      "knob_kind": {
+        "pipeline_parallel_size": "structural"
+      },
+      "in_knob_taxonomy": {
+        "pipeline_parallel_size": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": -0.02,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": -0.0047535399929364884,
+      "safety_tier": "high_risk",
+      "requires_qualification_commit": true,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": "Hardware 'AMD Instinct MI355X' matches none of ['A100', 'H100']",
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": "not_applicable: Hardware 'AMD Instinct MI355X' matches none of ['A100', 'H100']",
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "distributed_executor_ray",
+      "source": "library",
+      "entry": "distributed_executor_ray",
+      "knob_values": {
+        "distributed_executor_backend": "ray"
+      },
+      "knob_kind": {
+        "distributed_executor_backend": "structural"
+      },
+      "in_knob_taxonomy": {
+        "distributed_executor_backend": true
+      },
+      "applies_to_kernels": [],
+      "expected_delta_mean": 0.0,
+      "coverage": 0.0,
+      "predicted_delta": 0.0,
+      "safety_tier": "high_risk",
+      "requires_qualification_commit": true,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "moe_backend_deep_gemm",
+      "source": "library",
+      "entry": "moe_backend_deep_gemm",
+      "knob_values": {
+        "moe_backend": "deep_gemm"
+      },
+      "knob_kind": {
+        "moe_backend": "structural"
+      },
+      "in_knob_taxonomy": {
+        "moe_backend": true
+      },
+      "applies_to_kernels": [
+        "mlp_gate_up",
+        "mlp_down"
+      ],
+      "expected_delta_mean": 0.05,
+      "coverage": 0.001161821492844405,
+      "predicted_delta": 5.809107464222025e-05,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": "not_applicable: dtype 'bf16' not in ['fp8']",
+        "safety": null
+      },
+      "gate_sequential": "not_applicable: dtype 'bf16' not in ['fp8']",
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "enable_expert_parallel",
+      "source": "library",
+      "entry": "enable_expert_parallel",
+      "knob_values": {
+        "enable_expert_parallel": true
+      },
+      "knob_kind": {
+        "enable_expert_parallel": "structural"
+      },
+      "in_knob_taxonomy": {
+        "enable_expert_parallel": true
+      },
+      "applies_to_kernels": [
+        "mlp_gate_up",
+        "mlp_down"
+      ],
+      "expected_delta_mean": 0.0,
+      "coverage": 0.001161821492844405,
+      "predicted_delta": 0.0,
+      "safety_tier": "high_risk",
+      "requires_qualification_commit": true,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": "Hardware 'AMD Instinct MI355X' matches none of ['A100', 'H100', 'H200']",
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": "not_applicable: Hardware 'AMD Instinct MI355X' matches none of ['A100', 'H100', 'H200']",
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "enable_eplb",
+      "source": "library",
+      "entry": "enable_eplb",
+      "knob_values": {
+        "enable_eplb": true
+      },
+      "knob_kind": {
+        "enable_eplb": "structural"
+      },
+      "in_knob_taxonomy": {
+        "enable_eplb": true
+      },
+      "applies_to_kernels": [
+        "mlp_gate_up",
+        "mlp_down"
+      ],
+      "expected_delta_mean": 0.03,
+      "coverage": 0.001161821492844405,
+      "predicted_delta": 3.485464478533215e-05,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": "prerequisite 'enable_expert_parallel' not enabled on this engine",
+        "hardware": null,
+        "mutual_dependency": "needs 'enable_expert_parallel'; no feasible lever in the pool sets it",
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": {
+        "enable_eplb": "prerequisite 'enable_expert_parallel' not enabled on this engine"
+      },
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "enable_dbo",
+      "source": "library",
+      "entry": "enable_dbo",
+      "knob_values": {
+        "enable_dbo": true
+      },
+      "knob_kind": {
+        "enable_dbo": "structural"
+      },
+      "in_knob_taxonomy": {
+        "enable_dbo": true
+      },
+      "applies_to_kernels": [
+        "qkv_proj",
+        "attn_score_value",
+        "attn_out_proj",
+        "mlp_gate_up",
+        "mlp_down",
+        "lm_head"
+      ],
+      "expected_delta_mean": 0.04,
+      "coverage": 0.23767699964682443,
+      "predicted_delta": 0.009507079985872977,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": null,
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": null,
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": {
+        "enable_dbo": "prerequisite 'enable_dbo' not enabled on this engine"
+      },
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "edge_fp16_autocast",
+      "source": "library",
+      "entry": "edge_fp16_autocast",
+      "knob_values": {
+        "edge.inference_dtype": "fp16"
+      },
+      "knob_kind": {
+        "edge.inference_dtype": "structural"
+      },
+      "in_knob_taxonomy": {
+        "edge.inference_dtype": false
+      },
+      "applies_to_kernels": [
+        "conv",
+        "pointpillars",
+        "centerpoint"
+      ],
+      "expected_delta_mean": 0.4,
+      "coverage": 0.0,
+      "predicted_delta": 0.0,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": "load_library(workload='vllm-decode') excludes it (workloads=['edge', 'kitti', 'nuscenes'])",
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": "not_applicable: workload 'vllm-decode' not in ['edge', 'kitti', 'nuscenes']",
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "edge_frame_batching",
+      "source": "library",
+      "entry": "edge_frame_batching",
+      "knob_values": {
+        "edge.batch_size": 4
+      },
+      "knob_kind": {
+        "edge.batch_size": "structural"
+      },
+      "in_knob_taxonomy": {
+        "edge.batch_size": false
+      },
+      "applies_to_kernels": [
+        "conv",
+        "pointpillars",
+        "centerpoint"
+      ],
+      "expected_delta_mean": 0.3,
+      "coverage": 0.0,
+      "predicted_delta": 0.0,
+      "safety_tier": "moderate",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": "load_library(workload='vllm-decode') excludes it (workloads=['edge', 'kitti', 'nuscenes'])",
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": "not_applicable: workload 'vllm-decode' not in ['edge', 'kitti', 'nuscenes']",
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    },
+    {
+      "name": "hft_top_of_book_fewer_scans",
+      "source": "library",
+      "entry": "hft_top_of_book_fewer_scans",
+      "knob_values": {
+        "hft.top_of_book_grouped_scans": 2
+      },
+      "knob_kind": {
+        "hft.top_of_book_grouped_scans": "structural"
+      },
+      "in_knob_taxonomy": {
+        "hft.top_of_book_grouped_scans": false
+      },
+      "applies_to_kernels": [
+        "cudf_groupby_scan",
+        "reduce",
+        "scan"
+      ],
+      "expected_delta_mean": 0.1,
+      "coverage": 0.02214722220734647,
+      "predicted_delta": 0.0022147222207346473,
+      "safety_tier": "low_risk",
+      "requires_qualification_commit": false,
+      "reasons": {
+        "validity": "load_library(workload='vllm-decode') excludes it (workloads=['hft', 'hft-lob'])",
+        "prerequisites": null,
+        "hardware": null,
+        "mutual_dependency": null,
+        "deployment": null,
+        "applicability": "not_applicable: workload 'vllm-decode' not in ['hft', 'hft-lob']",
+        "safety": null
+      },
+      "gate_sequential": null,
+      "raw_unmet_prerequisite": null,
+      "baseline_equal": null,
+      "ranked_top_n": false,
+      "survives": false
+    }
+  ]
+}

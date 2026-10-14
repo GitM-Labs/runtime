@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from gitm.optimizer.degradation import unreliable_ab
+
 __all__ = [
     "LeverRecord",
     "runs_with_results",
@@ -86,12 +88,18 @@ class History:
     ``filtered`` is counted separately and deliberately: a run excluded because it
     ran on a different GPU is the filter working, not history going missing. Adding
     the two together would make a clean read of one box look like a damaged one.
+
+    ``excluded`` is per *record*, keyed ``"<run>/<lever>"``: an A/B measured under
+    an unreliable degradation (a probe refusing a restarted engine, a runner that
+    failed) is not a measurement. It costs that record only; the run's other
+    A/Bs are read as usual.
     """
 
     records: dict[tuple[str, str | None], LeverRecord] = field(default_factory=dict)
     runs_read: int = 0
     skipped: dict[str, str] = field(default_factory=dict)
     filtered: int = 0
+    excluded: dict[str, str] = field(default_factory=dict)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -243,10 +251,18 @@ def load_history(
     exports.sort(key=lambda e: e[0])
 
     acc: dict[tuple[str, str | None, str | None], dict[str, Any]] = {}
+    excluded: dict[str, str] = {}
     for _mtime, run_id, sku, fp, results in exports:
         for r in results:
             name = r.get("intervention_name")
             if not name:
+                continue
+            # Judged per record: the degradations it was measured under, as the
+            # loop attributed them. A bad A/B late in a run is not a reason to
+            # drop the valid ones measured before it.
+            bad_ab = unreliable_ab(r.get("degradations") or [])
+            if bad_ab:
+                excluded[f"{run_id}/{name}"] = f"unreliable A/B: {', '.join(bad_ab)}"
                 continue
             key = (name, sku, fp)
             a = acc.setdefault(
@@ -281,7 +297,7 @@ def load_history(
         )
 
     return History(records=records, runs_read=len(exports), skipped=skipped,
-                   filtered=filtered)
+                   filtered=filtered, excluded=excluded)
 
 
 def record_for(
@@ -322,6 +338,8 @@ def render_history(history: History, *, top: int = 20) -> str:
         head += f", {history.filtered} filtered out by gpu"
     if history.skipped:
         head += f", skipped {len(history.skipped)}"
+    if history.excluded:
+        head += f", {len(history.excluded)} A/B record(s) excluded as unreliable"
     out = [head]
     if history.skipped:
         reasons: dict[str, int] = {}

@@ -100,7 +100,9 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
     # needle below claims it as an expert GEMM, which puts routing cost — cheap,
     # and bound by something else entirely — inside the entry whose weight
     # traffic dominates the step.
-    "moe_router": ("moe_align", "topk_softmax", "topkgating", "gating", "router",
+    # AMD: AITER's `topksoftmax_*` and `moeTopK`.
+    "moe_router": ("moe_align", "topk_softmax", "topksoftmax", "moetopk", "grouped_topk",
+                   "topkgating", "gating", "router",
                    "routing", "sinkhorn", "expert_bias"),
     # Dispatch/gather into expert-major order and the weighted scatter back.
     # Before the generic "moe" needle below, which would claim both as expert
@@ -112,7 +114,9 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
     # dispatch.
     "moe_combine": ("moe_sum", "finalize_moe", "unpermute", "scatter_add",
                     "index_add", "moe_combine"),
-    "moe_permute": ("permute", "expert_sort", "shuffle_rows", "gather_rows"),
+    # AMD: AITER's `*_moe_sort_kernel`, CK's `MoeSortingKernel`.
+    "moe_permute": ("permute", "expert_sort", "shuffle_rows", "gather_rows", "moe_sort",
+                    "moesorting"),
     "moe_routed": ("moe", "expert", "grouped_gemm", "group_gemm", "groupedgemm"),
     "dspark": ("dspark",),
 
@@ -125,7 +129,12 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
     # H200, FLASHINFER on the B200 in the same vLLM build), so a rule set that
     # covers only one of them silently loses the whole attention path on the
     # other machine.
-    "attn_score_value": ("flash_mla", "mla_sparse", "sparse_mla", "cutlass_mla",
+    # AMD: AITER MLA decode and paged-attention asm kernels (hsa/gfx950/{mla,pa});
+    # both vendors: vLLM's Triton decode attention (`_fwd_*kernel_stage*`).
+    "attn_score_value": ("mla_dec", "mla_a16", "mla_a8", "mla_reduce", "mla_stage",
+                         "pa_a16w", "pa_a8w", "pa_bf16", "pa_fp8", "pa_decode",
+                         "_fwd_grouped_kernel_stage", "_fwd_kernel_stage",
+                         "flash_mla", "mla_sparse", "sparse_mla", "cutlass_mla",
                          "sparse_fwd", "flash_attn", "flashattn", "flash_fwd",
                          "paged_attention", "paged_attn", "fmha", "attention",
                          "attn_score", "reshape_and_cache", "slot_mapping",
@@ -151,7 +160,7 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
     "rms_norm": ("rms_norm", "rmsnorm", "layernorm", "layer_norm", "fused_add_rms"),
     # Dynamic FP8 activation scaling ahead of a quantised GEMM. "dequant" is
     # excluded on purpose: it is the epilogue of the GEMM, not this kernel.
-    "act_quant": ("scaled_fp8_quant", "per_token_quant", "act_quant",
+    "act_quant": ("scaled_fp8_quant", "per_token_quant", "act_quant", "scaled_quant",
                   "quant_fp8", "dynamic_scaled"),
     # Before ``lm_head``, whose "embed" needle would otherwise claim the input
     # gather and attribute it to the vocabulary projection.
@@ -177,6 +186,13 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
 }
 
 
+#: Tested before :data:`_OP_RULES`, whose "moe" needle would claim AITER's
+#: `moe_smooth_per_token_scaled_quant_kernel` as an expert GEMM.
+_EARLY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("act_quant", ("smooth_per_token_scaled_quant", "moe_smooth")),
+)
+
+
 def classify_op(kernel_name: str) -> str | None:
     """Map a raw kernel name to a predicted-graph op, or ``None`` if unmodeled.
 
@@ -186,7 +202,7 @@ def classify_op(kernel_name: str) -> str | None:
     projection) → treated as unmodeled work.
     """
     n = kernel_name.lower()
-    for op, needles in _OP_RULES.items():
+    for op, needles in (*_EARLY_RULES, *_OP_RULES.items()):
         if any(k in n for k in needles):
             return op
     return None
@@ -201,7 +217,8 @@ def observed_op(name: str, range_op: str | None = None) -> str | None:
     guessed = classify_op(name)
     if range_op not in _OP_RULES:
         return guessed or range_op
-    if guessed in ("act_quant", "rms_norm", "moe_permute", "moe_combine",
+    # Routing runs inside the experts module's range but has its own node.
+    if guessed in ("act_quant", "rms_norm", "moe_router", "moe_permute", "moe_combine",
                    "tp_all_reduce", "moe_all_to_all"):
         return guessed
     return range_op
@@ -888,13 +905,25 @@ def main(argv: list[str] | None = None) -> int:
     band = next((i.band_width for i in INVARIANTS if i.id == "kernel_time"), 0.4)
 
     if args.as_json:
-        scale = args.steps or 1
+        # The graph prices ONE step. ``--steps`` says how many the window holds,
+        # and nothing here can derive it. ``steps or 1`` quietly left the floor at
+        # a single step while ``observed_s`` beside it covered the whole capture,
+        # so a 100-step window read 100x over budget with nothing in the payload
+        # saying why. ``render_deviation`` already refuses that comparison and
+        # prints UNSCALED instead of a ratio; this path never got the same
+        # treatment, and it is the one a tool reads without a human present.
+        #
+        # No step count means no floor to state. ``floors_scaled`` says which of
+        # the two reasons a null ``floor_s`` has: the op is unmodeled, or nothing
+        # could be scaled at all.
+        scaled = args.steps is not None
         print(json.dumps({
             "trace": str(args.trace),
             "n_kernels": n_kernels,
             "device_time_s": total_ns / 1e9,
             "window_s": span_ns / 1e9,
             "steps": args.steps,
+            "floors_scaled": scaled,
             "pid": args.pid,
             "device": args.device,
             "speculative_tokens": args.spec_tokens,
@@ -905,8 +934,8 @@ def main(argv: list[str] | None = None) -> int:
                 op: {
                     "kernels": c,
                     "observed_s": ns / 1e9,
-                    "floor_s": (pred.get(op, 0.0) * scale)
-                    if pred and op != "<unmodeled>" else None,
+                    "floor_s": (pred.get(op, 0.0) * args.steps)
+                    if (scaled and pred and op != "<unmodeled>") else None,
                 }
                 for op, (c, ns) in sorted(per_op.items(), key=lambda kv: -kv[1][1])
             },

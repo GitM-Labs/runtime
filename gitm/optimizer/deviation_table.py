@@ -305,10 +305,11 @@ def from_trace(
 
     ``steps`` scales a per-step floor to the captured window and is **required**:
     passing ``None`` with a graph raises rather than silently comparing a
-    one-step prediction against a whole-window observation. That mistake is
-    already live in ``gitm deviate --as-json``, which computes
-    ``pred * (steps or 1)`` and prints no warning, while the renderer beside it
-    does warn. Pass ``steps=1`` explicitly if the trace really is one step.
+    one-step prediction against a whole-window observation. ``gitm deviate
+    --json`` takes the softer form of the same position — it states no floor at
+    all rather than an unscaled one — and the renderer beside it prints UNSCALED
+    instead of a ratio. Pass ``steps=1`` explicitly if the trace really is one
+    step.
     """
     if graphs is not None and steps is None:
         raise ValueError(
@@ -350,11 +351,15 @@ def from_trace(
 
 
 def from_deviate_json(src: str | Path | dict, *, steps: int | None = None) -> DeviationTable:
-    """Rehydrate the artifact ``gitm deviate --as-json`` already emits.
+    """Rehydrate the artifact ``gitm deviate --json`` already emits.
 
     That payload has no per-op phase or bound, so every row comes back
     ``phase="unknown"`` with ``bound=None``. This reads what is there rather than
     guessing at what is not — use :func:`from_trace` when the trace is available.
+
+    A payload emitted without ``--steps`` carries no floors at all (its
+    ``floors_scaled`` is false), so every row rehydrates unmodeled. That is the
+    honest reading: there was never a floor to state.
     """
     doc = src if isinstance(src, dict) else json.loads(Path(src).read_text(encoding="utf-8"))
     ops = doc.get("ops") or {}

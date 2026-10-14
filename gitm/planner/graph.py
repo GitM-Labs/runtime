@@ -208,12 +208,20 @@ def predict_graph(
     n_kv = model.num_kv_heads
     n_h = model.n_heads
     dt = model.dtype_bytes
+    # Weight width for the attention projections. A quantized checkpoint stores
+    # them narrow exactly as it does the FFN, and at decode the weight read *is*
+    # the cost, so pricing them at the activation width doubles an fp8 floor.
+    wb = model.w_bytes
+    # Width of the attention's value space. Equal to ``hidden`` for Llama-style
+    # shapes, but not in general: Qwen3-0.6B runs 16 x 128 = 2048 against a
+    # 1024-wide residual, Gemma 16 x 256 = 4096 against 3072.
+    attn_width = n_h * head_dim
 
     for layer in range(model.n_layers):
         # QKV projection: matmul (b, h) @ (h, (n_h + 2*n_kv) * head_dim)
         qkv_out = (n_h + 2 * n_kv) * head_dim
         flops = 2 * b * h * qkv_out
-        bytes_moved = dt * (b * h + h * qkv_out + b * qkv_out)
+        bytes_moved = dt * (b * h + b * qkv_out) + wb * h * qkv_out
         g.nodes.append(
             PredictedNode("qkv_proj", layer, roofline("qkv_proj", flops, bytes_moved, hw))
         )
@@ -241,29 +249,41 @@ def predict_graph(
             )
         )
 
-        # Output projection
-        flops = 2 * b * h * h
-        bytes_moved = dt * (b * h + h * h + b * h)
+        # Output projection: (b, n_h * head_dim) @ (n_h * head_dim, h). Not h x h —
+        # that is only the same matrix when n_h * head_dim == hidden.
+        flops = 2 * b * attn_width * h
+        bytes_moved = dt * (b * attn_width + b * h) + wb * attn_width * h
         g.nodes.append(
             PredictedNode("attn_out_proj", layer, roofline("attn_out_proj", flops, bytes_moved, hw))
         )
 
-        # MLP gate+up / down. On an MoE model these two ops carry the expert
-        # GEMMs, so their flops/bytes come from the mixture model instead of a
-        # single dense FFN (see _ffn_terms).
+        # MLP gate+up / down. On an MoE layer the two GEMMs are the expert GEMMs,
+        # so their flops/bytes come from the mixture model instead of a single
+        # dense FFN (see _ffn_terms), and they are named ``moe_routed``: that is
+        # what ``classify_op`` files vLLM's ``fused_moe_kernel`` (and every other
+        # grouped-GEMM expert kernel) under, and what the sparse-MoE, GLM and
+        # hybrid graphs already call it. Named ``mlp_*`` they could never be
+        # paired — the expert kernels landed as unmodeled while both predicted
+        # nodes read as "predicted but never observed". Two nodes, not one, because
+        # the fused kernel launches once per GEMM: two structural classes let
+        # ``residuals()`` score each launch against the interval they span.
+        moe_layer = model.is_moe_layer(layer)
         gate_up_flops, gate_up_bytes, down_flops, down_bytes = _ffn_terms(
-            model, b, moe_layer=model.is_moe_layer(layer)
+            model, b, moe_layer=moe_layer
         )
+        gate_up_op, down_op = ("moe_routed", "moe_routed") if moe_layer else (
+            "mlp_gate_up", "mlp_down")
         g.nodes.append(
             PredictedNode(
-                "mlp_gate_up", layer, roofline("mlp_gate_up", gate_up_flops, gate_up_bytes, hw)
+                gate_up_op, layer, roofline(gate_up_op, gate_up_flops, gate_up_bytes, hw)
             )
         )
         g.nodes.append(
-            PredictedNode("mlp_down", layer, roofline("mlp_down", down_flops, down_bytes, hw))
+            PredictedNode(down_op, layer, roofline(down_op, down_flops, down_bytes, hw))
         )
 
-    # Final vocab projection
+    # Final vocab projection. Priced at the activation width on purpose: fp8 and
+    # int4 checkpoints conventionally leave lm_head unquantized.
     flops = 2 * b * h * model.vocab
     bytes_moved = dt * (b * h + h * model.vocab + b * model.vocab)
     g.nodes.append(

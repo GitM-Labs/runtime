@@ -56,6 +56,16 @@ def test_recognizes_the_server_and_not_its_own_workers():
     assert not discover.is_vllm_server([])
 
 
+def test_a_console_script_launch_is_a_server():
+    """L-1. The shebang puts the interpreter at argv[0] and `vllm` at argv[1];
+    that is how `vllm serve` is normally started."""
+    assert discover.is_vllm_server(
+        ["/home/u/.venv/bin/python", "/home/u/.venv/bin/vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct"])
+    # Not every interpreter running a file called vllm is a server.
+    assert not discover.is_vllm_server(["/usr/bin/python3", "vllm", "bench", "serve"])
+    assert not discover.is_vllm_server(["/usr/bin/bash", "/opt/vllm", "serve"])
+
+
 # --- traceability verdicts ---------------------------------------------------
 
 
@@ -464,3 +474,12 @@ def test_amd_server_held_by_rocprofv3_alone_is_not_ours(tmp_path):
     t = discover.classify(700, proc)
     assert t.traceable is False
     assert "another profiler" in t.reason
+
+
+def test_an_unmeasured_latency_prints_as_missing_not_zero():
+    """L-7. A null TPOT printed as 0.0 ms read as instantaneous."""
+    from gitm.serve.metrics import fmt_ms
+
+    assert fmt_ms(None) == "n/a"
+    assert fmt_ms(0.0118) == "11.8 ms"
+    assert fmt_ms(0.25, 0) == "250 ms"

@@ -14,6 +14,19 @@
 > **Qualification gate diagnostic.** {{ qualification_diagnostic }}
 {%- endif %}
 
+{%- if degradations %}
+
+## Degradations
+
+Where this run fell back instead of measuring. `unreliable` numbers do not
+describe this run and are excluded from history; `approximate` ones describe it
+under the stated default.
+
+{% for d in degradations -%}
+- **{{ d.severity }}** `{{ d.stage }}`: used {{ d.used }} — {{ d.reason }}{% if d.affects %} _(affects: {{ d.affects | join(', ') }})_{% endif %}
+{% endfor %}
+{%- endif %}
+
 ## Claims
 
 Every claim below carries the full provenance chain. Incomplete chain = no
@@ -25,7 +38,7 @@ _No claims._
 | # | Claim | Residual | Causal evidence | Intervention | Predicted Δ | Measured Δ |
 |---|---|---|---|---|---|---|
 {% for c in claims -%}
-| {{ loop.index }} | {{ c.summary }} | `{{ c.residual_invariant }}`: {{ '{:+.1%}'.format(c.residual_value) }} | {{ c.causal_evidence }} | `{{ c.intervention_name }}` | {{ '{:+.1%}'.format(c.predicted_delta) }} | {% if c.measured_delta is none %}—{% else %}{{ '{:+.1%}'.format(c.measured_delta) }}{% endif %}{% if c.rolled_back %} (rolled back){% endif %} |
+| {{ loop.index }} | {{ c.summary }} | `{{ c.residual_invariant }}`: {{ '{:+.1%}'.format(c.residual_value) }} | {{ c.causal_evidence }} | `{{ c.intervention_name }}` | {{ '{:+.1%}'.format(c.predicted_delta) }} | {% if c.measured_delta is none %}—{% else %}{{ '{:+.1%}'.format(c.measured_delta) }}{% endif %}{% if c.rolled_back %} (rolled back){% endif %}{% if c.restore_failed %} (not kept; baseline not restored){% endif %}{% if c.unreliable_ab %} (unreliable A/B: {{ c.unreliable_ab | join(', ') }}){% endif %} |
 {% endfor %}
 {%- endif %}
 
