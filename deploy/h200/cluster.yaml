@@ -1,0 +1,192 @@
+# A small control VM + two 8x H200 VMs = one k3s cluster with one shared queue.
+# Each job takes a whole GPU node (all 8 GPUs); at most one job per node.
+#
+# Applied by deploy/h200/setup-control.sh after k3s, the NVIDIA device plugin
+# and Kueue are up. Everything team members touch lives in namespace `gitm`.
+#
+# How "one job, whole node" is enforced, in three layers:
+#   1. Kueue ClusterQueue `h200` has a quota of 16 nvidia.com/gpu (2 nodes x 8),
+#      so it admits two 8-GPU Jobs and holds every later Job suspended (no
+#      pods) in strict FIFO order. An 8-GPU pod only fits on a node with all 8
+#      free, so the scheduler puts each admitted job on its own node.
+#      Adding a third GPU node? Raise nominalQuota to 24.
+#   2. The ValidatingAdmissionPolicy below rejects any Job in `gitm` that skips
+#      the queue, asks for anything other than 8 GPUs, or sets
+#      NVIDIA_VISIBLE_DEVICES (the env var that sneaks GPUs past the scheduler).
+#   3. RBAC: team members can create Jobs, not bare Pods.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gitm
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: h200
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: h200
+spec:
+  namespaceSelector: {}
+  # Admit strictly in submission order; a big job at the head is never skipped
+  # by later ones (there is only one size of job here anyway).
+  queueingStrategy: StrictFIFO
+  resourceGroups:
+    - coveredResources: ["nvidia.com/gpu"]
+      flavors:
+        - name: h200
+          resources:
+            - name: nvidia.com/gpu
+              nominalQuota: 16
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: gpu
+  namespace: gitm
+spec:
+  clusterQueue: h200
+---
+# ---------------------------------------------------------------------------
+# Team access: one ServiceAccount whose token is handed to the `gitm-users`
+# Unix group as /etc/gitm-gpu/kubeconfig (see setup.sh). Namespace-scoped.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: team
+  namespace: gitm
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: team-token
+  namespace: gitm
+  annotations:
+    kubernetes.io/service-account.name: team
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: team
+  namespace: gitm
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kueue.x-k8s.io"]
+    resources: ["workloads", "localqueues"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: team
+  namespace: gitm
+subjects:
+  - kind: ServiceAccount
+    name: team
+    namespace: gitm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: team
+---
+# ---------------------------------------------------------------------------
+# Every Job in `gitm` must go through the queue and take the whole node.
+# ---------------------------------------------------------------------------
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: gitm-whole-node-jobs
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["jobs"]
+  validations:
+    - expression: >-
+        has(object.metadata.labels) &&
+        'kueue.x-k8s.io/queue-name' in object.metadata.labels &&
+        object.metadata.labels['kueue.x-k8s.io/queue-name'] == 'gpu'
+      message: "Jobs must use the queue: label kueue.x-k8s.io/queue-name=gpu (use gitm-job submit)."
+    - expression: >-
+        object.spec.template.spec.containers.exists(c,
+          has(c.resources) && has(c.resources.limits) &&
+          'nvidia.com/gpu' in c.resources.limits &&
+          string(c.resources.limits['nvidia.com/gpu']) == '8')
+      message: "Each job takes the whole node: one container must set limits nvidia.com/gpu: 8."
+    - expression: >-
+        !has(object.spec.parallelism) || object.spec.parallelism <= 1
+      message: "One pod per job (parallelism must be 1)."
+    - expression: >-
+        object.spec.template.spec.containers.all(c,
+          !has(c.env) || c.env.all(e, e.name != 'NVIDIA_VISIBLE_DEVICES'))
+        && (!has(object.spec.template.spec.initContainers) ||
+          object.spec.template.spec.initContainers.all(c,
+            !has(c.env) || c.env.all(e, e.name != 'NVIDIA_VISIBLE_DEVICES')))
+      message: "NVIDIA_VISIBLE_DEVICES is managed by the device plugin; do not set it."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: gitm-whole-node-jobs
+spec:
+  policyName: gitm-whole-node-jobs
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: gitm
+---
+# ---------------------------------------------------------------------------
+# GPU metrics for the status page. The pusher on the control VM runs
+# `kubectl exec ... nvidia-smi` in these pods. They hold no GPUs (no resource
+# request); privileged + NVIDIA_VISIBLE_DEVICES=all lets them read every GPU's
+# counters, which the toolkit only allows for privileged pods. Lives outside
+# `gitm`, where team members have no access.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gitm-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gpu-metrics
+  namespace: gitm-system
+spec:
+  selector:
+    matchLabels: {app: gpu-metrics}
+  template:
+    metadata:
+      labels: {app: gpu-metrics}
+    spec:
+      nodeSelector:
+        gitm.dev/gpu-node: "true"
+      automountServiceAccountToken: false
+      containers:
+        - name: smi
+          image: ubuntu:24.04
+          command: ["sleep", "infinity"]
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: utility
+          securityContext:
+            privileged: true
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 200m, memory: 128Mi}

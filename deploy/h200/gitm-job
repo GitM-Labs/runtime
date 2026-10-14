@@ -1,0 +1,709 @@
+#!/usr/bin/env python3
+"""gitm-job: queue whole-node (8x H200) gitm tracing jobs and see what's running.
+
+    gitm-job submit --name kimi-k26 --model moonshotai/Kimi-K2.6
+    gitm-job submit --name custom --model Qwen/Qwen3-235B -- python my_script.py
+    gitm-job ls                  # running, queued (with position), recent
+    gitm-job logs <job> [-f]
+    gitm-job cancel <job>
+
+Every job gets all 8 GPUs of one node. Jobs wait in one strict-FIFO queue and
+start on whichever GPU node frees up first. Results land on that node under
+the results dir (see `gitm-job ls`, column NODE).
+
+The same file also runs the status pusher behind the team web page
+(`gitm-job _push-status`, started by gitm-status.service as root).
+
+Stdlib only; talks to the cluster through kubectl.
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import hashlib
+import json
+import os
+import random
+import re
+import shlex
+import string
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+CONF_DIR = "/etc/gitm-gpu"
+NAMESPACE = "gitm"
+QUEUE = "gpu"
+GPUS_PER_JOB = 8
+DEFAULT_IMAGE = "vllm/vllm-openai:latest"
+GITM_REPO_URL = "https://github.com/GitM-Labs/runtime"
+MAX_HOURS = 48
+LOG_TAIL_LINES = 25
+SCHEMA_VERSION = 1
+
+
+# --------------------------------------------------------------------------
+# config + kubectl
+# --------------------------------------------------------------------------
+
+def load_config() -> dict[str, str]:
+    cfg = {"HF_CACHE": "/var/lib/gitm/hf-cache", "RESULTS_DIR": "/var/lib/gitm/results",
+           "STATUS_REPO": "", "DEFAULT_IMAGE": DEFAULT_IMAGE}
+    path = os.path.join(CONF_DIR, "config")
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+def kubeconfig(admin: bool) -> str | None:
+    if os.environ.get("KUBECONFIG"):
+        return os.environ["KUBECONFIG"]
+    if admin:
+        return "/etc/rancher/k3s/k3s.yaml"
+    team = os.path.join(CONF_DIR, "kubeconfig")
+    if os.path.exists(team) and not os.access(team, os.R_OK):
+        sys.exit(f"gitm-job: no access to {team}. Ask an admin to run:\n"
+                 f"  sudo usermod -aG gitm-users {getpass.getuser()}\n"
+                 "then log out and back in.")
+    return team
+
+
+class Kube:
+    def __init__(self, admin: bool = False):
+        self.env = dict(os.environ)
+        kc = kubeconfig(admin)
+        if kc:
+            self.env["KUBECONFIG"] = kc
+
+    def run(self, *args: str, input: str | None = None, check: bool = True,
+            timeout: float = 60, ns: str | None = NAMESPACE) -> subprocess.CompletedProcess:
+        cmd = ["kubectl", *(["-n", ns] if ns else []), *args]
+        try:
+            p = subprocess.run(cmd, input=input, capture_output=True, text=True,
+                               env=self.env, timeout=timeout)
+        except FileNotFoundError:
+            sys.exit("gitm-job: kubectl not found (run this on the control VM)")
+        if check and p.returncode != 0:
+            raise RuntimeError(f"kubectl {' '.join(args[:3])}: {p.stderr.strip() or p.stdout.strip()}")
+        return p
+
+    def get(self, *what: str, ns: str | None = NAMESPACE) -> list[dict]:
+        p = self.run("get", *what, "-o", "json", ns=ns)
+        return json.loads(p.stdout).get("items", [])
+
+
+# --------------------------------------------------------------------------
+# job state, shared by `ls` and the status pusher
+# --------------------------------------------------------------------------
+
+def parse_ts(s: str | None) -> float | None:
+    if not s:
+        return None
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+
+
+def iso(ts: float | None) -> str | None:
+    return None if ts is None else datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _cond(job: dict, kind: str) -> dict | None:
+    for c in job.get("status", {}).get("conditions", []) or []:
+        if c.get("type") == kind and c.get("status") == "True":
+            return c
+    return None
+
+
+def _pod_detail(pod: dict) -> tuple[str, str]:
+    """(state, human detail) for a pod that exists."""
+    phase = pod.get("status", {}).get("phase", "Pending")
+    statuses = pod.get("status", {}).get("containerStatuses") or []
+    for cs in statuses:
+        w = cs.get("state", {}).get("waiting")
+        if w:
+            reason = w.get("reason", "")
+            if reason in ("ImagePullBackOff", "ErrImagePull", "CreateContainerConfigError",
+                          "CrashLoopBackOff", "InvalidImageName"):
+                return "starting", f"{reason}: {w.get('message', '')[:200]}"
+            return "starting", reason or "starting"
+    if phase == "Pending":
+        for c in pod.get("status", {}).get("conditions", []) or []:
+            if c.get("type") == "PodScheduled" and c.get("status") == "False":
+                return "starting", f"waiting for node: {c.get('message', '')[:200]}"
+        return "starting", "pulling image / creating container"
+    if phase == "Running":
+        return "running", ""
+    return phase.lower(), ""
+
+
+def describe_jobs(jobs: list[dict], pods: list[dict], workloads: list[dict]) -> list[dict]:
+    pods_by_job: dict[str, list[dict]] = {}
+    for p in pods:
+        jn = p.get("metadata", {}).get("labels", {}).get("job-name")
+        if jn:
+            pods_by_job.setdefault(jn, []).append(p)
+    wl_msg: dict[str, str] = {}
+    for w in workloads:
+        for ref in w.get("metadata", {}).get("ownerReferences", []) or []:
+            if ref.get("kind") == "Job":
+                for c in w.get("status", {}).get("conditions", []) or []:
+                    if c.get("type") == "QuotaReserved" and c.get("status") == "False":
+                        wl_msg[ref["name"]] = c.get("message", "")
+
+    out = []
+    for j in jobs:
+        md, spec, st = j["metadata"], j.get("spec", {}), j.get("status", {})
+        labels, ann = md.get("labels", {}) or {}, md.get("annotations", {}) or {}
+        name = md["name"]
+        jpods = sorted(pods_by_job.get(name, []),
+                       key=lambda p: p["metadata"].get("creationTimestamp", ""))
+        pod = jpods[-1] if jpods else None
+        rec = {
+            "name": name,
+            "display_name": ann.get("gitm.dev/display-name", name),
+            "owner": labels.get("gitm.dev/owner", "?"),
+            "model": ann.get("gitm.dev/model", ""),
+            "image": (spec.get("template", {}).get("spec", {}).get("containers") or [{}])[0].get("image", ""),
+            "node": (pod or {}).get("spec", {}).get("nodeName"),
+            "pod": (pod or {}).get("metadata", {}).get("name"),
+            "submitted": md.get("creationTimestamp"),
+            "started": st.get("startTime"),
+            "finished": None,
+            "max_runtime_s": spec.get("activeDeadlineSeconds"),
+            "detail": "",
+        }
+        done, failed = _cond(j, "Complete"), _cond(j, "Failed")
+        if done:
+            rec["state"], rec["finished"] = "succeeded", st.get("completionTime") or done.get("lastTransitionTime")
+        elif failed:
+            rec["state"], rec["finished"] = "failed", failed.get("lastTransitionTime")
+            reason = failed.get("reason", "")
+            rec["detail"] = {"DeadlineExceeded": "hit max runtime",
+                             "BackoffLimitExceeded": "exited with an error"}.get(reason, reason)
+            term = _terminated(pod)
+            if term:
+                rec["detail"] += f" (exit {term.get('exitCode')}{', ' + term['reason'] if term.get('reason') else ''})"
+        elif spec.get("suspend"):
+            rec["state"], rec["detail"] = "queued", wl_msg.get(name, "")
+            rec["started"] = None
+        elif pod:
+            rec["state"], rec["detail"] = _pod_detail(pod)
+        else:
+            rec["state"], rec["detail"] = "starting", "admitted; creating pod"
+        out.append(rec)
+
+    queued = sorted((r for r in out if r["state"] == "queued"), key=lambda r: r["submitted"] or "")
+    for i, r in enumerate(queued, 1):
+        r["position"] = i
+    return out
+
+
+def _terminated(pod: dict | None) -> dict | None:
+    for cs in (pod or {}).get("status", {}).get("containerStatuses") or []:
+        t = cs.get("state", {}).get("terminated")
+        if t:
+            return t
+    return None
+
+
+# --------------------------------------------------------------------------
+# submit
+# --------------------------------------------------------------------------
+
+def whoami() -> str:
+    u = os.environ.get("SUDO_USER") or getpass.getuser()
+    return re.sub(r"[^a-z0-9-]", "-", u.lower()).strip("-")[:30] or "user"
+
+
+def dns_name(s: str, limit: int) -> str:
+    s = re.sub(r"[^a-z0-9-]+", "-", s.lower()).strip("-")
+    return s[:limit].strip("-")
+
+
+def build_job(args, cfg: dict[str, str]) -> dict:
+    owner = whoami()
+    suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
+    name = f"{dns_name(owner, 20)}-{dns_name(args.name, 30)}-{suffix}"
+    image = args.image or cfg.get("DEFAULT_IMAGE") or DEFAULT_IMAGE
+
+    env = [
+        {"name": "MODEL", "value": args.model},
+        {"name": "GITM_JOB", "value": name},
+        {"name": "OUT", "value": f"/results/{name}"},
+        {"name": "HF_HOME", "value": "/hf"},
+        {"name": "GITM_SCRATCH", "value": f"/results/{name}"},
+        {"name": "HF_TOKEN", "valueFrom": {"secretKeyRef": {"name": "hf-token", "key": "token", "optional": True}}},
+    ]
+    for kv in args.env or []:
+        if "=" not in kv:
+            sys.exit(f"gitm-job: --env expects KEY=VALUE, got {kv!r}")
+        k, v = kv.split("=", 1)
+        if k in ("NVIDIA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+            sys.exit(f"gitm-job: {k} is managed for you (every job gets all 8 GPUs)")
+        env.append({"name": k, "value": v})
+
+    install = (f'pip install -q "gitm-labs[nvidia] @ {GITM_REPO_URL}/archive/{args.gitm_ref}.tar.gz"')
+    if args.command:
+        user_cmd = shlex.join(args.command)
+        script = f"set -euo pipefail\nmkdir -p \"$OUT\"\n{install}\ncd \"$OUT\"\n{user_cmd}\n"
+    else:
+        capture = args.capture_args or ""
+        vllm = args.vllm_args or ""
+        script = (
+            "set -euo pipefail\n"
+            'mkdir -p "$OUT"\n'
+            f"{install}\n"
+            'echo "gitm $(python3 -c "import gitm; print(gitm.__version__)") | model $MODEL | out $OUT"\n'
+            f'gitm capture serve --out "$OUT" {capture} -- \\\n'
+            f'  vllm serve "$MODEL" --tensor-parallel-size {GPUS_PER_JOB} --trust-remote-code {vllm}\n'
+        )
+
+    pod_spec: dict = {
+        "restartPolicy": "Never",
+        "automountServiceAccountToken": False,
+        "terminationGracePeriodSeconds": 60,
+        "containers": [{
+            "name": "main",
+            "image": image,
+            "command": ["/bin/bash", "-c", script],
+            "env": env,
+            "resources": {"limits": {"nvidia.com/gpu": GPUS_PER_JOB}},
+            "volumeMounts": [
+                {"name": "hf", "mountPath": "/hf"},
+                {"name": "results", "mountPath": "/results"},
+                {"name": "dshm", "mountPath": "/dev/shm"},
+            ],
+        }],
+        "volumes": [
+            {"name": "hf", "hostPath": {"path": cfg["HF_CACHE"], "type": "DirectoryOrCreate"}},
+            {"name": "results", "hostPath": {"path": cfg["RESULTS_DIR"], "type": "DirectoryOrCreate"}},
+            {"name": "dshm", "emptyDir": {"medium": "Memory", "sizeLimit": "256Gi"}},
+        ],
+    }
+    if args.node:
+        pod_spec["nodeSelector"] = {"kubernetes.io/hostname": args.node}
+
+    return {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": name,
+            "namespace": NAMESPACE,
+            "labels": {"kueue.x-k8s.io/queue-name": QUEUE, "gitm.dev/owner": owner},
+            "annotations": {
+                "gitm.dev/display-name": args.name,
+                "gitm.dev/model": args.model,
+            },
+        },
+        "spec": {
+            "backoffLimit": 0,
+            "parallelism": 1,
+            "completions": 1,
+            # Counted from when the job actually starts, not while it queues.
+            "activeDeadlineSeconds": int(args.max_hours * 3600),
+            "ttlSecondsAfterFinished": 7 * 24 * 3600,
+            "template": {
+                "metadata": {"labels": {"gitm.dev/owner": owner}},
+                "spec": pod_spec,
+            },
+        },
+    }
+
+
+def cmd_submit(args) -> int:
+    cfg = load_config()
+    if not 0 < args.max_hours <= MAX_HOURS:
+        sys.exit(f"gitm-job: --max-hours must be between 0 and {MAX_HOURS}")
+    job = build_job(args, cfg)
+    if args.dry_run:
+        print(json.dumps(job, indent=2))
+        return 0
+    kube = Kube()
+    kube.run("create", "-f", "-", input=json.dumps(job))
+    jobs = describe_jobs(kube.get("jobs"), [], [])
+    me = next((j for j in jobs if j["name"] == job["metadata"]["name"]), None)
+    ahead = sum(1 for j in jobs if j["state"] in ("queued",) and j["submitted"] < (me or {}).get("submitted", "~"))
+    busy = sum(1 for j in jobs if j["state"] in ("running", "starting"))
+    name = job["metadata"]["name"]
+    print(f"submitted {name}")
+    if busy >= 2 or ahead:
+        print(f"  queued: {ahead} job(s) ahead of you, {busy} running")
+    else:
+        print("  a GPU node is free; it should start within a few seconds")
+    print(f"  follow it:   gitm-job logs {name} -f")
+    print(f"  results:     {cfg['RESULTS_DIR']}/{name}  (on the GPU node it runs on)")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# ls / logs / cancel
+# --------------------------------------------------------------------------
+
+def _age(ts: str | None, now: float) -> str:
+    t = parse_ts(ts)
+    if t is None:
+        return "-"
+    s = int(now - t)
+    if s < 120:
+        return f"{s}s"
+    if s < 7200:
+        return f"{s // 60}m"
+    if s < 172800:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    return f"{s // 86400}d"
+
+
+def cmd_ls(args) -> int:
+    kube = Kube()
+    jobs = kube.get("jobs")
+    pods = kube.get("pods")
+    try:
+        wls = kube.get("workloads.kueue.x-k8s.io")
+    except RuntimeError:
+        wls = []
+    recs = describe_jobs(jobs, pods, wls)
+    now = time.time()
+    order = {"running": 0, "starting": 1, "queued": 2, "failed": 3, "succeeded": 3}
+    recs.sort(key=lambda r: (order.get(r["state"], 4),
+                             r.get("position") or 0,
+                             -(parse_ts(r["finished"]) or 0) if r["finished"] else 0))
+    if not args.all:
+        finished = [r for r in recs if r["state"] in ("succeeded", "failed")][:5]
+        recs = [r for r in recs if r["state"] not in ("succeeded", "failed")] + finished
+    if args.json:
+        print(json.dumps(recs, indent=2))
+        return 0
+    if not recs:
+        print("no jobs. Submit one: gitm-job submit --name NAME --model ORG/MODEL")
+        return 0
+    rows = [("JOB", "OWNER", "STATE", "NODE", "TIME", "MODEL", "NOTE")]
+    for r in recs:
+        state = r["state"] + (f" #{r['position']}" if r.get("position") else "")
+        if r["state"] in ("running", "starting"):
+            t = _age(r["started"], now)
+        elif r["state"] == "queued":
+            t = "waiting " + _age(r["submitted"], now)
+        else:
+            t = _age(r["finished"], now) + " ago"
+        rows.append((r["name"], r["owner"], state, r["node"] or "-", t, r["model"] or "-", r["detail"][:60]))
+    widths = [max(len(str(row[i])) for row in rows) for i in range(len(rows[0]))]
+    for row in rows:
+        print("  ".join(str(c).ljust(w) for c, w in zip(row, widths, strict=True)).rstrip())
+    return 0
+
+
+def _resolve(kube: Kube, name: str) -> dict:
+    jobs = kube.get("jobs")
+    exact = [j for j in jobs if j["metadata"]["name"] == name]
+    if exact:
+        return exact[0]
+    partial = [j for j in jobs if name in j["metadata"]["name"]]
+    if len(partial) == 1:
+        return partial[0]
+    if not partial:
+        sys.exit(f"gitm-job: no job matching {name!r} (see gitm-job ls)")
+    sys.exit(f"gitm-job: {name!r} matches several jobs: " + ", ".join(j["metadata"]["name"] for j in partial))
+
+
+def cmd_logs(args) -> int:
+    kube = Kube()
+    job = _resolve(kube, args.job)
+    if job.get("spec", {}).get("suspend"):
+        print(f"{job['metadata']['name']} is still queued; no logs yet.")
+        return 0
+    cmd = ["kubectl", "-n", NAMESPACE, "logs", f"job/{job['metadata']['name']}", f"--tail={args.tail}"]
+    if args.follow:
+        cmd.append("-f")
+    return subprocess.call(cmd, env=kube.env)
+
+
+def cmd_cancel(args) -> int:
+    kube = Kube()
+    job = _resolve(kube, args.job)
+    name = job["metadata"]["name"]
+    owner = job["metadata"].get("labels", {}).get("gitm.dev/owner")
+    if owner != whoami() and not args.force:
+        sys.exit(f"gitm-job: {name} belongs to {owner}. Use --force if you really mean to cancel it.")
+    kube.run("delete", "job", name, "--wait=false")
+    print(f"cancelled {name}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# status pusher (runs on the control VM as root via gitm-status.service)
+# --------------------------------------------------------------------------
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_SECRETS = [
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.S), "[redacted private key]"),
+    (re.compile(r"\bhf_[A-Za-z0-9]{20,}"), "hf_[redacted]"),
+    (re.compile(r"\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"), "gh_[redacted]"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "github_pat_[redacted]"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"), "sk-[redacted]"),
+    (re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b"), "[redacted aws key]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "[redacted google key]"),
+    (re.compile(r"\bya29\.[0-9A-Za-z_-]+"), "[redacted google token]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "[redacted jwt]"),
+    (re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [redacted]"),
+    (re.compile(r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|ACCESS_KEY)[A-Z0-9_]*)"
+                r"(\s*[=:]\s*|\"\s*:\s*\")([^\s\"',]{4,})"), r"\1\2[redacted]"),
+    (re.compile(r"(?i)(://[^/\s:@]+:)[^@\s/]+@"), r"\1[redacted]@"),
+]
+
+
+def redact(line: str) -> str:
+    line = _ANSI.sub("", line).replace("\r", "")
+    for pat, repl in _SECRETS:
+        line = pat.sub(repl, line)
+    if len(line) > 400:
+        line = line[:400] + " …"
+    return line
+
+
+def _gpu_metrics(kube: Kube) -> dict[str, list[dict]]:
+    """node name -> per-GPU metrics, via nvidia-smi in the gpu-metrics DaemonSet."""
+    out: dict[str, list[dict]] = {}
+    try:
+        pods = kube.get("pods", ns="gitm-system")
+    except RuntimeError:
+        return out
+    q = "index,name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu"
+    for p in pods:
+        node = p.get("spec", {}).get("nodeName")
+        if not node or p.get("status", {}).get("phase") != "Running":
+            continue
+        r = kube.run("exec", p["metadata"]["name"], "--",
+                     "nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits",
+                     check=False, timeout=20, ns="gitm-system")
+        if r.returncode != 0:
+            continue
+        gpus = []
+        for line in r.stdout.strip().splitlines():
+            f = [x.strip() for x in line.split(",")]
+            if len(f) < 7:
+                continue
+
+            def num(x: str) -> float | None:
+                try:
+                    return round(float(x), 1)
+                except ValueError:
+                    return None
+            gpus.append({"index": int(f[0]), "name": f[1], "util": num(f[2]),
+                         "mem_used_mib": num(f[3]), "mem_total_mib": num(f[4]),
+                         "power_w": num(f[5]), "temp_c": num(f[6])})
+        out[node] = gpus
+    return out
+
+
+def collect_status(kube: Kube) -> dict:
+    jobs, pods = kube.get("jobs"), kube.get("pods")
+    try:
+        wls = kube.get("workloads.kueue.x-k8s.io")
+    except RuntimeError:
+        wls = []
+    recs = describe_jobs(jobs, pods, wls)
+
+    # Log tails: everything live, plus the 3 most recently finished.
+    finished = sorted((r for r in recs if r["state"] in ("succeeded", "failed")),
+                      key=lambda r: r["finished"] or "", reverse=True)
+    tail_for = {r["name"] for r in recs if r["state"] in ("running", "starting")}
+    tail_for |= {r["name"] for r in finished[:3]}
+    for r in recs:
+        r["log_tail"] = []
+        if r["name"] in tail_for and r["pod"]:
+            p = kube.run("logs", r["pod"], f"--tail={LOG_TAIL_LINES}", check=False, timeout=20)
+            if p.returncode == 0:
+                r["log_tail"] = [redact(x) for x in p.stdout.splitlines()][-LOG_TAIL_LINES:]
+
+    metrics = _gpu_metrics(kube)
+    nodes = []
+    for n in kube.get("nodes", ns=None):
+        labels = n["metadata"].get("labels", {}) or {}
+        if labels.get("gitm.dev/gpu-node") != "true":
+            continue
+        name = n["metadata"]["name"]
+        ready = any(c.get("type") == "Ready" and c.get("status") == "True"
+                    for c in n.get("status", {}).get("conditions", []))
+        running = next((r["name"] for r in recs
+                        if r["node"] == name and r["state"] in ("running", "starting")), None)
+        nodes.append({
+            "name": name,
+            "ready": ready,
+            "schedulable": not n.get("spec", {}).get("unschedulable", False),
+            "gpus_allocatable": int(n.get("status", {}).get("allocatable", {}).get("nvidia.com/gpu", "0") or 0),
+            "job": running,
+            "gpus": metrics.get(name, []),
+        })
+    nodes.sort(key=lambda x: x["name"])
+
+    live = [r for r in recs if r["state"] in ("running", "starting")]
+    queued = sorted((r for r in recs if r["state"] == "queued"), key=lambda r: r["position"])
+    for r in recs:
+        r.pop("pod", None)
+    return {
+        "schema": SCHEMA_VERSION,
+        "updated": iso(time.time()),
+        "nodes": nodes,
+        "running": live,
+        "queued": queued,
+        "recent": finished[:15],
+    }
+
+
+class GitPublisher:
+    """Force-pushes a one-commit orphan branch holding status.json.
+
+    One commit, always replaced: the status repo never grows, and readers fetch
+    the file by commit sha (immutable, so no CDN staleness)."""
+
+    def __init__(self, repo: str, branch: str = "status"):
+        self.remote = f"git@github.com:{repo}.git"
+        self.branch = branch
+        self.gitdir = "/var/lib/gitm-gpu/status.git"
+        key = os.path.join(CONF_DIR, "deploy_key")
+        self.env = dict(os.environ, GIT_DIR=self.gitdir,
+                        GIT_SSH_COMMAND=f"ssh -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
+                                        f"-o UserKnownHostsFile=/var/lib/gitm-gpu/known_hosts",
+                        GIT_AUTHOR_NAME="gitm-status", GIT_AUTHOR_EMAIL="gitm-status@localhost",
+                        GIT_COMMITTER_NAME="gitm-status", GIT_COMMITTER_EMAIL="gitm-status@localhost")
+        if not os.path.isdir(self.gitdir):
+            os.makedirs(os.path.dirname(self.gitdir), exist_ok=True)
+            subprocess.run(["git", "init", "-q", "--bare", self.gitdir], check=True)
+
+    def _git(self, *args: str, input: str | None = None) -> str:
+        p = subprocess.run(["git", *args], input=input, capture_output=True, text=True,
+                           env=self.env, timeout=60)
+        if p.returncode != 0:
+            raise RuntimeError(f"git {args[0]}: {p.stderr.strip()}")
+        return p.stdout.strip()
+
+    def publish(self, content: str) -> None:
+        blob = self._git("hash-object", "-w", "--stdin", input=content)
+        tree = self._git("mktree", input=f"100644 blob {blob}\tstatus.json\n")
+        commit = self._git("commit-tree", tree, "-m", "status")
+        self._git("push", "-q", "--force", self.remote, f"{commit}:refs/heads/{self.branch}")
+
+
+def cmd_push_status(args) -> int:
+    cfg = load_config()
+    kube = Kube(admin=True)
+    pub = None
+    if not args.out:
+        repo = cfg.get("STATUS_REPO")
+        if not repo:
+            sys.exit("gitm-job: STATUS_REPO missing from /etc/gitm-gpu/config")
+        pub = GitPublisher(repo)
+
+    last_state_key = last_full_key = None
+    last_push = 0.0
+    failures = 0
+    while True:
+        try:
+            status = collect_status(kube)
+            body = {k: v for k, v in status.items() if k != "updated"}
+            full_key = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+            # "State" = what jobs exist and where they are; changes push at once.
+            state_key = hashlib.sha256(json.dumps(
+                [(r["name"], r["state"], r.get("position"), r["node"])
+                 for r in status["running"] + status["queued"] + status["recent"]]
+                + [(n["name"], n["ready"], n["job"]) for n in status["nodes"]],
+                sort_keys=True).encode()).hexdigest()
+            since = time.time() - last_push
+            # Push policy, sized for the page's GitHub API budget (60/h per viewer):
+            # state change -> now; logs/metrics change -> at most every 60s;
+            # nothing changed -> heartbeat every 5 min so the page can tell
+            # "idle" from "pusher down".
+            due = (state_key != last_state_key
+                   or (full_key != last_full_key and since >= args.min_interval)
+                   or since >= args.heartbeat)
+            if due:
+                text = json.dumps(status, indent=1)
+                if args.out:
+                    with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(os.path.abspath(args.out)),
+                                                     delete=False) as f:
+                        f.write(text)
+                    os.replace(f.name, args.out)
+                else:
+                    pub.publish(text)
+                last_push, last_state_key, last_full_key = time.time(), state_key, full_key
+                print(f"{status['updated']} pushed: {len(status['running'])} running, "
+                      f"{len(status['queued'])} queued", flush=True)
+            failures = 0
+        except Exception as e:  # keep the service alive; the page shows staleness
+            failures += 1
+            print(f"error ({failures}): {e}", file=sys.stderr, flush=True)
+        if args.once:
+            return 1 if failures else 0
+        time.sleep(min(args.poll * (2 ** min(failures, 4)), 300))
+
+
+# --------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="gitm-job", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("submit", help="queue a job that gets a whole 8-GPU node",
+                       description="Queue a job. By default it installs gitm and runs "
+                                   "`gitm capture serve -- vllm serve MODEL --tensor-parallel-size 8`. "
+                                   "Anything after `--` replaces that command (gitm is still installed, "
+                                   "$MODEL and $OUT are set).")
+    s.add_argument("--name", required=True, help="short label, e.g. kimi-k26-baseline")
+    s.add_argument("--model", required=True, help="Hugging Face model id, e.g. moonshotai/Kimi-K2.6")
+    s.add_argument("--image", help=f"container image (default from config, else {DEFAULT_IMAGE})")
+    s.add_argument("--gitm-ref", default="main", help="branch/tag/sha of GitM-Labs/runtime to install")
+    s.add_argument("--max-hours", type=float, default=12, help=f"hard runtime limit (default 12, max {MAX_HOURS})")
+    s.add_argument("--node", help="pin to one GPU node (e.g. h200-a); default: first free")
+    s.add_argument("--env", action="append", metavar="KEY=VALUE", help="extra env var (repeatable)")
+    s.add_argument("--capture-args", help='extra args for gitm capture serve, e.g. "--requests 1024"')
+    s.add_argument("--vllm-args", help='extra args for vllm serve, e.g. "--max-model-len 65536"')
+    s.add_argument("--dry-run", action="store_true", help="print the Job instead of submitting it")
+    s.add_argument("command", nargs=argparse.REMAINDER, help="-- custom command")
+    s.set_defaults(fn=cmd_submit)
+
+    s = sub.add_parser("ls", help="running, queued and recent jobs")
+    s.add_argument("--all", action="store_true", help="all finished jobs (kept 7 days)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_ls)
+
+    s = sub.add_parser("logs", help="print a job's output")
+    s.add_argument("job", help="job name (or a unique part of it)")
+    s.add_argument("-f", "--follow", action="store_true")
+    s.add_argument("--tail", type=int, default=200)
+    s.set_defaults(fn=cmd_logs)
+
+    s = sub.add_parser("cancel", help="cancel a queued or running job")
+    s.add_argument("job")
+    s.add_argument("--force", action="store_true", help="cancel someone else's job")
+    s.set_defaults(fn=cmd_cancel)
+
+    s = sub.add_parser("_push-status", help=argparse.SUPPRESS)
+    s.add_argument("--poll", type=float, default=15)
+    s.add_argument("--min-interval", type=float, default=60)
+    s.add_argument("--heartbeat", type=float, default=300)
+    s.add_argument("--once", action="store_true")
+    s.add_argument("--out", help="write status.json here instead of pushing (testing)")
+    s.set_defaults(fn=cmd_push_status)
+
+    args = ap.parse_args(argv)
+    if getattr(args, "command", None) and args.command[:1] == ["--"]:
+        args.command = args.command[1:]
+    try:
+        return args.fn(args)
+    except RuntimeError as e:
+        print(f"gitm-job: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

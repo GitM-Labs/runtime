@@ -1,0 +1,13 @@
+[Unit]
+Description=gitm GPU queue status pusher (feeds the team status page)
+After=k3s.service network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/gitm-job _push-status
+Restart=always
+RestartSec=15
+StateDirectory=gitm-gpu
+
+[Install]
+WantedBy=multi-user.target
