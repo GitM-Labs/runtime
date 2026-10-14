@@ -1,12 +1,12 @@
-"""Result semantics are explicit for every existing catalogue entry."""
+"""Result semantics are explicit for every plannable catalogue entry."""
 import json
-from pathlib import Path
 
 import pytest
 
+from gitm.planner.model_catalogue import available, load_entry
 from gitm.planner.registry import main
 
-MODELS = sorted(path.stem for path in (Path(__file__).resolve().parents[1]/'gitm/planner/models').glob('*.yaml'))
+MODELS = [model for model in available() if load_entry(model).get('execution_status') != 'static_only']
 
 
 @pytest.mark.parametrize('model', MODELS)
