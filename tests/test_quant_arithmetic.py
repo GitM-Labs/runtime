@@ -437,8 +437,8 @@ def test_plan_prices_an_explicit_cache_dtype_over_the_resolved_default(capsys):
     default = capsys.readouterr().out
     assert main([*base, "--kv-cache-dtype", "bf16"]) == 0
     wide = capsys.readouterr().out
-    assert "floor 11.404 ms/step" in default and "35,136 B/token" in default
-    assert "floor 13.323 ms/step" in wide and "70,272 B/token" in wide
+    assert "serial proxy 11.404 ms/step" in default and "35,136 B/token" in default
+    assert "serial proxy 13.323 ms/step" in wide and "70,272 B/token" in wide
     assert "4.5 GB workspace" in default and "46.2 GB for KV" in default
 
 
