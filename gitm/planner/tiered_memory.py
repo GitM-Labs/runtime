@@ -218,7 +218,10 @@ def memory_resource_bounds(plan: MemoryPlan, region: RegionTraffic) -> dict:
                          path.engine_resource_id):
             charge(resource, transfer.bytes, transfer.evidence)
             evidence[resource].append(path.evidence)
-        if transfer.bytes != 0:
+        if transfer.bytes is None:
+            # An unknown size might be zero, so no startup is guaranteed.
+            startup_unknown.add(path.engine_resource_id)
+        elif transfer.bytes > 0:
             if path.startup_floor_s is None:
                 startup_unknown.add(path.engine_resource_id)
             else:

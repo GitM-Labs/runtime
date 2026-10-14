@@ -93,7 +93,7 @@ Ishaan authorized local integration on October 11. The optional `gitm/planner/ti
 
 ## Exact local API semantics
 
-The design sketch above predates the local API. The implementation names the startup input `startup_floor_s`: it is an additive lower bound on service occupied on the transfer engine per nonzero transfer. It is not an arbitrary host startup latency or a delay that can overlap payload service. A platform unable to establish that meaning must supply `None`. A startup floor cannot tighten an upper bound on ideal payload service. Zero-byte transfers add no startup service.
+The design sketch above predates the local API. The implementation names the startup input `startup_floor_s`: it is an additive lower bound on service occupied on the transfer engine per nonzero transfer. It is not an arbitrary host startup latency or a delay that can overlap payload service. A platform unable to establish that meaning must supply `None`. A startup floor cannot tighten an upper bound on ideal payload service. Zero-byte transfers add no startup service. An unknown byte count may also be zero, so its startup contribution is unknown and cannot increase the known service floor.
 
 `RegionTraffic.coverage_complete` and the residency validator’s corresponding argument default to false and require actual booleans. Unknown demands preserve their known component bytes but prevent a complete memory floor. Point rates yield conditional payload service, lower-rate bounds yield ideal payload-service upper bounds, and upper-rate bounds yield service floors. The output always withholds whole-step and attainable-region latency. Explicit scenario provenance is allowed for synthetic examples and is never relabeled measured.
 
