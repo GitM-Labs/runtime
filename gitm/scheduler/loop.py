@@ -1835,7 +1835,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                                       "error": swap_err})
                 fresh, why, motivated_now, batch_now = None, swap_err, {}, None
                 if traced_engine is not None:
-                    applicator.engine = traced_engine
+                    applicator.install(traced_engine)
                     fresh, why, motivated_now, batch_now = _recapture(
                         rerank_path, workload=workload, run_id=run_id, runner=runner,
                         engine=traced_engine)
@@ -1844,7 +1844,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                     tracing_swaps.append({"when": f"after re-trace {step}",
                                           "to": "untraced", "error": swap_err})
                     if back is not None:
-                        applicator.engine = back
+                        applicator.install(back)
                 if swap_err is not None:
                     engine_lost = f"could not swap engines for re-trace {step}: {swap_err}"
                     n_untried = sum(1 for x in queue if x.rejected_reason is None)

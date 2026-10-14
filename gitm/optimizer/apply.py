@@ -969,6 +969,18 @@ class LiveEngineApplicator:
                 f"could not rebuild the baseline engine ({cause}): {exc}") from exc
         self._activate(self.engine)
 
+    def install(self, engine: Any) -> None:
+        """Make ``engine``, built outside the applicator, the running one.
+
+        The same configuration (a re-trace swaps in a traced build and then an
+        untraced one), so its measurements still pair with the baseline's; and
+        a new build, so its next measurement is a fresh one. Assigning
+        ``engine`` directly kept the previous engine's freshness, and the first
+        measurement after every re-trace was discarded as a warm re-measurement.
+        """
+        self.engine = engine
+        self._unmeasured_build = True
+
     def commit(self) -> None:
         """The candidate was kept: release what restore() would have swapped back.
 

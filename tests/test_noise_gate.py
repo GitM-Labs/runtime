@@ -467,3 +467,18 @@ def test_a_baseline_brought_back_in_parallel_mode_is_not_fresh():
     app.snapshot()
     assert app._last_measure_fresh is False
     assert app.noise.samples == [] and app.noise.skipped_not_fresh == 1
+
+
+def test_an_engine_a_retrace_swaps_in_is_a_fresh_build():
+    """A re-trace replaces the running baseline with a traced build and then an
+    untraced one. That engine is new, so its first measurement pairs with the
+    last fresh one instead of being discarded as a warm re-measurement."""
+    box = _Box([1000.0, 1000.0, 1000.0, 1010.0])
+    app = box.applicator()
+    app.calibrate(1)                        # the warm-up, then one A/A pair
+    assert app.noise.samples == pytest.approx([0.0])
+    app.snapshot()                          # the same engine again: not fresh
+    assert app.noise.skipped_not_fresh == 1
+    app.install(box.build("A"))             # what the re-trace leaves running
+    app.snapshot()
+    assert app.noise.samples == pytest.approx([0.0, 0.01])
