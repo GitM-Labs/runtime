@@ -668,3 +668,35 @@ def test_a_release_that_fails_on_keep_does_not_undo_the_keep():
 
     res = apply_intervention(_spec(), _App(), min_keep_delta=0.0)
     assert res.kept and "releasing the replaced engine failed" in res.error
+
+
+def test_autoresearch_does_not_start_when_the_catalogue_stopped_for_time(tmp_path, monkeypatch):
+    """A catalogue pass that stopped because the next candidate would overrun
+    the budget used to hand the remainder to autoresearch, which started a
+    build anyway as long as the budget was not yet spent."""
+    from gitm.agents.policy import RankedCandidate
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield _trace(run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "select_interventions", lambda *a, **kw: [
+        RankedCandidate(spec=_spec("a", 1), predicted_delta=0.05),
+        RankedCandidate(spec=_spec("b", 2), predicted_delta=0.04)])
+    monkeypatch.setattr(loop, "apply_intervention", lambda *a, **kw: ApplyResult(
+        True, rolled_back=True, measured_delta=-0.01))
+    # Time for the first candidate, none for a second.
+    monkeypatch.setattr(loop, "_next_cycle_overruns", lambda _e, _b, cycles: (
+        "1 min left, and a candidate has taken 50 min on average" if cycles else None))
+    started = []
+    monkeypatch.setattr(loop, "autoresearch", lambda *a, **kw: started.append(1))
+
+    out = loop.run_loop(loop.LoopConfig(budget="5h", scratch=str(tmp_path),
+                                        workload_runner=_Runner()))
+    assert started == []
+    assert out["summary"]["n_untried"] == 1                     # b
+    reasons = [d["reason"] for d in json.loads(
+        (Path(out["run_dir"]) / "degradations.json").read_text())["items"]]
+    assert any("would be overrun" in r and "50 min" in r for r in reasons)

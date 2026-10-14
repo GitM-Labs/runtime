@@ -1947,6 +1947,11 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 n_untried = _stop_at_budget()
                 break
 
+    if cycle_started_ns is not None:
+        # The last candidate's cycle, which no later iteration closed: the
+        # autoresearch pass below goes by these too.
+        cycle_s.append((time.time_ns() - cycle_started_ns) / 1e9)
+
     if tracing_swaps:
         # Which engines carried the tracer, and every swap between them. A reader
         # comparing A/B numbers needs to know none of them was traced.
@@ -1964,7 +1969,15 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         }, indent=2))
 
     # Phase 4b - agentic autoresearch through the catalog gate/rollback path.
-    if engine_lost is None and time.time_ns() - started_ns < int(budget_s * 1e9):
+    # The same rule as Phase 4: no pass, and no candidate within it, that the
+    # budget left cannot finish. Otherwise a catalogue pass that stopped early
+    # for that reason handed the remainder to an autoresearch build that
+    # overran it anyway.
+    ar_overrun = _next_cycle_overruns((time.time_ns() - started_ns) / 1e9, budget_s, cycle_s)
+    ar_deadline_ns = started_ns + int(budget_s * 1e9)
+    if cycle_s:
+        ar_deadline_ns -= int(sum(cycle_s) / len(cycle_s) * 1e9)
+    if engine_lost is None and ar_overrun is None:
         proposer = FallbackProposer(EngineArgsProposer(), TableProposer())
 
         def _unenactable(spec: Any) -> str | None:
@@ -2026,9 +2039,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             gpu_sku=pctx.sku,
             fingerprint=qual.fingerprint,
             degradations=degradations,
-            # The same deadline Phase 4 stops on. Without it the pass ran every
+            # The last moment a candidate can start and still finish, by Phase
+            # 4's mean candidate. Without a deadline the pass ran every
             # proposal regardless, and a 15-minute run took 36 (P2-7).
-            deadline_ns=started_ns + int(budget_s * 1e9),
+            deadline_ns=ar_deadline_ns,
             on_result=_checkpoint_ar,
         )
         if _catalogue_validation is not None:
@@ -2040,7 +2054,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         ar_run.degradations.append(Degradation(
             AR_SKIPPED, used="no autoresearch pass",
             reason=(f"engine lost in Phase 4: {engine_lost}" if engine_lost is not None
-                    else f"budget {cfg.budget} exhausted by Phase 4"),
+                    else f"budget {cfg.budget} exhausted by Phase 4" if ar_overrun == "spent"
+                    else f"budget {cfg.budget} would be overrun ({ar_overrun})"),
             severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,)))
     degradations.extend(ar_run.degradations)
     lost_in_ar = next((r for r in ar_run.results
@@ -2056,8 +2071,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         n_untried += ar_run.n_untried
         degradations.record(
             AR_SKIPPED, used="an autoresearch pass stopped at the budget",
-            reason=(f"budget {cfg.budget} spent; {ar_run.n_untried} ranked "
-                    "candidate(s) not tried"),
+            reason=(f"budget {cfg.budget} left no time for another candidate; "
+                    f"{ar_run.n_untried} ranked candidate(s) not tried"),
             severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
     # Again, now that autoresearch has had its proposals vetoed: an exclusion
     # that only stopped a proposal is still something the run held back, and a
