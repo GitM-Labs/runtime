@@ -313,6 +313,10 @@ def build_script(args, cfg: dict[str, str]) -> str:
 # here touches the node. Results: {results}/<jobid>/ on the node it ran on.
 set -euo pipefail
 OUT_HOST={shlex.quote(results)}/$SLURM_JOB_ID
+# Model cache: this node's own setting (HF_CACHE in /etc/gitm-gpu/config), read
+# when the job starts, so each node can keep its models wherever it likes.
+HF_DIR=$(grep -E '^HF_CACHE=' /etc/gitm-gpu/config 2>/dev/null | tail -1 | cut -d= -f2-)
+HF_DIR=${{HF_DIR:-{shlex.quote(cfg['HF_CACHE'])}}}
 mkdir -p "$OUT_HOST"
 # The submitter's own Hugging Face paths (e.g. ~/hf_hub) don't exist in the
 # container: always use the node's cache, mounted at /hf.
@@ -320,9 +324,9 @@ unset HF_HUB_CACHE HF_XET_CACHE HF_ASSETS_CACHE HF_MODULES_CACHE TRANSFORMERS_CA
 export MODEL={shlex.quote(args.model)} OUT=/out HF_HOME=/hf HF_HUB_CACHE=/hf/hub GITM_SCRATCH=/out GITM_JOB=$SLURM_JOB_ID
 if [ -r {CONF_DIR}/hf_token ]; then export HF_TOKEN="$(cat {CONF_DIR}/hf_token)"; fi
 {chr(10).join(extra_env)}
-echo "job $SLURM_JOB_ID on $(hostname) | image {image}"
+echo "job $SLURM_JOB_ID on $(hostname) | image {image} | models $HF_DIR"
 srun --container-image={shlex.quote(image)} \\
-     --container-mounts={shlex.quote(cfg['HF_CACHE'])}:/hf,"$OUT_HOST":/out \\
+     --container-mounts="$HF_DIR":/hf,"$OUT_HOST":/out \\
      --container-workdir=/out \\
      --container-writable \\
      --no-container-mount-home \\
