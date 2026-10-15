@@ -84,6 +84,9 @@ echo "enroot $(enroot version)"
 # a job ends. Nothing goes into home directories.
 mkdir -p /var/lib/enroot/{cache,data} /run/enroot
 chmod 1777 /var/lib/enroot/cache /var/lib/enroot/data /run/enroot
+# Enroot bind-mounts the host's /etc/hostname into every container; some
+# images (GCP Ubuntu) never write one, and then every container start fails.
+[[ -f /etc/hostname ]] || hostname > /etc/hostname
 mkdir -p /etc/enroot/enroot.conf.d
 cat > /etc/enroot/enroot.conf.d/gitm.conf <<'EOF'
 # gitm: per-user container storage on local disk, never in $HOME
