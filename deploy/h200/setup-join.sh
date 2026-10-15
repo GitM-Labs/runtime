@@ -69,9 +69,15 @@ if [[ -f "$B/slurm-install.tgz" ]]; then
   systemctl daemon-reload
   # The build may live outside sudo's PATH (e.g. /opt/slurm): find it from the
   # bundle, use it here, and add it to every login shell's PATH.
-  SLURMD_P=$(tar -tzf "$B/slurm-install.tgz" | grep -E '(^|/)sbin/slurmd$|(^|/)slurmd$' | head -1)
-  SRUN_P=$(tar -tzf "$B/slurm-install.tgz" | grep -E '(^|/)bin/srun$' | head -1)
-  [[ -n "$SLURMD_P" ]] || die "the bundle has no slurmd binary"
+  SLURMD_P=$(tar -tzf "$B/slurm-install.tgz" | grep -E '(^|/)s?bin/slurmd$' | head -1 || true)
+  SRUN_P=$(tar -tzf "$B/slurm-install.tgz" | grep -E '(^|/)bin/srun$' | head -1 || true)
+  if [[ -z "$SLURMD_P" ]]; then
+    for d in /usr/local/sbin /usr/sbin /opt/slurm/sbin /usr/local/slurm/sbin /opt/slurm/bin /usr/local/bin; do
+      if [[ -x "$d/slurmd" ]]; then SLURMD_P="${d#/}/slurmd"; break; fi
+    done
+  fi
+  [[ -n "$SLURMD_P" ]] || die "slurmd binary not found in the bundle. On gitmachine-2 run: command -v slurmd; sudo sh -c 'command -v slurmd'"
+  echo "slurmd: /$SLURMD_P   srun: /${SRUN_P:-?}"
   ADD=""
   for p in "/$SLURMD_P" "/${SRUN_P:-$SLURMD_P}"; do
     d=$(dirname "$p")
