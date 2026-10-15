@@ -129,7 +129,8 @@ def build_script(args) -> str:
             f"gitm capture serve --out /out {args.capture_args or ''} -- \\\n"
             f'  vllm serve "$MODEL" --tensor-parallel-size {GPUS} --trust-remote-code {args.vllm_args or ""}\n'
         )
-    inner = "set -euo pipefail\nexport HF_HOME=/hf HOME=/out/.home\nmkdir -p \"$HOME\"\n" + body
+    inner = ("set -euo pipefail\nexport HF_HOME=/hf HOME=/out/.home CUDA_HOME=/usr/local/cuda\n"
+             "mkdir -p \"$HOME\"\n" + body)
     extra = []
     for kv in args.env or []:
         k, _, v = kv.partition("=")

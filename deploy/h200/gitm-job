@@ -296,7 +296,8 @@ def build_script(args, cfg: dict[str, str]) -> str:
             f"gitm capture serve --out /out {args.capture_args or ''} -- \\\n"
             f'  vllm serve "$MODEL" --tensor-parallel-size {GPUS_PER_JOB} --trust-remote-code {args.vllm_args or ""}\n'
         )
-    inner = "set -euo pipefail\n" + body
+    inner = ("set -euo pipefail\nexport CUDA_HOME=/usr/local/cuda HOME=/out/.home\n"
+             "mkdir -p \"$HOME\"\n" + body)
 
     node = f"#SBATCH --nodelist={args.node}\n" if args.node else ""
     return f"""#!/bin/bash
