@@ -76,7 +76,7 @@ fi
 
 # ---------------------------------------------------------------------------
 step "Slurm $SLURM_VER on $THIS ($SLURM_CONF)"
-dpkg -S "$(command -v slurmd)" >/dev/null 2>&1 || echo "Slurm here is a source build; the join bundle will carry it to the other node."
+dpkg -S "$(readlink -f "$(command -v slurmd)")" >/dev/null 2>&1 || echo "Slurm here is a source build; the join bundle will carry it to the other node."
 BUSY=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | wc -l)
 if [[ "$BUSY" -gt 0 ]]; then
   warn "$BUSY process(es) hold GPUs on $THIS outside Slurm. Queued jobs will run out of GPU memory until they stop:"
@@ -232,7 +232,7 @@ cp -a /etc/munge/munge.key "$B/munge.key"
 SLURM_USER=$(scontrol show config | awk -F'= ' '/^SlurmUser/{print $2}' | cut -d'(' -f1)
 getent passwd "${SLURM_USER:-slurm}" > "$B/slurm_user" || true
 getent group "$(id -g "${SLURM_USER:-slurm}" 2>/dev/null || echo slurm)" > "$B/slurm_group" || true
-if ! dpkg -S "$(command -v slurmd)" >/dev/null 2>&1; then
+if ! dpkg -S "$(readlink -f "$(command -v slurmd)")" >/dev/null 2>&1; then
   # Slurm here was built from source: ship this exact build, plus the list of
   # Ubuntu packages its binaries and plugins link against, so the other node
   # runs byte-identical Slurm.
