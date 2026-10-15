@@ -3,13 +3,13 @@
 Two 8x H200 machines in one Slurm cluster (controller: gitmachine-2). Each job
 gets a whole node (all 8 GPUs), runs in a throwaway container (Pyxis + Enroot)
 so CUPTI tracing and pip installs never touch the host, and waits its turn in
-one queue. Live status: <https://aditchawdhary.github.io/gpu/>.
+one queue. Live status: <https://gitm-labs.github.io/gpu-status/>.
 
 ```
  teammates ──ssh──► gitmachine-2  (slurmctld + slurmd, 8x H200)  ──git push──► github: gpu-status
                         │  Slurm (munge)                                        │ (branch `status`)
                         ▼                                                       ▼
-                    node 2        (slurmd, 8x H200)                 aditchawdhary.github.io/gpu/
+                    node 2        (slurmd, 8x H200)                 gitm-labs.github.io/gpu-status/
 ```
 
 | File | Run where | What it does |
@@ -26,7 +26,7 @@ On node 2, note its name and internal IP: `hostname -s; hostname -I`.
 
 ```bash
 # 1. gitmachine-2
-sudo ./setup-controller.sh --add-node NODE2NAME=NODE2_IP --status-repo aditchawdhary/gpu-status
+sudo ./setup-controller.sh --add-node NODE2NAME=NODE2_IP --status-repo GitM-Labs/gpu-status
 
 # 2. node 2 (copy this folder + the bundle it printed)
 sudo ./setup-join.sh --bundle ~/gitm-join.tgz && rm ~/gitm-join.tgz

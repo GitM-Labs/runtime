@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Run on the Slurm controller (gitmachine-2). Turns the existing Slurm into the
 # team's whole-node GPU queue, adds the second H200 machine, and starts the
-# status feed for https://aditchawdhary.github.io/gpu/.
+# status feed for https://gitm-labs.github.io/gpu-status/.
 #
 #   sudo ./setup-controller.sh --add-node NODE2NAME=NODE2_IP \
-#                              --status-repo aditchawdhary/gpu-status
+#                              --status-repo GitM-Labs/gpu-status
 #   sudo ./setup-controller.sh --smoke        # after setup-join.sh on the 2nd machine
 #
 # NODE2NAME is what `hostname -s` prints on the second machine; NODE2_IP is its
@@ -72,7 +72,7 @@ if [[ $SMOKE -eq 1 ]]; then
   exit 0
 fi
 
-[[ -n "$STATUS_REPO" ]] || die "--status-repo is required (e.g. aditchawdhary/gpu-status)"
+[[ -n "$STATUS_REPO" ]] || die "--status-repo is required (e.g. GitM-Labs/gpu-status)"
 
 # ---------------------------------------------------------------------------
 step "Slurm $SLURM_VER on $THIS ($SLURM_CONF)"
