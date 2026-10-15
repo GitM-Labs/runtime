@@ -46,10 +46,12 @@ step "Unpacking $SRC"
 enroot create --name "$NAME" "$SRC" >/dev/null
 
 step "Installing build tools, CUDA headers and libcupti ${DRIVER_MAJOR} inside the image"
-# --root: root inside the container only. NVIDIA_VISIBLE_DEVICES=void: no GPUs
-# needed (or touched) to build.
-enroot start --root --rw --env NVIDIA_VISIBLE_DEVICES=void --env DRIVER_MAJOR="$DRIVER_MAJOR" \
-  --env GITM_REF="$GITM_REF" "$NAME" bash -s <<'IN'
+# The vLLM image's entry point is `vllm serve`; a plain `enroot start NAME cmd`
+# would hand cmd to it as arguments. So the build script is copied into the
+# unpacked rootfs and run through a replacement rc file that skips the entry point.
+ROOTFS="$ENROOT_DATA_PATH/$NAME"
+[[ -d "$ROOTFS" ]] || { echo "unpacked rootfs not found at $ROOTFS" >&2; exit 1; }
+cat > "$ROOTFS/gitm-build.sh" <<'IN'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive PIP_ROOT_USER_ACTION=ignore
 CUDA_VER=$(python3 -c 'import torch; print(torch.version.cuda or "")' 2>/dev/null || true)
@@ -95,7 +97,15 @@ PY
 # Let job users (non-root inside the container) rebuild it after reinstalling gitm.
 chmod -R a+rwX "$(python3 -c 'import gitm, os; print(os.path.dirname(gitm.__file__))')"
 echo 'export CUDA_HOME=/usr/local/cuda' > /etc/profile.d/gitm-cuda.sh
+rm -f /gitm-build.sh
 IN
+RC=$(mktemp); trap 'rm -f "$RC"; cleanup' EXIT
+printf '#!/bin/sh\nexec /bin/bash /gitm-build.sh\n' > "$RC"
+# --root: root inside the container only. NVIDIA_VISIBLE_DEVICES=void: no GPUs
+# are needed (or touched) to build.
+enroot start --root --rw --rc "$RC" \
+  --env NVIDIA_VISIBLE_DEVICES=void --env DRIVER_MAJOR="$DRIVER_MAJOR" --env GITM_REF="$GITM_REF" \
+  "$NAME"
 
 step "Saving $OUT"
 rm -f "$OUT.tmp"
