@@ -39,6 +39,29 @@ Then add the printed deploy key (with write access) to the `gpu-status` repo and
 `sudo systemctl restart gitm-status`. Slurm tokens (JWT) keep working: only the
 controller checks them, and jobs can now land on either node.
 
+## Interns: submit with a Slurm token (no SSH)
+
+Interns never log into the machines. They get a Slurm token and the
+`gitm-submit` script (this folder; Python 3.9+, no packages needed):
+
+```bash
+# admin, on gitmachine-2: one token per person (90 days)
+sudo scontrol token username=tarun lifespan=7776000
+
+# intern, on their laptop
+export SLURM_JWT=eyJ...                 # their token
+export SLURM_API=https://<cluster REST address>
+./gitm-submit run --name qwen3-smoke --model Qwen/Qwen3-0.6B \
+    --capture-args "--requests 64 --concurrency 32"
+./gitm-submit ls
+./gitm-submit status <jobid>
+```
+
+Results show up on the status page under *Finished recently*: latency, goodput,
+where GPU kernel time went, and the files written. Until the REST API has a
+public HTTPS address, test it through an SSH tunnel:
+`ssh -N -L 6820:localhost:6820 gitmachine-2` and `SLURM_API=http://localhost:6820`.
+
 ## Using it
 
 ```bash

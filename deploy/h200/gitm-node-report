@@ -4,11 +4,12 @@
     gitm-node-report [JOBID ...]
 
 Prints per-GPU readings from nvidia-smi and, for each JOBID, the last lines of
-that job's log (<RESULTS_DIR>/<JOBID>.log, written by gitm-job jobs).
+that job's log (<RESULTS_DIR>/<JOBID>.log) and a short summary of its gitm
+results (<RESULTS_DIR>/<JOBID>/: serving latency, kernel-time breakdown, files).
 
 The status pusher on the Slurm controller runs this locally for its own node
 and over SSH for the others. The SSH key it uses is pinned to this program in
-root's authorized_keys (command="...",restrict), so the key can do nothing
+the gitm-report account's authorized_keys (command="...",restrict), so it can do nothing
 else; job ids then arrive in SSH_ORIGINAL_COMMAND and only digits are accepted.
 Stdlib only.
 """
@@ -73,13 +74,60 @@ def tail(path: str) -> list[str]:
         return []
 
 
+def _load(path: str) -> dict | None:
+    try:
+        if os.path.getsize(path) > 8 * 1024 * 1024:
+            return None
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def result(rd: str, jobid: str) -> dict | None:
+    """Compact summary of a finished gitm capture in <RESULTS_DIR>/<jobid>/."""
+    d = os.path.join(rd, jobid)
+    if not os.path.isdir(d):
+        return None
+    files = []
+    try:
+        for name in sorted(os.listdir(d))[:40]:
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                files.append([name, os.path.getsize(p)])
+    except OSError:
+        pass
+    out: dict = {"files": files}
+    ss = _load(os.path.join(d, "serving_summary.json"))
+    if ss:
+        c = ss.get("client") or {}
+        out["serving"] = {k: c.get(k) for k in (
+            "n_requests", "n_failed_requests", "ttft_p50_s", "ttft_p95_s",
+            "tpot_p50_s", "tpot_p95_s", "goodput_rps", "window_s")}
+        out["serving"]["wall_s"] = ss.get("wall_s")
+        out["serving"]["tracing"] = ss.get("tracing")
+    kb = _load(os.path.join(d, "kernel_breakdown.json"))
+    if kb:
+        buckets = sorted(kb.get("buckets") or [], key=lambda b: -(b.get("share") or 0))
+        out["kernels"] = {
+            "n_kernels": kb.get("n_kernels"),
+            "gpu_active_share": kb.get("gpu_active_share"),
+            "n_devices": kb.get("n_devices"),
+            "buckets": [[b.get("bucket"), round(b.get("share") or 0, 4)] for b in buckets[:8]],
+        }
+        out["warnings"] = [w[:240] for w in (kb.get("warnings") or [])[:3]]
+    return out if (len(out) > 1 or files) else None
+
+
 def main() -> int:
     args = sys.argv[1:]
     if not args and os.environ.get("SSH_ORIGINAL_COMMAND"):
         args = os.environ["SSH_ORIGINAL_COMMAND"].split()[1:]   # drop the program name
     ids = [a for a in args if re.fullmatch(r"\d{1,12}", a)][:32]
     rd = results_dir()
-    print(json.dumps({"gpus": gpus(), "logs": {i: tail(os.path.join(rd, f"{i}.log")) for i in ids}}))
+    print(json.dumps({"gpus": gpus(),
+                      "logs": {i: tail(os.path.join(rd, f"{i}.log")) for i in ids},
+                      "results": {i: r for i in ids if (r := result(rd, i))}}))
     return 0
 
 

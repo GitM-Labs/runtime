@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""gitm-submit: queue gitm tracing jobs on the H200 cluster from your laptop.
+
+No SSH needed: it talks to the Slurm REST API with your Slurm token.
+
+    export SLURM_JWT=eyJ...            # your token (ask the admin)
+    export SLURM_API=https://...       # the cluster's REST address
+    gitm-submit run --name kimi-k26 --model moonshotai/Kimi-K2.6
+    gitm-submit ls                     # your jobs
+    gitm-submit status 123
+    gitm-submit cancel 123
+
+Each job gets a whole node (all 8 H200s) and runs in a throwaway container.
+Results (latency, kernel breakdown, files) appear on the team status page when
+the job ends. Python 3.9+, standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import getpass
+import json
+import os
+import re
+import shlex
+import sys
+import urllib.error
+import urllib.request
+
+GITM_REPO_URL = "https://github.com/GitM-Labs/runtime"
+GPUS = 8
+API_VERSIONS = ["v0.0.45", "v0.0.44", "v0.0.43", "v0.0.42", "v0.0.41", "v0.0.40"]
+
+
+# --------------------------------------------------------------------------
+# REST plumbing
+# --------------------------------------------------------------------------
+
+def token() -> str:
+    t = os.environ.get("SLURM_JWT", "").strip()
+    if t.startswith("SLURM_JWT="):
+        t = t.split("=", 1)[1]
+    if not t:
+        sys.exit("gitm-submit: set SLURM_JWT to your Slurm token first")
+    return t
+
+
+def user_from_token(t: str) -> str | None:
+    try:
+        payload = t.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("sun")
+    except (IndexError, ValueError):
+        return None
+
+
+class Api:
+    def __init__(self):
+        self.base = os.environ.get("SLURM_API", "http://localhost:6820").rstrip("/")
+        self.jwt = token()
+        self.user = os.environ.get("SLURM_USER") or user_from_token(self.jwt) or getpass.getuser()
+        self.version = os.environ.get("SLURM_API_VERSION")
+
+    def _req(self, method: str, path: str, body: dict | None = None) -> dict:
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers={
+            "X-SLURM-USER-NAME": self.user,
+            "X-SLURM-USER-TOKEN": self.jwt,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            try:
+                payload = json.loads(e.read() or b"{}")
+            except ValueError:
+                payload = {}
+            payload["_http"] = e.code
+            return payload
+        except urllib.error.URLError as e:
+            sys.exit(f"gitm-submit: can't reach {self.base} ({e.reason}). Check SLURM_API "
+                     "(and that your tunnel is up, if you use one).")
+
+    def call(self, method: str, path: str, body: dict | None = None) -> dict:
+        v = self.detect()
+        out = self._req(method, f"/slurm/{v}{path}", body)
+        if out.get("_http") in (401, 403):
+            sys.exit("gitm-submit: the cluster rejected your token (expired, or not yours). "
+                     "Ask the admin for a new one.")
+        return out
+
+    def detect(self) -> str:
+        if self.version:
+            return self.version
+        for v in API_VERSIONS:
+            out = self._req("GET", f"/slurm/{v}/ping")
+            if out.get("_http") in (401, 403):
+                sys.exit("gitm-submit: the cluster rejected your token (expired, or not yours).")
+            if "_http" not in out:
+                self.version = v
+                return v
+        sys.exit(f"gitm-submit: no supported Slurm REST version answered at {self.base}")
+
+
+def errors(out: dict) -> list[str]:
+    msgs = []
+    for e in out.get("errors") or []:
+        msgs.append(e.get("description") or e.get("error") or json.dumps(e))
+    if out.get("_http") and not msgs:
+        msgs.append(f"HTTP {out['_http']}")
+    return msgs
+
+
+# --------------------------------------------------------------------------
+# the job
+# --------------------------------------------------------------------------
+
+def build_script(args) -> str:
+    install = f'pip install -q "gitm-labs[nvidia] @ {GITM_REPO_URL}/archive/{args.gitm_ref}.tar.gz"'
+    if args.command:
+        body = f"{install}\ncd /out\n{shlex.join(args.command)}\n"
+    else:
+        body = (
+            f"{install}\n"
+            'echo "gitm $(python3 -c "import gitm; print(gitm.__version__)") | model $MODEL | out /out"\n'
+            f"gitm capture serve --out /out {args.capture_args or ''} -- \\\n"
+            f'  vllm serve "$MODEL" --tensor-parallel-size {GPUS} --trust-remote-code {args.vllm_args or ""}\n'
+        )
+    inner = "set -euo pipefail\nexport HF_HOME=/hf HOME=/out/.home\nmkdir -p \"$HOME\"\n" + body
+    extra = []
+    for kv in args.env or []:
+        k, _, v = kv.partition("=")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k) or not _:
+            sys.exit(f"gitm-submit: --env expects KEY=VALUE, got {kv!r}")
+        extra.append(f"export {k}={shlex.quote(v)}")
+    image = args.image or ""
+    # Node paths come from the node's own /etc/gitm-gpu/config at run time, so
+    # each node uses its own Hugging Face cache and results folder.
+    return f"""#!/bin/bash
+set -euo pipefail
+CONF=/etc/gitm-gpu/config
+val() {{ grep -E "^$1=" "$CONF" 2>/dev/null | tail -1 | cut -d= -f2-; }}
+RESULTS=$(val RESULTS_DIR); RESULTS=${{RESULTS:-/var/lib/gitm/results}}
+HF=$(val HF_CACHE); HF=${{HF:-/var/lib/gitm/hf-cache}}
+IMAGE={shlex.quote(image)}; IMAGE=${{IMAGE:-$(val DEFAULT_IMAGE)}}; IMAGE=${{IMAGE:-vllm/vllm-openai:latest}}
+OUT_HOST="$RESULTS/$SLURM_JOB_ID"; mkdir -p "$OUT_HOST"
+export MODEL={shlex.quote(args.model)}
+if [ -r /etc/gitm-gpu/hf_token ]; then export HF_TOKEN="$(cat /etc/gitm-gpu/hf_token)"; fi
+{chr(10).join(extra)}
+echo "job $SLURM_JOB_ID on $(hostname) | image $IMAGE"
+srun --container-image="$IMAGE" \\
+     --container-mounts="$HF:/hf,$OUT_HOST:/out" \\
+     --container-workdir=/out --container-writable --no-container-mount-home \\
+     bash -c {shlex.quote(inner)}
+"""
+
+
+def cmd_run(args) -> int:
+    script = build_script(args)
+    image_note = args.image or "default"
+    job = {
+        "name": re.sub(r"[^A-Za-z0-9._-]+", "-", args.name)[:60] or "job",
+        "partition": args.partition,
+        "nodes": "1",
+        "tres_per_node": f"gres/gpu:{GPUS}",
+        "time_limit": {"set": True, "number": int(args.max_hours * 60)},
+        "current_working_directory": "/tmp",
+        "standard_output": f"{args.results_dir}/%j.log",
+        "standard_error": f"{args.results_dir}/%j.log",
+        "environment": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+        "comment": f"gitm model={re.sub(r'[ ]', '', args.model)} image={image_note}",
+    }
+    if args.node:
+        job["required_nodes"] = [args.node]
+    if args.dry_run:
+        print(script)
+        print(json.dumps({"job": job}, indent=2))
+        return 0
+    api = Api()
+    out = api.call("POST", "/job/submit", {"script": script, "job": job})
+    if errors(out) and any("script" in m.lower() for m in errors(out)):
+        # Newer APIs want the script inside the job description.
+        out = api.call("POST", "/job/submit", {"job": {**job, "script": script}})
+    jid = out.get("job_id") or (out.get("result") or {}).get("job_id")
+    if not jid:
+        sys.exit("gitm-submit: submit failed: " + "; ".join(errors(out) or [json.dumps(out)[:300]]))
+    print(f"submitted job {jid} as {api.user}")
+    print(f"  check it:   gitm-submit status {jid}")
+    print("  watch it:   the team status page (results appear there when it ends)")
+    return 0
+
+
+def _time(v) -> str:
+    n = v.get("number") if isinstance(v, dict) else v
+    if not n:
+        return "-"
+    import datetime
+    return datetime.datetime.fromtimestamp(n).strftime("%m-%d %H:%M")
+
+
+def _state(j: dict) -> str:
+    s = j.get("job_state")
+    return ",".join(s) if isinstance(s, list) else str(s)
+
+
+def cmd_status(args) -> int:
+    api = Api()
+    out = api.call("GET", f"/job/{args.job}")
+    jobs = out.get("jobs") or []
+    if not jobs:
+        sys.exit("gitm-submit: " + ("; ".join(errors(out)) or f"no job {args.job}"))
+    j = jobs[0]
+    print(f"job {j.get('job_id')}  {j.get('name')}  ({j.get('user_name')})")
+    print(f"  state:     {_state(j)}  {j.get('state_reason') if j.get('state_reason') not in (None, 'None') else ''}")
+    print(f"  node:      {j.get('nodes') or '-'}")
+    print(f"  submitted: {_time(j.get('submit_time'))}   started: {_time(j.get('start_time'))}   "
+          f"ended: {_time(j.get('end_time'))}")
+    print(f"  comment:   {j.get('comment', {}).get('job') if isinstance(j.get('comment'), dict) else j.get('comment')}")
+    return 0
+
+
+def cmd_ls(args) -> int:
+    api = Api()
+    out = api.call("GET", "/jobs")
+    jobs = [j for j in out.get("jobs") or [] if args.all or j.get("user_name") == api.user]
+    if not jobs:
+        print("no jobs" + ("" if args.all else f" for {api.user}"))
+        return 0
+    rows = [("JOBID", "NAME", "USER", "STATE", "NODE", "SUBMITTED")]
+    for j in sorted(jobs, key=lambda j: j.get("job_id", 0)):
+        rows.append((str(j.get("job_id")), str(j.get("name")), str(j.get("user_name")),
+                     _state(j), str(j.get("nodes") or "-"), _time(j.get("submit_time"))))
+    w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(c.ljust(x) for c, x in zip(r, w, strict=True)).rstrip())
+    return 0
+
+
+def cmd_cancel(args) -> int:
+    api = Api()
+    out = api.call("DELETE", f"/job/{args.job}")
+    if errors(out):
+        sys.exit("gitm-submit: " + "; ".join(errors(out)))
+    print(f"cancelled job {args.job}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="gitm-submit", description=__doc__.split("\n\n")[0],
+                                 epilog="Env: SLURM_JWT (required), SLURM_API, SLURM_USER, SLURM_API_VERSION.",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("run", help="queue a job (whole node, 8 GPUs, in a container)")
+    s.add_argument("--name", required=True)
+    s.add_argument("--model", required=True, help="Hugging Face model id")
+    s.add_argument("--max-hours", type=float, default=2)
+    s.add_argument("--vllm-args", help='extra vllm serve args, e.g. "--max-model-len 65536"')
+    s.add_argument("--capture-args", help='extra gitm capture args, e.g. "--requests 1024"')
+    s.add_argument("--image", help="container image (default: the cluster's pre-loaded vLLM image)")
+    s.add_argument("--gitm-ref", default="main", help="branch/tag/sha of GitM-Labs/runtime")
+    s.add_argument("--env", action="append", metavar="KEY=VALUE")
+    s.add_argument("--node", help="pin to one node, e.g. gitmachine-2")
+    s.add_argument("--partition", default="gpu")
+    s.add_argument("--results-dir", default="/var/lib/gitm/results", help=argparse.SUPPRESS)
+    s.add_argument("--dry-run", action="store_true", help="print the job instead of submitting")
+    s.add_argument("command", nargs=argparse.REMAINDER, help="-- custom command instead of the capture")
+    s.set_defaults(fn=cmd_run)
+    s = sub.add_parser("status", help="one job's state")
+    s.add_argument("job")
+    s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("ls", help="your jobs")
+    s.add_argument("--all", action="store_true", help="everyone's jobs")
+    s.set_defaults(fn=cmd_ls)
+    s = sub.add_parser("cancel", help="cancel one of your jobs")
+    s.add_argument("job")
+    s.set_defaults(fn=cmd_cancel)
+    args = ap.parse_args()
+    if getattr(args, "command", None) and args.command[:1] == ["--"]:
+        args.command = args.command[1:]
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

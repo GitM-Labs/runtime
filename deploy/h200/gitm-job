@@ -492,6 +492,8 @@ class History:
                     keep[k] = r[k]
             if r.get("log_tail"):
                 keep["log_tail"] = r["log_tail"]
+            if r.get("result"):
+                keep["result"] = r["result"]
             keep["last_seen"] = time.time()
         cutoff = time.time() - 8 * 86400
         self.seen = {k: v for k, v in self.seen.items() if v.get("last_seen", 0) > cutoff}
@@ -508,7 +510,7 @@ class History:
         out = []
         for r in rows:
             mem = self.seen.get(r["name"], {})
-            for k in ("model", "image", "log_tail", "display_name", "max_runtime_s"):
+            for k in ("model", "image", "log_tail", "display_name", "max_runtime_s", "result"):
                 if not r.get(k) and mem.get(k):
                     r[k] = mem[k]
             r.setdefault("log_tail", [])
@@ -609,6 +611,9 @@ def collect_status(cfg: dict[str, str], history: History) -> dict:
             tail = rep.get("logs", {}).get(r["name"])
             if tail:
                 r["log_tail"] = [redact(x) for x in tail]
+            res = rep.get("results", {}).get(r["name"])
+            if res:
+                r["result"] = res
         n["job"] = next((r["name"] for r in live if r["node"] == n["name"]), None)
     for r in recs:
         r.setdefault("log_tail", [])
