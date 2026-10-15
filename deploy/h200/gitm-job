@@ -664,6 +664,82 @@ class GitPublisher:
         self._git("push", "-q", "--force", self.remote, f"{commit}:refs/heads/{self.branch}")
 
 
+PAGE_PASSWORD_FILE = os.path.join(CONF_DIR, "page_password")
+KDF_ITERATIONS = 600_000
+
+
+class PageSealer:
+    """Encrypts status.json with the team page password (AES-256-GCM, key from
+    PBKDF2-SHA256). The status page decrypts it in the browser with WebCrypto;
+    the public repo only ever holds ciphertext.
+
+    The password file is re-read every cycle, so a new password takes effect on
+    the next push without restarting the service."""
+
+    def __init__(self, path: str = PAGE_PASSWORD_FILE):
+        self.path = path
+        self._fingerprint = None
+        self._key = self._salt = None
+
+    def password_changed(self) -> bool:
+        pw = self._read()
+        fp = hashlib.sha256(pw.encode()).hexdigest()
+        if fp == self._fingerprint:
+            return False
+        try:
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        except ImportError:
+            raise RuntimeError("python3-cryptography is missing: sudo apt-get install -y python3-cryptography") from None
+        self._salt = os.urandom(16)
+        self._key = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=self._salt,
+                               iterations=KDF_ITERATIONS).derive(pw.encode())
+        changed = self._fingerprint is not None
+        self._fingerprint = fp
+        return changed
+
+    def _read(self) -> str:
+        try:
+            with open(self.path) as f:
+                pw = f.read().strip()
+        except OSError:
+            pw = ""
+        if not pw:
+            raise RuntimeError("no page password set, refusing to publish status in the clear. "
+                               "Set one with: sudo gitm-job set-page-password")
+        return pw
+
+    def seal(self, text: str) -> str:
+        import base64
+
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        self.password_changed()
+        iv = os.urandom(12)
+        ct = AESGCM(self._key).encrypt(iv, text.encode(), None)
+        b64 = lambda b: base64.b64encode(b).decode()  # noqa: E731
+        return json.dumps({"sealed": 1, "alg": "AES-256-GCM", "kdf": "PBKDF2-SHA256",
+                           "iter": KDF_ITERATIONS, "salt": b64(self._salt), "iv": b64(iv),
+                           "data": b64(ct)})
+
+
+def cmd_set_page_password(args) -> int:
+    if os.geteuid() != 0:
+        sys.exit("gitm-job: run with sudo")
+    pw = getpass.getpass("New page password: ")
+    if len(pw) < 10:
+        sys.exit("gitm-job: use at least 10 characters")
+    if getpass.getpass("Again: ") != pw:
+        sys.exit("gitm-job: passwords don't match")
+    os.makedirs(CONF_DIR, exist_ok=True)
+    fd = os.open(PAGE_PASSWORD_FILE + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(pw + "\n")
+    os.replace(PAGE_PASSWORD_FILE + ".tmp", PAGE_PASSWORD_FILE)
+    print("Saved. The page switches to the new password within a minute; "
+          "anyone with the old one is asked again.")
+    return 0
+
+
 def cmd_push_status(args) -> int:
     cfg = load_config()
     history = History(cfg)
@@ -673,11 +749,14 @@ def cmd_push_status(args) -> int:
             sys.exit("gitm-job: STATUS_REPO missing from /etc/gitm-gpu/config")
         pub = GitPublisher(cfg["STATUS_REPO"])
 
+    sealer = None if args.plaintext else PageSealer()
     last_state_key = last_full_key = None
     last_push = 0.0
     failures = 0
     while True:
         try:
+            if sealer and sealer.password_changed():
+                last_state_key = None   # new password: re-publish now
             status = collect_status(cfg, history)
             body = {k: v for k, v in status.items() if k != "updated"}
             full_key = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
@@ -694,6 +773,8 @@ def cmd_push_status(args) -> int:
                     or (full_key != last_full_key and since >= args.min_interval)
                     or since >= args.heartbeat):
                 text = json.dumps(status, indent=1)
+                if sealer:
+                    text = sealer.seal(text)
                 if args.out:
                     with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(os.path.abspath(args.out)),
                                                      delete=False) as f:
@@ -761,7 +842,11 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--heartbeat", type=float, default=300)
     s.add_argument("--once", action="store_true")
     s.add_argument("--out", help="write status.json here instead of pushing (testing)")
+    s.add_argument("--plaintext", action="store_true", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_push_status)
+
+    s = sub.add_parser("set-page-password", help="set the password for the team status page (admin)")
+    s.set_defaults(fn=cmd_set_page_password)
 
     args = ap.parse_args(argv)
     if getattr(args, "command", None) and args.command[:1] == ["--"]:

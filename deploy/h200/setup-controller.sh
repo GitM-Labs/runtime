@@ -288,6 +288,8 @@ echo "bundle: $BUNDLE  (contains the munge key: delete it after joining)"
 
 # ---------------------------------------------------------------------------
 step "Status pusher"
+python3 -c 'import cryptography' 2>/dev/null || apt-get install -y -qq python3-cryptography >/dev/null
+[[ -s "$CONF_DIR/page_password" ]] || warn "no page password yet; the pusher publishes nothing until you run: sudo gitm-job set-page-password"
 install -m 644 "$HERE/gitm-status.service" /etc/systemd/system/gitm-status.service
 systemctl daemon-reload
 systemctl enable gitm-status >/dev/null
