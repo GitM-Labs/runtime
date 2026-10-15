@@ -273,6 +273,8 @@ def test_a_failed_restore_is_not_kept():
     assert not lost.kept
     assert ApplyResult(True, rolled_back=False, measured_delta=0.1).kept
     assert not ApplyResult(True, rolled_back=True, measured_delta=-0.1).kept
+    assert not ApplyResult(False, rolled_back=False, measured_delta=None,
+                           error="snapshot failed, nothing applied").kept
 
 
 def test_the_export_does_not_record_a_failed_restore_as_kept():
@@ -337,6 +339,44 @@ def test_autoresearch_counts_what_it_never_reached(monkeypatch):
     assert set(not_applied) == {"knob_2", "knob_4", "knob_6"}
     assert not_applied["knob_6"].startswith("history:")
     assert len(run.results) == 4
+
+
+def test_a_gate_still_running_stops_the_pass_like_a_failed_restore(monkeypatch):
+    """A refusal that reads as an ordinary apply failure let the pass spend
+    every remaining candidate on it."""
+    import threading
+
+    import gitm.agents.autoresearch as ar
+    from gitm.agents.policy import RankedCandidate
+    from gitm.optimizer.apply import DictApplicator
+
+    specs = [_spec(f"knob_{i}", 1) for i in range(3)]
+    monkeypatch.setattr(ar, "select_interventions", lambda *a, **kw: [
+        RankedCandidate(spec=s, predicted_delta=0.05) for s in specs])
+
+    class _Proposer:
+        def propose(self, cls, target_op=None):
+            return specs
+
+    release = threading.Event()
+    hung = _spec().model_copy(update={"correctness_gate": lambda _s: release.wait(10),
+                                      "safety": _spec().safety.model_copy(
+                                          update={"correctness_gate_timeout_s": 0.2})})
+    try:
+        assert "timed out" in apply_intervention(
+            hung, DictApplicator({"block_size": 8}, measure_fn=lambda s: 0.1)).error
+        run = ar.autoresearch(_trace(), applicator=object(), proposer=_Proposer())
+    finally:
+        release.set()
+        for t in threading.enumerate():
+            if t.name.startswith("correctness-gate"):
+                t.join(5)
+
+    assert len(run.results) == 1
+    first = run.results[0].apply_result
+    assert first.restore_failed and not first.applied
+    assert "still running" in first.error
+    assert run.n_untried == 2
 
 
 def test_phase4_still_records_what_the_gate_rejected(tmp_path, monkeypatch):
@@ -668,3 +708,35 @@ def test_a_release_that_fails_on_keep_does_not_undo_the_keep():
 
     res = apply_intervention(_spec(), _App(), min_keep_delta=0.0)
     assert res.kept and "releasing the replaced engine failed" in res.error
+
+
+def test_autoresearch_does_not_start_when_the_catalogue_stopped_for_time(tmp_path, monkeypatch):
+    """A catalogue pass that stopped because the next candidate would overrun
+    the budget used to hand the remainder to autoresearch, which started a
+    build anyway as long as the budget was not yet spent."""
+    from gitm.agents.policy import RankedCandidate
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield _trace(run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "select_interventions", lambda *a, **kw: [
+        RankedCandidate(spec=_spec("a", 1), predicted_delta=0.05),
+        RankedCandidate(spec=_spec("b", 2), predicted_delta=0.04)])
+    monkeypatch.setattr(loop, "apply_intervention", lambda *a, **kw: ApplyResult(
+        True, rolled_back=True, measured_delta=-0.01))
+    # Time for the first candidate, none for a second.
+    monkeypatch.setattr(loop, "_next_cycle_overruns", lambda _e, _b, cycles: (
+        "1 min left, and a candidate has taken 50 min on average" if cycles else None))
+    started = []
+    monkeypatch.setattr(loop, "autoresearch", lambda *a, **kw: started.append(1))
+
+    out = loop.run_loop(loop.LoopConfig(budget="5h", scratch=str(tmp_path),
+                                        workload_runner=_Runner()))
+    assert started == []
+    assert out["summary"]["n_untried"] == 1                     # b
+    reasons = [d["reason"] for d in json.loads(
+        (Path(out["run_dir"]) / "degradations.json").read_text())["items"]]
+    assert any("would be overrun" in r and "50 min" in r for r in reasons)

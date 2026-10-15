@@ -32,6 +32,27 @@ def test_catalogue_graph_and_raw_config_gate():
     assert len(graph.nodes) > 1000
 
 
+@pytest.mark.parametrize("tp", [1, 8])
+def test_deepseek_draft_graph_separate_tables_and_order(tp):
+    spec = load_spec("deepseek-v3.2")
+    graph, _ = predict(
+        "deepseek-v3.2",
+        batch=BatchConfig(batch=2, kv_cache_len=4096, speculative_tokens=2),
+        sharding=ShardingConfig(tp=tp),
+    )
+    for stage in range(2):
+        nodes = [n for n in graph.nodes if n.layer == spec.n_layers + stage]
+        ops = [n.op for n in nodes]
+        assert ops[:3] == ["embed_tokens", "rms_norm", "mtp_eh_proj"]
+        assert ops[-1] == "lm_head"
+        assert ops.count("embed_tokens") == ops.count("lm_head") == 1
+        assert ops.index("mtp_eh_proj") < ops.index("attn_index_proj") < len(ops) - 1
+        for op in ("embed_tokens", "mtp_eh_proj", "lm_head"):
+            assert next(n for n in nodes if n.op == op).prediction.dtype == "bf16"
+        # Each draft head projects one row per sequence, vocabulary-sharded by TP.
+        assert nodes[-1].prediction.flops == 2 * 2 * spec.hidden * (spec.vocab // tp)
+
+
 def test_header_manifest_closes_exact_stored_bytes_but_formula_does_not():
     entry = model_catalogue.load_entry("deepseek-v3.2")
     manifest = json.loads((model_catalogue.CATALOGUE_DIR / entry["checkpoint"]["header_manifest"]).read_text())

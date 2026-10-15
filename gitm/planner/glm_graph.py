@@ -172,9 +172,34 @@ class GlmMoeDsaModelSpec:
     #: A tuple, not a mapping, so the spec stays hashable. Read from the
     #: checkpoint, never assumed — see the module docstring.
     op_dtype_overrides: tuple[tuple[str, str], ...] = ()
-    #: Stored precision may differ from the graph's execution precision. For
-    #: example DeepSeek's router is stored bf16 but priced as fp32 compute.
+    #: Tensor storage can differ from the runtime execution dtype.
     stored_dtype_overrides: tuple[tuple[str, str], ...] = ()
+
+    #: Independent index-key storage; absent retains kv_dtype exactly. Scale
+    #: bytes are per cached key/token, not per head or per weight block.
+    index_kv_dtype: str | None = None
+    index_scale_bytes_per_token: int = 0
+
+    def __post_init__(self):
+        if type(self.index_scale_bytes_per_token) is not int or self.index_scale_bytes_per_token < 0:
+            raise ValueError('index_scale_bytes_per_token must be a nonnegative integer')
+        if self.index_kv_dtype is not None and (
+            not isinstance(self.index_kv_dtype, str)
+            or self.index_kv_dtype not in {'bf16', 'fp16', 'fp32', 'fp8'}
+        ):
+            raise ValueError('unsupported index_kv_dtype')
+
+    @property
+    def index_entry_bytes(self) -> float:
+        """One stored index key including explicitly declared per-token scales."""
+        dtype = self.kv_dtype if self.index_kv_dtype is None else self.index_kv_dtype
+        return self.index_head_dim * kv_elem_bytes(dtype) + self.index_scale_bytes_per_token
+
+    def index_cache_bytes(self, entries: float) -> float:
+        if self.index_kv_dtype is None and self.index_scale_bytes_per_token == 0:
+            # Preserve the original multiplication order for legacy callers.
+            return entries * self.index_head_dim * kv_elem_bytes(self.kv_dtype)
+        return entries * self.index_entry_bytes
 
     # ── derived shapes / schedule ────────────────────────────────────────────
 
@@ -534,9 +559,8 @@ def kv_bytes_per_token(spec: GlmMoeDsaModelSpec) -> float:
     Flat across layers — there is no compression schedule to sum over — but the
     indexer key is only cached where an indexer runs.
     """
-    kw = kv_elem_bytes(spec.kv_dtype)
     latent = spec.n_layers * kv_entry_bytes(spec)
-    index_keys = spec.n_full_indexer_layers * spec.index_head_dim * kw
+    index_keys = spec.index_cache_bytes(spec.n_full_indexer_layers)
     return latent + index_keys
 
 
@@ -733,12 +757,12 @@ def _emit_layer(
         add(
             "attn_index_proj",
             f_q + f_k + f_g,
-            b_q + b_k + b_g + rows * spec.index_head_dim * kv_elem_bytes(spec.kv_dtype),
+            b_q + b_k + b_g + spec.index_cache_bytes(rows),
             wd,
         )
 
         # Two dtypes, two questions: the *bytes* follow how the keys are stored
-        # (``kv_dtype``), the *FLOPs* follow what the indexer computes in — and the
+        # (independent index storage), the *FLOPs* follow what the indexer computes in — and the
         # indexer is one of the modules the quantiser skipped. Invisible at decode
         # (memory-bound at every context); doubles the prefill row.
         add(
@@ -752,8 +776,7 @@ def _emit_layer(
             # Index keys live in the cache: read once per sequence (or per
             # prefilling request), not per position, and replicated across ranks
             # alongside the KV latent.
-            index_scan_entries(batch) * spec.index_head_dim
-            * kv_elem_bytes(spec.kv_dtype),
+            spec.index_cache_bytes(index_scan_entries(batch)),
             spec.dtype_for("attn_index_proj", wd),
         )
 
@@ -1376,5 +1399,7 @@ def spec_from_hf_config(
         # The config declares no cache dtype; bf16 is the model fact. A served
         # deployment may pick fp8 — that is a serving decision, set at deploy time.
         kv_dtype=dtype,
+        index_kv_dtype=cfg.get("index_kv_dtype"),
+        index_scale_bytes_per_token=cfg.get("index_scale_bytes_per_token", 0),
         act_dtype=dtype,
     )

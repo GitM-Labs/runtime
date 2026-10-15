@@ -239,6 +239,8 @@ def predict(
 ):
     """``(graph, family)`` for a catalogue entry — the one-call path."""
     entry = load_entry(name_or_path)
+    if entry.get("execution_status") == "static_only":
+        raise ValueError(f"{name_or_path}: checkpoint evidence only; planner integration pending")
     spec = load_spec(name_or_path)
     family = entry["family"]
 

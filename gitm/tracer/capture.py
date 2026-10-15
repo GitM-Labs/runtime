@@ -127,12 +127,14 @@ def capture(
             try:
                 injection.settle()
                 injection.disarm()
-                trace.events = injection.read_shards(window_start, window_end)
+                trace.events, trace.dropped_records = injection.read_shards_with_loss(
+                    window_start, window_end)
             except Exception as exc:
                 warnings.warn(f"trace capture incomplete: shard merge failed: {exc}", stacklevel=2)
         elif backend is not None:
             try:
                 trace.events = backend.stop()
+                trace.dropped_records = getattr(backend, "dropped_records", None)
             except Exception as exc:
                 warnings.warn(f"trace capture incomplete: backend.stop() failed: {exc}", stacklevel=2)
         trace.duration_ns = ended_ns - started_ns
@@ -160,6 +162,7 @@ def write_trace_jsonl(path: str | Path, trace: Trace) -> None:
             "captured_at_ns": trace.captured_at_ns,
             "duration_ns": trace.duration_ns,
             "source": getattr(trace, "source", "cupti"),
+            "dropped_records": getattr(trace, "dropped_records", None),
         }
         fh.write(json.dumps({"_header": header}))
         fh.write("\n")

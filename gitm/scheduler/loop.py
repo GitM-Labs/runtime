@@ -103,6 +103,57 @@ from gitm.workloads import WorkloadRunner, get_factory, sync_device
 #: range earlier runs saw on any setup.
 _THRESHOLD_WITHOUT_FLOOR = 0.02
 
+#: A re-trace that cannot change the order is skipped (see _retrace_skip_reason),
+#: but never this many times in a row: a kept lever can create pressure the run
+#: did not show before, and only a re-trace would see it.
+_RETRACE_ANYWAY_EVERY = 3
+
+
+def _retrace_skip_reason(queue: list[Any], *, floors_priced: bool,
+                         causes_seen: bool) -> str | None:
+    """Why a re-trace could not change the order of what is left, or ``None``.
+
+    A re-trace re-orders on three things: time above floor per op (only with
+    floors priced for this run), the scheduler and collective causes it
+    re-samples, and coverage, how much of the fresh trace each op-scoped lever
+    touches. With no priced floors, no cause seen so far, and only whole-step
+    levers left (coverage 1.0 for every one), none of the three can move, and
+    the re-trace costs two engine builds and a capture for nothing: about 23
+    minutes per candidate on Kimi K2.5 at TP=8.
+    """
+    if floors_priced or causes_seen:
+        return None
+    live = [x for x in queue if x.rejected_reason is None]
+    if any(not x.spec.whole_step and x.spec.applies_to_kernels for x in live):
+        return None
+    return ("the floors were not priced for this run, no scheduler or collective "
+            "cause has been observed, and every candidate left is whole-step, so a "
+            "re-trace could not change their order")
+
+
+def _next_cycle_overruns(elapsed_s: float, budget_s: float,
+                         cycle_s: list[float]) -> str | None:
+    """Why the next candidate should not start, or ``None`` if it fits.
+
+    ``cycle_s`` holds how long each candidate this run measured took, from the
+    start of its A/B to the end of its re-trace. Checking only that the budget
+    is not yet spent starts a candidate with a minute left: the first Kimi K2.5
+    run on MI355X started its last one 35 s before a 5 h budget ended and
+    overran by 19 minutes. So a candidate starts only if the time left covers
+    the mean of the ones before it. The first has nothing to go by, and starts
+    whenever the budget is not spent.
+    """
+    left = budget_s - elapsed_s
+    if left <= 0:
+        return "spent"
+    if cycle_s:
+        mean = sum(cycle_s) / len(cycle_s)
+        if left < mean:
+            return (f"{left / 60:.0f} min left, and a candidate has taken "
+                    f"{mean / 60:.0f} min on average")
+    return None
+
+
 _BUDGET_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd])\s*$")
 
 # Workloads the predicted graph + intervention library actually model. Anything
@@ -1632,6 +1683,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # to writing up what it has.
     engine_lost: str | None = early_engine_lost or calibration_lost
     n_untried = 0
+    # Whether any scheduler or collective cause has fired so far this run, and
+    # how many re-traces in a row were skipped (see _retrace_skip_reason).
+    causes_seen = bool(_motivated)
+    retrace_skips = 0
     if engine_lost is not None and isinstance(applicator, LiveEngineApplicator):
         # The engine was lost before the first candidate (a failed noise
         # calibration): there is nothing to measure them against.
@@ -1640,7 +1695,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                         for x in queue if x.rejected_reason is not None)
         queue = []
 
-    def _stop_at_budget() -> int:
+    def _stop_at_budget(why: str = "spent") -> int:
         """The queue left behind when the budget stops Phase 4, accounted for.
 
         Without this the loop just broke out: the summary said nothing was left
@@ -1654,15 +1709,25 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         if left:
             degradations.record(
                 BUDGET_SPENT, used="a Phase 4 that stopped at the budget",
-                reason=f"budget {cfg.budget} spent; {left} ranked candidate(s) not tried",
+                reason=f"budget {cfg.budget} {why}; {left} ranked candidate(s) not tried",
                 severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
         return left
 
+    # How long each measured candidate took, A/B and re-trace together, for
+    # _next_cycle_overruns; and when the one in progress started.
+    cycle_s: list[float] = []
+    cycle_started_ns: int | None = None
     while queue:
-        if time.time_ns() - started_ns >= int(budget_s * 1e9):
+        if cycle_started_ns is not None:
+            cycle_s.append((time.time_ns() - cycle_started_ns) / 1e9)
+            cycle_started_ns = None
+        overrun = _next_cycle_overruns((time.time_ns() - started_ns) / 1e9, budget_s, cycle_s)
+        if overrun is not None:
             # The budget can run out before a candidate starts (the noise
-            # calibration spends it too): do not start an A/B it cannot afford.
-            n_untried = _stop_at_budget()
+            # calibration spends it too), or be too short for one to finish:
+            # do not start an A/B it cannot afford.
+            n_untried = _stop_at_budget(overrun if overrun == "spent"
+                                        else f"would be overrun ({overrun})")
             break
         c = queue.pop(0)
         if c.rejected_reason is not None:
@@ -1675,6 +1740,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         if cfg.engine is not None and live_restart_fn is None and _has_structural_knob(c.spec):
             rejected.append(f"{c.spec.name} (structural knob: needs engine restart, no restart_fn)")
             continue
+        cycle_started_ns = time.time_ns()
         # Snapshot the engine config BEFORE the apply: a hot-swap mutates these
         # kwargs in place and a restart replaces the engine outright, so reading
         # them afterwards would report the candidate on both sides of the diff.
@@ -1764,6 +1830,29 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             break
 
         if cfg.rerank == "recapture" and queue:
+            skip = (_retrace_skip_reason(queue, floors_priced=_floors_priced_for_this_run,
+                                         causes_seen=causes_seen)
+                    if retrace_skips < _RETRACE_ANYWAY_EVERY - 1 else None)
+            if skip is not None:
+                retrace_skips += 1
+                order = [x.spec.name for x in queue]
+                reranks.append({
+                    "after": c.spec.name,
+                    "measured_delta": result.measured_delta,
+                    "recaptured": False,
+                    "skipped": skip,
+                    "error": None,
+                    "order_before": order,
+                    "order_after": order,
+                    "changed": False,
+                    "causes": sorted(set(_motivated.values())),
+                    "targeted": False,
+                    "batch_priced": getattr(_batch, "batch", None),
+                    "batch_observed": None,
+                    "not_targeted_because": None,
+                })
+                continue
+            retrace_skips = 0
             # After the gate has decided, so the tracing overhead never lands on
             # the A/B that decides keep or rollback.
             step = len(reranks) + 1
@@ -1780,7 +1869,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                                       "error": swap_err})
                 fresh, why, motivated_now, batch_now = None, swap_err, {}, None
                 if traced_engine is not None:
-                    applicator.engine = traced_engine
+                    applicator.install(traced_engine)
                     fresh, why, motivated_now, batch_now = _recapture(
                         rerank_path, workload=workload, run_id=run_id, runner=runner,
                         engine=traced_engine)
@@ -1789,7 +1878,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                     tracing_swaps.append({"when": f"after re-trace {step}",
                                           "to": "untraced", "error": swap_err})
                     if back is not None:
-                        applicator.engine = back
+                        applicator.install(back)
                 if swap_err is not None:
                     engine_lost = f"could not swap engines for re-trace {step}: {swap_err}"
                     n_untried = sum(1 for x in queue if x.rejected_reason is None)
@@ -1849,6 +1938,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 "batch_observed": getattr(batch_now, "batch", None),
                 "not_targeted_because": not_targeted,
             })
+            causes_seen = causes_seen or bool(_motivated)
             # The re-capture runs the workload, so it spends budget. Checked
             # again here because the check above ran before that spend: a
             # candidate cycle started on its strength could overrun by a whole
@@ -1856,6 +1946,11 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             if time.time_ns() - started_ns >= int(budget_s * 1e9):
                 n_untried = _stop_at_budget()
                 break
+
+    if cycle_started_ns is not None:
+        # The last candidate's cycle, which no later iteration closed: the
+        # autoresearch pass below goes by these too.
+        cycle_s.append((time.time_ns() - cycle_started_ns) / 1e9)
 
     if tracing_swaps:
         # Which engines carried the tracer, and every swap between them. A reader
@@ -1874,7 +1969,15 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         }, indent=2))
 
     # Phase 4b - agentic autoresearch through the catalog gate/rollback path.
-    if engine_lost is None and time.time_ns() - started_ns < int(budget_s * 1e9):
+    # The same rule as Phase 4: no pass, and no candidate within it, that the
+    # budget left cannot finish. Otherwise a catalogue pass that stopped early
+    # for that reason handed the remainder to an autoresearch build that
+    # overran it anyway.
+    ar_overrun = _next_cycle_overruns((time.time_ns() - started_ns) / 1e9, budget_s, cycle_s)
+    ar_deadline_ns = started_ns + int(budget_s * 1e9)
+    if cycle_s:
+        ar_deadline_ns -= int(sum(cycle_s) / len(cycle_s) * 1e9)
+    if engine_lost is None and ar_overrun is None:
         proposer = FallbackProposer(EngineArgsProposer(), TableProposer())
 
         def _unenactable(spec: Any) -> str | None:
@@ -1936,9 +2039,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             gpu_sku=pctx.sku,
             fingerprint=qual.fingerprint,
             degradations=degradations,
-            # The same deadline Phase 4 stops on. Without it the pass ran every
+            # The last moment a candidate can start and still finish, by Phase
+            # 4's mean candidate. Without a deadline the pass ran every
             # proposal regardless, and a 15-minute run took 36 (P2-7).
-            deadline_ns=started_ns + int(budget_s * 1e9),
+            deadline_ns=ar_deadline_ns,
             on_result=_checkpoint_ar,
         )
         if _catalogue_validation is not None:
@@ -1950,7 +2054,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         ar_run.degradations.append(Degradation(
             AR_SKIPPED, used="no autoresearch pass",
             reason=(f"engine lost in Phase 4: {engine_lost}" if engine_lost is not None
-                    else f"budget {cfg.budget} exhausted by Phase 4"),
+                    else f"budget {cfg.budget} exhausted by Phase 4" if ar_overrun == "spent"
+                    else f"budget {cfg.budget} would be overrun ({ar_overrun})"),
             severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,)))
     degradations.extend(ar_run.degradations)
     lost_in_ar = next((r for r in ar_run.results
@@ -1966,8 +2071,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         n_untried += ar_run.n_untried
         degradations.record(
             AR_SKIPPED, used="an autoresearch pass stopped at the budget",
-            reason=(f"budget {cfg.budget} spent; {ar_run.n_untried} ranked "
-                    "candidate(s) not tried"),
+            reason=(f"budget {cfg.budget} left no time for another candidate; "
+                    f"{ar_run.n_untried} ranked candidate(s) not tried"),
             severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
     # Again, now that autoresearch has had its proposals vetoed: an exclusion
     # that only stopped a proposal is still something the run held back, and a
@@ -2111,6 +2216,12 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             "threshold_without_floor": _THRESHOLD_WITHOUT_FLOOR,
             "calibration_samples": noise_calibration,
             "samples": _noise.samples,
+            # Baseline measurements left out of the samples because they were a
+            # second measurement on an engine, not the first after its build.
+            "skipped_not_fresh": _noise.skipped_not_fresh,
+            # The calibration's warm-up pair: the first rebuilt baseline against
+            # the engine running before it, left out of the floor.
+            "warmup_sample": _noise.warmup,
             "floor": _noise.floor,
             "threshold": {
                 str(r): _noise.threshold(mean_noise_factor(r, rebuilt=True),

@@ -179,9 +179,9 @@ def test_window_filter_drops_records_outside_the_capture_window(run_env):
 
 
 def test_collector_drop_report_warns_and_is_not_an_event(run_env):
-    """The ROCm collector writes {"kind":"meta","dropped_records":N} when
-    rocprofiler drops records. It must surface as a loss warning, not decode as
-    an event and not count as a malformed line."""
+    """A collector writes {"kind":"meta","dropped_records":N} for every armed
+    buffer. A non-zero count must surface as a loss warning, not decode as an
+    event and not count as a malformed line."""
     shard = run_env.with_name(run_env.name + ".111")
     shard.write_text(
         json.dumps({"kind": "meta", "dropped_records": 7}) + "\n"
@@ -190,6 +190,47 @@ def test_collector_drop_report_warns_and_is_not_an_event(run_env):
     with pytest.warns(RuntimeWarning, match="7 record"):
         events = injection.read_shards()
     assert [e.name for e in events] == ["k"]
+
+
+def test_loss_count_is_known_only_when_every_shard_reports_one(run_env, monkeypatch):
+    """Zero must mean a collector counted and found none, never that it could not count."""
+    monkeypatch.setattr(injection, "_pid_alive", lambda pid: True)
+    meta = lambda n, ts=None: json.dumps(  # noqa: E731
+        {"kind": "meta", "dropped_records": n, **({"timestamp_ns": ts} if ts else {})})
+    a = run_env.with_name(run_env.name + ".111")
+    b = run_env.with_name(run_env.name + ".222")
+    a.write_text(meta(0, 60) + "\n" + _kernel("k", 100, 200) + "\n")
+    assert injection.read_shards_with_loss()[1] == 0
+
+    # A second shard from a library that writes no count: unknown, not zero.
+    b.write_text(_kernel("old", 300, 400) + "\n")
+    assert injection.read_shards_with_loss()[1] is None
+    # Even when none of its events fall in the window: its buffers may not have landed.
+    assert injection.read_shards_with_loss(50, 250)[1] is None
+    # An empty shard, and one holding only an earlier capture's count, are as silent.
+    for silent in ("", meta(0, 10) + "\n" + _kernel("old", 20, 30) + "\n"):
+        b.write_text(silent)
+        assert injection.read_shards_with_loss(50, 250)[1] is None, silent
+
+    # Collector drops and unreadable lines add up; a count from before the window is
+    # an earlier capture's, and a collector that could not say leaves it unknown.
+    b.write_text(meta(4, 10) + "\n" + meta(2, 150) + "\n" + _kernel("k2", 120, 130)
+                 + "\n" + '{"kind":"kernel","na')
+    with pytest.warns(RuntimeWarning):
+        assert injection.read_shards_with_loss(50, 250)[1] == 3
+    b.write_text(meta(-1, 150) + "\n" + _kernel("k2", 120, 130) + "\n")
+    assert injection.read_shards_with_loss(50, 250)[1] == -1  # lost, and not counted
+
+
+def test_a_process_that_died_without_its_final_line_leaves_the_loss_unknown(run_env, monkeypatch):
+    """A killed worker's last buffers never reach its shard; an orderly exit says so."""
+    monkeypatch.setattr(injection, "_pid_alive", lambda pid: False)
+    shard = run_env.with_name(run_env.name + ".111")
+    body = json.dumps({"kind": "meta", "dropped_records": 0}) + "\n" + _kernel("k", 1, 2) + "\n"
+    shard.write_text(body)
+    assert injection.read_shards_with_loss()[1] == -1
+    shard.write_text(body + json.dumps({"kind": "meta", "final": True, "timestamp_ns": 3}) + "\n")
+    assert injection.read_shards_with_loss()[1] == 0
 
 
 def test_partial_trailing_line_from_a_killed_process_is_tolerated(run_env):
@@ -435,6 +476,78 @@ def test_a_truncated_final_line_is_still_reported(tmp_path, monkeypatch):
         injection.read_shards()
     assert any("malformed or incomplete" in str(c.message) for c in caught)
 
+
+def test_loss_count_edges(run_env, monkeypatch):
+    """What must leave the loss unknown, and what counts as a lost record."""
+    monkeypatch.setattr(injection, "_pid_alive", lambda pid: True)
+    meta = lambda n, **kw: json.dumps({"kind": "meta", "dropped_records": n, **kw})  # noqa: E731
+    shard = run_env.with_name(run_env.name + ".111")
+    good = meta(0, timestamp_ns=150) + "\n" + _kernel("k", 160, 170) + "\n"
+    shard.write_text(good)
+    assert injection.read_shards_with_loss(100, 300)[1] == 0
+    # A count exactly at the window start is this window's.
+    shard.write_text(meta(2, timestamp_ns=100) + "\n" + _kernel("k", 160, 170) + "\n")
+    with pytest.warns(RuntimeWarning):
+        assert injection.read_shards_with_loss(100, 300)[1] == 2
+    # A stamp of 0 is a failed clock read, not an earlier capture; true is not a count.
+    for bad in (meta(4096, timestamp_ns=0), meta(1, timestamp_ns=True), meta(True)):
+        shard.write_text(good + bad + "\n")
+        assert injection.read_shards_with_loss(100, 300)[1] is None, bad
+    # Lines that are not records, and records the decoder has no model for, are lost.
+    shard.write_text(good + "[1]\n" + json.dumps({"kind": "kernel", "start_ns": "x"}) + "\n"
+                     + json.dumps({"kind": "novel", "start_ns": 165}) + "\n")
+    with pytest.warns(RuntimeWarning):
+        assert injection.read_shards_with_loss(100, 300)[1] == 3
+
+
+def test_an_unreadable_shard_leaves_the_loss_unknown(run_env, monkeypatch):
+    monkeypatch.setattr(injection, "_pid_alive", lambda pid: True)
+    ok = run_env.with_name(run_env.name + ".111")
+    ok.write_text(json.dumps({"kind": "meta", "dropped_records": 0}) + "\n"
+                  + _kernel("k", 100, 200) + "\n")
+    bad = run_env.with_name(run_env.name + ".222")
+    bad.write_text("x")
+    bad.chmod(0)
+    try:
+        with pytest.warns(RuntimeWarning, match="unreadable"):
+            assert injection.read_shards_with_loss()[1] == -1
+    finally:
+        bad.chmod(0o644)
+
+
+def test_capture_writes_the_merged_loss_count_to_the_header(run_env, tmp_path, monkeypatch):
+    monkeypatch.setattr(injection, "clock_now", lambda: None)
+    monkeypatch.setattr(injection, "settle", lambda: None)
+    monkeypatch.setattr(injection, "_pid_alive", lambda pid: True)
+    out = tmp_path / "trace.jsonl"
+    with pytest.warns(Warning), capture(out) as trace:
+        run_env.with_name(run_env.name + ".111").write_text(
+            json.dumps({"kind": "meta", "dropped_records": 4}) + "\n" + _kernel("k", 1, 2) + "\n")
+    assert trace.dropped_records == 4
+    assert json.loads(out.read_text().splitlines()[0])["_header"]["dropped_records"] == 4
+
+
+def test_what_cannot_be_placed_or_was_never_collected_is_unknown(run_env, monkeypatch):
+    # No shard at all: the collector never loaded, which is not a capture with zero loss.
+    assert injection.read_shards_with_loss(100, 300) == ([], None)
+    shard = run_env.with_name(run_env.name + ".111")
+    k = _kernel("k", 160, 170) + "\n"
+    meta = lambda n, **kw: json.dumps({"kind": "meta", "dropped_records": n, **kw}) + "\n"  # noqa: E731
+    monkeypatch.setattr(injection, "_pid_alive", lambda pid: True)
+    # A count with no stamp cannot be placed in a window; a float or text stamp is not one.
+    for line in (meta(0), meta(0, timestamp_ns=150.0), meta(0, timestamp_ns="150")):
+        shard.write_text(meta(0, timestamp_ns=150) + k + line)
+        assert injection.read_shards_with_loss(100, 300)[1] is None, line
+    # A count stamped after the window's end still counts: the last buffer lands during settle.
+    shard.write_text(meta(2, timestamp_ns=400) + k)
+    with pytest.warns(RuntimeWarning):
+        assert injection.read_shards_with_loss(100, 300)[1] == 2
+    # A dead process with a count and no final line is unknown, whatever else it wrote.
+    monkeypatch.setattr(injection, "_pid_alive", lambda pid: False)
+    shard.write_text(meta(0, timestamp_ns=150) + json.dumps(
+        {"kind": "marker", "timestamp_ns": 160, "marker_id": 1, "marker_flags": 0, "name": "x",
+         "thread_id": 1}) + "\n")
+    assert injection.read_shards_with_loss(100, 300)[1] == -1
 
 
 def _cli_run_env(monkeypatch, vendor, argv0="/venv/bin/gitm"):

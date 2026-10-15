@@ -1,0 +1,133 @@
+{
+  "scope": "field coverage and real loader rejection; semantic closure still requires consumer review",
+  "submission_sha256": "0434ec56c155fa7a0cd3c58ffffd0c331d92a32c410770d095a84b4562d2833b",
+  "flagged_scalar_count": 15,
+  "reconciled_scalars": [
+    {
+      "register_id": "K3-01",
+      "field": "q_lora_rank",
+      "value": 1536,
+      "present_in_hybrid_schema": false
+    },
+    {
+      "register_id": "K3-01",
+      "field": "kv_lora_rank",
+      "value": 512,
+      "present_in_hybrid_schema": false
+    },
+    {
+      "register_id": "K3-01",
+      "field": "qk_nope_head_dim",
+      "value": 128,
+      "present_in_hybrid_schema": false
+    },
+    {
+      "register_id": "K3-01",
+      "field": "qk_rope_head_dim",
+      "value": 64,
+      "present_in_hybrid_schema": false
+    },
+    {
+      "register_id": "K3-01",
+      "field": "mla_use_nope",
+      "value": true,
+      "present_in_hybrid_schema": false
+    },
+    {
+      "register_id": "K3-01",
+      "field": "mla_cache_elems_per_token",
+      "value": 576,
+      "present_in_hybrid_schema": false
+    },
+    {
+      "register_id": "K3-02",
+      "field": "linear_conv_channels",
+      "value": 36864,
+      "present_in_hybrid_schema": true
+    },
+    {
+      "register_id": "K3-02",
+      "field": "linear_conv_state_dtype",
+      "value": "bf16",
+      "present_in_hybrid_schema": true
+    },
+    {
+      "register_id": "K3-03",
+      "field": "routed_expert_hidden_size",
+      "value": 3584,
+      "present_in_hybrid_schema": false
+    },
+    {
+      "register_id": "K3-04",
+      "field": "latent_moe_use_norm",
+      "value": true,
+      "present_in_hybrid_schema": false
+    },
+    {
+      "register_id": "K3-05",
+      "field": "moe_router_activation_func",
+      "value": "sigmoid",
+      "present_in_hybrid_schema": false
+    },
+    {
+      "register_id": "K3-05",
+      "field": "topk_method",
+      "value": "noaux_tc",
+      "present_in_hybrid_schema": false
+    },
+    {
+      "register_id": "K3-06",
+      "field": "expert_dtype",
+      "value": "mxfp4-pack-quantized",
+      "present_in_hybrid_schema": false
+    },
+    {
+      "register_id": "K3-06",
+      "field": "expert_group_size",
+      "value": 32,
+      "present_in_hybrid_schema": false
+    },
+    {
+      "register_id": "K3-06",
+      "field": "expert_scale_dtype",
+      "value": "torch.uint8",
+      "present_in_hybrid_schema": false
+    }
+  ],
+  "unknown_scalar_spec_keys": [
+    "expert_dtype",
+    "expert_group_size",
+    "expert_scale_dtype",
+    "kv_lora_rank",
+    "latent_moe_use_norm",
+    "mla_cache_elems_per_token",
+    "mla_use_nope",
+    "moe_router_activation_func",
+    "q_lora_rank",
+    "qk_nope_head_dim",
+    "qk_rope_head_dim",
+    "routed_expert_hidden_size",
+    "routed_scaling_factor",
+    "topk_method"
+  ],
+  "unflagged_unknown_scalar_keys": [
+    "routed_scaling_factor"
+  ],
+  "precision_overrides": [
+    [
+      "moe_router",
+      "fp32"
+    ],
+    [
+      "linattn_recurrent_state",
+      "fp32"
+    ],
+    [
+      "linattn_conv_state",
+      "bf16"
+    ]
+  ],
+  "precision_override_review": "K3-07a and K3-07b; not inferred from field presence",
+  "loader_rejection": "docs/cross-architecture/sources/k3/kimi-k3.yaml: unknown spec field(s) ['expert_dtype', 'expert_group_size', 'expert_scale_dtype', 'kv_lora_rank', 'latent_moe_use_norm', 'mla_cache_elems_per_token', 'mla_use_nope', 'moe_router_activation_func', 'q_lora_rank', 'qk_nope_head_dim', 'qk_rope_head_dim', 'routed_expert_hidden_size', 'routed_scaling_factor', 'topk_method'] for family 'hybrid'. Known fields: ['act_dtype', 'all_reduces_per_layer', 'attn_output_gate', 'conv_dim', 'dense_intermediate_size', 'dense_layers', 'full_attention_interval', 'head_dim', 'hidden', 'kv_dtype', 'layer_types', 'linear_conv_channels', 'linear_conv_kernel_dim', 'linear_conv_state_dtype', 'linear_key_head_dim', 'linear_num_key_heads', 'linear_num_value_heads', 'linear_value_head_dim', 'moe_intermediate_size', 'mtp_dense', 'mtp_layer_kind', 'mtp_num_hidden_layers', 'n_heads', 'n_layers', 'name', 'num_experts', 'num_experts_per_tok', 'num_kv_heads', 'op_dtype_overrides', 'partial_rotary_factor', 'shared_expert_intermediate_size', 'sliding_window', 'ssm_state_dtype', 'swa_attention_sink', 'swa_head_dim', 'swa_num_kv_heads', 'swa_rope_theta', 'swa_v_head_dim', 'v_head_dim', 'vocab', 'weight_dtype']",
+  "model_loadable": false
+}

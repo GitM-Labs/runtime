@@ -163,7 +163,12 @@ named workload and written down in `docs/hypotheses/` before anything runs.
   spec carries it (`InterventionSpec.correctness_gate`, runtime-only).
   `apply_intervention` runs it after measure and before keep with any
   applicator, so a faster but wrong candidate is rolled back. The keep gate
-  otherwise sees throughput alone.
+  otherwise sees throughput alone. The gate has a deadline
+  (`safety.correctness_gate_timeout_s`); no verdict by then restores. A saved
+  spec loses the callable, so `safety.requires_correctness_gate` makes a
+  reloaded spec without its gate get refused. Ctrl-C restores before it
+  propagates, and no new candidate is applied while an earlier gate is still
+  running.
 - The emitted `applies_to_kernels` is the hypothesis's `kernel_scope`, kernel
   substrings narrower than its planner op where the taxonomy rule is wider
   than the mechanism.

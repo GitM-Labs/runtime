@@ -133,23 +133,24 @@ def test_list_names_each_entry_and_its_family(capsys):
     assert "[hybrid]" in out
 
 
-def test_a_table_reports_the_floor_and_what_bounds_it(capsys):
+def test_a_table_reports_the_serial_proxy_and_what_bounds_it(capsys):
     assert main(["qwen3.6-35b-a3b", "--gpu", "H200", "--batch", "8",
                  "--kv-len", "1024"]) == 0
     out = capsys.readouterr().out
     assert "moe_routed" in out
     assert "linattn_recurrent" in out
     assert "ridge" in out
-    assert "floor" in out
+    assert "serial proxy" in out
 
 
-def test_the_table_says_the_floor_is_not_a_target(capsys):
+def test_the_table_conditions_the_bound_and_rejects_a_latency_target(capsys):
     """A predicted number sitting next to a measured one is read as a target
     unless it says otherwise, and then a 1.4x residual reads as a defect."""
     main(["qwen3.6-35b-a3b", "--gpu", "H200"])
     out = capsys.readouterr().out
-    assert "not a target" in out
-    assert "a lead, not a defect" in out
+    assert "not an empirical latency target" in out
+    assert "needs validated traffic, rate and serial-schedule assumptions" in out
+    assert "a lead, not by itself a defect" in out
 
 
 def test_fitted_fields_are_named_in_the_source_line(capsys):
@@ -210,6 +211,13 @@ def test_json_output_carries_every_node(capsys):
     assert payload["family"] == "hybrid"
     assert len(payload["nodes"]) == 281
     assert {"t_compute_s", "t_memory_s", "bound"} <= set(payload["nodes"][0])
+    semantics = payload["prediction_semantics"]
+    assert semantics["kind"] == "serial_resource_proxy"
+    assert semantics["aggregation"] == "sum_of_node_t_pred_s"
+    assert semantics["latency_estimate_s"] is None
+    assert semantics["whole_step_bound_status"] == "not_validated"
+    assert len(semantics["assumptions"]) == 3
+    assert payload["total_pred_s"] == sum(node["t_pred_s"] for node in payload["nodes"])
 
 
 def test_a_config_json_path_is_accepted_and_marked_as_having_no_provenance(

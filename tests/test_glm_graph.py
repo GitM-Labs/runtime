@@ -921,7 +921,7 @@ def test_kimi_k26_plans_the_production_shape_on_b300():
 
 def test_plan_cli_forwards_spec_decode_and_launch_flags(capsys):
     """`gitm plan` parsed --spec-tokens, --acceptance-rate and --launch-overhead and
-    then dropped them, so the floor silently priced a plain decode step."""
+    then dropped them, so the proxy silently priced a plain decode step."""
     import re
 
     from gitm.cli import main as cli_main
@@ -929,15 +929,15 @@ def test_plan_cli_forwards_spec_decode_and_launch_flags(capsys):
     base = ["plan", "kimi-k2.6", "--gpu", "B300", "--batch", "32", "--kv-len", "8192",
             "--tp", "8"]
 
-    def floor(extra):
+    def proxy(extra):
         assert cli_main(base + extra) == 0
         out = capsys.readouterr().out
-        return float(re.search(r"floor ([\d.]+) ms/step", out).group(1)), out
+        return float(re.search(r"serial proxy ([\d.]+) ms/step", out).group(1)), out
 
-    plain, _ = floor([])
-    spec, out = floor(["--spec-tokens", "3", "--acceptance-rate", "0.6"])
+    plain, _ = proxy([])
+    spec, out = proxy(["--spec-tokens", "3", "--acceptance-rate", "0.6"])
     assert "D=3 alpha=0.6" in out and spec > plain
-    eager, _ = floor(["--launch-overhead", "5e-6"])
+    eager, _ = proxy(["--launch-overhead", "5e-6"])
     assert eager > plain
 
 
