@@ -314,7 +314,10 @@ def build_script(args, cfg: dict[str, str]) -> str:
 set -euo pipefail
 OUT_HOST={shlex.quote(results)}/$SLURM_JOB_ID
 mkdir -p "$OUT_HOST"
-export MODEL={shlex.quote(args.model)} OUT=/out HF_HOME=/hf GITM_SCRATCH=/out GITM_JOB=$SLURM_JOB_ID
+# The submitter's own Hugging Face paths (e.g. ~/hf_hub) don't exist in the
+# container: always use the node's cache, mounted at /hf.
+unset HF_HUB_CACHE HF_XET_CACHE HF_ASSETS_CACHE HF_MODULES_CACHE TRANSFORMERS_CACHE HF_DATASETS_CACHE HUGGINGFACE_HUB_CACHE
+export MODEL={shlex.quote(args.model)} OUT=/out HF_HOME=/hf HF_HUB_CACHE=/hf/hub GITM_SCRATCH=/out GITM_JOB=$SLURM_JOB_ID
 if [ -r {CONF_DIR}/hf_token ]; then export HF_TOKEN="$(cat {CONF_DIR}/hf_token)"; fi
 {chr(10).join(extra_env)}
 echo "job $SLURM_JOB_ID on $(hostname) | image {image}"
