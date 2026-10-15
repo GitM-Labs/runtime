@@ -574,7 +574,7 @@ class History:
 
 
 def node_report(node: dict, jobids: list[str], cfg: dict[str, str]) -> dict:
-    """GPU readings + log tails from one node: local exec here, restricted SSH elsewhere."""
+    """GPU readings + log tails from one node: local exec here, restricted SSH (user gitm-report) elsewhere."""
     here = {socket.gethostname().split(".")[0], socket.gethostname()}
     if node["name"] in here or node["addr"] in ("localhost", "127.0.0.1"):
         cmd = ["/usr/local/bin/gitm-node-report", *jobids]
@@ -582,7 +582,7 @@ def node_report(node: dict, jobids: list[str], cfg: dict[str, str]) -> dict:
         cmd = ["ssh", "-i", cfg["REPORT_KEY"], "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
                "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new",
                "-o", f"UserKnownHostsFile={STATE_DIR}/known_hosts",
-               f"root@{node['addr']}", "gitm-node-report", *jobids]
+               f"gitm-report@{node['addr']}", "gitm-node-report", *jobids]
     p = run(cmd, check=False, timeout=30)
     if p.returncode != 0:
         return {"gpus": [], "logs": {}}

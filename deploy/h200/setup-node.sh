@@ -154,11 +154,15 @@ setkey RESULTS_DIR "$RESULTS_DIR"
 setkey HF_CACHE "$HF_CACHE"
 if [[ -n "$REPORT_KEY" ]]; then
   [[ "$REPORT_KEY" =~ ^ssh-(ed25519|rsa)\  ]] || { echo "--report-key must be an ssh public key line" >&2; exit 1; }
-  mkdir -p /root/.ssh; chmod 700 /root/.ssh; touch /root/.ssh/authorized_keys
-  sed -i '/gitm-report$/d' /root/.ssh/authorized_keys
-  echo "command=\"/usr/local/bin/gitm-node-report\",restrict ${REPORT_KEY% *} gitm-report" >> /root/.ssh/authorized_keys
-  chmod 600 /root/.ssh/authorized_keys
-  echo "report key installed (can only run gitm-node-report)"
+  # A dedicated unprivileged account (works where root SSH login is disabled):
+  # its key can run gitm-node-report and nothing else.
+  id gitm-report >/dev/null 2>&1 || useradd --system --create-home --home-dir /var/lib/gitm-report --shell /bin/sh gitm-report
+  install -d -m 700 -o gitm-report -g gitm-report /var/lib/gitm-report/.ssh
+  echo "command=\"/usr/local/bin/gitm-node-report\",restrict $(awk '{print $1, $2}' <<<"$REPORT_KEY") gitm-report" \
+    > /var/lib/gitm-report/.ssh/authorized_keys
+  chown gitm-report:gitm-report /var/lib/gitm-report/.ssh/authorized_keys
+  chmod 600 /var/lib/gitm-report/.ssh/authorized_keys
+  echo "report key installed for user gitm-report (can only run gitm-node-report)"
 fi
 
 # ---------------------------------------------------------------------------
