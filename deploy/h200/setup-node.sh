@@ -100,7 +100,7 @@ EOF
 step "Pyxis ${PYXIS_VERSION}"
 SPANK_H=""
 for d in /usr/include /usr/local/include /opt/slurm/include; do
-  [[ -f "$d/slurm/spank.h" ]] && { SPANK_H="$d"; break; }
+  if [[ -f "$d/slurm/spank.h" ]]; then SPANK_H="$d"; break; fi
 done
 if [[ -z "$SPANK_H" ]]; then
   apt-get install -y -qq libslurm-dev >/dev/null 2>&1 || true
@@ -111,7 +111,7 @@ PYXIS_SO=/usr/local/lib/slurm/spank_pyxis.so
 PYXIS_STAMP=/usr/local/share/pyxis/.built-${PYXIS_VERSION}-$(sinfo -V | awk '{print $2}')
 if [[ ! -f "$PYXIS_SO" || ! -f "$PYXIS_STAMP" ]]; then
   TMP=$(mktemp -d)
-  git clone -q --depth 1 --branch "$PYXIS_VERSION" https://github.com/NVIDIA/pyxis "$TMP/pyxis"
+  git -c advice.detachedHead=false clone -q --depth 1 --branch "$PYXIS_VERSION" https://github.com/NVIDIA/pyxis "$TMP/pyxis"
   # CPPFLAGS via the environment: the Makefile appends it to its own flags,
   # whereas a make-argument CPPFLAGS would replace them.
   CPPFLAGS="-I$SPANK_H" make -C "$TMP/pyxis" -s >/dev/null
@@ -122,20 +122,23 @@ fi
 SLURM_CONF=$(scontrol show config 2>/dev/null | awk -F'= ' '/^SLURM_CONF/{print $2}')
 SLURM_DIR=$(dirname "${SLURM_CONF:-/etc/slurm/slurm.conf}")
 PLUGSTACK=$(scontrol show config 2>/dev/null | awk -F'= ' '/^PlugStackConfig/{print $2}')
-PLUGSTACK=${PLUGSTACK:-$SLURM_DIR/plugstack.conf}
+[[ -z "$PLUGSTACK" || "$PLUGSTACK" == "(null)" ]] && PLUGSTACK="$SLURM_DIR/plugstack.conf"
 mkdir -p "$SLURM_DIR/plugstack.conf.d"
 CHANGED=0
-LINE="required $PYXIS_SO"
 if ! grep -qsF "$PYXIS_SO" "$SLURM_DIR/plugstack.conf.d/pyxis.conf"; then
-  echo "$LINE" > "$SLURM_DIR/plugstack.conf.d/pyxis.conf"; CHANGED=1
+  echo "required $PYXIS_SO" > "$SLURM_DIR/plugstack.conf.d/pyxis.conf"; CHANGED=1
 fi
-if ! grep -qs "plugstack.conf.d" "$PLUGSTACK"; then
-  [[ -f "$PLUGSTACK" ]] && cp -a "$PLUGSTACK" "$PLUGSTACK.bak.$(date +%s)"
-  echo "include $SLURM_DIR/plugstack.conf.d/*" >> "$PLUGSTACK"; CHANGED=1
+# Only add an include line if Pyxis isn't already picked up (some Slurm
+# installs read plugstack.conf.d by themselves; loading it twice fails).
+if ! srun --help 2>/dev/null | grep -q -- '--container-image'; then
+  if ! grep -qs "plugstack.conf.d" "$PLUGSTACK"; then
+    [[ -f "$PLUGSTACK" ]] && cp -a "$PLUGSTACK" "$PLUGSTACK.bak.$(date +%s)"
+    echo "include $SLURM_DIR/plugstack.conf.d/*" >> "$PLUGSTACK"; CHANGED=1
+  fi
 fi
 if [[ $CHANGED -eq 1 ]]; then
   systemctl restart slurmd
-  echo "pyxis added to $PLUGSTACK; slurmd restarted"
+  echo "pyxis registered ($SLURM_DIR/plugstack.conf.d/pyxis.conf); slurmd restarted"
 fi
 srun --help 2>/dev/null | grep -q -- '--container-image' \
   && echo "srun knows --container-image: ok" \

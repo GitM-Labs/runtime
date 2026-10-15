@@ -48,15 +48,34 @@ timeout 3 bash -c "</dev/tcp/$CONTROLLER_IP/6817" 2>/dev/null \
 echo "slurmctld port reachable"
 
 # ---------------------------------------------------------------------------
-step "Slurm and munge packages"
+step "Slurm $SLURM_VER and munge"
 export DEBIAN_FRONTEND=noninteractive
-if ! command -v slurmd >/dev/null; then
-  apt-get update -qq
-  apt-get install -y -qq munge slurmd slurm-client >/dev/null
+apt-get update -qq
+apt-get install -y -qq munge >/dev/null
+if [[ -f "$B/slurm_user" && -s "$B/slurm_user" ]]; then
+  IFS=: read -r gname _ ggid _ < "$B/slurm_group" || true
+  [[ -n "${ggid:-}" ]] && { getent group "$ggid" >/dev/null || groupadd -r -g "$ggid" "$gname"; }
+  IFS=: read -r suser _ suid sgid sgecos shome sshell < "$B/slurm_user"
+  id "$suser" >/dev/null 2>&1 || useradd -r -u "$suid" -g "$sgid" -c "$sgecos" -d "$shome" -M -s "$sshell" "$suser"
 fi
-HAVE=$(sinfo -V 2>/dev/null | awk '{print $2}' || slurmd -V | awk '{print $2}')
+if [[ -f "$B/slurm-install.tgz" ]]; then
+  # The controller's own source build, file for file.
+  if [[ -s "$B/slurm-deps.txt" ]]; then
+    # shellcheck disable=SC2046
+    apt-get install -y -qq $(cat "$B/slurm-deps.txt") >/dev/null || warn "some runtime packages failed to install"
+  fi
+  tar -C / -xzf "$B/slurm-install.tgz"
+  ldconfig
+  systemctl daemon-reload
+  MISSING=$(ldd "$(command -v slurmd)" 2>/dev/null | grep 'not found' || true)
+  [[ -z "$MISSING" ]] || die "slurmd is missing libraries:
+$MISSING"
+elif ! command -v slurmd >/dev/null; then
+  apt-get install -y -qq slurmd slurm-client >/dev/null
+fi
+HAVE=$(slurmd -V | awk '{print $2}')
 echo "controller: $SLURM_VER   this machine: $HAVE"
-[[ "${HAVE%.*}" == "${SLURM_VER%.*}" ]] || die "Slurm versions differ ($HAVE vs $SLURM_VER). Install Slurm $SLURM_VER here the same way as on $CONTROLLER."
+[[ "${HAVE%.*}" == "${SLURM_VER%.*}" ]] || die "Slurm versions differ ($HAVE vs $SLURM_VER)."
 
 # ---------------------------------------------------------------------------
 step "Team accounts (same UIDs as $CONTROLLER)"

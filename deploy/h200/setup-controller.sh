@@ -76,10 +76,7 @@ fi
 
 # ---------------------------------------------------------------------------
 step "Slurm $SLURM_VER on $THIS ($SLURM_CONF)"
-if ! dpkg -S "$(command -v slurmd)" >/dev/null 2>&1; then
-  warn "slurmd here was not installed from a .deb package. setup-join.sh installs Slurm from apt on the
-  second machine, which must match $SLURM_VER. If you built Slurm from source, install the same build there first."
-fi
+dpkg -S "$(command -v slurmd)" >/dev/null 2>&1 || echo "Slurm here is a source build; the join bundle will carry it to the other node."
 BUSY=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader | wc -l)
 if [[ "$BUSY" -gt 0 ]]; then
   warn "$BUSY process(es) hold GPUs on $THIS outside Slurm. Queued jobs will run out of GPU memory until they stop:"
@@ -232,6 +229,41 @@ step "Join bundle for the other machine(s)"
 B=$(mktemp -d); mkdir -p "$B/slurm" "$B/gitm"
 for f in slurm.conf gres.conf cgroup.conf; do [[ -f "$SLURM_DIR/$f" ]] && cp -a "$SLURM_DIR/$f" "$B/slurm/"; done
 cp -a /etc/munge/munge.key "$B/munge.key"
+SLURM_USER=$(scontrol show config | awk -F'= ' '/^SlurmUser/{print $2}' | cut -d'(' -f1)
+getent passwd "${SLURM_USER:-slurm}" > "$B/slurm_user" || true
+getent group "$(id -g "${SLURM_USER:-slurm}" 2>/dev/null || echo slurm)" > "$B/slurm_group" || true
+if ! dpkg -S "$(command -v slurmd)" >/dev/null 2>&1; then
+  # Slurm here was built from source: ship this exact build, plus the list of
+  # Ubuntu packages its binaries and plugins link against, so the other node
+  # runs byte-identical Slurm.
+  echo "packing this Slurm $SLURM_VER build (not from a .deb)"
+  F=$(mktemp)
+  SBIN_DIR=$(dirname "$(command -v slurmd)")
+  for c in slurmd slurmstepd slurmctld slurmrestd slurmdbd srun sbatch salloc sattach squeue sinfo scontrol \
+           scancel sacct sacctmgr sstat sprio sshare sreport strigger sbcast sdiag scrontab scrun sh5util seff; do
+    p=$(command -v "$c" 2>/dev/null || true)
+    [[ -z "$p" && -x "$SBIN_DIR/$c" ]] && p="$SBIN_DIR/$c"
+    if [[ -n "$p" ]]; then echo "$p"; readlink -f "$p"; fi >> "$F"
+  done
+  LIBSLURM=$(ldd "$(command -v srun)" | awk '/libslurm/{print $3; exit}')
+  if [[ -n "$LIBSLURM" ]]; then ls -d "$(dirname "$(readlink -f "$LIBSLURM")")"/libslurm* >> "$F"; fi
+  PLUGIN_DIR=$(scontrol show config | awk -F'= ' '/^PluginDir/{print $2}')
+  [[ -d "$PLUGIN_DIR" ]] && echo "$PLUGIN_DIR" >> "$F"
+  for d in /usr/include/slurm /usr/local/include/slurm /opt/slurm/include/slurm; do [[ -d "$d" ]] && echo "$d" >> "$F"; done
+  UNIT=$(systemctl show -p FragmentPath slurmd | cut -d= -f2); [[ -f "$UNIT" ]] && echo "$UNIT" >> "$F"
+  [[ -f /etc/default/slurmd ]] && echo /etc/default/slurmd >> "$F"
+  [[ -n "$LIBSLURM" ]] && grep -ls "$(dirname "$(readlink -f "$LIBSLURM")")" /etc/ld.so.conf.d/* >> "$F" || true
+  sort -u "$F" | sed 's#^/##' > "$F.rel"
+  tar -C / -czf "$B/slurm-install.tgz" -T "$F.rel"
+  # Runtime library packages (skip driver/CUDA packages: the node has its own driver).
+  { sort -u "$F" | while read -r f; do if [[ -f "$f" ]]; then ldd "$f" 2>/dev/null || true; fi; done
+    if [[ -d "$PLUGIN_DIR" ]]; then find "$PLUGIN_DIR" -name '*.so' -exec ldd {} \; 2>/dev/null || true; fi; } \
+    | awk '/=> \//{print $3}' | { grep -v libslurm || true; } | sort -u | while read -r lib; do
+        dpkg -S "$lib" 2>/dev/null || dpkg -S "/usr$lib" 2>/dev/null || dpkg -S "${lib#/usr}" 2>/dev/null || true
+      done | cut -d: -f1 | { grep -viE 'nvidia|cuda' || true; } | sort -u > "$B/slurm-deps.txt"
+  rm -f "$F" "$F.rel"
+  echo "  $(tar -tzf "$B/slurm-install.tgz" | wc -l) files, $(wc -l < "$B/slurm-deps.txt") runtime packages"
+fi
 cp "$CONF_DIR/report_key.pub" "$B/gitm/"
 grep -v '^STATUS_REPO=' "$CONF_DIR/config" > "$B/gitm/config"
 cat > "$B/info" <<EOF
