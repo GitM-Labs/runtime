@@ -642,11 +642,11 @@ class GitPublisher:
     One commit, always replaced: the status repo never grows, and readers fetch
     the file by commit sha (immutable, so no CDN staleness)."""
 
-    def __init__(self, repo: str, branch: str = "status"):
+    def __init__(self, repo: str, branch: str = "status", key: str | None = None):
         self.remote = f"git@github.com:{repo}.git"
         self.branch = branch
         self.gitdir = os.path.join(STATE_DIR, "status.git")
-        key = os.path.join(CONF_DIR, "deploy_key")
+        key = key or os.path.join(CONF_DIR, "deploy_key")
         self.env = dict(os.environ, GIT_DIR=self.gitdir,
                         GIT_SSH_COMMAND=f"ssh -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
                                         f"-o UserKnownHostsFile={STATE_DIR}/known_hosts",
@@ -753,7 +753,7 @@ def cmd_push_status(args) -> int:
     if not args.out:
         if not cfg.get("STATUS_REPO"):
             sys.exit("gitm-job: STATUS_REPO missing from /etc/gitm-gpu/config")
-        pub = GitPublisher(cfg["STATUS_REPO"])
+        pub = GitPublisher(cfg["STATUS_REPO"], key=cfg.get("DEPLOY_KEY") or None)
 
     sealer = None if args.plaintext else PageSealer()
     last_state_key = last_full_key = None
