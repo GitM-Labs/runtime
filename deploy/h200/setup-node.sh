@@ -151,7 +151,11 @@ srun --help 2>/dev/null | grep -q -- '--container-image' \
 step "gitm folders, CLI and node reporter"
 mkdir -p "$RESULTS_DIR" "$HF_CACHE" "$IMAGE_DIR" /etc/gitm-gpu
 chmod 1777 "$RESULTS_DIR"          # jobs write here; sticky so runs can't delete each other
-chmod 1775 "$HF_CACHE"
+# Shared Hugging Face cache: every user's job reads and adds models here.
+# Default ACLs keep new files writable by all, whatever each job's umask.
+chmod 0777 "$HF_CACHE"
+command -v setfacl >/dev/null || apt-get install -y -qq acl >/dev/null
+setfacl -d -m u::rwx,g::rwx,o::rwx "$HF_CACHE"
 install -m 755 "$HERE/gitm-job" /usr/local/bin/gitm-job
 install -m 755 "$HERE/gitm-node-report" /usr/local/bin/gitm-node-report
 touch /etc/gitm-gpu/config
