@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""gitm-node-report: one JSON snapshot of this GPU node for the status page.
+
+    gitm-node-report [JOBID ...]
+
+Prints per-GPU readings from nvidia-smi and, for each JOBID, the last lines of
+that job's log (<RESULTS_DIR>/<JOBID>.log, written by gitm-job jobs).
+
+The status pusher on the Slurm controller runs this locally for its own node
+and over SSH for the others. The SSH key it uses is pinned to this program in
+root's authorized_keys (command="...",restrict), so the key can do nothing
+else; job ids then arrive in SSH_ORIGINAL_COMMAND and only digits are accepted.
+Stdlib only.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import deque
+
+CONF = "/etc/gitm-gpu/config"
+TAIL = 25
+
+
+def results_dir() -> str:
+    d = "/var/lib/gitm/results"
+    try:
+        with open(CONF) as f:
+            for line in f:
+                if line.startswith("RESULTS_DIR="):
+                    d = line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return d
+
+
+def gpus() -> list[dict]:
+    q = "index,name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu"
+    try:
+        out = subprocess.run(["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+    def num(x: str) -> float | None:
+        try:
+            return round(float(x), 1)
+        except ValueError:
+            return None
+
+    res = []
+    for line in out.strip().splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) >= 7 and f[0].isdigit():
+            res.append({"index": int(f[0]), "name": f[1], "util": num(f[2]),
+                        "mem_used_mib": num(f[3]), "mem_total_mib": num(f[4]),
+                        "power_w": num(f[5]), "temp_c": num(f[6])})
+    return res
+
+
+def tail(path: str) -> list[str]:
+    try:
+        with open(path, errors="replace") as f:
+            # Bound the work on huge logs: only the last 256 KiB is read.
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 262144))
+            return list(deque(f.read().splitlines(), maxlen=TAIL))
+    except OSError:
+        return []
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args and os.environ.get("SSH_ORIGINAL_COMMAND"):
+        args = os.environ["SSH_ORIGINAL_COMMAND"].split()[1:]   # drop the program name
+    ids = [a for a in args if re.fullmatch(r"\d{1,12}", a)][:32]
+    rd = results_dir()
+    print(json.dumps({"gpus": gpus(), "logs": {i: tail(os.path.join(rd, f"{i}.log")) for i in ids}}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
