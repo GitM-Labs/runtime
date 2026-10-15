@@ -642,16 +642,35 @@ class GitPublisher:
     One commit, always replaced: the status repo never grows, and readers fetch
     the file by commit sha (immutable, so no CDN staleness)."""
 
-    def __init__(self, repo: str, branch: str = "status", key: str | None = None):
-        self.remote = f"git@github.com:{repo}.git"
+    def __init__(self, repo: str, branch: str = "status", key: str | None = None,
+                 token_file: str | None = None):
         self.branch = branch
         self.gitdir = os.path.join(STATE_DIR, "status.git")
-        key = key or os.path.join(CONF_DIR, "deploy_key")
-        self.env = dict(os.environ, GIT_DIR=self.gitdir,
-                        GIT_SSH_COMMAND=f"ssh -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
-                                        f"-o UserKnownHostsFile={STATE_DIR}/known_hosts",
+        self.env = dict(os.environ, GIT_DIR=self.gitdir, GIT_TERMINAL_PROMPT="0",
                         GIT_AUTHOR_NAME="gitm-status", GIT_AUTHOR_EMAIL="gitm-status@localhost",
                         GIT_COMMITTER_NAME="gitm-status", GIT_COMMITTER_EMAIL="gitm-status@localhost")
+        if token_file:
+            # HTTPS with a fine-grained token (for orgs that disable deploy keys).
+            # The token goes in through git's environment config, never argv, so
+            # it doesn't show up in `ps` for other users on the machine.
+            import base64
+            try:
+                with open(token_file) as f:
+                    tok = f.read().strip()
+            except OSError as e:
+                raise RuntimeError(f"cannot read {token_file}: {e}") from None
+            if not tok:
+                raise RuntimeError(f"{token_file} is empty")
+            basic = base64.b64encode(f"x-access-token:{tok}".encode()).decode()
+            self.remote = f"https://github.com/{repo}.git"
+            self.env.update(GIT_CONFIG_COUNT="1",
+                            GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
+                            GIT_CONFIG_VALUE_0=f"Authorization: Basic {basic}")
+        else:
+            key = key or os.path.join(CONF_DIR, "deploy_key")
+            self.remote = f"git@github.com:{repo}.git"
+            self.env["GIT_SSH_COMMAND"] = (f"ssh -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
+                                           f"-o UserKnownHostsFile={STATE_DIR}/known_hosts")
         if not os.path.isdir(self.gitdir):
             os.makedirs(STATE_DIR, exist_ok=True)
             subprocess.run(["git", "init", "-q", "--bare", self.gitdir], check=True)
@@ -753,7 +772,8 @@ def cmd_push_status(args) -> int:
     if not args.out:
         if not cfg.get("STATUS_REPO"):
             sys.exit("gitm-job: STATUS_REPO missing from /etc/gitm-gpu/config")
-        pub = GitPublisher(cfg["STATUS_REPO"], key=cfg.get("DEPLOY_KEY") or None)
+        pub = GitPublisher(cfg["STATUS_REPO"], key=cfg.get("DEPLOY_KEY") or None,
+                           token_file=cfg.get("STATUS_TOKEN_FILE") or None)
 
     sealer = None if args.plaintext else PageSealer()
     last_state_key = last_full_key = None
