@@ -67,7 +67,22 @@ if [[ -f "$B/slurm-install.tgz" ]]; then
   tar -C / -xzf "$B/slurm-install.tgz"
   ldconfig
   systemctl daemon-reload
-  MISSING=$(ldd "$(command -v slurmd)" 2>/dev/null | grep 'not found' || true)
+  # The build may live outside sudo's PATH (e.g. /opt/slurm): find it from the
+  # bundle, use it here, and add it to every login shell's PATH.
+  SLURMD_P=$(tar -tzf "$B/slurm-install.tgz" | grep -E '(^|/)sbin/slurmd$|(^|/)slurmd$' | head -1)
+  SRUN_P=$(tar -tzf "$B/slurm-install.tgz" | grep -E '(^|/)bin/srun$' | head -1)
+  [[ -n "$SLURMD_P" ]] || die "the bundle has no slurmd binary"
+  ADD=""
+  for p in "/$SLURMD_P" "/${SRUN_P:-$SLURMD_P}"; do
+    d=$(dirname "$p")
+    case ":$PATH:" in *":$d:"*) ;; *) PATH="$d:$PATH"; ADD="$ADD:$d" ;; esac
+  done
+  export PATH
+  if [[ -n "$ADD" ]]; then
+    echo "export PATH=\"\$PATH$ADD\"" > /etc/profile.d/gitm-slurm-path.sh
+    echo "Slurm binaries are in ${ADD#:} (added to PATH for login shells)"
+  fi
+  MISSING=$(ldd "/$SLURMD_P" 2>/dev/null | grep 'not found' || true)
   [[ -z "$MISSING" ]] || die "slurmd is missing libraries:
 $MISSING"
 elif ! command -v slurmd >/dev/null; then
