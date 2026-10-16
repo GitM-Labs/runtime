@@ -1,0 +1,12 @@
+[Unit]
+Description=gitm GPU queue status pusher (feeds gitm-labs.github.io/gpu-status)
+After=slurmctld.service network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/gitm-job _push-status
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

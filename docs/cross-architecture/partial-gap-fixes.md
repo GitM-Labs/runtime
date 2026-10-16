@@ -1,6 +1,6 @@
 # Partial gap fixes
 
-Status update October 13, 2026: Ishaan authorized local commits. Earlier October 11 references to uncommitted work describe that snapshot. Maintainer review, pushing, publication and external contact remain separate; none is established by creating local commits.
+Status update October 14, 2026: [PR #178](https://github.com/GitM-Labs/runtime/pull/178) merged these fields. References below to local or uncommitted work describe the October 11 snapshot.
 
 October 11, 2026. User-authorized local fixes, uncommitted. Existing catalogue defaults and measured evidence remain unchanged.
 
@@ -8,7 +8,7 @@ October 11, 2026. User-authorized local fixes, uncommitted. Existing catalogue d
 
 `HybridMoEModelSpec` now accepts the original submission’s `linear_conv_channels` and `linear_conv_state_dtype` fields. Explicit channels take precedence over the existing fitted `conv_dim`; omission retains that field. Explicit convolution state precision is independent of `ssm_state_dtype`; omission retains the old shared-state precision.
 
-Both the residency byte calculation and emitted convolution read/write traffic use these fields. The HF reader preserves explicitly supplied fields rather than overwriting them with the value-head-width fallback. Explicit channels must divide TP, so a remainder cannot disappear through integer division. Channel and dtype validation rejects malformed opt-in inputs. Fields are appended after existing fields to avoid shifting existing positional arguments.
+Both the state-byte calculation and emitted convolution read/write traffic use these fields. The planner does not provide a fit ledger for hybrid models, so the state-byte calculation is not a capacity verdict. The HF reader preserves explicitly supplied fields rather than overwriting them with the value-head-width fallback. Explicit channels must divide TP, so a remainder cannot disappear through integer division. Channel and dtype validation rejects malformed opt-in inputs. Fields are appended after existing fields to avoid shifting existing positional arguments.
 
 For the submitted K3 geometry, convolution history has 36864 channels with three previous inputs under the current graph’s history convention. BF16 stores 221184 bytes per sequence/layer instead of 442368 bytes when charged as FP32. Recurrent-state storage remains FP32. This fixes the independent-storage expression; it does not establish the actual engine allocation policy, fusion, or physical KDA lowering.
 

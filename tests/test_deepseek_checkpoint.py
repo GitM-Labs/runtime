@@ -33,12 +33,6 @@ def test_catalogue_loads_and_static_ledger_closes():
     assert sum(c["bytes"] for c in manifest["classes"].values()) == pin["payload_bytes"] == 689471107200
     assert sum(c["bytes"] for group in manifest["components"].values()
                for c in group.values()) == pin["payload_bytes"]
-    with pytest.raises(ValueError, match="planner integration pending"):
-        model_catalogue.predict("deepseek-v3.2")
-    from gitm.planner.registry import _load
-
-    with pytest.raises(ValueError, match="planner integration pending"):
-        _load("deepseek-v3.2")
 
 
 @pytest.fixture

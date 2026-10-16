@@ -6,8 +6,6 @@
 
 name: deepseek-ai/DeepSeek-V3.2
 family: glm_moe_dsa
-# This change only verifies checkpoint evidence. Planner pricing follows in PR 2.
-execution_status: static_only
 checkpoint:
   repository: deepseek-ai/DeepSeek-V3.2
   revision: a7e62ac04ecb2c0a54d736dc46601c5606cf10a6
@@ -139,10 +137,11 @@ provenance:
         dtype classes and per-shard header digests. The index metadata.total_size
         (1,370,793,842,752) equals exactly twice all 685,396,921,376 indexed
         tensor elements, including scale tensors. It is not the stored payload.
-        This first checkpoint-audit change establishes the exact stored-byte
-        inventory. Pricing the separate MTP tensors and reconciling the
-        analytic per-rank footprint belongs to the planner integration change.
-        Header bytes do not establish how an engine places weights on ranks.
+        The analytic model_weight_bytes now includes separate MTP embedding,
+        output head and fusion weights. It returns 689,467,088,807 B, leaving
+        4,018,393 B of norms/biases and scale-boundary detail. The exact
+        header ledger is authoritative for stored payload; the analytic
+        per-rank footprint remains an estimate until placement is verified.
 
   estimated:
     - field: per-layer index selection execution
