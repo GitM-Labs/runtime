@@ -594,6 +594,63 @@ def _pointwise(rows: float, elems: float, act_b: float, *, ops: float = 1.0) -> 
     return ops * n, 2.0 * n * act_b
 
 
+def moe_routed_cost(
+    spec: GlmMoeDsaModelSpec, hw: HardwareSpec, sh: ShardingConfig,
+    rows: float, distinct: float,
+) -> tuple[float, float]:
+    """(flops, bytes) for one ``moe_routed`` node on one rank, ``distinct`` experts woken."""
+    h, inter = spec.hidden, spec.moe_intermediate_size
+    aw = weight_bytes(spec.act_dtype)
+    tp = max(1, sh.tp)
+    es = max(1, sh.expert_shards)
+    per_expert_weights = 3.0 * h * inter
+    per_position_flops = 6.0 * h * inter  # 2 * (gate + up + down) * h * inter
+    ex = resolve_execution(spec.dtype_for("moe_routed", spec.expert_dtype), hw)
+    ew = ex.bytes_per_use * expert_pad_factor(ex, h, inter, 1 if sh.ep > 1 else tp)
+    skew = sh.ep_imbalance if sh.ep > 1 else 1.0
+    # SwiGLU is inside this node, not beside it: ``silu_and_mul`` is one of
+    # ``mlp_gate_up``'s needles in ``deviation._OP_RULES``, so a separate SwiGLU
+    # node would be a prediction with no observed kernel to pair against.
+    swiglu_f, swiglu_b = _pointwise(rows, spec.top_k * inter / es, aw, ops=4.0)
+    return (
+        per_position_flops * rows * spec.num_experts_per_tok * skew / es + swiglu_f,
+        per_expert_weights * distinct * ew * skew / es
+        + aw * (rows * inter * 2 * spec.num_experts_per_tok / es)
+        + swiglu_b,
+    )
+
+
+#: Rows per expert beyond any knee the catalogue reaches; above it is "never".
+_KNEE_CEILING_ROWS = 1e6
+
+
+def moe_routed_knee(spec: GlmMoeDsaModelSpec, hw: HardwareSpec, sh: ShardingConfig) -> float:
+    """Rows per expert at which ``moe_routed`` turns compute-bound, or ``inf``.
+
+    Every term of :func:`moe_routed_cost` scales with rows except the weight
+    term, which scales with ``distinct``, so the crossing is one rows-per-expert
+    value whatever the step. The shard count moves it only through a rank's
+    padding and ``ep_imbalance``. Bisected on :func:`roofline`'s times.
+    """
+    if not spec.top_k:
+        return float("inf")
+    d = float(spec.n_routed_experts)
+    dtype = spec.dtype_for("moe_routed", spec.expert_dtype)
+
+    def compute_bound(r: float) -> bool:
+        f, b = moe_routed_cost(spec, hw, sh, r * d / spec.num_experts_per_tok, d)
+        p = roofline("moe_routed", f, b, hw, dtype)
+        return p.t_compute_s >= p.t_memory_s
+
+    lo, hi = 0.0, _KNEE_CEILING_ROWS
+    if not compute_bound(hi):
+        return float("inf")
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        lo, hi = (lo, mid) if compute_bound(mid) else (mid, hi)
+    return hi
+
+
 def _emit_layer(
     g: Graph,
     spec: GlmMoeDsaModelSpec,
@@ -864,10 +921,6 @@ def _emit_layer(
     inter = spec.moe_intermediate_size
     per_expert_weights = 3.0 * h * inter
     per_position_flops = 6.0 * h * inter  # 2 * (gate + up + down) * h * inter
-    ex_routed = w_exec("moe_routed", ed)
-    ew = ex_routed.bytes_per_use * expert_pad_factor(
-        ex_routed, h, spec.moe_intermediate_size, 1 if sh.ep > 1 else tp
-    )
 
     if spec.n_shared_experts > 0:
         sw = w_exec("moe_shared", ed).bytes_per_use
@@ -895,19 +948,7 @@ def _emit_layer(
     distinct = distinct_experts(
         int(rows), spec.n_routed_experts, spec.num_experts_per_tok
     )
-    skew = sh.ep_imbalance if sh.ep > 1 else 1.0
-    # SwiGLU is inside this node, not beside it: ``silu_and_mul`` is one of
-    # ``mlp_gate_up``'s needles in ``deviation._OP_RULES``, so a separate SwiGLU
-    # node would be a prediction with no observed kernel to pair against.
-    swiglu_f, swiglu_b = _pointwise(rows, spec.top_k * inter / es, aw, ops=4.0)
-    add(
-        "moe_routed",
-        per_position_flops * rows * spec.num_experts_per_tok * skew / es + swiglu_f,
-        per_expert_weights * distinct * ew * skew / es
-        + aw * (rows * inter * 2 * spec.num_experts_per_tok / es)
-        + swiglu_b,
-        ed,
-    )
+    add("moe_routed", *moe_routed_cost(spec, hw, sh, rows, distinct), ed)
 
     # Weighted scatter-add back to ``rows x hidden``, including the
     # routed_scaling_factor multiply.

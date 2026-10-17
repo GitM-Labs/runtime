@@ -590,23 +590,29 @@ def _render_precision_and_fit(spec, hw: HardwareSpec, batch, sharding, args) -> 
     format, the backend it lands on and the rows at which it turns compute-bound
     are printed rather than left implicit in a bytes column.
     """
-    from gitm.planner.roofline import critical_rows, distinct_experts, resolve_execution
+    from gitm.planner.glm_graph import moe_routed_cost, moe_routed_knee
+    from gitm.planner.roofline import distinct_experts, resolve_execution, roofline
 
     dtype = spec.dtype_for("moe_routed", spec.expert_dtype)
     ex = resolve_execution(dtype, hw)
     fmt = ex.stored
-    distinct = distinct_experts(batch.positions_per_step, spec.n_routed_experts,
-                                spec.num_experts_per_tok)
-    rows_per_expert = (batch.positions_per_step * spec.num_experts_per_tok / distinct
-                       if distinct else 0.0)
-    knee = critical_rows(dtype, hw, spec.hidden, spec.moe_intermediate_size)
+    # Decode positions plus the prefill chunk, as the graph's moe_routed node counts.
+    rows = batch.positions_per_step + batch.prefill_tokens
+    distinct = distinct_experts(rows, spec.n_routed_experts, spec.num_experts_per_tok)
+    rows_per_expert = rows * spec.num_experts_per_tok / distinct if distinct else 0.0
+    knee = moe_routed_knee(spec, hw, sharding)
+    d = float(spec.n_routed_experts)
+    at_knee = isfinite(knee) and roofline(
+        "moe_routed", *moe_routed_cost(spec, hw, sharding, knee * d / spec.num_experts_per_tok, d),
+        hw, dtype, serial_launches=1).bound == "launch"
     out = [
         f"  experts   {fmt.name}: {fmt.bytes_per_elem:.4f} B/weight stored "
         f"({fmt.scale_overhead:.1%} scales) -> {ex.backend}, {ex.compute_dtype} MACs, "
         f"{ex.bytes_per_use:.4f} B/weight per use"
         + (" [estimated rule]" if ex.estimated else ""),
-        f"            {rows_per_expert:.2f} rows/expert at this batch; compute-bound "
-        f"above {knee:.0f}",
+        f"            {rows_per_expert:.2f} rows/expert this step; moe_routed is "
+        + (f"launch-bound at its {knee:.1f}-row knee at this launch cost" if at_knee
+           else f"compute-bound above {f'{knee:.1f}' if isfinite(knee) else 'never'}"),
     ]
     fit, why = _fit_ledger(spec, hw, batch, sharding, args)
     if fit is None:
