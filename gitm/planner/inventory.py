@@ -619,8 +619,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     existing = next((r for r in data["checkpoints"] if r["repository"].lower() == args.repository.lower()), None)
     try:
+        # Preserve the existing record's include patterns when refreshing (not DEFAULT_INCLUDE).
+        existing_include = tuple((existing or {}).get("artifacts", {}).get("include") or DEFAULT_INCLUDE)
         rec = build_record(source, args.repository, rec_id=args.rec_id or (existing or {}).get("id"),
-                           revision=args.revision, ref=args.ref)
+                           revision=args.revision, ref=args.ref, include=existing_include)
     except SourceError as exc:
         print(f"could not pin {args.repository}: {exc}", file=sys.stderr)
         return 2
