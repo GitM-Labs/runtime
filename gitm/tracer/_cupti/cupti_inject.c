@@ -37,8 +37,10 @@
  * per completed buffer (8 MiB), not per kernel.
  */
 
+#define _GNU_SOURCE  /* dladdr, RTLD_NOLOAD */
 #include "cupti_core.h"
 
+#include <dlfcn.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -201,4 +203,29 @@ int InitializeInjection(void) {
 
     atexit(finish);
     return 1;
+}
+
+
+/* NVTX's entry point, so NVTX_INJECTION64_PATH can name this library.
+ *
+ * NVTX hands push/pop to whichever library that variable names, and only a
+ * libcupti that is also the one collecting can turn them into MARKER records.
+ * Naming a libcupti by path guessed wrong: `import torch` loads torch's bundled
+ * libcupti.so.N before CUDA initialises, this library's libcupti.so.N
+ * dependency then resolves to that already-loaded copy, and the path we named
+ * (the toolkit's) came in as a second, idle CUPTI. Every range was dropped —
+ * on an RTX 4050 with torch's cu13 wheel, zero markers; the same push recorded
+ * when NVTX was pointed at torch's copy instead.
+ *
+ * So ask the loader which libcupti this library is actually bound to, and
+ * forward to that one's InitializeInjectionNvtx2. Returning 0 tells NVTX the
+ * injection failed, and it carries on without one. */
+int InitializeInjectionNvtx2(const void *get_export_table) {
+    Dl_info info;
+    if (!dladdr((void *)&cuptiActivityEnable, &info) || !info.dli_fname) return 0;
+    void *cupti = dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+    if (!cupti) return 0;
+    int (*init)(const void *) =
+        (int (*)(const void *))dlsym(cupti, "InitializeInjectionNvtx2");
+    return init ? init(get_export_table) : 0;
 }

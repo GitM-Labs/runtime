@@ -547,3 +547,223 @@ def test_an_engine_a_retrace_swaps_in_is_a_fresh_build():
     app.install(box.build("A"))             # what the re-trace leaves running
     app.snapshot()
     assert app.noise.samples == pytest.approx([0.0, 0.01])
+
+
+# --------------------------------------------------------------------------- #
+# the end-to-end check                                                         #
+# --------------------------------------------------------------------------- #
+def _config_engines(speed):
+    """Engines whose throughput is a function of their configuration."""
+    class E:
+        def __init__(self, kwargs):
+            self.gitm_llm_kwargs = dict(kwargs)
+            self.gitm_untraced_rebuild_fn = lambda old: E(old.gitm_llm_kwargs)
+
+    built: list[dict] = []
+
+    def make(kwargs):
+        built.append(dict(kwargs))
+        return E(kwargs)
+
+    def applicator(start):
+        return LiveEngineApplicator(
+            make(start), throughput_fn=lambda e: speed(e.gitm_llm_kwargs),
+            restart_fn=lambda old, kv: make({**old.gitm_llm_kwargs, **kv}),
+            baseline_restart_fn=lambda old: make(old.gitm_llm_kwargs),
+            restart_mode="serial", noise_gate=True, validation=2, min_effect=0.01,
+            threshold_without_floor=0.02)
+
+    return applicator, built
+
+
+def test_the_final_check_measures_the_end_against_the_start(monkeypatch):
+    from gitm.scheduler.loop import _final_check
+
+    monkeypatch.setattr(LiveEngineApplicator, "_shutdown", staticmethod(lambda e: None))
+    def speed(kw):
+        return 1000.0 * (1.05 if not kw.get("enforce_eager", True) else 1.0)
+
+    make_app, built = _config_engines(speed)
+    app = make_app({"enforce_eager": False, "max_num_seqs": 64})   # where the run ended
+    out = _final_check(app, {"enforce_eager": True, "max_num_seqs": 64})
+    assert out["changed"] == {"enforce_eager": False}
+    assert out["original_tps"] == pytest.approx(1000.0) and out["final_tps"] == pytest.approx(1050.0)
+    assert out["delta"] == pytest.approx(0.05) and out["holds"]
+    assert {"enforce_eager": True, "max_num_seqs": 64} in built     # the original was rebuilt
+
+
+def test_a_final_configuration_that_does_not_hold_up_says_so(monkeypatch):
+    from gitm.scheduler.loop import _final_check
+
+    monkeypatch.setattr(LiveEngineApplicator, "_shutdown", staticmethod(lambda e: None))
+    make_app, _ = _config_engines(lambda kw: 1000.0)               # nothing changes speed
+    out = _final_check(make_app({"block_size": 32}), {"block_size": 16})
+    assert out["delta"] == pytest.approx(0.0) and not out["holds"]
+
+
+def test_no_final_check_when_nothing_was_kept():
+    from gitm.scheduler.loop import _final_check
+
+    make_app, built = _config_engines(lambda kw: 1000.0)
+    out = _final_check(make_app({"block_size": 16}), {"block_size": 16})
+    assert "skipped" in out and len(built) == 1                     # nothing rebuilt
+
+
+def test_a_final_check_that_cannot_rebuild_reports_a_lost_engine(monkeypatch):
+    """Review finding: a rebuild that raised aborted the run before its report."""
+    from gitm.scheduler.loop import _final_check
+
+    monkeypatch.setattr(LiveEngineApplicator, "_shutdown", staticmethod(lambda e: None))
+    make_app, _ = _config_engines(lambda kw: 1000.0)
+    app = make_app({"block_size": 32})
+
+    def broken(_old):
+        raise TimeoutError("engine build ran past 3600s")
+
+    app.engine.gitm_untraced_rebuild_fn = broken
+    out = _final_check(app, {"block_size": 16})
+    assert "TimeoutError" in out["engine_lost"] and app.engine is None
+
+
+def test_a_final_check_that_loses_its_baseline_reports_a_lost_engine(monkeypatch):
+    """Review finding: apply_intervention reports a lost engine as a flag, and
+    the final check dropped it, so the run could finish looking clean."""
+    from gitm.optimizer.apply import ApplyResult
+    from gitm.scheduler import loop as loop_mod
+    from gitm.scheduler.loop import _final_check
+
+    monkeypatch.setattr(LiveEngineApplicator, "_shutdown", staticmethod(lambda e: None))
+    monkeypatch.setattr(loop_mod, "apply_intervention", lambda *a, **kw: ApplyResult(
+        True, rolled_back=False, measured_delta=None,
+        error="restore failed: baseline decode timed out", restore_failed=True))
+    make_app, _ = _config_engines(lambda kw: 1000.0)
+    out = _final_check(make_app({"block_size": 32}), {"block_size": 16})
+    assert "baseline decode timed out" in out["engine_lost"]
+
+
+# --------------------------------------------------------------------------- #
+# candidates that change nothing                                               #
+# --------------------------------------------------------------------------- #
+def _engine(**kwargs):
+    e = type("E", (), {})()
+    e.gitm_llm_kwargs = dict(kwargs)
+    return e
+
+
+def test_a_candidate_the_engine_already_runs_is_skipped(monkeypatch):
+    """With the baseline at vLLM's defaults, cuda_graphs_enable sets
+    enforce_eager=False, which is already vLLM's default: an identical engine,
+    measured for nothing."""
+    from gitm.scheduler import loop
+
+    defaults = {"enforce_eager": False, "max_num_seqs": None}
+    monkeypatch.setattr(loop, "_engine_arg_default", lambda k: defaults.get(k))
+    graphs = _spec("enforce_eager", False)
+
+    assert "enforce_eager=False" in loop._already_set(_engine(), graphs)
+    assert loop._already_set(_engine(enforce_eager=True), graphs) is None   # an eager baseline
+    assert "already" in loop._already_set(_engine(max_num_seqs=64), _spec("max_num_seqs", 64))
+    # vLLM decides at run time: not known to be a no-op, so it is tried.
+    assert loop._already_set(_engine(), _spec("max_num_seqs", 256)) is None
+    # A joint candidate is a no-op only if every knob is.
+    joint = _spec("enforce_eager", False).model_copy(
+        update={"knobs": {"enforce_eager": False, "max_num_seqs": 128}})
+    assert loop._already_set(_engine(max_num_seqs=64), joint) is None
+
+
+def test_a_relative_value_or_an_unknown_engine_is_never_skipped(monkeypatch):
+    from gitm.scheduler import loop
+
+    monkeypatch.setattr(loop, "_engine_arg_default", lambda k: 8192)
+    relative = _spec("max_num_batched_tokens", 8192).model_copy(update={"value_multiplier": 2.0})
+    assert loop._already_set(_engine(), relative) is None
+    assert loop._already_set(object(), _spec("max_num_batched_tokens", 8192)) is None
+
+
+def test_linear_attention_settings_are_not_tried_on_a_model_without_it():
+    """On Qwen2.5-0.5B, 8 of 15 autoresearch proposals were gdn_/kda_ backends."""
+    from gitm.scheduler.loop import _not_for_this_model
+
+    for knob in ("gdn_prefill_backend", "kda_prefill_backend", "mamba_cache_dtype"):
+        assert "declares none" in _not_for_this_model(_spec(knob, "triton"), False)
+    # A model with such layers, or one whose config could not be read: tried.
+    assert _not_for_this_model(_spec("gdn_prefill_backend", "triton"), True) is None
+    assert _not_for_this_model(_spec("gdn_prefill_backend", "triton"), None) is None
+    assert _not_for_this_model(_spec("max_num_seqs", 128), False) is None
+
+
+def test_linear_layers_are_read_from_the_models_own_config(monkeypatch):
+    """Review finding: the planner's family is hybrid only for models that also
+    have experts, so a dense model with linear-attention layers read as having
+    none. Its own config says otherwise."""
+    from gitm.scheduler import loop
+
+    def engine_with(cfg):
+        monkeypatch.setattr(loop, "_hf_config_from_engine", lambda e: cfg)
+        monkeypatch.setattr(loop, "_hf_config_dict", lambda hf: hf)
+        return loop._declares_linear_layers(object())
+
+    qwen2 = {"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"],
+             "num_hidden_layers": 24, "layer_types": ["full_attention"] * 24}
+    assert engine_with(qwen2) is False
+    dense_hybrid = {"model_type": "falcon_h1", "num_hidden_layers": 4}
+    assert engine_with(dense_hybrid) is True
+    by_layer = {"model_type": "x", "layer_types": ["linear_attention", "full_attention"]}
+    assert engine_with(by_layer) is True
+    by_field = {"model_type": "x", "mamba_d_state": 128}
+    assert engine_with(by_field) is True
+    monkeypatch.setattr(loop, "_hf_config_from_engine", lambda e: None)
+    assert loop._declares_linear_layers(object()) is None
+
+
+def test_reps_reach_the_measurement_and_are_recorded(tmp_path, monkeypatch):
+    """--reps decodes each engine several times with no rebuild; --validation
+    rebuilds between rounds. Both are recorded beside the result."""
+    import json
+    import sys
+    from contextlib import contextmanager
+    from pathlib import Path
+
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .conftest import make_kernel, make_trace
+    from .test_vllm_knobs_and_restart import _FullEngine
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [make_kernel(f"paged_attention_{i % 4}", start_ns=i * 100,
+                               end_ns=i * 100 + 80) for i in range(80)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setitem(sys.modules, "vllm", None)
+    seen: list[int] = []
+    real_init = LiveEngineApplicator.__init__
+
+    def spy(self, *a, **kw):
+        seen.append(kw.get("reps"))
+        real_init(self, *a, **kw)
+
+    monkeypatch.setattr(LiveEngineApplicator, "__init__", spy)
+    monkeypatch.setenv("GITM_AB_REPS", "5")                      # the flag wins over it
+    out = run_loop(LoopConfig(engine=_FullEngine(), workload="vllm-decode", budget="24h",
+                              scratch=str(tmp_path), top_n_interventions=2, reps=3))
+    assert seen == [3]
+    assert out["summary"]["reps"] == 3
+    doc = json.loads((Path(out["run_dir"]) / "noise_floor.json").read_text())
+    assert doc["reps"] == 3
+
+
+def test_validation_and_reps_below_one_are_refused_with_a_reason(capsys):
+    """--validation 0 used to be quietly treated as 1, so someone asking for no
+    rebuilds got one round without being told."""
+    from gitm.cli import _parser
+
+    for args, needle in ((["--validation", "0"], "--reps"), (["--reps", "0"], "at least 1")):
+        with pytest.raises(SystemExit):
+            _parser().parse_args(["run", "--workload", "vllm-decode", *args])
+        assert needle in capsys.readouterr().err
+    ns = _parser().parse_args(["run", "--workload", "vllm-decode", "--validation", "1", "--reps", "3"])
+    assert (ns.validation, ns.reps) == (1, 3)

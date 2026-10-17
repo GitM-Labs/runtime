@@ -25,6 +25,7 @@ def optimize(
     rerank: str = "off",
     skip_levers: str | Iterable[str] | None = None,
     validation: int | None = None,
+    reps: int | None = None,
 ) -> dict[str, Any]:
     """Run the autonomous 24-hour optimization loop and return a report.
 
@@ -57,6 +58,11 @@ def optimize(
     averaged over that many paired A/B rounds. ``None`` reads
     ``GITM_VALIDATION``, else 2.
 
+    ``reps`` is how many times each engine decodes per measurement, averaged,
+    with no rebuild. ``validation`` rebuilds between rounds and so catches a
+    lucky or unlucky build; ``reps`` only steadies run-to-run noise on the
+    engine already up, at no build cost. ``None`` reads ``GITM_AB_REPS``, else 1.
+
     ``workload_runner`` optionally supplies an explicit zero-arg callable that
     launches the workload's GPU work; it runs inside the capture window. When
     omitted, the loop resolves ``workload`` against the registry in
@@ -76,6 +82,7 @@ def optimize(
         use_history=use_history,
         rerank=rerank,
         validation=validation,
+        reps=reps,
         skip_levers=parse_skips(skip_levers),
     )
     try:

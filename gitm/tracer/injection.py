@@ -133,20 +133,6 @@ def active() -> bool:
     return active_vendor() is not None
 
 
-def libcupti_path() -> Path | None:
-    """The libcupti the shim was linked against, or ``None`` if none was found.
-
-    Reuses the build's own resolution so the library NVTX is pointed at is the
-    same one CUPTI is collecting through. Two different libcupti majors in one
-    process is not a configuration that works.
-    """
-    from gitm.tracer._cupti.build import _cuda_home, _pick_libcupti
-
-    d, major = _pick_libcupti(_cuda_home())
-    if d is None or major is None:
-        return None
-    so = d / f"libcupti.so.{major}"
-    return so if so.exists() else None
 
 
 def detect_vendor() -> str:
@@ -184,7 +170,9 @@ def run_env(
     ``NVTX_INJECTION64_PATH`` to decide which tool receives push/pop. Enabling
     ``CUPTI_ACTIVITY_KIND_MARKER`` gives CUPTI somewhere to put ranges but does
     not make NVTX hand them over — verified on a B200, where markers stayed at
-    zero until this was set.
+    zero until this was set. It names the collector itself, which forwards to
+    the libcupti it is bound to: naming a libcupti by path missed whenever torch
+    had already loaded its own copy, and NVTX fed an idle second CUPTI.
 
     On AMD the collection side needs no third variable — rocTX push/pop is
     delivered to the SAME injected tool by rocprofiler-sdk's marker tracing
@@ -213,9 +201,10 @@ def run_env(
     env = {ENV_LIB: str(lib_path()), ENV_OUT: out}
     if nvtx:
         env[ENV_NVTX] = "1"
-        cupti = libcupti_path()
-        if cupti is not None:
-            env[ENV_NVTX_INJECT] = str(cupti)
+        # The collector, not a libcupti: it forwards NVTX to the libcupti it is
+        # actually bound to (InitializeInjectionNvtx2 in cupti_inject.c). A path
+        # to one only matched by luck — torch loads its own copy first.
+        env[ENV_NVTX_INJECT] = str(lib_path())
     return env
 
 
@@ -565,6 +554,45 @@ def clock_now() -> int | None:
 
         return _rocm.timestamp()
     return cupti_now()
+
+
+@contextlib.contextmanager
+def nvtx_env(env=None):
+    """Run a block with NVTX range collection turned on for the injected tracer.
+
+    For starting a traced engine whose kernels should carry the layer and op
+    they ran in. The variables are exactly the ones :func:`run_env` adds for
+    ``nvtx=True`` — ``gitm capture serve --nvtx`` reads the same function — so
+    the two paths cannot drift apart. Workers inherit them when they start; the
+    previous values are back when the block exits, so an engine built after it
+    without tracing does not carry them.
+
+    NVTX is pointed at the collector this process already injects
+    (``CUDA_INJECTION64_PATH``), not at :func:`lib_path`: an operator may have
+    injected a copy installed elsewhere, and NVTX must reach the collector that
+    is actually recording, which forwards to the libcupti it is bound to.
+
+    A no-op when no collector is injected (no ``GITM_TRACE_OUT``).
+    """
+    env = os.environ if env is None else env
+    out = env.get(ENV_OUT)
+    if not out or active_vendor() is None:
+        yield
+        return
+    traced = run_env(out, nvtx=True)
+    if ENV_NVTX_INJECT in traced and env.get(ENV_LIB):
+        traced[ENV_NVTX_INJECT] = env[ENV_LIB]
+    keys = [k for k in (ENV_NVTX, ENV_NVTX_INJECT, "LD_PRELOAD") if k in traced]
+    saved = {k: env.get(k) for k in keys}
+    env.update({k: traced[k] for k in keys})
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                env.pop(k, None)
+            else:
+                env[k] = v
 
 
 @contextlib.contextmanager

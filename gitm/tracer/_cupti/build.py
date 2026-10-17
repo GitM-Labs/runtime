@@ -176,6 +176,7 @@ def _compile(sources: list[Path], out: Path, extra_includes: list[str], label: s
         f"-L{cudart_lib}",
         f"-l:libcupti.so.{cupti_major}",
         "-lcudart",
+        "-ldl",
         f"-Wl,-rpath,{cupti_lib}",
         f"-Wl,-rpath,{cudart_lib}",
         "-o", str(out),

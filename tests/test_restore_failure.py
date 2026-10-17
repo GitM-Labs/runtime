@@ -740,3 +740,97 @@ def test_autoresearch_does_not_start_when_the_catalogue_stopped_for_time(tmp_pat
     reasons = [d["reason"] for d in json.loads(
         (Path(out["run_dir"]) / "degradations.json").read_text())["items"]]
     assert any("would be overrun" in r and "50 min" in r for r in reasons)
+
+
+def test_a_failed_opening_run_stops_the_run_instead_of_ranking_a_fragment(tmp_path, monkeypatch):
+    """Two Kimi K2.5 runs on MI355X hung at the opening decode. The loop
+    recorded it, built a fresh engine and carried on into Phase 4, judging every
+    candidate against a baseline that had just failed and ranking from a trace
+    fragment. It now stops: no A/B, no re-trace, no autoresearch, the engine it
+    built released, and the report says why."""
+    from gitm.agents.policy import RankedCandidate
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield _trace(run_id or "r")
+
+    released: list = []
+    built: list = []
+
+    class _Engine:
+        gitm_traced = True
+
+        def gitm_untraced_rebuild_fn(self, old):
+            built.append("untraced")
+            return _Engine()
+
+    class _HangingRunner(_Runner):
+        engine = _Engine()
+
+        def __call__(self) -> dict:
+            raise TimeoutError("RPC call to sample_tokens timed out")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "select_interventions", lambda *a, **kw: [
+        RankedCandidate(spec=_spec("a", 1), predicted_delta=0.05)])
+    applies: list = []
+    monkeypatch.setattr(loop, "apply_intervention", lambda *a, **kw: applies.append(1))
+    monkeypatch.setattr(loop, "autoresearch", lambda *a, **kw: applies.append("ar"))
+    monkeypatch.setattr(LiveEngineApplicator, "_shutdown", staticmethod(released.append))
+
+    # The loop built this runner (from the registry), so the engine is the run's.
+    monkeypatch.setattr(loop, "get_factory", lambda w: lambda cfg: _HangingRunner())
+    out = loop.run_loop(loop.LoopConfig(workload="vllm-decode", budget="5h",
+                                        scratch=str(tmp_path), rerank="recapture"))
+    s = out["summary"]
+    assert applies == [] and built == []
+    assert len(released) == 1
+    assert "opening workload run failed" in s["engine_lost"]
+    assert "sample_tokens" in s["engine_lost"]
+    assert s["n_untried"] == 1
+    assert (Path(out["run_dir"]) / "report.md").exists()
+
+
+def test_a_callers_engine_is_not_released_when_no_runner_was_available(tmp_path, monkeypatch):
+    """No workload runner at all (the embedded path) is not a failed run on the
+    engine: the caller's engine stays theirs and the run goes on."""
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield _trace(run_id or "r")
+
+    released: list = []
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(LiveEngineApplicator, "_shutdown", staticmethod(released.append))
+
+    def no_runner(*a, **kw):
+        raise RuntimeError("workload runner unavailable")
+
+    monkeypatch.setattr(loop, "get_factory", lambda w: no_runner)
+    out = loop.run_loop(loop.LoopConfig(engine=object(), workload="vllm-decode",
+                                        budget="30s", scratch=str(tmp_path)))
+    assert "opening workload run failed" not in str(out["summary"].get("engine_lost"))
+
+
+def test_a_callers_runner_keeps_its_engine_when_the_opening_run_fails(tmp_path, monkeypatch):
+    """Review finding: a workload_runner the caller passed carries the caller's
+    engine. The run still stops, but leaves that engine for the caller."""
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield _trace(run_id or "r")
+
+    class _CallersRunner(_Runner):
+        engine = object()
+
+        def __call__(self) -> dict:
+            raise TimeoutError("RPC call to sample_tokens timed out")
+
+    released: list = []
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(LiveEngineApplicator, "_shutdown", staticmethod(released.append))
+    out = loop.run_loop(loop.LoopConfig(budget="5h", scratch=str(tmp_path),
+                                        workload_runner=_CallersRunner()))
+    assert released == []
+    assert "opening workload run failed" in out["summary"]["engine_lost"]
