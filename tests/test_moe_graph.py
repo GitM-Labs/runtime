@@ -469,14 +469,17 @@ def test_blackwell_ultra_is_in_the_catalogue(b300):
 def test_b300_and_b200_predict_the_same_memory_bound_step(spec, b200, b300):
     """Blackwell Ultra's 1.67x fp4 uplift buys nothing on a memory-bound decode.
 
-    Same 8 TB/s, and every node is memory-bound, so the extra compute never
+    Every node is memory-bound, so at equal bandwidth the extra compute never
     binds. Any prediction that shows B300 faster at decode has a bug — most
-    likely a compute term that should have been a memory term.
+    likely a compute term that should have been a memory term. B200 is held at
+    B300's bandwidth because the two catalogue rows differ there (HGX B200 is
+    7.7 TB/s per GPU), and bandwidth is not what this test is about.
     """
     bc = BatchConfig(batch=256, kv_cache_len=32768)
     sh = ShardingConfig(tp=8)
+    b200_same_bw = replace(b200, peak_mem_bw_bytes_per_s=b300.peak_mem_bw_bytes_per_s)
     assert predict_moe_graph(spec, b300, bc, sh).total_pred_s == pytest.approx(
-        predict_moe_graph(spec, b200, bc, sh).total_pred_s
+        predict_moe_graph(spec, b200_same_bw, bc, sh).total_pred_s
     )
 
 

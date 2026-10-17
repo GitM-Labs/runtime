@@ -29,16 +29,20 @@ from gitm.planner.roofline import HardwareSpec
 # a substring of "l40" and the first substring match wins.
 _PEAKS: dict[str, tuple[float, float]] = {
     # "GB200" must precede "B200": the latter is a substring of the former, and
-    # the first substring match wins. Both are the same silicon per GPU, so the
-    # ordering is cosmetic here — it stops mattering the moment they diverge.
+    # the first substring match wins. They differ in HBM bandwidth: NVIDIA's
+    # Blackwell datasheets give 7.7 TB/s per GPU for HGX B200 (doc 3384703 Dec
+    # 2024 p.7; the DGX page's "64 TB/s" per board is the same parts rounded up)
+    # and 8 TB/s for the GB200 GPU (doc 4204213 Oct 2025 p.8). NVML calls both
+    # HGX and DGX parts "NVIDIA B200".
     # Blackwell Ultra raises dense fp4 by ~1.67x and doubles HBM, but leaves
     # bf16/fp8 and — decisively for decode — memory bandwidth unchanged at
-    # 8 TB/s. A memory-bound decode step therefore sees essentially none of the
-    # uplift, which is only visible if these are separate entries.
+    # 8 TB/s (3.9% over HGX B200's 7.7). A memory-bound decode step therefore
+    # sees essentially none of the uplift, which is only visible if these are
+    # separate entries.
     "GB300": (2250e12, 8000e9),
     "B300": (2250e12, 8000e9),
     "GB200": (2250e12, 8000e9),
-    "B200": (2250e12, 8000e9),
+    "B200": (2250e12, 7700e9),
     "H100": (989e12, 3350e9),
     "H200": (989e12, 4800e9),
     # CDNA4. Dense matrix bf16 peak — AMD quotes 5 PFLOPS *with* 2:4 sparsity,

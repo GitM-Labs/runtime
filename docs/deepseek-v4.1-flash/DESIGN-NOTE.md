@@ -50,7 +50,7 @@ gitm plan deepseek-v4.1-flash --gpu B200 --batch 32 --kv-len 8192 --tp 2
 | FP8 e4m3 tensor peak | **1,979 TFLOP/s** | **4,500 TFLOP/s** | `_QUANT_PEAKS`, dense, no 2:4 sparsity |
 | FP4 tensor peak | **none** | **9,000 TFLOP/s** | Hopper has no fp4 path. fp4 nodes price against the fp8 peak — see below |
 | FP32 CUDA-core peak | 67 TFLOP/s | not in `context.py` | the router casts to float (line 811) |
-| HBM3e | **4.8 TB/s** | **8.0 TB/s** | `context.py` |
+| HBM3e | **4.8 TB/s** | **7.7 TB/s** | `context.py` (HGX B200 per GPU; the GB200 GPU is 8.0) |
 | NVLink | 900 GB/s per GPU | 1,800 GB/s per GPU | `_INTERCONNECT` |
 | Memory | 141 GB × 8 = 1,128 GB | 180 GB × 8 [A1] | B200 capacity is a datasheet assumption, not in `context.py` |
 | Kernel launch | ~2 µs graph-replay / ~5 µs eager | same | the planner's `serial_launches` floor |
@@ -91,9 +91,9 @@ H200  FP8  ridge = 1,979e12 / 4.8e12 = 412 FLOP/byte
 H200  BF16 ridge =   989e12 / 4.8e12 = 206 FLOP/byte
 H200  FP32 ridge =    67e12 / 4.8e12 =  14 FLOP/byte
 H200  FP4  ridge = none — priced at the fp8 ridge, 412
-B200  FP4  ridge = 9,000e12 / 8.0e12 = 1,125 FLOP/byte
-B200  FP8  ridge = 4,500e12 / 8.0e12 =   562 FLOP/byte
-B200  BF16 ridge = 2,250e12 / 8.0e12 =   281 FLOP/byte
+B200  FP4  ridge = 9,000e12 / 7.7e12 = 1,169 FLOP/byte
+B200  FP8  ridge = 4,500e12 / 7.7e12 =   584 FLOP/byte
+B200  BF16 ridge = 2,250e12 / 7.7e12 =   292 FLOP/byte
 ```
 
 **You need four precisions.**
@@ -696,7 +696,7 @@ Per sequence per step:
 | **total** | **5.98 GB** | **34.21 GB** |
 | floor at 4.8 TB/s | 1.25 ms | 7.13 ms |
 | tokens/s per TP4 instance | 802 | 2,245 |
-| floor at 8.0 TB/s (B200) | 0.75 ms | 4.28 ms |
+| floor at 7.7 TB/s (B200) | 0.78 ms | 4.44 ms |
 
 - **At 1M the index scans are 40.8 % of the B = 16 step.** Layers 24–36 alone are 8.59 GB of them (§5 rank 1).
 - Engram lookups add 2 × 24 rows × 264 B = 12,672 B per token over PCIe, which is 202,752 B per step at B = 16.
@@ -714,7 +714,7 @@ Per sequence per step:
 | 128 | 16.611 ms | 7,706 | 0 |
 | 256 | 20.620 ms | 12,415 | 44 |
 
-**Hardware sensitivity.** The planner's B200 TP2 at the same B and S is 8.493 ms and 3,768 tok/s. That is slower than H200 TP4, because TP2 doubles each GPU's expert share. `moe_routed` is 90.5 % of the step. B200 TP2 also only fits with offload (§1).
+**Hardware sensitivity.** The planner's B200 TP2 at the same B and S is 8.817 ms and 3,629 tok/s (at the catalogue's 7.7 TB/s; 8.493 ms and 3,768 tok/s at the 8.0 TB/s it carried before). That is slower than H200 TP4, because TP2 doubles each GPU's expert share. `moe_routed` is 90.6 % of the step. B200 TP2 also only fits with offload (§1).
 
 ### 4.2 Prefill and MTP — regions and what flips them
 
@@ -1055,23 +1055,23 @@ Trace-day reference for §3 and §4. Every table here is `gitm plan` output, ver
 
 | op | ×N | t_pred | share | t_comp | t_mem | AI | bound |
 |---|---:|---:|---:|---:|---:|---:|---|
-| `moe_routed` | 43 | 7.689 ms | 90.5 % | 0.032 | 7.689 | 4.7 | memory |
-| `mhc_mix` | 86 | 0.172 | 2.0 % | 0.001 | 0.076 | 5.2 | launch |
-| `attn_q_b` | 43 | 0.134 | 1.6 % | 0.014 | 0.134 | 60.7 | memory |
-| `attn_index_score` | 38 | 0.122 | 1.4 % | 0.007 | 0.122 | 64.0 | memory |
-| `attn_score_value` | 43 | 0.064 | 0.8 % | 0.012 | 0.064 | 108.8 | memory |
-| `attn_kv_a` | 43 | 0.060 | 0.7 % | 0.007 | 0.060 | 61.2 | memory |
-| `moe_shared` | 43 | 0.055 | 0.6 % | 0.005 | 0.055 | 111.0 | memory |
-| `attn_out_proj` | 43 | 0.047 | 0.6 % | 0.004 | 0.047 | 53.4 | memory |
-| `lm_head` | 1 | 0.042 | 0.5 % | 0.005 | 0.042 | 63.1 | memory |
-| `attn_q_a` | 43 | 0.037 | 0.4 % | 0.004 | 0.037 | 60.2 | memory |
-| `attn_index_proj` | 38 | 0.027 | 0.3 % | 0.003 | 0.027 | 60.0 | memory |
-| `attn_qnorm_rope_insert` | 43 | 0.016 | 0.2 % | 0.000 | 0.016 | 0.9 | memory |
+| `moe_routed` | 43 | 7.988 ms | 90.6 % | 0.032 | 7.988 | 4.7 | memory |
+| `mhc_mix` | 86 | 0.172 | 2.0 % | 0.001 | 0.079 | 5.2 | launch |
+| `attn_q_b` | 43 | 0.139 | 1.6 % | 0.014 | 0.139 | 60.7 | memory |
+| `attn_index_score` | 38 | 0.126 | 1.4 % | 0.007 | 0.126 | 64.0 | memory |
+| `attn_score_value` | 43 | 0.066 | 0.8 % | 0.012 | 0.066 | 108.8 | memory |
+| `attn_kv_a` | 43 | 0.063 | 0.7 % | 0.007 | 0.063 | 61.2 | memory |
+| `moe_shared` | 43 | 0.057 | 0.6 % | 0.005 | 0.057 | 111.0 | memory |
+| `attn_out_proj` | 43 | 0.049 | 0.6 % | 0.004 | 0.049 | 53.4 | memory |
+| `lm_head` | 1 | 0.044 | 0.5 % | 0.005 | 0.044 | 63.1 | memory |
+| `attn_q_a` | 43 | 0.039 | 0.4 % | 0.004 | 0.039 | 60.2 | memory |
+| `attn_index_proj` | 38 | 0.028 | 0.3 % | 0.003 | 0.028 | 60.0 | memory |
+| `attn_qnorm_rope_insert` | 43 | 0.017 | 0.2 % | 0.000 | 0.017 | 0.9 | memory |
 | `tp_all_reduce` | 43 | 0.016 | 0.2 % | 0.000 | 0.016 | 0.0 | memory |
-| `moe_router` | 43 | 0.012 | 0.1 % | 0.001 | 0.012 | 54.3 | memory |
+| `moe_router` | 43 | 0.013 | 0.1 % | 0.001 | 0.013 | 54.3 | memory |
 | `attn_kv_compress` | 38 | 0.001 | 0.0 % | 0.000 | 0.001 | 0.8 | memory |
 
-**Floor 8.493 ms/step, 3,768 tok/s at batch 32. 631 nodes, 0 compute-bound, 86 launch-bound.** No fallback warning, since B200 has an fp4 peak. The ridges print as 281 (bf16), 562 (fp8), 1125 (fp4).
+**Floor 8.817 ms/step, 3,629 tok/s at batch 32. 631 nodes, 0 compute-bound, 86 launch-bound.** No fallback warning, since B200 has an fp4 peak. The ridges print as 292 (bf16), 584 (fp8), 1169 (fp4). (Re-run at the catalogue's 7.7 TB/s B200; the first run of this note, at 8.0 TB/s, gave 8.493 ms, 3,768 tok/s and ridges 281 / 562 / 1125.)
 
 ### A.3 — MTP, H200, TP4, B=32, S=8192, D=5
 
