@@ -118,6 +118,7 @@ If earlier runs left results, the CLI asks whether to rank this run from them, u
 **The engine.** The `vllm-decode` workload (`gitm/workloads.py`) builds an offline `vllm.LLM` from environment variables:
 - `GITM_VLLM_MODEL`, `GITM_VLLM_TP`, `GITM_VLLM_ENFORCE_EAGER`, `GITM_VLLM_MAX_MODEL_LEN`, …
 - the workload size: `GITM_VLLM_PROMPTS` × `GITM_VLLM_MAX_TOKENS`, 256 × 512 by default. A much shorter decode (the old 64 × 128 took about 1.4 s) finishes before the tracer flushes anything.
+- **the traffic:** by default, `GITM_VLLM_PROMPTS` copies of a five-token prompt. That is pure decode with nothing shared, and on it stock vLLM sits at its ceiling: Kimi K2.6 on H200 rejected all 17 candidates. `GITM_VLLM_TRAFFIC=mooncake:<trace.jsonl>` (or `burstgpt:<file.csv>`) uses a production trace's request shapes instead (`gitm/traffic/offline.py`): each request's real input and output length, and prompts that share exactly the prefix blocks the requests shared, so the prefix cache sees production's reuse. Every request generates exactly its length, so every engine in an A/B does the same work. It is a batch, not a replay: arrival timing is not reproduced. Requests longer than the engine's context are skipped and counted, never trimmed, so raise `GITM_VLLM_MAX_MODEL_LEN` for long-prompt traces. The run's opening `run()` reports the batch it used (source, sha256, request count, mean lengths, skips).
 
 **Before the engine is built,** a collective health check runs an AllReduce across the visible GPUs (skipped with fewer than 2). It detects the GPUs in a separate process: initialising CUDA in gitm's own process would stop vLLM from forking its engine.
 
@@ -286,6 +287,7 @@ Useful switches:
   - a clear loss stops after round 1 and costs two, the candidate plus the baseline rebuilt by the rollback.
 
   The run also spends N + 2 baseline builds measuring its noise first (the running engine, as the warm-up, then N + 1 rebuilds). On Kimi K2.5 at TP=8, where a build takes minutes, plan on roughly one candidate an hour, or use `--validation 1` for a quicker, noisier pass.
+- **Offline traffic has no arrivals.** `GITM_VLLM_TRAFFIC` keeps a trace's request shapes and sharing but runs them as one batch, so queueing, burstiness and latency targets are not tested. Replaying a trace at its own timestamps against a server is `gitm.traffic.replay`; driving the A/B through it is the next step.
 - **The cluster round is manual.** The arms `gitm propose` writes have to be turned into harness jobs, launched and collected by hand. Each arm has one traffic point, and `gitm ingest` reads throughput only.
 - **Engine settings aren't priced.** The predicted graph depends on the model, the GPU and the batch, never on tensor parallelism, KV-cache dtype or quantization settings. Production extras like a speculative draft model aren't modelled either.
 - **Attribution beyond residuals isn't acted on.** Granger and doubly-robust results are reported, but they don't affect the ranking.
