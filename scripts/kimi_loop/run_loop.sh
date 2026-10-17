@@ -65,7 +65,7 @@ guide() {  # guide <outfile> <streams> <prompt> <output> <seconds>
 scrape_metrics() {  # scrape_metrics <outfile> — 1 Hz until killed
   while :; do
     printf '### ts_ns=%s\n' "$(date +%s%N)"
-    curl -sf "$EP/metrics" | grep -E 'vllm:(num_requests_running|num_requests_waiting|gpu_cache_usage_perc|num_preemptions)' || true
+    curl -sf "$EP/metrics" | grep -E 'vllm:(num_requests_running|num_requests_waiting|kv_cache_usage_perc|gpu_cache_usage_perc|num_preemptions)' || true
     sleep 1
   done >> "$1"
 }

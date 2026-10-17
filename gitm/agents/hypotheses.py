@@ -28,6 +28,8 @@ efficiency, so a total and its recoverable part are in the same units.
 
 from __future__ import annotations
 
+import json
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -53,6 +55,11 @@ class Workload:
     ``--kv-cache-dtype auto`` resolves to for that checkpoint. ``serving`` is an
     explicit engine override in EngineArgs names (``{"kv_cache_dtype": "fp8"}``);
     absent keys mean the engine default.
+
+    ``request_lengths`` is (prompt, output) tokens when every request has those
+    lengths and they are admitted together, so the batch decodes in lockstep
+    (``vllm bench serve`` at request rate inf, v0.29.0 benchmarks/serve.py:458-459,
+    :969-975); ``batch.kv_cache_len`` is then prompt + output // 2.
     """
 
     model: str
@@ -61,6 +68,17 @@ class Workload:
     batch: BatchConfig
     sharding: ShardingConfig
     serving: dict[str, Any] = field(default_factory=dict)
+    request_lengths: tuple[int, int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.request_lengths is None:
+            return
+        prompt, output = self.request_lengths
+        if prompt < 1 or output < 2 or prompt + output // 2 != self.batch.kv_cache_len:
+            raise ValueError(
+                f"request_lengths {self.request_lengths} do not put kv_cache_len "
+                f"{self.batch.kv_cache_len} at prompt + output // 2 with at least one "
+                "decode step")
 
 
 @dataclass(frozen=True)
@@ -69,10 +87,12 @@ class Prediction:
 
     ``op_delta`` is the covered-op effect the gate consumes; ``step_delta`` is the
     decode-step effect a verdict is judged against. Both are reductions: positive
-    means faster. Every tuple is (lo, mean, hi).
+    means faster. Every tuple is (lo, mean, hi); ``hardware`` is the SKU it was
+    priced on.
     """
 
     metric: str
+    hardware: str
     baseline_step_s: float
     predicted_step_s: float
     #: The modelled loss on the measured basis: everything the mechanism touches.
@@ -128,6 +148,7 @@ def _op_time(g: Graph, *ops: str) -> float:
 def _effect(
     g_old: Graph, g_new: Graph, ops: tuple[str, ...], hw: HardwareSpec,
     *, same_kernel: bool, extra_s: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    old_eff: float | None = None, new_add_s: float = 0.0,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
     """(saved seconds, op delta, step delta) for the changed ``ops``, (lo, mean, hi).
 
@@ -137,13 +158,18 @@ def _effect(
     smallest in absolute time) and hi at ``eff_lo``. Otherwise the old kernel and
     the new one are independent: lo puts the old at ``eff_hi`` and the new at
     ``eff_lo``. ``extra_s`` is cost the intervention adds (negative saving).
+    ``old_eff`` pins the old kernel at one measured efficiency at every end;
+    ``new_add_s`` is floor the new kernel moves beyond the graph's op, priced at
+    its efficiency at each end.
     """
     lo_e, hi_e = hw.eff_lo, hw.eff_hi
     mid = (lo_e + hi_e) / 2.0
-    old, new = _op_time(g_old, *ops), _op_time(g_new, *ops)
+    old, new = _op_time(g_old, *ops), _op_time(g_new, *ops) + new_add_s
     rest = (g_old.total_pred_s - old) / mid
     ends = ((hi_e, hi_e), (mid, mid), (lo_e, lo_e)) if same_kernel else (
         (hi_e, lo_e), (mid, mid), (lo_e, hi_e))
+    if old_eff is not None:
+        ends = ((old_eff, lo_e), (old_eff, mid), (old_eff, hi_e))
     saved, op, step = [], [], []
     for (e_old, e_new), extra in zip(ends, extra_s, strict=True):
         s = old / e_old - new / e_new - extra
@@ -233,6 +259,7 @@ def _h001_predict(w: Workload) -> Prediction:
     )
     return Prediction(
         metric="MoE kernel time and HBM read per decode step, then decode ITL p50",
+        hardware=w.hw.name,
         baseline_step_s=g_old.total_pred_s,
         predicted_step_s=g_new.total_pred_s,
         total_overhead_s=scale_stream / mid,
@@ -261,18 +288,14 @@ H001 = Hypothesis(
 
 # ── H-002: a bf16 MLA cache where the engine could store fp8 ──────────────────
 
-#: (backend with a bf16 cache, backend with fp8, same kernel?) per arch, in
-#: vLLM v0.19.1. Hopper switches: FLASH_ATTN_MLA (first on sm90, platforms/
-#: cuda.py:92-97) has no fp8 path (flashattn_mla.py:45-49, :322-323), so fp8
-#: lands on FLASHMLA (flashmla.py:48-53, :73-74). Blackwell keeps FLASHINFER_MLA
-#: (flashinfer_mla.py:40-45, :65-66); whether its fp8 path is the same kernel
-#: was not read, so it is priced as a switch, the wider band. CDNA4 keeps the
-#: ROCM_AITER_MLA backend (platforms/rocm.py:317-322; rocm_aiter_mla.py:30-38)
-#: but not the kernel: AITER picks a hand-written asm kernel per dtype pair
-#: (aiter/csrc/py_itfs_cu/asm_mla.cu:253-287), mla_a16w16_qh16_* for bf16 and
-#: mla_a8w8_qh16_qseqlen1_gqaratio16 for fp8, after vLLM quantises the query to
-#: fp8 too (mla_attention.py:669-674, :2099). A different kernel, so a switch.
-#: Without AITER the ROCm list is TRITON_MLA alone (:324-326), not priced.
+#: (backend with a bf16 cache, backend with fp8, same kernel?) per arch. CUDA
+#: rows read at vLLM v0.27.1 (last verified on H200), CDNA4 at v0.29.0 (the
+#: MI355X loop image). Hopper: FLASH_ATTN_MLA is first on sm90 but stores no
+#: fp8 (flashattn_mla.py:45-49), so fp8 lands on FLASHMLA. Blackwell keeps
+#: FLASHINFER_MLA; whether its fp8 path is the same kernel was not read, so it
+#: is priced as a switch. CDNA4 keeps ROCM_AITER_MLA but not the kernel: under
+#: 16 heads per rank bf16 runs AITER's Gluon ``_mla_gluon`` and fp8 the asm
+#: ``mla_a8w8_*`` kernels (rocm_aiter_mla.py:1334-1353).
 _MLA_BACKENDS: dict[str, tuple[str, str, bool]] = {
     "hopper": ("FLASH_ATTN_MLA", "FLASHMLA", False),
     "blackwell": ("FLASHINFER_MLA", "FLASHINFER_MLA", False),
@@ -280,50 +303,98 @@ _MLA_BACKENDS: dict[str, tuple[str, str, bool]] = {
 }
 
 
-def _aiter_enabled(w: Workload) -> bool:
-    """``VLLM_ROCM_USE_AITER=1`` in the serving config, as the loop deployment
-    sets it. The env var is not an EngineArg, so it is read by its own name."""
-    return str(w.serving.get("VLLM_ROCM_USE_AITER", "0")).lower() in ("1", "true")
+#: AITER's smallest native MLA decode head count (vLLM v0.29.0
+#: v1/attention/backends/mla/rocm_aiter_mla.py:1216).
+_AITER_MIN_MLA_HEADS = 16
+
+
+def _env_on(w: Workload, name: str, default: str) -> bool:
+    """On for "1" or "true" in any case, as vLLM reads a boolean env var (envs.py:1235-1237)."""
+    return str(w.serving.get(name, default)).lower() in ("1", "true")
+
+
+def _cdna4_refusal(w: Workload) -> str | None:
+    """Why the CDNA4 serving env is not the one the derivation prices, or None:
+    ROCM_AITER_MLA heads the MLA list only with both AITER flags on (v0.29.0
+    _aiter_ops.py:1953-1956, platforms/rocm.py:469-479), else it is TRITON_MLA."""
+    if not _env_on(w, "VLLM_ROCM_USE_AITER", "false"):
+        return ("CDNA4 without VLLM_ROCM_USE_AITER=1 selects TRITON_MLA "
+                "(platforms/rocm.py:469-479); the prediction is for ROCM_AITER_MLA")
+    if not _env_on(w, "VLLM_ROCM_USE_AITER_MLA", "true"):
+        return ("VLLM_ROCM_USE_AITER_MLA is off, so CDNA4 selects TRITON_MLA "
+                "(_aiter_ops.py:1953-1956, platforms/rocm.py:469-479); the "
+                "prediction is for ROCM_AITER_MLA")
+    padding = str(w.serving.get("VLLM_ROCM_AITER_MLA_ASM_PADDING", "auto")).lower()
+    heads = w.spec.n_heads // w.sharding.tp
+    # use_gluon_decode reads the mode only under 16 heads; auto takes Gluon
+    # when 16 is a multiple of the head count (rocm_aiter_mla.py:1334-1353).
+    if heads < _AITER_MIN_MLA_HEADS:
+        auto = "gluon" if _AITER_MIN_MLA_HEADS % heads == 0 else "asm"
+        if padding not in ("auto", auto):
+            return (f"VLLM_ROCM_AITER_MLA_ASM_PADDING={padding} moves the bf16 arm off "
+                    f"the {auto} kernel auto picks at {heads} heads per rank "
+                    "(rocm_aiter_mla.py:1334-1353); the derivation prices auto")
+    return None
 
 
 def _executed_kv(w: Workload) -> str:
     """The cache dtype the engine stores: an explicit flag, else what ``auto``
     resolves to. vLLM resolves ``auto`` from the checkpoint's quantization
-    config (engine/arg_utils.py:1567-1570 -> utils/torch_utils.py:324-342): a
-    modelopt ``kv_cache_scheme`` of static 8-bit float becomes fp8 (:262-296),
-    and anything else falls back to the model dtype (:345-351). The catalogue's
+    config (engine/arg_utils.py:2069-2071 -> utils/torch_utils.py:506-524): a
+    modelopt ``kv_cache_scheme`` of static 8-bit float becomes fp8 (:452-467),
+    and anything else falls back to the model dtype (:494, :524). The catalogue's
     ``kv_dtype`` records that resolved value."""
     flag = str(w.serving.get("kv_cache_dtype", "auto")).lower()
+    if flag == "bfloat16":  # vLLM's own spelling (config/cache.py:39-42)
+        return "bf16"
     return w.spec.kv_dtype if flag == "auto" else flag
+
+
+def _nested_config(w: Workload, key: str) -> Any:
+    """A config-object EngineArg (``compilation_config``, ``attention_config``):
+    a dict, or the JSON string the CLI takes (engine/arg_utils.py:815-819)."""
+    value = w.serving.get(key)
+    if value is None:
+        return {}
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def _forced_backend(w: Workload) -> str:
+    """The MLA backend the serving config pins, or "": ``--attention-backend`` lands
+    in ``attention_config.backend`` (v0.29.0 engine/arg_utils.py:2489-2498) and
+    ``backend_per_kind`` overrides it per kind (v1/attention/selector.py:175-183)."""
+    ac = _nested_config(w, "attention_config")
+    per_kind = ac.get("backend_per_kind") or {}
+    forced = (per_kind.get("mla_attention") or ac.get("backend")
+              or w.serving.get("attention_backend") or "")
+    return str(forced).upper()
 
 
 def _mla_backends(w: Workload) -> tuple[str, str, bool] | str:
     """(backend with the executed cache, backend with fp8, same kernel), or why not.
 
-    The derivation prices one specific kernel pair per arch: vLLM's default
-    choice. An explicit ``attention_backend`` in the serving config is honoured
-    only when it is one of that pair. Forcing the fp8-capable backend on the
-    bf16 side is the same-kernel case only where that backend runs one kernel
-    for both dtypes (Hopper's FLASHMLA); on CDNA4 the backend class is shared
-    and the asm kernel is not, so it stays a switch.
+    The derivation prices vLLM's default kernel pair per arch; a pinned backend
+    is honoured only when it is one of the pair. Forcing the fp8-capable
+    backend on the bf16 side still switches the kernel: FLASHMLA and
+    ROCM_AITER_MLA each run a different kernel per cache dtype.
     """
     if w.hw.arch not in _MLA_BACKENDS:
         return f"no fp8 MLA decode backend pinned for arch {w.hw.arch or 'unknown'!r}"
-    if w.hw.arch == "cdna4" and not _aiter_enabled(w):
-        return ("CDNA4 without VLLM_ROCM_USE_AITER=1 selects TRITON_MLA "
-                "(platforms/rocm.py:324-326); the prediction is for ROCM_AITER_MLA")
+    if w.hw.arch == "cdna4":
+        why = _cdna4_refusal(w)
+        if why is not None:
+            return why
     default, fp8, same = _MLA_BACKENDS[w.hw.arch]
-    forced = str(w.serving.get("attention_backend", "") or "").upper()
+    forced = _forced_backend(w)
     if forced == default and default != fp8:
         return (f"attention_backend={forced} is explicitly pinned; the fp8 intervention "
                 f"does not switch it to {fp8}")
     if not forced or forced == default:
         return default, fp8, same
     if forced == fp8:
-        # One backend both sides. Same kernel only if the backend is one kernel
-        # family for both dtypes, which is true where the default differs from
-        # it (Hopper: forcing FLASHMLA at bf16 keeps FLASHMLA at fp8).
-        return fp8, fp8, default != fp8
+        # Pinned FLASHMLA still switches: flash_mla_with_kvcache for bf16 and
+        # flash_mla_with_kvcache_fp8 for fp8 (v0.27.1 flashmla.py:317-342).
+        return fp8, fp8, False
     return (f"attention_backend={forced} is not the pair the derivation prices "
             f"on {w.hw.arch} ({default} -> {fp8})")
 
@@ -334,7 +405,7 @@ def _h002_applies(w: Workload) -> str | None:
         return "not MLA: the cache is not one shared latent per token"
     # Sparse MLA (a DSA indexer on any layer) takes the fp8_ds_mla layout on
     # its own backends: 656 B per entry with per-128 fp32 scales, not the
-    # generic 576 B this derivation prices (mla_attention.py:341-362).
+    # generic 576 B this derivation prices (mla_attention.py:349-362, :1218-1220).
     if s.n_full_indexer_layers > 0 or s.index_n_heads > 0:
         return ("sparse MLA (DSA indexer present): fp8 becomes the fp8_ds_mla "
                 "layout on a sparse backend, which this derivation does not price")
@@ -344,15 +415,194 @@ def _h002_applies(w: Workload) -> str | None:
                 "whose kv_cache_scheme vLLM resolves 'auto' to fp8)")
     if _canon_dtype(executed) != "fp16":
         return f"executed cache dtype {executed!r} is neither bf16/fp16 nor fp8"
+    # The named layers stay at the model dtype (engine/arg_utils.py:1299,
+    # mla_attention.py:452-456); the derivation prices every layer fp8.
+    if w.serving.get("kv_cache_dtype_skip_layers"):
+        return ("kv_cache_dtype_skip_layers is set: a partly fp8 cache is a different "
+                "prediction and must be re-derived")
     pair = _mla_backends(w)
     if isinstance(pair, str):
         return pair
     if w.batch.is_prefill or w.batch.batch <= 0:
         return "decode-only prediction; prefill steps are out of scope"
+    return _decode_shape_refusal(w) or _graph_refusal(w)
+
+
+#: Strings pydantic reads as True for a bool field; vLLM's ModelConfig is a
+#: pydantic dataclass (v0.29.0 config/utils.py:51-74, config/model.py:123-124).
+_PYDANTIC_TRUE = ("1", "on", "t", "true", "y", "yes")
+
+
+def _opt_level(w: Workload) -> str:
+    return str(w.serving.get("optimization_level", 2)).upper().removeprefix("O")
+
+
+def _decode_cudagraph_mode(w: Workload, cc: dict[str, Any]) -> str:
+    """vLLM v0.29.0's cudagraph mode name: an explicit ``cudagraph_mode`` (name
+    in any case, or enum value; config/compilation.py:53-63, :870-876), else
+    the one ``optimization_level`` supplies (config/vllm.py:255, :278, :301)."""
+    mode = cc.get("cudagraph_mode")
+    if mode is None:
+        return {"0": "NONE", "1": "PIECEWISE"}.get(_opt_level(w), "FULL_AND_PIECEWISE")
+    return {0: "NONE", 1: "PIECEWISE", 2: "FULL"}.get(mode, str(mode).upper())
+
+
+def _compile_mode(w: Workload, cc: dict[str, Any]) -> str:
+    """vLLM v0.29.0's CompilationMode name (config/compilation.py:37-50).
+    TORCH_COMPILE_DISABLE=1 forces NONE (config/vllm.py:1390-1395); with no
+    explicit ``mode``, -O0 gives NONE and any other level VLLM_COMPILE
+    (:1431-1435)."""
+    if str(w.serving.get("TORCH_COMPILE_DISABLE", "")) == "1":
+        return "NONE"
+    mode = cc.get("mode")
+    if mode is None:
+        return "NONE" if _opt_level(w) == "0" else "VLLM_COMPILE"
+    names = {0: "NONE", 1: "STOCK_TORCH_COMPILE", 2: "DYNAMO_TRACE_ONCE", 3: "VLLM_COMPILE"}
+    return names.get(mode, str(mode).upper())
+
+
+def _graph_refusal(w: Workload) -> str | None:
+    """Why decode would not replay one full graph at this batch, or None. The
+    extra kernels are priced at the graph-replay launch (2 us); eager is nearer
+    5 us, which moves the whole band. PIECEWISE runs attention outside its
+    graphs, and a batch above the largest captured size dispatches to NONE
+    (v1/cudagraph_dispatcher.py:274-281)."""
+    why = "the derivation prices graph-replay launches (2 us), not eager ones"
+    if str(w.serving.get("enforce_eager", False)).lower() in _PYDANTIC_TRUE:
+        return f"enforce_eager runs decode without a graph: {why}"
+    cc = _nested_config(w, "compilation_config")
+    if not isinstance(cc, dict):
+        return (f"compilation_config={cc!r} is not the dict or JSON object vLLM v0.29.0 "
+                "takes (engine/arg_utils.py:815-819); -O levels are optimization_level")
+    mode = _decode_cudagraph_mode(w, cc)
+    if mode in ("NONE", "PIECEWISE"):
+        return f"cudagraph_mode {mode} runs decode attention outside a graph: {why}"
+    compile_mode = _compile_mode(w, cc)
+    if mode == "FULL_AND_PIECEWISE" and compile_mode != "VLLM_COMPILE":
+        return (f"compilation mode {compile_mode} does no piecewise compilation, so vLLM "
+                f"overrides cudagraph_mode {mode} to NONE (config/vllm.py:1468-1480): {why}")
+    pcp = int(w.serving.get("prefill_context_parallel_size") or 1)
+    if pcp > 1 and w.hw.arch == "cdna4":
+        return (f"prefill_context_parallel_size={pcp}: ROCm overrides full graphs to "
+                f"PIECEWISE (platforms/rocm.py:902-913), so decode attention runs outside "
+                f"a graph: {why}")
+    cap = cc.get("max_cudagraph_capture_size", w.serving.get("max_cudagraph_capture_size"))
+    sizes = cc.get("cudagraph_capture_sizes") or w.serving.get("cudagraph_capture_sizes")
+    if cap is None and sizes:
+        cap = max(int(s) for s in sizes)
+    if cap is None:
+        # vLLM's default ceiling (config/vllm.py:2003-2016); max_num_seqs
+        # defaults to 1024 on every priced SKU (engine/arg_utils.py:2698-2717).
+        cap = min(1024 if w.hw.arch == "blackwell" else 512,
+                  2 * int(w.serving.get("max_num_seqs") or 1024))
+    cap = min(int(cap), int(w.serving.get("max_num_batched_tokens") or cap))
+    if w.batch.batch > cap:
+        return (f"batch {w.batch.batch} is above the largest captured graph size {cap}, "
+                f"so decode runs without a graph: {why}")
     return None
 
 
-def _h002_predict(w: Workload) -> Prediction:
+#: Serving keys that turn on speculative decoding: EngineArgs (v0.29.0
+#: engine/arg_utils.py:692-695) and gitm's draft-length knob (optimizer/vllm_knobs.py:100-102).
+_SPEC_DECODE_KEYS = ("speculative_config", "spec_method", "spec_model", "spec_tokens",
+                     "num_speculative_tokens")
+
+
+def _decode_shape_refusal(w: Workload) -> str | None:
+    """Why a decode step is not one query token per sequence on
+    ``n_heads / tp`` heads per rank, the shape the derivation prices, or None."""
+    if w.batch.speculative_tokens > 0 or any(w.serving.get(k) for k in _SPEC_DECODE_KEYS):
+        return ("speculative decoding: verify steps carry more than one query token "
+                "per sequence, which turns AITER's Gluon decode off "
+                "(rocm_aiter_mla.py:1339-1340) and is not priced")
+    dcp = int(w.serving.get("decode_context_parallel_size") or 1)
+    if dcp > 1:
+        return (f"decode_context_parallel_size={dcp}: each rank decodes {dcp}x the "
+                "query heads (rocm_aiter_mla.py:1426-1428) over its shard of the "
+                "cache (v1/attention/backends/utils.py:1091-1100), which is not priced")
+    return None
+
+
+def _fp8_extra_kernels(
+    w: Workload, bf16_backend: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Kernels the fp8 arm runs that the bf16 arm does not: (per layer, per step).
+
+    With an fp8 cache vLLM concatenates and quantises the query in one op
+    (v0.29.0 mla_attention.py:945-950, :1415-1445), extra only where the bf16
+    backend takes the (q_nope, q_pe) tuple as is: FLASH_ATTN_MLA
+    (flashattn_mla.py:328-329) and AITER's Gluon path (rocm_aiter_mla.py:1770-1771).
+    Gluon serves bf16 under 16 heads per rank (16 a multiple of the count) with one
+    KV split and no reduce or schedule (:1090, :1798; mla_gluon.py:943-945); the
+    fp8 arm pads the query to 16 heads, runs asm stage 1 then ``mla_reduce_v1``
+    every layer (aiter/mla.py:656-694) and builds the schedule once per step
+    (:1053-1077). At 16 or more heads both arms take the padded asm path.
+    """
+    heads = w.spec.n_heads // w.sharding.tp
+    m = _AITER_MIN_MLA_HEADS
+    if w.hw.arch == "cdna4":
+        if heads < m and m % heads == 0:
+            return (("query concat+quant", f"{heads}->{m} head pad", "mla_reduce_v1"),
+                    ("get_mla_metadata_v1",))
+    elif bf16_backend == "FLASH_ATTN_MLA":
+        return ("query concat+quant",), ()
+    return (), ()
+
+
+#: AITER's persistent work slots: get_mla_metadata_v1 sizes its schedule by
+#: multiProcessorCount (v1_2_device.cuh:847, :901-903), 256 CUs on gfx950.
+_GFX950_CUS = 256
+
+
+def _aiter_partial_tiles(n_seq: int, kv_len: int, num_splits: int = _GFX950_CUS) -> int:
+    """Split-KV partial tiles AITER's persistent decode schedule makes for
+    ``n_seq`` sequences of ``kv_len`` cached tokens, one query token each: phase 1
+    of kn_get_mla_metadata_v1_2_parallel (AITER v0.1.19 v1_2_device.cuh:121-208)
+    at vLLM's call (page size 1, granularity 16). Each sequence costs its 16-token
+    blocks plus 16 of overhead, the total is cut into ``num_splits`` equal
+    payloads, and a sequence spanning k > 1 slots leaves k partials (:200-204)."""
+    gran = overhead = 16
+    blocks = -(-kv_len // gran)
+    payload = -(-(n_seq * (blocks + overhead)) // num_splits) + overhead
+    per_slot = payload - overhead
+    remain, tiles = payload, 0
+    for _ in range(n_seq):
+        if blocks + overhead <= remain:
+            remain -= blocks + overhead
+            continue
+        if remain > overhead:
+            rest = blocks - (remain - overhead)
+            fresh = -(-rest // per_slot)
+            frags = fresh + 1
+        else:
+            rest = blocks
+            fresh = -(-rest // per_slot)
+            frags = fresh
+        remain = payload - ((rest - (fresh - 1) * per_slot) + overhead)
+        tiles += frags if frags > 1 else 0
+    return tiles
+
+
+def _h002_mean_tiles(w: Workload) -> tuple[float, str]:
+    """AITER's partial tiles per decode step, and how they were counted: with
+    ``request_lengths`` (P, O) the mean over the O - 1 lockstep steps at P + 1 ..
+    P + O - 1 cached tokens (vLLM writes the step's own token before attention,
+    mla_attention.py:703-713), else the count at ``kv_cache_len``."""
+    b = w.batch
+    if w.request_lengths is None:
+        return (float(_aiter_partial_tiles(b.batch, b.kv_cache_len)),
+                f"at {b.kv_cache_len} cached tokens only")
+    prompt, output = w.request_lengths
+    counts = [_aiter_partial_tiles(b.batch, n) for n in range(prompt + 1, prompt + output)]
+    return (sum(counts) / len(counts),
+            f"mean over {len(counts)} lockstep decode steps at {prompt + 1} to "
+            f"{prompt + output - 1} cached tokens: {sum(counts)} / {len(counts)}, "
+            f"{min(counts)} to {max(counts)} per step")
+
+
+def _h002_predict(w: Workload, *, bf16_layer_s: float | None = None) -> Prediction:
+    """The registered derivation; with ``bf16_layer_s`` (the baseline decode
+    kernel's measured time per layer) the bf16 core is that time, not the band."""
     executed = replace(w.spec, kv_dtype=_executed_kv(w), kv_rope_dtype=_executed_kv(w))
     candidate = replace(w.spec, kv_dtype="fp8", kv_rope_dtype="fp8")
     g_old, g_new = _floor(executed, w), _floor(candidate, w)
@@ -360,33 +610,122 @@ def _h002_predict(w: Workload) -> Prediction:
     if isinstance(pair, str):
         raise ValueError(f"H-002 does not apply: {pair}")
     old_b, new_b, same = pair
-    saved, op, step = _effect(g_old, g_new, ("attn_score_value",), w.hw, same_kernel=same)
+    # Each extra kernel moves well under a microsecond of bytes, so it costs
+    # its launch, and nothing hides it, so lo, mean and hi all pay it.
+    per_layer, per_step = _fp8_extra_kernels(w, old_b)
+    launch = w.hw.kernel_launch_overhead_s
+    bw = w.hw.peak_mem_bw_bytes_per_s
     mid = (w.hw.eff_lo + w.hw.eff_hi) / 2.0
+    launches = len(per_layer) * executed.n_layers + len(per_step)
+    b = w.batch
+    # Where only the fp8 arm reduces, stage 1 writes split-KV partials of 16 heads
+    # x (fp32 output + fp32 LSE) (aiter/mla.py:607-616), priced with the fp8
+    # kernel; the reduce reads them plus the bf16 output (:684-694) and, like any
+    # node, costs max(launch, bytes / bandwidth), so only the part past its launch is new.
+    m, lora = _AITER_MIN_MLA_HEADS, executed.kv_lora_rank
+    tiles, counted = _h002_mean_tiles(w) if "mla_reduce_v1" in per_layer else (0.0, "none")
+    partial_b = tiles * m * (lora * 4 + 4)
+    writes_s = executed.n_layers * partial_b / bw
+    reduce_s = (partial_b + b.batch * m * lora * 2) / bw if tiles else 0.0
+    reduce_past_s = executed.n_layers * max(0.0, reduce_s - launch)
+    kernels_floor = launches * launch + reduce_past_s
+    extra_floor = kernels_floor + writes_s
+    # Same basis as the unchanged rest of the step in _effect: floor / mid.
+    extra = kernels_floor / mid
     old_attn = _op_time(g_old, "attn_score_value")
     new_attn = _op_time(g_new, "attn_score_value")
-    b = w.batch
+    layer_floor = old_attn / executed.n_layers
+    old_eff = None if bf16_layer_s is None else layer_floor / bf16_layer_s
+    saved, op, step = _effect(g_old, g_new, ("attn_score_value",), w.hw,
+                              same_kernel=same, extra_s=(extra, extra, extra),
+                              old_eff=old_eff, new_add_s=writes_s)
+    new_ends = ((w.hw.eff_hi, mid, w.hw.eff_lo) if same and old_eff is None
+                else (w.hw.eff_lo, mid, w.hw.eff_hi))
+    ends = (w.hw.eff_hi, mid, w.hw.eff_lo)
+    bf16_core = (
+        f"bf16 core per layer: floor {layer_floor * 1e6:.1f} us; at eff "
+        + " / ".join(f"{e:.2f}" for e in ends) + " = "
+        + " / ".join(f"{layer_floor / e * 1e6:.1f}" for e in ends) + " us"
+        + ("" if bf16_layer_s is None else
+           f"; measured {bf16_layer_s * 1e6:.1f} us per layer = eff {old_eff:.3f}, "
+           "used at every end")
+    )
     arithmetic = (
+        f"{w.hw.name}, TP{w.sharding.tp}: {b.batch} sequences x {b.kv_cache_len} cached "
+        f"tokens, {executed.n_heads // w.sharding.tp} query heads per rank",
         f"cache entry {executed.kv_entry_dim} elems: {kv_entry_bytes(executed):.0f} B "
         f"stored vs {kv_entry_bytes(candidate):.0f} B as generic fp8",
         f"attention core reads {b.batch} x {b.kv_cache_len} entries x {executed.n_layers} "
         "layers per rank (replicated latent, TP does not split it)",
         f"floor: attn_score_value {old_attn * 1e3:.3f} -> {new_attn * 1e3:.3f} ms; "
-        f"step {g_old.total_pred_s * 1e3:.3f} -> {g_new.total_pred_s * 1e3:.3f} ms",
+        f"step {g_old.total_pred_s * 1e3:.3f} -> {g_new.total_pred_s * 1e3:.3f} ms, "
+        f"{(g_new.total_pred_s + extra_floor) * 1e3:.3f} ms with the fp8-only kernels",
+        f"fp8-only kernels: {len(per_layer)} per layer ({', '.join(per_layer) or 'none'}) "
+        f"x {executed.n_layers} layers + {len(per_step)} per step "
+        f"({', '.join(per_step) or 'none'}) = {launches} launches x {launch * 1e6:.1f} us "
+        f"= {launches * launch * 1e3:.3f} ms floor",
+        f"split-KV partials: {tiles:.2f} tiles ({counted}; {tiles / b.batch:.2f} per "
+        f"sequence) x {m} heads x ({lora} x 4 + 4) B = {partial_b:.0f} B per layer, "
+        "written by stage 1 "
+        f"({partial_b / bw * 1e6:.3f} us, {executed.n_layers} layers = "
+        f"{writes_s * 1e3:.3f} ms floor); the reduce reads them and writes the output "
+        f"in {reduce_s * 1e6:.3f} us, charged past its {launch * 1e6:.1f} us launch only: "
+        f"{reduce_past_s * 1e3:.3f} ms floor",
+        f"fp8-only total {extra_floor * 1e3:.3f} ms floor: kernels "
+        f"{kernels_floor * 1e3:.3f} ms / {mid:.2f} = {extra * 1e3:.3f} ms at lo, mean "
+        f"and hi; stage 1 writes {writes_s * 1e3:.3f} ms at the fp8 kernel's efficiency: "
+        + " / ".join(f"{writes_s / e * 1e3:.3f}" for e in new_ends) + " ms (lo/mean/hi)",
+        bf16_core,
         f"backend {old_b} -> {new_b}"
         + (" (same kernel: one efficiency for both)" if same
            else " (different kernel: each end of the band independent)"),
         "saved " + " / ".join(f"{x * 1e3:.3f}" for x in saved) + " ms (lo/mean/hi)",
+        "ITL reduction " + " / ".join(f"{x:.2%}" for x in step) + " (lo/mean/hi)",
     )
     return Prediction(
         metric="decode ITL (ms/step), p50 over the steady-state window",
+        hardware=w.hw.name,
         baseline_step_s=g_old.total_pred_s,
-        predicted_step_s=g_new.total_pred_s,
+        predicted_step_s=g_new.total_pred_s + extra_floor,
         total_overhead_s=(old_attn - new_attn) / mid,
         recoverable_s=saved,
         op_delta=op,
         step_delta=step,
         arithmetic=arithmetic,
     )
+
+
+#: The lowest bf16 kernel efficiency ``rederive_h002`` accepts: 64 of MI355X's
+#: 256 CUs at the band's low end is 0.55 x 64 / 256 = 0.14, and well under that
+#: the number is more likely a unit error (ns read as us) or another kernel's time.
+_H002_MIN_MEASURED_EFF = 0.05
+
+
+def rederive_h002(w: Workload, bf16_layer_us: float) -> Prediction:
+    """H-002's band with the bf16 core at the baseline arm's measured decode kernel
+    time per layer (``_mla_gluon`` on MI355X), in microseconds; the fp8 kernel, the
+    extra kernels and the rest of the step stay as registered. Refuses a workload
+    H-002 refuses and a time the model cannot use."""
+    why = _h002_applies(w)
+    if why is not None:
+        raise ValueError(f"H-002 does not apply: {why}")
+    if not math.isfinite(bf16_layer_us) or bf16_layer_us <= 0:
+        raise ValueError(f"bf16 kernel time {bf16_layer_us!r} us is not a positive number")
+    executed = replace(w.spec, kv_dtype=_executed_kv(w), kv_rope_dtype=_executed_kv(w))
+    floor_us = _op_time(_floor(executed, w), "attn_score_value") / executed.n_layers * 1e6
+    if bf16_layer_us <= floor_us:
+        raise ValueError(
+            f"bf16 kernel time {bf16_layer_us:g} us per layer is at or below its byte "
+            f"floor {floor_us:.1f} us, an efficiency of {floor_us / bf16_layer_us:.2f}: "
+            "the measurement (kernel, attribution, seconds passed as us?) or the floor "
+            "(bytes per entry, cached tokens) is wrong")
+    if floor_us / bf16_layer_us < _H002_MIN_MEASURED_EFF:
+        raise ValueError(
+            f"bf16 kernel time {bf16_layer_us:g} us per layer is "
+            f"{bf16_layer_us / floor_us:.0f}x its byte floor {floor_us:.1f} us, an "
+            f"efficiency under {_H002_MIN_MEASURED_EFF}: check the unit (ns passed as "
+            "us?) and that the time is one _mla_gluon launch")
+    return _h002_predict(w, bf16_layer_s=bf16_layer_us * 1e-6)
 
 
 H002 = Hypothesis(
@@ -397,14 +736,17 @@ H002 = Hypothesis(
     knob="kv_cache_dtype",
     value="fp8",
     target_ops=("attn_score_value",),
-    # MLA cache-reading decode kernels only. ``reshape_and_cache`` and
-    # ``slot_mapping`` also classify to attn_score_value, and a narrower cache
-    # does not halve them; mla_reduce does not read the cached KV either.
-    # CUDA names, plus AITER's persistent-mode pair (aiter/aiter/mla.py:318-349:
-    # mla_decode_stage1_asm_fwd then mla_reduce_v1) and its asm symbols
-    # (mla_a16w16_*, mla_a8w8_*).
-    kernel_scope=("flash_mla", "flashmla", "cutlass_mla", "flashinfer_mla",
-                  "mla_decode", "aiter_mla", "mla_fwd", "mla_a16w16", "mla_a8w8"),
+    # Replay runs on the baseline (bf16) trace, so these are substrings of the
+    # cache-reading decode kernels in source: AITER's _mla_gluon (MI355X bf16
+    # under 16 heads per rank) and its bf16/fp8 asm decode kernels (mla_asm.csv),
+    # FlashMLA's sm90 mains (a8f794d), CUTLASS_MLA's main kernel (v0.27.1).
+    # Cache inserts and split-KV reduces also classify to attn_score_value but
+    # do not read the bytes fp8 halves, so no needle matches them ("mla_decode"
+    # would catch AITER's Triton _mla_decode_fwd_reduce_kernel). Not covered:
+    # H200's default bf16 kernel, FA3's FlashAttnFwdSm90, which prefill runs
+    # too, and B200's FlashInfer MLA kernels, named only in downloaded cubins.
+    kernel_scope=("mla_gluon", "mla_a16w16", "mla_dec_stage1", "mla_a8w8",
+                  "splitkv_mla_kernel", "Sm100FmhaMlaKernel"),
     applies=_h002_applies,
     predict=_h002_predict,
     requires_correctness_gate=True,
@@ -412,9 +754,14 @@ H002 = Hypothesis(
     correctness_gate_timeout_s=5400.0,
     requires_hardware=("H100", "H200", "B200", "B300", "GB200", "GB300", "MI355X"),
     safety_notes=(
-        "Kimi K2.5 ships no k_scale/v_scale, so vLLM stores with scale 1.0 "
-        "(quantization/kv_cache.py:71-75): gate on the accuracy sentinel in "
-        "docs/hypotheses/H-002-mla-kv-fp8.md before keep."
+        "Kimi K2.5 ships no k_scale/v_scale, so vLLM v0.29.0 stores the cache and "
+        "quantises the query at scale 1.0 (quantization/kv_cache.py:107-111, "
+        ":129-136), and on MI355X first-chunk prefill runs in fp8 too: gate on the "
+        "accuracy sentinel in docs/hypotheses/H-002-mla-kv-fp8.md before keep. On "
+        "the pinned image that prefill drops heads 4-7 at 8 heads per rank "
+        "(vllm-project/vllm#60907, open) and AITER v0.1.19's a8w8 decode "
+        "under-weights diffuse attention (ROCm/aiter#5535, open), so a gate failure "
+        "there is an image defect, not a scale result: record it as blocked."
     ),
 )
 
@@ -508,8 +855,9 @@ class HypothesisProposer:
                 # The derivation priced activations at the model dtype; a run
                 # whose dtype the gate cannot read is not one it covers.
                 requires_dtype=[w.spec.act_dtype],
-                other=(f"{w.model}; predicted step reduction {p.step_delta[0]:.1%} / "
-                       f"{p.step_delta[1]:.1%} / {p.step_delta[2]:.1%} (lo/mean/hi)"),
+                other=(f"{w.model} on {p.hardware}; predicted step reduction "
+                       f"{p.step_delta[0]:.1%} / {p.step_delta[1]:.1%} / "
+                       f"{p.step_delta[2]:.1%} (lo/mean/hi)"),
             ),
             safety=SafetyGate(tier="moderate", requires_rollback_window_s=120,
                               requires_correctness_gate=h.requires_correctness_gate,
