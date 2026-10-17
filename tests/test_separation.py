@@ -461,3 +461,45 @@ def test_tracer_leak_uses_each_arms_kernel_count():
                    control_ratio=dict.fromkeys(LABELS, 1.0), kernels_per_launch=(1, 2))
     assert d.tracer_leak_s == pytest.approx(1.1 * eps, rel=0.01)
     assert d.outcome == "multiplicative", d.reasons
+
+
+def test_wrong_shaped_json_drops_the_window_not_the_analysis(tmp_path, monkeypatch):
+    _write_run(tmp_path, monkeypatch)
+    cand = tmp_path / "p1" / "traced" / "cand"
+    trace = cand / "L2048_r1" / "cap" / "trace.jsonl"
+    trace.write_text(trace.read_text() + "[1, 2]\n")  # valid JSON, not an event
+    (cand / "L4096_r2" / "guidellm.json").write_text("[]")
+    (cand / "L8192_r3" / "guidellm.json").write_text('{"benchmarks": [{"metrics": []}]}')
+    report = sep.analyze(tmp_path, n_layers=61, concurrency=16)
+    joined = " | ".join(report["dropped_windows"])
+    assert "cand/L2048_r1: unreadable trace" in joined
+    assert "cand/L4096_r2: " in joined and "cand/L8192_r3: " in joined
+    assert report["decision"]["outcome"] == "multiplicative", report["decision"]["reasons"]
+
+
+def test_write_atomic_does_not_follow_a_planted_temp_symlink(tmp_path):
+    import os
+
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep")
+    out = tmp_path / "decision.json"
+    (tmp_path / f"decision.json.{os.getpid()}.tmp").symlink_to(victim)
+    sep._write_atomic(out, "{}")
+    assert victim.read_text() == "keep"
+    assert out.read_text() == "{}" and not out.is_symlink()
+
+
+def test_strict_json_and_atomic_cleanup(tmp_path, monkeypatch):
+    import os
+
+    from gitm.optimizer import metrics
+
+    got = metrics._strict_json({"a": float("nan"), "c": {1.5},
+                                "b": (float("inf"), np.float64("nan"), np.int64(3))})
+    assert got == {"a": None, "b": [None, None, 3], "c": [1.5]} and type(got["b"][2]) is int
+    out = tmp_path / "witness.json"
+    out.write_text("old")
+    monkeypatch.setattr(os, "replace", lambda *a: (_ for _ in ()).throw(OSError("full")))
+    with pytest.raises(OSError):
+        metrics._write_atomic(out, "new")
+    assert out.read_text() == "old" and [p.name for p in tmp_path.iterdir()] == ["witness.json"]

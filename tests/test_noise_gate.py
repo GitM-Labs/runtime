@@ -96,11 +96,26 @@ def test_rounds_that_share_a_build_shrink_the_noise_less_than_root_n():
 # calibration and free A/A samples                                            #
 # --------------------------------------------------------------------------- #
 def test_calibration_measures_the_baseline_against_itself_rebuilt():
-    box = _Box([1000.0, 1004.0, 998.0])
+    box = _Box([990.0, 1000.0, 1004.0, 998.0])
     app = box.applicator()
     samples = app.calibrate(2)
-    assert box.built == ["A", "A", "A"]                 # N + 1 builds for N pairs
+    assert box.built == ["A", "A", "A", "A"]            # the warm-up, then N + 1 rebuilds
     assert samples == pytest.approx([0.004, 998 / 1004 - 1])
+    assert app.noise.warmup == pytest.approx(1000 / 990 - 1)
+
+
+def test_a_cold_first_engine_does_not_set_the_floor():
+    """Kimi K2.5 on MI355X: the first engine after the opening capture decoded
+    at 1110 tok/s, every later build at about 1400. Paired, that one 24.8%
+    sample made the RMS floor 8.9% and rejected a +5% win against a 25% bar."""
+    box = _Box([1109.69, 1385.49, 1424.68, 1387.71])
+    app = box.applicator()
+    app.calibrate(2)
+    assert app.noise.warmup == pytest.approx(0.2485, abs=1e-3)
+    assert app.noise.floor < 0.03
+    bar = app.noise.threshold(mean_noise_factor(2, rebuilt=True),
+                              minimum=0.01, without_floor=0.02)
+    assert bar < 0.05                                   # the +5.0% graph-replay win clears it
 
 
 def test_a_rollback_rebuild_adds_an_aa_sample_for_free():
@@ -196,6 +211,24 @@ def test_a_candidate_that_fails_to_rebuild_mid_validation_is_rolled_back():
     app = box.applicator(noise_gate=True, validation=3, min_effect=0.01, threshold_without_floor=0.02)
     res = apply_intervention(_spec(), app)       # round 3 needs a second B: none scripted
     assert res.rolled_back and not res.restore_failed
+    assert app.engine.kind == "A"
+
+
+def test_ctrl_c_while_validation_rebuilds_the_candidate_rebuilds_the_baseline():
+    box = _Box([1000.0, 1000.0, 1000.0], candidate=[1050.0])
+    app = box.applicator(noise_gate=True, validation=3, min_effect=0.01, threshold_without_floor=0.02)
+    calls = []
+
+    def restart(_old, _v):
+        calls.append(1)
+        if len(calls) > 1:
+            raise KeyboardInterrupt
+        return box.build("B")
+
+    app._restart_fn = restart
+    with pytest.raises(KeyboardInterrupt):
+        apply_intervention(_spec(), app)
+    assert box.built == ["A", "B", "A", "A"]
     assert app.engine.kind == "A"
 
 
@@ -403,3 +436,114 @@ def test_a_parallel_baseline_that_dies_mid_validation_is_a_lost_engine():
         apply_mod.parallel_restart_fits = orig
     assert res.restore_failed and not res.rolled_back
     assert app.engine is not base and "A" in released
+
+
+def test_only_first_measurements_on_a_build_make_aa_samples():
+    """On a laptop on battery the first decode after a rebuild ran 4-5% faster
+    than the next one on the same engine. Pairing a second measurement with a
+    fresh one read that as noise and multiplied the floor by seven."""
+    box = _Box([1000.0] * 8,
+               candidate=[1003.0, 1003.0, 1003.0, 1003.0])
+    def tps(e):
+        # Counted on the engine, not by id(): a released engine's id is reused.
+        e.measured = getattr(e, "measured", 0) + 1
+        return e.tps * (1.0 if e.measured == 1 else 0.95)    # warm engines run slower
+
+    app = LiveEngineApplicator(
+        box.build("A"), throughput_fn=tps,
+        restart_fn=lambda _o, _v: box.build("B"),
+        baseline_restart_fn=lambda _o: box.build("A"),
+        restart_mode="serial", noise_gate=True, validation=2, min_effect=0.01,
+        threshold_without_floor=0.02)
+    app.calibrate(1)
+    apply_intervention(_spec(), app)        # round 2 rebuilds A: fresh
+    apply_intervention(_spec(), app)        # its snapshot re-measures that A: not fresh
+    # Every sample compares two fresh 1000s, so the floor is 0, not ~5%.
+    assert app.noise.samples and all(abs(d) < 1e-9 for d in app.noise.samples)
+    assert app.noise.skipped_not_fresh >= 1
+
+
+def test_a_baseline_brought_back_in_parallel_mode_is_not_fresh():
+    """A parallel rollback makes the already-measured baseline current again:
+    no build happened, so its next measurement is not an A/A sample."""
+    base = type("E", (), {"tps": 1000.0})()
+    cand = type("E", (), {"tps": 900.0})()
+    app = LiveEngineApplicator(
+        base, throughput_fn=lambda e: e.tps, restart_fn=lambda _o, _v: cand,
+        restart_mode="parallel", noise_gate=True, min_effect=0.01,
+        threshold_without_floor=0.02)
+    from gitm.optimizer import apply as apply_mod
+
+    orig = apply_mod.parallel_restart_fits
+    apply_mod.parallel_restart_fits = lambda *_a, **_k: (True, "")
+    try:
+        res = apply_intervention(_spec(), app)           # -10%: rolled back
+    finally:
+        apply_mod.parallel_restart_fits = orig
+    assert res.rolled_back and app.engine is base
+    app.snapshot()
+    assert app._last_measure_fresh is False
+    assert app.noise.samples == [] and app.noise.skipped_not_fresh == 1
+
+
+# --------------------------------------------------------------------------- #
+# the budget and the engine at exit                                           #
+# --------------------------------------------------------------------------- #
+def test_a_candidate_starts_only_if_the_budget_left_covers_one():
+    """The first Kimi run started its last candidate 35 s before a 5 h budget
+    ended and overran it by 19 minutes."""
+    from gitm.scheduler.loop import _next_cycle_overruns
+
+    assert _next_cycle_overruns(100.0, 3600.0, []) is None       # nothing to go by yet
+    assert _next_cycle_overruns(3600.0, 3600.0, []) == "spent"
+    assert _next_cycle_overruns(3000.0, 3600.0, [300.0, 500.0]) is None
+    why = _next_cycle_overruns(17965.0, 18000.0, [2700.0, 3300.0])
+    assert why is not None and "50 min" in why
+
+
+def test_the_run_releases_an_engine_it_built_and_only_that(monkeypatch):
+    """Left running, vLLM's spawned TP workers keep ``gitm run`` from exiting
+    after it has written its report."""
+    import gitm.api as api
+
+    released: list[str] = []
+    monkeypatch.setattr(LiveEngineApplicator, "_shutdown",
+                        staticmethod(lambda e: released.append(e)))
+
+    def fake_loop(cfg):
+        cfg.engine = cfg.engine or "built-by-the-workload"
+        return {}
+
+    monkeypatch.setattr(api, "run_loop", fake_loop)
+    api.optimize(workload="vllm-decode")
+    assert released == ["built-by-the-workload"]
+
+    released.clear()
+    api.optimize("the-callers-engine")
+    api.optimize(workload_runner=lambda: {})            # the runner's engine: not ours
+    assert released == []
+
+    def failing_loop(cfg):
+        cfg.engine = "built-by-the-workload"
+        raise RuntimeError("the loop failed")
+
+    released.clear()
+    monkeypatch.setattr(api, "run_loop", failing_loop)
+    with pytest.raises(RuntimeError):
+        api.optimize(workload="vllm-decode")
+    assert released == ["built-by-the-workload"]
+
+
+def test_an_engine_a_retrace_swaps_in_is_a_fresh_build():
+    """A re-trace replaces the running baseline with a traced build and then an
+    untraced one. That engine is new, so its first measurement pairs with the
+    last fresh one instead of being discarded as a warm re-measurement."""
+    box = _Box([1000.0, 1000.0, 1000.0, 1010.0])
+    app = box.applicator()
+    app.calibrate(1)                        # the warm-up, then one A/A pair
+    assert app.noise.samples == pytest.approx([0.0])
+    app.snapshot()                          # the same engine again: not fresh
+    assert app.noise.skipped_not_fresh == 1
+    app.install(box.build("A"))             # what the re-trace leaves running
+    app.snapshot()
+    assert app.noise.samples == pytest.approx([0.0, 0.01])

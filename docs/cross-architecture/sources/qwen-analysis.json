@@ -1,0 +1,305 @@
+{
+  "numerical_diagnostic": {
+    "model_pin": {
+      "model": "Qwen/Qwen2.5-3B-Instruct",
+      "revision": "aa8e72537993ba99e69dfaafa59ed015b17504d1",
+      "source": "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct/tree/aa8e72537993ba99e69dfaafa59ed015b17504d1"
+    },
+    "dtype": "float32",
+    "tf32": false,
+    "torch": "2.4.1+cu124",
+    "transformers": "4.46.3",
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "checks": [
+      {
+        "context": 128,
+        "max_abs_logits": 2.1457672119140625e-05,
+        "mean_abs_logits": 3.501338824207778e-06,
+        "allclose_atol_0_001_rtol_0_0001": true,
+        "top1_equal": true,
+        "finite": true
+      },
+      {
+        "context": 2048,
+        "max_abs_logits": 3.3736228942871094e-05,
+        "mean_abs_logits": 6.223616310307989e-06,
+        "allclose_atol_0_001_rtol_0_0001": true,
+        "top1_equal": true,
+        "finite": true
+      }
+    ],
+    "scope": "Path consistency at two prefixes; not a BF16 acceptance-threshold change or measured performance result."
+  },
+  "diagnostic_estimated_compute_usd": 0.04175078539715873,
+  "failed_attempts": [
+    {
+      "attempt": "failed-attempt-2",
+      "estimated_compute_usd": 0.04819133012625906,
+      "deletion_verified": true,
+      "failure": "Background SSH launcher retained connection; 30s transport timeout. Pod deleted; model results unavailable. Retry uses synchronous authenticated command."
+    },
+    {
+      "attempt": "failed-attempt-1",
+      "estimated_compute_usd": 0.02091333438224263,
+      "deletion_verified": true,
+      "failure": "Benchmark syntax error before model load. Fixed and parsed before retry."
+    }
+  ],
+  "total_estimated_compute_cost_usd": 0.14808940195772383,
+  "created_utc": "2026-10-11T22:25:31.575550+00:00",
+  "model_pin": {
+    "model": "Qwen/Qwen2.5-3B-Instruct",
+    "revision": "aa8e72537993ba99e69dfaafa59ed015b17504d1",
+    "source": "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct/tree/aa8e72537993ba99e69dfaafa59ed015b17504d1"
+  },
+  "planner_pin": {
+    "repository": "https://github.com/GitM-Labs/runtime",
+    "sha": "05abd11b866bdabe2619b5f289db52d647eb55ad",
+    "checked": "2026-10-06",
+    "method": "read-only HTTPS archive; no Git operations"
+  },
+  "rows": [
+    {
+      "batch": 1,
+      "context": 128,
+      "mode": "cuda_graph",
+      "predicted_ms": 3.030760145169201,
+      "event_median_ms": 8.992591857910156,
+      "event_p10_ms": 8.98567008972168,
+      "event_p90_ms": 9.001664447784425,
+      "wall_median_ms": 9.013744071125984,
+      "relative_prediction_error": -0.6629714554983108,
+      "measured_over_predicted": 2.967107731122721,
+      "within_20_percent": false,
+      "floor_respected_with_5_percent_tolerance": true,
+      "event_stability_flag": false,
+      "wall_stability_flag": false,
+      "peak_allocated_bytes": 6309952000
+    },
+    {
+      "batch": 1,
+      "context": 128,
+      "mode": "eager",
+      "predicted_ms": 3.030760145169201,
+      "event_median_ms": 28.922240257263184,
+      "event_p10_ms": 28.677554512023924,
+      "event_p90_ms": 29.407443618774415,
+      "wall_median_ms": 28.94349116832018,
+      "relative_prediction_error": -0.8952100487994497,
+      "measured_over_predicted": 9.542899758452682,
+      "within_20_percent": false,
+      "floor_respected_with_5_percent_tolerance": true,
+      "event_stability_flag": false,
+      "wall_stability_flag": false,
+      "peak_allocated_bytes": 6309952000
+    },
+    {
+      "batch": 1,
+      "context": 2048,
+      "mode": "cuda_graph",
+      "predicted_ms": 3.065472690534576,
+      "event_median_ms": 13.665071964263916,
+      "event_p10_ms": 13.655759811401367,
+      "event_p90_ms": 13.672627544403076,
+      "wall_median_ms": 13.686247169971466,
+      "relative_prediction_error": -0.7756709442474055,
+      "measured_over_predicted": 4.4577373031109655,
+      "within_20_percent": false,
+      "floor_respected_with_5_percent_tolerance": true,
+      "event_stability_flag": false,
+      "wall_stability_flag": false,
+      "peak_allocated_bytes": 6592283136
+    },
+    {
+      "batch": 1,
+      "context": 2048,
+      "mode": "eager",
+      "predicted_ms": 3.065472690534576,
+      "event_median_ms": 28.877344131469727,
+      "event_p10_ms": 28.711445999145507,
+      "event_p90_ms": 29.429973983764647,
+      "wall_median_ms": 28.89895625412464,
+      "relative_prediction_error": -0.8938450614925523,
+      "measured_over_predicted": 9.420192918578543,
+      "within_20_percent": false,
+      "floor_respected_with_5_percent_tolerance": true,
+      "event_stability_flag": false,
+      "wall_stability_flag": false,
+      "peak_allocated_bytes": 6592283136
+    },
+    {
+      "batch": 8,
+      "context": 128,
+      "mode": "cuda_graph",
+      "predicted_ms": 3.0593433800882783,
+      "event_median_ms": 10.663407802581787,
+      "event_p10_ms": 10.636678409576415,
+      "event_p90_ms": 10.694237232208252,
+      "wall_median_ms": 10.68674772977829,
+      "relative_prediction_error": -0.7130989045221021,
+      "measured_over_predicted": 3.485521720766791,
+      "within_20_percent": false,
+      "floor_respected_with_5_percent_tolerance": true,
+      "event_stability_flag": false,
+      "wall_stability_flag": false,
+      "peak_allocated_bytes": 6452400640
+    },
+    {
+      "batch": 8,
+      "context": 128,
+      "mode": "eager",
+      "predicted_ms": 3.0593433800882783,
+      "event_median_ms": 37.68849754333496,
+      "event_p10_ms": 37.3142707824707,
+      "event_p90_ms": 38.55904197692871,
+      "wall_median_ms": 37.71235607564449,
+      "relative_prediction_error": -0.9188255414912577,
+      "measured_over_predicted": 12.319145928054485,
+      "within_20_percent": false,
+      "floor_respected_with_5_percent_tolerance": true,
+      "event_stability_flag": false,
+      "wall_stability_flag": false,
+      "peak_allocated_bytes": 6452400640
+    },
+    {
+      "batch": 8,
+      "context": 2048,
+      "mode": "cuda_graph",
+      "predicted_ms": 3.33704374301128,
+      "event_median_ms": 23.26084804534912,
+      "event_p10_ms": 23.236025238037108,
+      "event_p90_ms": 23.289351081848146,
+      "wall_median_ms": 23.28497264534235,
+      "relative_prediction_error": -0.856538173651046,
+      "measured_over_predicted": 6.970495395532037,
+      "within_20_percent": false,
+      "floor_respected_with_5_percent_tolerance": true,
+      "event_stability_flag": false,
+      "wall_stability_flag": false,
+      "peak_allocated_bytes": 8301214720
+    },
+    {
+      "batch": 8,
+      "context": 2048,
+      "mode": "eager",
+      "predicted_ms": 3.33704374301128,
+      "event_median_ms": 37.450416564941406,
+      "event_p10_ms": 37.13865699768066,
+      "event_p90_ms": 37.808379364013675,
+      "wall_median_ms": 37.47428301721811,
+      "relative_prediction_error": -0.9108943491396249,
+      "measured_over_predicted": 11.22263279987661,
+      "within_20_percent": false,
+      "floor_respected_with_5_percent_tolerance": true,
+      "event_stability_flag": false,
+      "wall_stability_flag": false,
+      "peak_allocated_bytes": 8301214720
+    },
+    {
+      "batch": 16,
+      "context": 128,
+      "mode": "cuda_graph",
+      "predicted_ms": 3.0920099342815104,
+      "event_median_ms": 11.651103973388672,
+      "event_p10_ms": 11.646573257446288,
+      "event_p90_ms": 11.658627605438232,
+      "wall_median_ms": 11.672397144138813,
+      "relative_prediction_error": -0.7346165701255678,
+      "measured_over_predicted": 3.768132774804954,
+      "within_20_percent": false,
+      "floor_respected_with_5_percent_tolerance": true,
+      "event_stability_flag": false,
+      "wall_stability_flag": false,
+      "peak_allocated_bytes": 6574428672
+    },
+    {
+      "batch": 16,
+      "context": 128,
+      "mode": "eager",
+      "predicted_ms": 3.0920099342815104,
+      "event_median_ms": 28.944079399108887,
+      "event_p10_ms": 28.680213737487794,
+      "event_p90_ms": 30.120608520507812,
+      "wall_median_ms": 28.965733014047146,
+      "relative_prediction_error": -0.8931729735934629,
+      "measured_over_predicted": 9.360927039141165,
+      "within_20_percent": false,
+      "floor_respected_with_5_percent_tolerance": true,
+      "event_stability_flag": false,
+      "wall_stability_flag": false,
+      "peak_allocated_bytes": 6574428672
+    },
+    {
+      "batch": 16,
+      "context": 2048,
+      "mode": "cuda_graph",
+      "predicted_ms": 3.6474106601275134,
+      "event_median_ms": 35.6451358795166,
+      "event_p10_ms": 35.62475471496582,
+      "event_p90_ms": 35.685889053344724,
+      "wall_median_ms": 35.670277662575245,
+      "relative_prediction_error": -0.8976743791226929,
+      "measured_over_predicted": 9.772723501956987,
+      "within_20_percent": false,
+      "floor_respected_with_5_percent_tolerance": true,
+      "event_stability_flag": false,
+      "wall_stability_flag": false,
+      "peak_allocated_bytes": 10239147008
+    },
+    {
+      "batch": 16,
+      "context": 2048,
+      "mode": "eager",
+      "predicted_ms": 3.6474106601275134,
+      "event_median_ms": 38.74502372741699,
+      "event_p10_ms": 38.49463081359863,
+      "event_p90_ms": 40.95186767578125,
+      "wall_median_ms": 38.77030871808529,
+      "relative_prediction_error": -0.9058611839861512,
+      "measured_over_predicted": 10.62261076082463,
+      "within_20_percent": false,
+      "floor_respected_with_5_percent_tolerance": true,
+      "event_stability_flag": false,
+      "wall_stability_flag": false,
+      "peak_allocated_bytes": 10239147008
+    }
+  ],
+  "by_mode": {
+    "eager": {
+      "cases": 6,
+      "mean_absolute_percentage_error": 0.9029681930837498,
+      "median_measured_over_predicted": 10.082755259638656,
+      "within_20_percent_count": 0,
+      "floor_respected_count": 6
+    },
+    "cuda_graph": {
+      "cases": 6,
+      "mean_absolute_percentage_error": 0.7734284045278542,
+      "median_measured_over_predicted": 4.11293503895796,
+      "within_20_percent_count": 0,
+      "floor_respected_count": 6
+    }
+  },
+  "graph_checks_passed": true,
+  "max_graph_logits_difference": 0.0,
+  "cached_full_checks_passed": false,
+  "max_cached_full_logits_difference": 0.3125,
+  "trace_summary": {
+    "eager": {
+      "kernel_count": 1754,
+      "kernel_union_ms": 14.940725463867187,
+      "first_to_last_kernel_ms": 54.02860290527344,
+      "scope": "Separate profiled B1/context2048 step; not substituted for unprofiled medians."
+    },
+    "cuda_graph": {
+      "kernel_count": 1792,
+      "kernel_union_ms": 14.020465942382813,
+      "first_to_last_kernel_ms": 16.35973205566406,
+      "scope": "Separate profiled B1/context2048 step; not substituted for unprofiled medians."
+    }
+  },
+  "estimated_compute_cost_usd": 0.03723395205206341,
+  "pod_deletion_verified": true,
+  "parameters": 3085938688,
+  "parameter_bytes": 6171877376
+}

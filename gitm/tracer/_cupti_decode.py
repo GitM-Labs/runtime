@@ -118,6 +118,7 @@ def decode_kernel(d: dict) -> KernelEvent:
         range_attrs=d.get("range_attrs") or None,
         identity=d.get("identity"),
         kernel_id=_opt_graph_id(d.get("kernel_id")),
+        context_id=_opt_int(d.get("context_id")),
         pid=_opt_int(d.get("pid")),
     )
 
@@ -144,6 +145,7 @@ def decode_memcpy(d: dict) -> MemcpyEvent:
         launch_range=d.get("launch_range"),
         graph_id=_opt_graph_id(d.get("graph_id")),
         pid=_opt_int(d.get("pid")),
+        context_id=_opt_int(d.get("context_id")),
     )
 
 
@@ -163,6 +165,9 @@ def decode_sync(d: dict) -> SyncEvent:
         device_id=int(d.get("device_id", 0)),
         correlation_id=_opt_int(d.get("correlation_id")),
         sync_kind=_SYNC_KIND.get(sync_type, "device"),
+        pid=_opt_int(d.get("pid")),
+        context_id=_opt_int(d.get("context_id")),
+        sync_type=sync_type if raw_type is not None else None,
     )
 
 

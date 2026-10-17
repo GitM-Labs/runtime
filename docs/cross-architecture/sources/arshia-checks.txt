@@ -1,0 +1,68 @@
+PASS  MD-PARAMS F8 reproduced exactly  681,408,069,632 vs 681,408,069,632
+PASS  MD-PARAMS BF16 reproduced exactly  3,946,184,704 vs 3,946,184,704
+PASS  MD-PARAMS F32 reproduced exactly  42,667,040 vs 42,667,040
+PASS  MD-BYTES reproduced exactly  689,471,107,200
+PASS  C12: index total_size = params x 2  
+PASS  DV-FIT 62.7 %  62.71 %
+PASS  DV-SWAP fp8 copy >= 0.43 s  0.431 s
+PASS  DV-DDR-DECODE 23.0 B params  22,988,980,224
+PASS  expert bytes = 3 x 2048 x 7168 + 2688 scales x 4  
+PASS  OP-1 routed bytes at B=1 = 58 x 8 x expert  
+PASS  OP-1 cache read at 8K = 61 x (2048 x 1152 + 8192 x 132)  
+PASS  simulated distinct experts (rows=1) within 4 SE of formula  8.000 ± 0.000 vs 8.000
+PASS  simulated distinct experts (rows=4) within 4 SE of formula  30.554 ± 0.021 vs 30.531
+PASS  HLB <= measured time for D-V31-AA  1.499 ms vs 5.435 ms
+PASS  HLB <= measured time for D-R1-16  1.474 ms vs 5.051 ms
+PASS  SN40L P2P bandwidth is not defaulted  
+PASS  SN40L fp8 peak is not defaulted  
+PASS  SN50 SRAM bandwidth is not defaulted  
+PASS  input hbm_bw is cited  
+PASS  input hbm_bw_alt is cited  
+PASS  input hbm_cap is cited  
+PASS  input ddr_bw is cited  
+PASS  input ddr_cap is cited  
+PASS  input sram_cap is cited  
+PASS  input sram_bw_lower is cited  
+PASS  input peak_bf16 is cited  
+PASS  input peak_fp8 is cited  
+PASS  input p2p_bw is cited  
+PASS  input p2p_latency is cited  
+PASS  input node_chips is cited  
+PASS  input hbm_bw is cited  
+PASS  input hbm_bw_observed is cited  
+PASS  input hbm_cap is cited  
+PASS  input ddr_bw is cited  
+PASS  input sram_cap is cited  
+PASS  input sram_bw_lower is cited  
+PASS  input peak_bf16 is cited  
+PASS  input peak_fp8 is cited  
+PASS  input link_bw_dir is cited  
+PASS  input intra_links is cited  
+PASS  input inter_links is cited  
+PASS  input p2p_latency is cited  
+PASS  input node_chips is cited  
+PASS  input hidden is cited  
+PASS  input layers is cited  
+PASS  input dense_layers is cited  
+PASS  input mtp_layers is cited  
+PASS  input dense_inter is cited  
+PASS  input moe_inter is cited  
+PASS  input experts is cited  
+PASS  input topk is cited  
+PASS  input n_group is cited  
+PASS  input topk_group is cited  
+PASS  input heads is cited  
+PASS  input q_lora is cited  
+PASS  input kv_lora is cited  
+PASS  input qk_nope is cited  
+PASS  input qk_rope is cited  
+PASS  input v_head is cited  
+PASS  input idx_heads is cited  
+PASS  input idx_dim is cited  
+PASS  input idx_topk is cited  
+PASS  input vocab is cited  
+PASS  input block is cited  
+PASS  input latent_bytes is cited  
+PASS  input index_bytes is cited  
+
+66/66 checks pass

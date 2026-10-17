@@ -22,6 +22,7 @@ from __future__ import annotations
 import copy
 import gc
 import math
+import threading
 import time
 import warnings
 from collections.abc import Callable
@@ -51,7 +52,8 @@ class ApplyResult:
     #: The baseline could not be put back after this candidate, so whatever the
     #: applicator mutates is in a state nothing measured. A caller holding more
     #: candidates must stop: every A/B after this one would be taken against an
-    #: unknown baseline, or against no engine at all.
+    #: unknown baseline, or against no engine at all. Also set when an earlier
+    #: gate is still running against the target.
     restore_failed: bool = False
 
     @property
@@ -64,7 +66,7 @@ class ApplyResult:
         candidate measured at -20% whose rollback then failed into a kept result,
         which history counts as a win.
         """
-        return not self.rolled_back and not self.restore_failed
+        return self.applied and not self.rolled_back and not self.restore_failed
 
 
 class EngineTimeout(RuntimeError):
@@ -108,13 +110,27 @@ def apply_intervention(
     (e.g. a slowdown) is rolled back. With no measurement (``measure`` returns
     ``None``) the change is kept — apply-only mode. A spec carrying a
     ``correctness_gate`` is additionally rolled back when that gate fails,
-    regardless of the measured delta.
+    regardless of the measured delta, or when it gives no verdict within
+    ``spec.safety.correctness_gate_timeout_s``.
 
     When an ``audit`` log is supplied, every live mutation and every rollback is
     recorded to the durable safety trail (best-effort — a broken audit sink never
     blocks the apply). Pass one only where the applicator mutates a real target;
     a dry-run leaves it ``None`` so the trail stays free of no-op entries.
     """
+    # The gate callable is dropped when a spec is saved; don't apply ungated.
+    if spec.safety.requires_correctness_gate and spec.correctness_gate is None:
+        return ApplyResult(False, rolled_back=False, measured_delta=None,
+                           error="spec requires a correctness gate and carries none; "
+                                 "nothing applied")
+    # An earlier gate is still loading the server, so no A/B can be trusted.
+    # restore_failed=True makes the loops stop.
+    if running := _gates_still_running():
+        return ApplyResult(False, rolled_back=False, measured_delta=None,
+                           error=f"correctness gate still running ({', '.join(running)}); "
+                                 "nothing applied",
+                           restore_failed=True)
+
     # Step 1: snapshot. On a live engine this benchmarks the baseline, so it can
     # fail the same ways a measurement can — and when it does, nothing has been
     # applied yet. Returned as an error, not raised: one candidate whose baseline
@@ -131,6 +147,8 @@ def apply_intervention(
         return ApplyResult(False, rolled_back=False, measured_delta=None,
                            error=f"snapshot failed, nothing applied: {exc}")
 
+    restore_started = False
+
     def _unrestored(applied: bool, delta: float | None, cause: str,
                     exc: BaseException) -> ApplyResult:
         """The result for a candidate whose rollback itself failed.
@@ -142,6 +160,8 @@ def apply_intervention(
         nothing was rolled back; saying otherwise would tell the reader the
         baseline is in place.
         """
+        nonlocal restore_started
+        restore_started = True
         _audit(audit, "restore_failed", spec, knobs=_knob_values(spec),
                cause=f"{cause}; restore failed: {exc}")
         return ApplyResult(applied, rolled_back=False, measured_delta=delta,
@@ -150,84 +170,109 @@ def apply_intervention(
 
     def _rollback(applied: bool, delta: float | None, cause: str) -> ApplyResult | None:
         """Restore the snapshot. ``None`` on success, else the unrestored result."""
+        nonlocal restore_started
+        restore_started = True
         try:
             applicator.restore(snapshot)
         except Exception as exc:
             return _unrestored(applied, delta, cause, exc)
         return None
 
-    # Step 2: apply. A bad value (validation error) rolls straight back.
-    try:
-        applicator.apply(spec)
-    except RestoreFailed as exc:
-        # The applicator already tried to put the baseline back inside apply and
-        # could not. Calling restore() again would retry the same rebuild that
-        # just failed.
-        return _unrestored(False, None, "apply failed", exc)
-    except Exception as exc:
-        if (bad := _rollback(False, None, f"apply failed: {exc}")) is not None:
-            return bad
-        _audit(audit, "revert", spec, cause=f"apply failed, restored: {exc}",
-               knobs=_knob_values(spec))
-        return ApplyResult(False, rolled_back=True, measured_delta=None,
-                           error=f"apply failed, restored: {exc}")
-    _audit(audit, "apply", spec, cause="applied live", knobs=_knob_values(spec))
-
-    # Step 3: measure. A crash mid-measurement also rolls back.
-    try:
-        delta = applicator.measure(spec)
-    except RestoreFailed as exc:
-        # Validation rebuilds the baseline between rounds; when that rebuild
-        # fails there is no baseline left, which is a lost engine, not a
-        # measurement that failed and was rolled back.
-        _audit(audit, "restore_failed", spec, knobs=_knob_values(spec),
-               cause=f"measure failed: {exc}")
-        return ApplyResult(True, rolled_back=False, measured_delta=None,
-                           error=f"measure failed: {exc}", restore_failed=True)
-    except Exception as exc:
-        if (bad := _rollback(False, None, f"measure failed: {exc}")) is not None:
-            return bad
-        _audit(audit, "revert", spec, cause=f"measure failed, restored: {exc}",
-               knobs=_knob_values(spec))
-        return ApplyResult(False, rolled_back=True, measured_delta=None,
-                           error=f"measure failed, restored: {exc}")
-
-    # Step 3b: the spec's own correctness gate, before any keep decision. A
-    # faster candidate that fails it is restored with the reason, so the
-    # throughput number alone can never keep a change that alters output.
-    if spec.correctness_gate is not None:
-        # The gate is a benchmark against a live server: it can time out, lose
-        # the connection, or crash. Any of those is "not judged", and an
-        # unjudged change is restored exactly like a failed one — the same
-        # shape as the measure step above, so a crash mid-gate can never leave
-        # the candidate applied.
+    def _decide() -> ApplyResult:
+        """Steps 2-4: apply, measure, judge. The result says whether it was kept."""
+        # Step 2: apply. A bad value (validation error) rolls straight back.
         try:
-            why = spec.correctness_gate(spec)
+            applicator.apply(spec)
+        except RestoreFailed as exc:
+            # The applicator already tried to put the baseline back inside apply
+            # and could not. Calling restore() again would retry the same
+            # rebuild that just failed.
+            return _unrestored(False, None, "apply failed", exc)
         except Exception as exc:
-            if (bad := _rollback(True, delta, f"correctness gate crashed: {exc}")) is not None:
+            if (bad := _rollback(False, None, f"apply failed: {exc}")) is not None:
                 return bad
-            _audit(audit, "revert", spec, knobs=_knob_values(spec),
-                   cause=f"correctness gate crashed, restored: {exc}")
-            return ApplyResult(True, rolled_back=True, measured_delta=delta,
-                               error=f"correctness gate crashed, restored: {exc}")
-        if why is not None:
-            if (bad := _rollback(True, delta, f"correctness gate failed: {why}")) is not None:
-                return bad
-            _audit(audit, "revert", spec, knobs=_knob_values(spec),
-                   cause=f"correctness gate failed: {why}")
-            return ApplyResult(True, rolled_back=True, measured_delta=delta,
-                               error=f"correctness gate failed: {why}, restored")
+            _audit(audit, "revert", spec, cause=f"apply failed, restored: {exc}",
+                   knobs=_knob_values(spec))
+            return ApplyResult(False, rolled_back=True, measured_delta=None,
+                               error=f"apply failed, restored: {exc}")
+        _audit(audit, "apply", spec, cause="applied live", knobs=_knob_values(spec))
 
-    # Step 4: keep-or-rollback on the regression threshold.
-    if delta is not None and delta < min_keep_delta:
-        cause = f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}"
-        if (bad := _rollback(True, delta, cause)) is not None:
-            return bad
-        _audit(audit, "revert", spec, knobs=_knob_values(spec),
-               cause=f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}")
-        return ApplyResult(True, rolled_back=True, measured_delta=delta,
-                           error=f"regression {delta:+.3f} < keep threshold "
-                                 f"{min_keep_delta:+.3f}, restored")
+        # Step 3: measure. A crash mid-measurement also rolls back.
+        try:
+            delta = applicator.measure(spec)
+        except RestoreFailed as exc:
+            # Validation rebuilds the baseline between rounds; when that rebuild
+            # fails there is no baseline left, which is a lost engine, not a
+            # measurement that failed and was rolled back.
+            _audit(audit, "restore_failed", spec, knobs=_knob_values(spec),
+                   cause=f"measure failed: {exc}")
+            return ApplyResult(True, rolled_back=False, measured_delta=None,
+                               error=f"measure failed: {exc}", restore_failed=True)
+        except Exception as exc:
+            if (bad := _rollback(False, None, f"measure failed: {exc}")) is not None:
+                return bad
+            _audit(audit, "revert", spec, cause=f"measure failed, restored: {exc}",
+                   knobs=_knob_values(spec))
+            return ApplyResult(False, rolled_back=True, measured_delta=None,
+                               error=f"measure failed, restored: {exc}")
+
+        # Step 3b: the spec's own correctness gate, before any keep decision. A
+        # faster candidate that fails it is restored with the reason, so the
+        # throughput number alone can never keep a change that alters output.
+        if spec.correctness_gate is not None:
+            # The gate is a benchmark against a live server: it can time out, lose
+            # the connection, or crash. Any of those is "not judged", and an
+            # unjudged change is restored exactly like a failed one — the same
+            # shape as the measure step above, so a crash mid-gate can never leave
+            # the candidate applied.
+            try:
+                why = _run_gate(spec.correctness_gate, spec,
+                                spec.safety.correctness_gate_timeout_s)
+            except Exception as exc:
+                what = "timed out" if isinstance(exc, _GateDeadline) else "crashed"
+                cause = f"correctness gate {what}: {exc}"
+                if (bad := _rollback(True, delta, cause)) is not None:
+                    return bad
+                _audit(audit, "revert", spec, knobs=_knob_values(spec),
+                       cause=f"correctness gate {what}, restored: {exc}")
+                return ApplyResult(True, rolled_back=True, measured_delta=delta,
+                                   error=f"correctness gate {what}, restored: {exc}")
+            if why is not None:
+                if (bad := _rollback(True, delta, f"correctness gate failed: {why}")) is not None:
+                    return bad
+                _audit(audit, "revert", spec, knobs=_knob_values(spec),
+                       cause=f"correctness gate failed: {why}")
+                return ApplyResult(True, rolled_back=True, measured_delta=delta,
+                                   error=f"correctness gate failed: {why}, restored")
+
+        # Step 4: keep-or-rollback on the regression threshold.
+        if delta is not None and delta < min_keep_delta:
+            cause = f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}"
+            if (bad := _rollback(True, delta, cause)) is not None:
+                return bad
+            _audit(audit, "revert", spec, knobs=_knob_values(spec),
+                   cause=f"regression {delta:+.3f} < keep threshold {min_keep_delta:+.3f}")
+            return ApplyResult(True, rolled_back=True, measured_delta=delta,
+                               error=f"regression {delta:+.3f} < keep threshold "
+                                     f"{min_keep_delta:+.3f}, restored")
+        return ApplyResult(True, rolled_back=False, measured_delta=delta)
+
+    # Ctrl-C or SystemExit: restore once, then re-raise. A restore that already
+    # started is not retried.
+    try:
+        result = _decide()
+    except BaseException as exc:
+        cause = f"aborted by {type(exc).__name__}"
+        if restore_started:
+            _audit(audit, "interrupted", spec, knobs=_knob_values(spec),
+                   cause=f"{cause} after a restore began; whether it finished is unknown")
+        elif _rollback(True, None, cause) is None:
+            _audit(audit, "revert", spec, knobs=_knob_values(spec),
+                   cause=f"{cause}; applicator restore() completed")
+        raise
+    if not result.kept:
+        return result
+    delta = result.measured_delta
 
     # Kept: whatever restore() would have needed is now garbage (for a restart,
     # the whole previous engine). Optional hook — only applicators holding
@@ -242,6 +287,54 @@ def apply_intervention(
             return ApplyResult(True, rolled_back=False, measured_delta=delta,
                                error=f"kept; releasing the replaced engine failed: {exc}")
     return ApplyResult(True, rolled_back=False, measured_delta=delta)
+
+
+class _GateDeadline(Exception):
+    """The correctness gate returned no verdict before its deadline."""
+
+
+@dataclass(frozen=True)
+class _GateRun:
+    thread: threading.Thread
+    finished: threading.Event
+
+
+# Every gate thread that has not returned. A thread can't be killed, so a
+# timed-out or interrupted gate stays here until it ends. Not Thread.is_alive():
+# on CPython 3.10-3.12 an interrupted join() marks a running thread as stopped.
+_unfinished_gates: list[_GateRun] = []
+
+
+def _gates_still_running() -> list[str]:
+    _unfinished_gates[:] = [g for g in _unfinished_gates
+                           if g.thread.ident is not None and not g.finished.is_set()]
+    return [g.thread.name for g in _unfinished_gates]
+
+
+def _run_gate(
+    gate: Callable[[Any], str | None], spec: InterventionSpec, timeout_s: float
+) -> str | None:
+    """Run ``gate(spec)`` on a thread and return its verdict, or raise after ``timeout_s``."""
+    box: dict[str, Any] = {}
+    finished = threading.Event()
+
+    def run() -> None:
+        try:
+            box["why"] = gate(spec)
+        except BaseException as exc:
+            box["exc"] = exc
+        finally:
+            finished.set()
+
+    t = threading.Thread(target=run, name=f"correctness-gate:{spec.name}", daemon=True)
+    _unfinished_gates.append(_GateRun(t, finished))  # before start(), so Ctrl-C can't skip it
+    t.start()
+    t.join(min(timeout_s, threading.TIMEOUT_MAX))
+    if not finished.is_set():
+        raise _GateDeadline(f"no verdict within {timeout_s:g} s, not judged")
+    if "exc" in box:
+        raise box["exc"]
+    return box.get("why")
 
 
 def _audit(
@@ -412,6 +505,13 @@ class NoiseFloor:
     """
 
     samples: list[float] = field(default_factory=list)
+    #: Baseline measurements left out because they were not the first on their
+    #: build (see ``LiveEngineApplicator._note_baseline``).
+    skipped_not_fresh: int = 0
+    #: The calibration's warm-up pair, left out of ``samples``: the first rebuilt
+    #: baseline against the engine running when calibration began (see
+    #: ``LiveEngineApplicator.calibrate``). Kept so a cold start stays visible.
+    warmup: float | None = None
 
     @property
     def floor(self) -> float | None:
@@ -658,6 +758,11 @@ class LiveEngineApplicator:
         noise: NoiseFloor | None = None,
     ) -> None:
         self.engine = engine
+        # True from the moment an engine is built until it is first measured.
+        # The first measurement on a build is the only one that counts for an
+        # A/A sample; see _note_baseline. The engine handed in is unmeasured.
+        self._unmeasured_build = True
+        self._last_measure_fresh = False
         self._tps = throughput_fn
         # The engine's own hook is the fallback, so a caller handing over an
         # engine gitm built need not re-pass what is already on it. One effective
@@ -739,6 +844,8 @@ class LiveEngineApplicator:
         stdev is 0.0 for a single rep → the noise band is 0 and keep falls back to
         ``delta > 0``, i.e. reps=1 behaves exactly as before reps were added.
         """
+        self._last_measure_fresh = self._unmeasured_build
+        self._unmeasured_build = False
         samples = [self._tps(self.engine) for _ in range(self._reps)]
         mean = sum(samples) / len(samples)
         if len(samples) < 2:
@@ -760,17 +867,35 @@ class LiveEngineApplicator:
 
     def _note_baseline(self, tps: float) -> None:
         """Record a baseline measurement, and the A/A sample it makes with the
-        previous one when both are the same configuration on different builds."""
-        engine_id = id(self.engine)
+        previous one: the same configuration, each measured first on its build.
+
+        Only a build's first measurement counts. A second measurement of the
+        same engine is not comparable with a fresh one: on a laptop on battery
+        the first decode after a rebuild (after the GPU had cooled through it)
+        ran 4-5% faster than the next, and pairing the two made that heat
+        effect read as build-to-build noise, multiplying the floor by seven.
+        Two first measurements on separate builds of the same configuration
+        are exactly an A/A pair, which is what the opening calibration takes.
+        """
+        if not self._last_measure_fresh:
+            self.noise.skipped_not_fresh += 1
+            return
         last = self._last_baseline
-        if (last is not None and last[0] == self._generation and last[1] != engine_id
-                and last[2] > 0 and tps > 0):
+        if last is not None and last[0] == self._generation and last[2] > 0 and tps > 0:
             self.noise.samples.append(tps / last[2] - 1.0)
-        self._last_baseline = (self._generation, engine_id, tps)
+        self._last_baseline = (self._generation, id(self.engine), tps)
 
     def calibrate(self, pairs: int, *, deadline_ns: int | None = None) -> list[float]:
-        """Measure the baseline ``pairs + 1`` times, rebuilding it in between, so
-        the first candidate is judged against a measured noise floor.
+        """Measure the baseline against itself, rebuilt each time, for ``pairs``
+        A/A samples, so the first candidate is judged against a measured floor.
+
+        The engine running when calibration begins is measured as a warm-up and
+        left out of the floor, so ``pairs`` samples cost ``pairs + 1`` rebuilds.
+        It is the first engine after the opening capture, and on Kimi K2.5
+        (MI355X, TP=8) it decoded at 1110 tok/s where every later build of the
+        same configuration ran at 1380-1470: one 24.8% sample, and an RMS floor
+        of 8.9% that rejected a +5% CUDA-graph win against a 25% bar. Its pair
+        is recorded as ``noise.warmup``.
 
         Serial restart only: it needs ``baseline_restart_fn``. Stops early at
         ``deadline_ns``. Returns the A/A samples it added. A rebuild or a
@@ -780,15 +905,19 @@ class LiveEngineApplicator:
         if pairs < 1 or self._baseline_restart_fn is None or self._restart_mode != "serial":
             return []
         before = len(self.noise.samples)
-        self._note_baseline(self._bench_baseline())
-        for _ in range(pairs):
+        warm = self._bench_baseline()
+        self._last_baseline = None          # nothing pairs with the warm-up
+        for i in range(pairs + 1):
             if deadline_ns is not None and time.time_ns() >= deadline_ns:
                 break
             old = self.engine
             self._shutdown(old)
             self._rebuild_baseline(lambda old=old: self._baseline_restart_fn(old),
                                    "calibrating the noise floor")
-            self._note_baseline(self._bench_baseline())
+            tps = self._bench_baseline()
+            if i == 0 and warm > 0 and tps > 0:
+                self.noise.warmup = tps / warm - 1.0
+            self._note_baseline(tps)
         return self.noise.samples[before:]
 
     def _bench_baseline(self) -> float:
@@ -875,6 +1004,7 @@ class LiveEngineApplicator:
                 f"restart_fn produced no engine for knob(s) {', '.join(values)}"
             )
         self.engine = new_engine
+        self._unmeasured_build = True
         self._activate(new_engine)
         if self._restart_mode != "serial":
             self._prev = ("restart", old_engine)
@@ -891,6 +1021,8 @@ class LiveEngineApplicator:
             _, old_engine = self._prev
             self._shutdown(self.engine)  # drop the candidate engine we built
             self.engine = old_engine
+            # Not a build: the baseline that was already measured comes back.
+            self._unmeasured_build = False
             self._activate(old_engine)
         elif tag == "serial_restart":
             _, restore_baseline = self._prev
@@ -921,6 +1053,7 @@ class LiveEngineApplicator:
         self._prev = None
         try:
             self.engine = restore_baseline()
+            self._unmeasured_build = True
         except Exception as exc:
             # The baseline was already shut down: hold nothing rather than a
             # dead handle the loop would pass back to the caller as live.
@@ -928,6 +1061,18 @@ class LiveEngineApplicator:
             raise RestoreFailed(
                 f"could not rebuild the baseline engine ({cause}): {exc}") from exc
         self._activate(self.engine)
+
+    def install(self, engine: Any) -> None:
+        """Make ``engine``, built outside the applicator, the running one.
+
+        The same configuration (a re-trace swaps in a traced build and then an
+        untraced one), so its measurements still pair with the baseline's; and
+        a new build, so its next measurement is a fresh one. Assigning
+        ``engine`` directly kept the previous engine's freshness, and the first
+        measurement after every re-trace was discarded as a warm re-measurement.
+        """
+        self.engine = engine
+        self._unmeasured_build = True
 
     def commit(self) -> None:
         """The candidate was kept: release what restore() would have swapped back.
@@ -1165,6 +1310,9 @@ class LiveEngineApplicator:
         candidate is rolled back rather than left half-applied."""
         base = self.engine
         self._shutdown(base)
+        self.engine = None
+        # A Ctrl-C during the build must still leave restore() able to rebuild the baseline.
+        self._prev = ("serial_restart", lambda: self._baseline_restart_fn(base))
         try:
             new_engine = self._restart_fn(base, _knob_values(spec))
             if new_engine is None:
@@ -1175,6 +1323,7 @@ class LiveEngineApplicator:
             self._prev = ("baseline_running",)
             raise
         self.engine = new_engine
+        self._unmeasured_build = True
         self._activate(new_engine)
 
 

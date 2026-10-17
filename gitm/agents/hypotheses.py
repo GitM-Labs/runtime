@@ -111,6 +111,8 @@ class Hypothesis:
     #: was given a correctness gate, and the emitted spec carries that gate so
     #: ``apply_intervention`` runs it before keep with any applicator.
     requires_correctness_gate: bool = False
+    #: How long apply_intervention waits for the gate before restoring.
+    correctness_gate_timeout_s: float = 1800.0
     requires_hardware: tuple[str, ...] = ()
     safety_notes: str = ""
 
@@ -406,6 +408,8 @@ H002 = Hypothesis(
     applies=_h002_applies,
     predict=_h002_predict,
     requires_correctness_gate=True,
+    # 2x the ~45 min one arm's GSM8K + needle takes (doc budget: 1.5 h, 2 arms).
+    correctness_gate_timeout_s=5400.0,
     requires_hardware=("H100", "H200", "B200", "B300", "GB200", "GB300", "MI355X"),
     safety_notes=(
         "Kimi K2.5 ships no k_scale/v_scale, so vLLM stores with scale 1.0 "
@@ -508,6 +512,8 @@ class HypothesisProposer:
                        f"{p.step_delta[1]:.1%} / {p.step_delta[2]:.1%} (lo/mean/hi)"),
             ),
             safety=SafetyGate(tier="moderate", requires_rollback_window_s=120,
+                              requires_correctness_gate=h.requires_correctness_gate,
+                              correctness_gate_timeout_s=h.correctness_gate_timeout_s,
                               notes=h.safety_notes),
             correctness_gate=self.correctness_gate if h.requires_correctness_gate else None,
         )

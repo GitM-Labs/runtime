@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""gitm-node-report: one JSON snapshot of this GPU node for the status page.
+
+    gitm-node-report [JOBID ...]
+
+Prints per-GPU readings from nvidia-smi and, for each JOBID, the last lines of
+that job's log (<RESULTS_DIR>/<JOBID>.log) and a short summary of its gitm
+results (<RESULTS_DIR>/<JOBID>/: serving latency, kernel-time breakdown, files).
+
+The status pusher on the Slurm controller runs this locally for its own node
+and over SSH for the others. The SSH key it uses is pinned to this program in
+the gitm-report account's authorized_keys (command="...",restrict), so it can do nothing
+else; job ids then arrive in SSH_ORIGINAL_COMMAND and only digits are accepted.
+Stdlib only.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import deque
+
+CONF = "/etc/gitm-gpu/config"
+TAIL = 25
+
+
+def results_dir() -> str:
+    d = "/var/lib/gitm/results"
+    try:
+        with open(CONF) as f:
+            for line in f:
+                if line.startswith("RESULTS_DIR="):
+                    d = line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return d
+
+
+def gpus() -> list[dict]:
+    q = "index,name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu"
+    try:
+        out = subprocess.run(["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+    def num(x: str) -> float | None:
+        try:
+            return round(float(x), 1)
+        except ValueError:
+            return None
+
+    res = []
+    for line in out.strip().splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) >= 7 and f[0].isdigit():
+            res.append({"index": int(f[0]), "name": f[1], "util": num(f[2]),
+                        "mem_used_mib": num(f[3]), "mem_total_mib": num(f[4]),
+                        "power_w": num(f[5]), "temp_c": num(f[6])})
+    return res
+
+
+def tail(path: str) -> list[str]:
+    try:
+        with open(path, errors="replace") as f:
+            # Bound the work on huge logs: only the last 256 KiB is read.
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 262144))
+            return list(deque(f.read().splitlines(), maxlen=TAIL))
+    except OSError:
+        return []
+
+
+def _load(path: str) -> dict | None:
+    try:
+        if os.path.getsize(path) > 8 * 1024 * 1024:
+            return None
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def result(rd: str, jobid: str) -> dict | None:
+    """Compact summary of a finished gitm capture in <RESULTS_DIR>/<jobid>/."""
+    d = os.path.join(rd, jobid)
+    if not os.path.isdir(d):
+        return None
+    files = []
+    try:
+        for name in sorted(os.listdir(d))[:40]:
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                files.append([name, os.path.getsize(p)])
+    except OSError:
+        pass
+    out: dict = {"files": files}
+    ss = _load(os.path.join(d, "serving_summary.json"))
+    if ss:
+        c = ss.get("client") or {}
+        out["serving"] = {k: c.get(k) for k in (
+            "n_requests", "n_failed_requests", "ttft_p50_s", "ttft_p95_s",
+            "tpot_p50_s", "tpot_p95_s", "goodput_rps", "window_s")}
+        out["serving"]["wall_s"] = ss.get("wall_s")
+        out["serving"]["tracing"] = ss.get("tracing")
+    kb = _load(os.path.join(d, "kernel_breakdown.json"))
+    if kb:
+        buckets = sorted(kb.get("buckets") or [], key=lambda b: -(b.get("share") or 0))
+        out["kernels"] = {
+            "n_kernels": kb.get("n_kernels"),
+            "gpu_active_share": kb.get("gpu_active_share"),
+            "n_devices": kb.get("n_devices"),
+            "buckets": [[b.get("bucket"), round(b.get("share") or 0, 4)] for b in buckets[:8]],
+        }
+        out["warnings"] = [w[:240] for w in (kb.get("warnings") or [])[:3]]
+    return out if (len(out) > 1 or files) else None
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args and os.environ.get("SSH_ORIGINAL_COMMAND"):
+        args = os.environ["SSH_ORIGINAL_COMMAND"].split()[1:]   # drop the program name
+    ids = [a for a in args if re.fullmatch(r"\d{1,12}", a)][:32]
+    rd = results_dir()
+    print(json.dumps({"gpus": gpus(),
+                      "logs": {i: tail(os.path.join(rd, f"{i}.log")) for i in ids},
+                      "results": {i: r for i in ids if (r := result(rd, i))}}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

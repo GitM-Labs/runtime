@@ -234,9 +234,13 @@ def _load(model: str) -> tuple[Any, str, str]:
     else:
         entry = load_entry(model)
     if entry is not None:
+        if entry.get("execution_status") == "static_only":
+            raise ValueError(f"{model}: checkpoint evidence only; planner integration pending")
         prov = entry.get("provenance", {})
         est = [e.get("field") for e in prov.get("estimated", [])]
         note = f"catalogue; fitted fields: {est or 'none'}"
+        if entry.get("checkpoint"):
+            note += "; STATIC_CHECKPOINT_ONLY; UNVERIFIED: engine, deployment, traffic, trace"
         return load_spec(model), entry["family"], note
 
     # No entry: read the checkpoint itself, from a config.json path or from the
@@ -272,6 +276,26 @@ def _predict(spec, family: str, hw, batch, sharding):
     from gitm.planner.moe_graph import predict_moe_graph
 
     return predict_moe_graph(spec, hw, batch, sharding)
+
+
+def _prediction_semantics() -> dict[str, Any]:
+    """Interpret the legacy aggregate without asserting an empirical latency.
+
+    A sum of modeled node costs is a whole-step lower bound only after its
+    traffic, rate and schedule assumptions have been established. Keep the
+    numeric legacy result unchanged; expose the interpretation to JSON clients.
+    """
+    return {
+        "kind": "serial_resource_proxy",
+        "aggregation": "sum_of_node_t_pred_s",
+        "latency_estimate_s": None,
+        "whole_step_bound_status": "not_validated",
+        "assumptions": [
+            "configured rates bound the resources used by this backend",
+            "modeled bytes match physical traffic at those resources",
+            "serial node aggregation matches the execution schedule",
+        ],
+    }
 
 
 def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
@@ -343,7 +367,7 @@ def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
     n_launch = sum(1 for n in g.nodes if n.prediction.bound == "launch")
     out += [
         "",
-        f"  floor {total * 1e3:.3f} ms/step   " + (
+        f"  serial proxy {total * 1e3:.3f} ms/step   " + (
             f"{g.batch.prefill_tokens / total:,.0f} tok/s "
             f"prefilling {g.batch.prefill_tokens:,} tokens"
             if g.batch.is_prefill
@@ -377,9 +401,10 @@ def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
         out.append("  ! priced against fallback peaks — the ceiling is low in a "
                    "known direction")
     out.append("")
-    out.append("  This is a floor at vendor peak, not a target. A measured kernel is")
-    out.append("  slower by whatever the implementation leaves on the table; a residual")
-    out.append("  here is a lead, not a defect.")
+    out.append("  This is a serial sum of modeled node costs at configured rates.")
+    out.append("  It is not an empirical latency target. A whole-step lower bound")
+    out.append("  needs validated traffic, rate and serial-schedule assumptions.")
+    out.append("  A residual is a lead, not by itself a defect.")
     return "\n".join(out)
 
 
@@ -494,6 +519,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({
             "model": getattr(spec, "name", None),
             "family": family,
+            "provenance": note,
             "hardware": hw.name,
             "sharding": {"tp": args.tp, "ep": args.ep, "dp": args.dp},
             "batch": {"batch": args.batch, "kv_cache_len": args.kv_len,
@@ -509,6 +535,7 @@ def main(argv: list[str] | None = None) -> int:
             "memory_fit": fit_data,
             "memory_fit_unavailable_reason": None if fit_data is not None else fit_why,
             "total_pred_s": g.total_pred_s,
+            "prediction_semantics": _prediction_semantics(),
             "has_unpriced_collectives": g.has_unpriced_collectives,
             "has_fallback_peaks": g.has_fallback_peaks,
             "nodes": [

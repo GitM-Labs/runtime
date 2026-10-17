@@ -1,0 +1,197 @@
+# deepseek-ai/DeepSeek-V3.2 — DeepseekV32ForCausalLM (MLA + DeepSeek Sparse
+# Attention + MoE), the FP8 block-quantised release.
+# Source: https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/a7e62ac04ecb2c0a54d736dc46601c5606cf10a6/config.json
+# Static evidence: pinned config/index and all 163 safetensors headers; no engine
+# source, deployment contract, or qualified trace has been supplied.
+
+name: deepseek-ai/DeepSeek-V3.2
+family: glm_moe_dsa
+checkpoint:
+  repository: deepseek-ai/DeepSeek-V3.2
+  revision: a7e62ac04ecb2c0a54d736dc46601c5606cf10a6
+  config_sha256: c7fa8b191e9936d8e6a57d864baab82b792fae16a116416cdd3a75ba76bc5af1
+  index_sha256: 2a150b2af4aba7b037edc9fdba70f3b41abf758ee926279e7701d954298f9884
+  header_manifest: deepseek-v3.2.evidence.json
+  tensor_count: 92425
+  shard_count: 163
+  index_total_size: 1370793842752
+  payload_bytes: 689471107200
+description: >
+  61 layers, hidden 7168, ~671B total params. MLA attention (kv_lora_rank 512,
+  one latent shared across 128 query heads) with a DeepSeek Sparse Attention
+  lightning indexer selecting top-2048. Every layer carries its own indexer
+  weights (VERIFIED: all 61 layers, plus the MTP layer, hold self_attn.indexer.*
+  tensors, unlike GLM-5.2's shared layers). That each layer also recomputes its
+  own selection at run time (no IndexShare, index_topk_freq 1) is a planner
+  ASSUMPTION pending engine evidence, not established by the checkpoint. First 3
+  layers dense, remaining 58 MoE (256 experts, top-8, one shared). One MTP draft
+  layer carries its own indexer weights. FP8
+  e4m3 weights, 128x128 block scales; embeddings, lm_head, router weights and
+  indexer.weights_proj are stored bf16. Execution details need an engine pin.
+
+spec:
+  hidden: 7168
+  n_layers: 61
+  vocab: 129280
+
+  # MLA attention. On V3.2 qk_nope_head_dim (128) equals v_head_dim (128) — unlike
+  # GLM-5.2, where they differ (192 vs 256). q_head_dim widens to 128+64=192.
+  # num_key_value_heads is 128 in the config but is a red herring: the cache holds
+  # one kv_lora_rank (512) latent per token, shared across all 128 query heads, so
+  # KV traffic derives from kv_lora_rank + qk_rope_head_dim, never 128*head_dim.
+  n_heads: 128
+  q_lora_rank: 1536
+  kv_lora_rank: 512
+  qk_nope_head_dim: 128
+  qk_rope_head_dim: 64
+  v_head_dim: 128
+
+  # DeepSeek Sparse Attention indexer.
+  # VERIFIED (weight map): every layer, and the MTP layer, carries its own
+  # self_attn.indexer.* tensors, whereas GLM-5.2's 'shared' layers carry none.
+  # ASSUMPTION (pending engine evidence): index_topk_freq 1 models each layer as
+  # recomputing its own top-2048 selection (no IndexShare). The stored weights do
+  # not prove the runtime recomputes selection per layer rather than reusing it;
+  # an engine pin/trace is needed to confirm. index_n_heads is 64 (GLM: 32).
+  index_n_heads: 64
+  index_head_dim: 128
+  index_topk: 2048
+  index_topk_freq: 1
+
+  # Mixture of experts. moe_intermediate_size 2048 per expert; the first 3 layers
+  # are dense FFN (intermediate_size 18432) with no router or experts.
+  n_routed_experts: 256
+  n_shared_experts: 1
+  num_experts_per_tok: 8
+  moe_intermediate_size: 2048
+  intermediate_size: 18432
+  first_k_dense_replace: 3
+  routed_scaling_factor: 2.5
+
+  # Multi-token prediction. One MTP module. Unlike GLM-5.2, the V3.2 MTP block
+  # carries its OWN indexer tensors in the weight map. Whether the serving engine
+  # recomputes selection remains an execution question.
+  num_nextn_predict_layers: 1
+  index_share_for_mtp_iteration: false
+  mtp_separate_embedding_head: true
+
+  # FP8 e4m3, 128x128 block-scaled, dynamic activation scaling
+  # (quantization_config: quant_method fp8, weight_block_size [128,128],
+  # scale_fmt ue8m0). act_dtype stays bf16: weights are fp8 on disk, activations
+  # are bf16 in flight and quantised per-GEMM at run time (the act_quant node).
+  weight_dtype: fp8
+  expert_dtype: fp8
+  # The cache layout is a serving choice, not determined by FP8 weight storage.
+  # BF16 here is an exploratory scenario; the workload contract must override it.
+  kv_dtype: bf16
+  act_dtype: bf16
+
+  # Read from the weight map (presence/absence of a .weight_scale_inv sibling):
+  #   - embed_tokens, lm_head: stored bf16 (no scale) -> wide.
+  #   - indexer.weights_proj: stored bf16 -> wide (but indexer.wk / wq_b ARE fp8,
+  #     so the indexer projections otherwise run at weight_dtype — the opposite of
+  #     GLM-5.2-FP8, whose whole indexer stays bf16).
+  #   - moe router gate: stored bf16; fp32 execution is a hypothesis until
+  #     checked against a pinned engine/kernel path.
+  #   - o_proj, q_b_proj, kv_b_proj, dense MLP, shared + routed experts: fp8.
+  op_dtype_overrides:
+    - [embed_tokens, bf16]
+    - [lm_head, bf16]
+    - [mtp_embed_tokens, bf16]
+    - [mtp_lm_head, bf16]
+    - [mtp_eh_proj, bf16]
+    - [moe_router, fp32]
+  stored_dtype_overrides:
+    - [moe_router, bf16]
+    - [attn_index_weights_proj, bf16]
+
+provenance:
+  verified:
+    - claim: every layer carries its own indexer weights (weights, not execution)
+      detail: >
+        model.safetensors.index.json carries self_attn.indexer.* tensors on all
+        61 layers (0-60) and on the MTP layer (61). GLM-5.2, by contrast, carries
+        them on only 21 of 78 layers. A layer that reused a neighbour's selection
+        would not need indexer weights; every V3.2 layer has them. This verifies
+        the stored weight inventory ONLY. It does not establish that the serving
+        engine recomputes a fresh selection at each layer — that per-layer
+        selection execution is a planner assumption (see estimated, below).
+    - claim: dense/sparse MLP split matches the tensor map
+      detail: >
+        Layers 0-2 carry mlp.{gate,up,down}_proj (dense FFN) and no experts;
+        layers 3-60 and the MTP layer carry mlp.experts.* and shared_experts.*.
+        Matches first_k_dense_replace 3.
+    - claim: FP8 precision classes read from the weight map
+      detail: >
+        A .weight_scale_inv sibling marks an fp8 block-quantised tensor. Present
+        on o_proj, q_b_proj, kv_b_proj, dense MLP, shared and routed experts, and
+        indexer.wk / wq_b. Absent on embed_tokens, lm_head and indexer.weights_proj
+        (bf16). Router gate is bf16 on disk; execution precision is not stated
+        by this checkpoint's config and must be checked in engine source.
+        Confirmed from shard headers: dtypes are F8_E4M3 (weights) + F32 (block
+        scales) + BF16 (embeddings/lm_head/indexer.weights_proj).
+    - claim: exact on-disk tensor-class payload from pinned shard headers
+      detail: >
+        The 163 pinned shard headers contain 92,425 indexed tensors with
+        689,471,107,200 payload bytes. See deepseek-v3.2.evidence.json for
+        dtype classes and per-shard header digests. The index metadata.total_size
+        (1,370,793,842,752) equals exactly twice all 685,396,921,376 indexed
+        tensor elements, including scale tensors. It is not the stored payload.
+        The analytic model_weight_bytes now includes separate MTP embedding,
+        output head and fusion weights. It returns 689,467,088,807 B, leaving
+        4,018,393 B of norms/biases and scale-boundary detail. The exact
+        header ledger is authoritative for stored payload; the analytic
+        per-rank footprint remains an estimate until placement is verified.
+
+  estimated:
+    - field: per-layer index selection execution
+      value: planner assumption (index_topk_freq 1, no IndexShare)
+      detail: >
+        The weight map verifies every layer carries its own indexer weights, but
+        it does not establish that the serving engine recomputes a fresh top-2048
+        selection at each layer. index_topk_freq 1 models per-layer selection; an
+        engine that shared or reused selections across layers would lower the
+        indexer scan cost. Pending engine source / a qualified trace.
+    - field: kv_dtype
+      value: bf16 exploratory scenario; deployment UNVERIFIED
+      detail: >
+        Checkpoint torch_dtype does not establish the cache representation.
+        The engine flag, latent and RoPE layout, scale bytes and kernel choice
+        must be pinned before a customer-facing prediction.
+    - field: moe_router execution precision
+      value: fp32 hypothesis
+      detail: >
+        Router weights are stored bf16. The pinned engine/kernel determines
+        execution and accumulation precision; the graph's current fp32 override
+        must not be treated as stored-byte evidence.
+    - field: index_share_for_mtp_iteration
+      value: false (MTP recomputes its own index)
+      detail: >
+        The config carries no index_share_for_mtp_iteration flag. The weight map
+        shows the MTP layer (61) carries its own indexer.* tensors, so it is
+        emitted as a full-indexer block. If the runtime in fact reuses the main
+        model's selection during MTP verify, this over-predicts one indexer scan
+        per drafted token — a headroom lever to settle against a trace.
+    - field: MLA absorption (attn_kv_b vs attn_out_proj width)
+      value: unabsorbed — kv_b runs as its own GEMM, o_proj narrow
+      detail: >
+        The graph models MLA unabsorbed: attn_kv_b reconstructs per-head K/V from
+        the latent and attn_out_proj is n_heads*v_head_dim -> hidden (16384->7168).
+        A serving engine that absorbs MLA (the common vLLM decode path) folds W^UK
+        into the query and W^UV into the output, doubling attn_out_proj's input to
+        n_heads*kv_lora_rank (65536->7168). Same resident weights; the two readings
+        move attn_out_proj by ~4x here, which re-ranks the attention side.
+
+  unmodelled:
+    - Exact analytic per-rank closure of norms, biases and scale boundaries.
+      The evidence manifest closes the whole-checkpoint stored payload; the
+      formula remains 4,018,393 B low at TP1/EP1.
+    - BF16 indexer.weights_proj alongside FP8 indexer.wq_b and wk. Stored bytes
+      are separated, but the graph's single attn_index_proj compute/traffic
+      node cannot express their mixed execution without engine evidence.
+    - Absorbed-MLA decode. See the estimated entry above.
+    - Acceptance rate under MTP. The graph prices D drafts and a 1+D verify; the
+      fraction kept is a serving observable, not a config-derivable one.
+    - Expert-capacity padding. If the grouped-GEMM backend pads to a fixed
+      capacity, every step reads all 256 experts and the distinct-experts union
+      term underestimates at low batch.

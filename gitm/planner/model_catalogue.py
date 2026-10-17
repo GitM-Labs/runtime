@@ -215,10 +215,9 @@ def load_spec(name_or_path: str | Path):
     # from the file that caused it.
     if isinstance(raw.get("dense_layers"), list):
         raw["dense_layers"] = frozenset(int(i) for i in raw["dense_layers"])
-    if isinstance(raw.get("op_dtype_overrides"), list):
-        raw["op_dtype_overrides"] = tuple(
-            (str(op), str(dt)) for op, dt in raw["op_dtype_overrides"]
-        )
+    for key in ("op_dtype_overrides", "stored_dtype_overrides"):
+        if isinstance(raw.get(key), list):
+            raw[key] = tuple((str(op), str(dt)) for op, dt in raw[key])
 
     unknown = set(raw) - known
     if unknown:
@@ -240,6 +239,8 @@ def predict(
 ):
     """``(graph, family)`` for a catalogue entry — the one-call path."""
     entry = load_entry(name_or_path)
+    if entry.get("execution_status") == "static_only":
+        raise ValueError(f"{name_or_path}: checkpoint evidence only; planner integration pending")
     spec = load_spec(name_or_path)
     family = entry["family"]
 
