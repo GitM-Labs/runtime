@@ -138,53 +138,68 @@ def test_nvfp4_on_b200_runs_w4a4_with_activation_quant():
 
 
 def test_mxfp4_on_blackwell_defaults_to_bf16_macs():
-    """FLASHINFER_TRTLLM_MXFP4_BF16 is first in the v0.19.1 priority list: stored
-    fp4, executed bf16, on a part that has fp4 tensor cores."""
+    """FLASHINFER_TRTLLM_MXFP4_BF16 is first in the priority list: stored fp4,
+    executed bf16, on a part that has fp4 tensor cores. v0.29.0 pads hidden to
+    256 and each rank's intermediate to 128 (oracle/mxfp4.py:740-742); v0.19.1
+    padded both to 256."""
     ex = resolve_execution("mxfp4", B200)
     assert ex.compute_dtype == "bf16" and ex.is_upcast
-    assert (ex.pad_hidden, ex.pad_inter) == (256, 256)
+    assert (ex.pad_hidden, ex.pad_inter) == (256, 128)
 
 
-def test_mxfp4_with_and_without_marlin_upcast_differ_in_padding_not_bytes():
+def test_mxfp4_forced_marlin_has_trtllm_bytes_and_padding():
     default = resolve_execution("mxfp4", B200)
     marlin = resolve_execution("mxfp4", B200, backend="marlin")
     assert default.streamed_bytes == marlin.streamed_bytes == 0.53125
-    assert (marlin.pad_hidden, marlin.pad_inter) == (256, 128)
+    assert (marlin.pad_hidden, marlin.pad_inter) == (default.pad_hidden, default.pad_inter) == (256, 128)
 
 
 def test_backend_padding_is_applied_to_each_ranks_slice():
     """Finding 2 of Jalon's review. vLLM splits intermediate across TP ranks first
     (fused_moe/layer.py:426) and pads the per-rank width afterwards (:537-538).
-    Width 2,880 across 8 ranks with a 256 multiple: split-then-pad is 360 -> 512
-    per rank; pad-then-split is 3,072 / 8 = 384, which the kernel pads again.
-    The old order under-counted by 25% (384 / 512). Hidden is not split."""
+    Width 2,880 across 8 ranks with a 128 multiple: split-then-pad is 360 -> 384
+    per rank; pad-then-split is 2,944 / 8 = 368, which the kernel pads again.
+    The old order under-counted by 4% (368 / 384), and by 25% under v0.19.1's
+    256 multiple. Hidden is not split."""
     trtllm = resolve_execution("mxfp4", B200)
     per_rank = expert_pad_factor(trtllm, 2880, 2880, shards=8)
-    assert per_rank == pytest.approx((3072 * 512) / (2880 * 360))
-    wrong_order = (3072 * (3072 / 8)) / (2880 * 360)
-    assert wrong_order / per_rank == pytest.approx(384 / 512)
+    assert per_rank == pytest.approx((3072 * 384) / (2880 * 360))
+    wrong_order = (3072 * (2944 / 8)) / (2880 * 360)
+    assert wrong_order / per_rank == pytest.approx(368 / 384)
     marlin = resolve_execution("mxfp4", H200, backend="marlin")
     assert expert_pad_factor(marlin, 2880, 2880, shards=8) == pytest.approx((3072 * 384) / (2880 * 360))
-    # Unsharded, the old numbers still hold.
-    assert expert_pad_factor(trtllm, 2880, 2880) == pytest.approx((3072 / 2880) ** 2)
+    # Unsharded, hidden and intermediate pad to their own multiples.
+    assert expert_pad_factor(trtllm, 2880, 2880) == pytest.approx((3072 * 2944) / 2880**2)
     # Kimi and GLM are exact multiples per rank at TP8, so nothing moves there.
     assert expert_pad_factor(trtllm, 7168, 2048, shards=8) == 1.0
     assert expert_pad_factor(marlin, 7168, 2048, shards=8) == 1.0
     assert expert_pad_factor(trtllm, 6144, 2048, shards=8) == 1.0
 
 
-def test_padded_expert_bytes_flow_through_the_graph_per_rank():
-    """The graph divides expert bytes by the shard count; the pad factor must
-    already be per rank or the two cancel into the wrong order."""
-    gpt_oss_like = replace(load_spec("kimi-k2.6"), hidden=2880, moe_intermediate_size=2880,
-                           expert_dtype="mxfp4")
-    g8 = predict_glm_graph(gpt_oss_like, B200, BASELINE, ShardingConfig(tp=8))
-    g1 = predict_glm_graph(gpt_oss_like, B200, BASELINE, ShardingConfig(tp=1))
-    r8 = next(n for n in g8.nodes if n.op == "moe_routed").prediction.bytes
-    r1 = next(n for n in g1.nodes if n.op == "moe_routed").prediction.bytes
-    # Weight bytes per rank at TP8 = (whole-model padded-per-rank) / 8, so the
-    # ratio to TP1 is the padding ratio between the two orders, not exactly 1/8.
-    assert r8 / r1 > (1 / 8) * 1.2
+@pytest.mark.parametrize("sharding,held_inter,padded_inter,expert_share", [
+    (ShardingConfig(tp=1), 2880, 2944, 1.0),
+    (ShardingConfig(tp=8), 360, 384, 1.0),
+    (ShardingConfig(tp=8, ep=8), 2880, 2944, 1 / 8),
+], ids=["tp1", "tp8", "tp8-ep8"])
+def test_padded_expert_bytes_flow_through_the_graph_per_rank(sharding, held_inter,
+                                                             padded_inter, expert_share):
+    """TRT-LLM pads hidden to 256 and each rank's intermediate to 128: a 2,880 x
+    360 slice becomes 3,072 x 384, a whole expert under EP 3,072 x 2,944. Padding
+    is isolated against 'fp4' experts, which have MXFP4's bytes and no backend
+    rule. The old bound, r8 / r1 > 0.15, never ran EP."""
+    spec = replace(load_spec("kimi-k2.6"), hidden=2880, moe_intermediate_size=2880)
+    unpadded = resolve_execution("fp4", B200)
+    assert (unpadded.pad_hidden, unpadded.pad_inter, unpadded.bytes_per_use) == (1, 1, 0.53125)
+
+    def routed_bytes(dtype):
+        g = predict_glm_graph(replace(spec, expert_dtype=dtype), B200, BASELINE, sharding)
+        return next(n for n in g.nodes if n.op == "moe_routed").prediction.bytes
+
+    e, k = spec.n_routed_experts, spec.num_experts_per_tok
+    woken = e * (1 - (1 - k / e) ** BASELINE.batch)
+    per_expert = 3 * 0.53125 * (3072 * padded_inter - 2880 * held_inter)
+    assert routed_bytes("mxfp4") - routed_bytes("fp4") == pytest.approx(
+        woken * expert_share * per_expert)
 
 
 def test_mxfp8_has_no_hopper_kernel():
@@ -400,12 +415,15 @@ def test_resident_weights_equal_storage_when_nothing_pads():
 
 def test_mi355x_rules_are_read_from_aiter_and_vllm_rocm_sources():
     """CDNA4 rules come from vLLM b1388b1f plus the AITER tag its ROCm image pins
-    (v0.1.10.post2) and CK; none is inferred, though the AITER-gated ones stay
-    estimated because the flag is a serving choice the planner cannot see. INT4 g32 runs the Triton W4A16
-    kernel (compressed_tensors_moe.py:177-190; fused_moe.py:288-289 dequantises
-    in-kernel), block fp8 runs AITER with per-token group-128 fp32 activation
-    scales, MXFP4 runs the CK 2-stage scaled-f8f6f4 MFMA with a separate MXFP4
-    activation quant and per-rank padding to 256. NVFP4 has no ROCm backend."""
+    (v0.1.10.post2) and CK, except the MXFP4 and NVFP4 cells, re-read at vLLM
+    v0.29.0 / AITER v0.1.19. None is inferred, though the AITER-gated ones stay
+    estimated because the flag is a serving choice the planner cannot see. INT4
+    g32 runs the Triton W4A16 kernel (compressed_tensors_moe.py:177-190;
+    fused_moe.py:288-289 dequantises in-kernel), block fp8 runs AITER with
+    per-token group-128 fp32 activation scales, MXFP4 runs AITER's tuned FlyDSL
+    kernels (the ``aiter_ck2stages`` label predates that read) with a separate
+    MXFP4 activation quant and per-rank padding to 256. NVFP4 MoE runs on ROCm
+    only through the Triton emulation, which no rule prices."""
     assert MI355X.arch == "cdna4" and MI355X.memory_bytes == 288e9
     int4 = resolve_execution("int4", MI355X)
     assert (int4.backend, int4.compute_dtype, int4.act_format, int4.estimated) == (
@@ -421,7 +439,7 @@ def test_mi355x_rules_are_read_from_aiter_and_vllm_rocm_sources():
     assert mx.act_format.name == "mxfp4" and (mx.pad_hidden, mx.pad_inter) == (256, 256)
     for dtype in ("fp8", "mxfp4", "int4"):
         assert "aiter/" in resolve_execution(dtype, MI355X).source or "rocm" in resolve_execution(dtype, MI355X).source
-    with pytest.raises(UnsupportedExecution, match="no NvFp4 MoE backend"):
+    with pytest.raises(UnsupportedExecution, match="Triton emulation"):
         resolve_execution("nvfp4", MI355X)
     with pytest.raises(UnsupportedExecution, match="is_cuda"):
         resolve_execution("int4", MI355X, backend="marlin")
@@ -520,7 +538,7 @@ def test_expert_parallel_memory_pads_whole_experts(tp):
     padding_bytes = (model_weight_bytes(spec, sharding, B200)
                      - model_weight_bytes(spec, sharding))
     expected = ((spec.n_sparse_mlp_layers + spec.num_nextn_predict_layers)
-                * spec.n_routed_experts * 3 * (3072**2 - 2880**2) * 0.53125 / 8)
+                * spec.n_routed_experts * 3 * (3072 * 2944 - 2880**2) * 0.53125 / 8)
     assert padding_bytes == pytest.approx(expected)
 
 
