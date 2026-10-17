@@ -185,9 +185,13 @@ def test_entry_predicts_a_decode_graph_on_mi355x():
 
 
 def test_whole_model_decode_bytes_match_the_design_note(spec):
-    """Design note §3.2: planner node bytes at TP1, B=1 and B=32, S=8k."""
+    """Design note §3.2: planner node bytes at TP1, B=1 and B=32, S=8k.
+
+    B=32 includes AITER's stage-2 activation quant on the routed experts, 92
+    nodes, 0.18 GB (aiter_mxfp4_routed_quants: K3's shape has no tuned fused
+    row, so both quants run). B=1 moves 0.006 GB, inside the tolerance."""
     hw = hardware_spec_for(peak_for_sku("MI355X"))
-    for batch, expected_gb in ((1, 82.91), (32, 721.44)):
+    for batch, expected_gb in ((1, 82.91), (32, 721.62)):
         g = glm_graph.predict_glm_graph(
             spec, hw, BatchConfig(batch=batch, kv_cache_len=8192), ShardingConfig(tp=1)
         )

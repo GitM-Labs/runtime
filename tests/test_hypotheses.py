@@ -30,7 +30,7 @@ from gitm.optimizer.apply import DictApplicator, apply_intervention
 from gitm.optimizer.preconditions import GateContext
 from gitm.optimizer.replay import predict_delta
 from gitm.planner.context import hardware_spec_for, peak_for_sku
-from gitm.planner.glm_graph import model_weight_bytes
+from gitm.planner.glm_graph import model_weight_bytes, predict_glm_graph
 from gitm.planner.model_catalogue import load_spec
 from gitm.planner.roofline import BatchConfig, ShardingConfig, UnsupportedExecution
 from gitm.planner.roofline import BatchConfig as _BC  # noqa: F401
@@ -335,8 +335,75 @@ def test_h001_latency_effect_is_inside_its_own_band():
     """A few percent of step against a two-kernel efficiency band of tens of
     percent: the spec therefore verdicts on MoE bytes, not on ITL alone."""
     lo, mean, hi = H001.predict(_k25(batch=128, kv_len=1024)).step_delta
-    assert 0.02 < mean < 0.05
+    assert 0.005 < mean < 0.02
     assert lo < 0 < mean < hi
+
+
+def test_h001_mean_is_the_floor_ratio():
+    """At the mean both arms sit at the same efficiency, so the mean step delta
+    is the floors' ratio; the quant cost cannot sit on a different basis from
+    the rest of the step."""
+    p = H001.predict(_k25(batch=64, kv_len=4352))
+    assert p.step_delta[1] == pytest.approx(1 - p.predicted_step_s / p.baseline_step_s)
+
+
+@pytest.mark.parametrize(("batch", "kv_len", "routed"), [(128, 1024, 1), (64, 4352, 2), (32, 8192, 2)])
+def test_h001_charges_every_activation_quant_the_mxfp4_graph_runs(batch, kv_len, routed):
+    """Two quants on dense layer 0, two per shared expert, one or two per routed
+    MoE (one where the tuned stage 1 writes fp4 itself). The band charges them
+    at every end, divided by that end's efficiency like every other node."""
+    w = _k25(batch=batch, kv_len=kv_len)
+    g_old = predict_glm_graph(w.spec, w.hw, w.batch, w.sharding)
+    g_new = predict_glm_graph(mxfp4_variant(w.spec), w.hw, w.batch, w.sharding)
+    quants = [n for n in g_new.nodes if n.op == "act_quant"]
+    n = 2 + 60 * (routed + 2)
+    assert len(quants) == n and not any(x.op == "act_quant" for x in g_old.nodes)
+    assert all(x.prediction.bound == "launch" for x in quants)
+    q = n * w.hw.kernel_launch_overhead_s
+
+    p = H001.predict(w)
+    q1 = w.hw.kernel_launch_overhead_s * 1e3
+    text = " ".join(p.arithmetic)
+    assert f"{n} act_quant nodes = {q * 1e3:.3f} ms" in text
+    assert f"({60 * routed * q1:.3f} routed, {122 * q1:.3f} shared + dense)" in text
+    assert f"{122 * q1:.3f} ms of quant launches added" in text
+    old = sum(x.prediction.t_pred_s for x in g_old.nodes if x.op in H001.target_ops)
+    new = sum(x.prediction.t_pred_s for x in g_new.nodes if x.op in H001.target_ops)
+    lo_e, hi_e = w.hw.eff_lo, w.hw.eff_hi
+    mid = (lo_e + hi_e) / 2
+    expected = (old / hi_e - (new + q) / lo_e, (old - new - q) / mid, old / lo_e - (new + q) / hi_e)
+    assert p.recoverable_s == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("tp", [8, 16, 32])
+def test_h001_quant_nodes_carry_their_gemm_input_width(tp):
+    """Each MXFP4 quant reads its GEMM's input: hidden before gate-up, the
+    per-rank intermediate before down, top_k x the per-rank expert slice before
+    stage 2. ROCm pads that slice to 256 (oracle/mxfp4.py:759-761) and AITER
+    quantises the padded width, so TP16 and TP32 read TP8's 256. At a prefill
+    shape the bytes set the node time, so pin them."""
+    w = replace(_k25(kv_len=1024), batch=BatchConfig(batch=1, kv_cache_len=1024,
+                                                     prefill_tokens=8192, prefill_requests=1),
+                sharding=ShardingConfig(tp=tp))
+    g = predict_glm_graph(mxfp4_variant(w.spec), w.hw, w.batch, w.sharding)
+    s, rows, per_elem = w.spec, 8193, 2 + 0.53125
+
+    def widths(layer):
+        return [n.prediction.bytes / (rows * per_elem)
+                for n in g.nodes if n.op == "act_quant" and n.layer == layer]
+
+    assert widths(0) == pytest.approx([s.hidden, s.intermediate_size / tp])
+    assert widths(1) == pytest.approx(
+        [s.hidden, s.hidden, s.moe_intermediate_size / tp, s.top_k * 256])
+
+
+def test_h001_counts_the_tp4_tuned_rows_at_128_sequences():
+    """At TP4 (per-rank intermediate 512) AITER's tuned stage 1 at 128 tokens
+    is ..._t32x128x256_w2_fp4 (kimik2_fp4_tuned_fmoe.csv:25), so one routed
+    quant per layer, as at TP8: 2 + 60 x (1 + 2) launches, not 242."""
+    w = replace(_k25(batch=128, kv_len=1024), sharding=ShardingConfig(tp=4))
+    g = predict_glm_graph(mxfp4_variant(w.spec), w.hw, w.batch, w.sharding)
+    assert sum(n.op == "act_quant" for n in g.nodes) == 182
 
 
 def test_h001_is_excluded_where_mxfp4_emulates():

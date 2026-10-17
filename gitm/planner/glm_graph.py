@@ -564,6 +564,35 @@ def kv_bytes_per_token(spec: GlmMoeDsaModelSpec) -> float:
     return latent + index_keys
 
 
+#: AITER v0.1.19's tuned Kimi MXFP4 rows (configs/model_configs/kimik2_fp4_tuned_fmoe.csv,
+#: TP8 :2-17, TP4 :18-33): (hidden, per-rank intermediate, experts, top-k) -> the padded
+#: token counts whose stage-1 kernel name has ``_fp4`` after its last ``_t``, and so
+#: writes stage 2's input itself (aiter/fused_moe.py:2056, :2107, :2713-2721).
+_AITER_FP4_FUSED_M: dict[tuple[int, int, int, int], frozenset[int]] = {
+    (7168, 256, 384, 8): frozenset({8, 16, 128, 256, 512, 1024}),
+    (7168, 512, 384, 8): frozenset({2, 4, 8, 16, 128, 256, 512, 1024, 2048}),
+}
+
+
+def _aiter_rank_inter(spec: GlmMoeDsaModelSpec, sh: ShardingConfig) -> int:
+    """The per-rank expert intermediate AITER's W4A4 MoE runs at: ROCm rounds each
+    rank's slice up to 256 (oracle/mxfp4.py:759-761, via quark_moe.py:1140-1161),
+    and AITER reads it back from the w2 shape (aiter/fused_moe.py:432-438)."""
+    inter = spec.moe_intermediate_size // (1 if sh.ep > 1 else max(1, sh.tp))
+    return (inter + 255) // 256 * 256
+
+
+def aiter_mxfp4_routed_quants(spec: GlmMoeDsaModelSpec, rows: float, sh: ShardingConfig) -> int:
+    """Activation quants per MoE layer on AITER's W4A4 path: one before stage 1
+    (aiter/fused_moe.py:2612) and one before stage 2 (:2761-2773) unless the tuned
+    stage 1 writes fp4 itself. Keyed on the token count rounded up to a power of
+    two (:1102-1117, :2530-2531) and on the padded per-rank intermediate
+    (:func:`_aiter_rank_inter`)."""
+    shape = (spec.hidden, _aiter_rank_inter(spec, sh), spec.n_routed_experts, spec.top_k)
+    padded_m = 1 << max(0, int(rows) - 1).bit_length()
+    return 1 if padded_m in _AITER_FP4_FUSED_M.get(shape, frozenset()) else 2
+
+
 def _linear(
     rows: float, k: int, n: int, act_b: float, ex: WeightExecution
 ) -> tuple[float, float]:
@@ -609,7 +638,9 @@ def _emit_layer(
 
     ``batch`` is the phase, already adjusted by the caller: decode, chunked
     prefill, or a draft stage (prefill stripped). The node *set* is identical
-    across all three; only the class of four of them changes.
+    across all three, except AITER's MXFP4 stage-2 quant, which follows the row
+    count (:func:`aiter_mxfp4_routed_quants`); only the class of four of them
+    changes.
 
     Three row counts, and conflating any two is a real error: ``rows`` (positions
     computed — every projection scales with it), ``batch.batch`` (distinct KV
@@ -700,6 +731,14 @@ def _emit_layer(
             return
         add(op, 2.0 * rows * elems, act_quant_bytes(ex, rows, elems, aw), spec.act_dtype,
             estimated=ex.estimated)
+
+    def add_mxfp4_quant(elems: float, gemm_op: str, default: str = wd) -> None:
+        """MXFP4 only: AITER's linear quantises its own input in its own kernel
+        (kernels/linear/mxfp4/aiter.py:28-104, :191-203), and no ROCm compile pass
+        fuses it (act_quant_fusion.py:36-40 is NVFP4 on CUDA)."""
+        ex = w_exec(gemm_op, default)
+        if ex.act_format is not None and ex.act_format.name == "mxfp4":
+            add_act_quant("act_quant", elems, gemm_op, default)
 
     # ── MLA attention: low-rank query, compressed KV latent ──────────────────
     add_rms_norm(with_residual=layer > 0)
@@ -834,6 +873,7 @@ def _emit_layer(
         f_gu, b_gu = _linear(rows, h, 2 * inter // tp, aw, w_exec("mlp_gate_up", wd))
         f_act, b_act = _pointwise(rows, inter / tp, aw, ops=4.0)
         add("mlp_gate_up", f_gu + f_act, b_gu + b_act, wd)
+        add_mxfp4_quant(inter / tp, "mlp_down")
         f_d, b_d = _linear(rows, inter // tp, h, aw, w_exec("mlp_down", wd))
         add("mlp_down", f_d, b_d, wd)
         _emit_collective(g, spec, hw, layer, "tp_all_reduce_mlp", rows, sh, prefix)
@@ -870,6 +910,9 @@ def _emit_layer(
     )
 
     if spec.n_shared_experts > 0:
+        # One node for two linears (gate_up, then down), so two quants.
+        add_mxfp4_quant(h, "moe_shared", ed)
+        add_mxfp4_quant(inter * spec.n_shared_experts / tp, "moe_shared", ed)
         sw = w_exec("moe_shared", ed).bytes_per_use
         add(
             "moe_shared",
@@ -908,6 +951,12 @@ def _emit_layer(
         + swiglu_b,
         ed,
     )
+
+    # Stage 2's input, between the two expert GEMMs the node above holds, at the
+    # padded per-rank width AITER quantises (aiter/fused_moe.py:2761-2773).
+    if aiter_mxfp4_routed_quants(spec, rows, sh) == 2:
+        padded_inter = _aiter_rank_inter(spec, sh) * (1 if sh.ep > 1 else tp)
+        add_mxfp4_quant(spec.top_k * padded_inter / es, "moe_routed", ed)
 
     # Weighted scatter-add back to ``rows x hidden``, including the
     # routed_scaling_factor multiply.

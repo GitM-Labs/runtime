@@ -270,15 +270,21 @@ def _h001_predict(w: Workload) -> Prediction:
     # change the AMD checkpoint bundles in, which is not.
     routed = _op_time(g_old, "moe_routed") - _op_time(g_new, "moe_routed")
     bundled = (_op_time(g_old, *_MLP_OPS) - _op_time(g_new, *_MLP_OPS)) - routed
-    # The checkpoint quantises activations too (input_tensors fp4, dynamic). If
-    # the backend runs that as separate kernels, a W4A4 MLP needs two: its input
-    # and the SiLU output feeding the down projection. The lo end pays both per
-    # MLP layer; the hi end assumes they fuse into the GEMMs.
-    n_quant = 2 * base.n_layers
-    launches = n_quant * w.hw.kernel_launch_overhead_s
+    # The checkpoint quantises activations too (input_tensors fp4, dynamic): the
+    # act_quant nodes the MXFP4 graph carries and the INT4 W4A16 one does not. A
+    # routed-only variant splits the bundled change's share out for the arithmetic.
+    n_quant = (sum(n.op == "act_quant" for n in g_new.nodes)
+               - sum(n.op == "act_quant" for n in g_old.nodes))
+    quant_s = _op_time(g_new, "act_quant") - _op_time(g_old, "act_quant")
+    g_routed = _floor(replace(base, expert_dtype="mxfp4"), w)
+    routed_quant_s = _op_time(g_routed, "act_quant") - _op_time(g_old, "act_quant")
+    bundled_quant_s = quant_s - routed_quant_s
+    # Charged at every end on the measured basis, like any other node: each quant
+    # feeds a GEMM on the same stream, so it cannot hide behind one.
+    lo_e, hi_e = w.hw.eff_lo, w.hw.eff_hi
     saved, op, step = _effect(
         g_old, g_new, _MLP_OPS, w.hw, same_kernel=False,
-        extra_s=(launches, launches / 2.0, 0.0),
+        extra_s=(quant_s / lo_e, quant_s / mid, quant_s / hi_e),
     )
     scale_stream = _scale_stream_s(g_old, base)
     nv, mx = QUANT_FORMATS["nvfp4"], QUANT_FORMATS["mxfp4"]
@@ -289,9 +295,10 @@ def _h001_predict(w: Workload) -> Prediction:
         f"routed scale stream {scale_stream * 1e3:.3f} ms floor; MXFP4 removes "
         f"{routed * 1e3:.3f} ms of it (half), the other half stays",
         f"bundled bf16 -> MXFP4 on shared expert + dense layer 0: "
-        f"{bundled * 1e3:.3f} ms floor (not scale recovery)",
-        f"activation-quant launches if unfused: {n_quant} x "
-        f"{w.hw.kernel_launch_overhead_s * 1e6:.0f} us = {launches * 1e3:.3f} ms",
+        f"{bundled * 1e3:.3f} ms of GEMM floor saved, {bundled_quant_s * 1e3:.3f} ms "
+        "of quant launches added (not scale recovery)",
+        f"activation quant added: {n_quant} act_quant nodes = {quant_s * 1e3:.3f} ms "
+        f"floor ({routed_quant_s * 1e3:.3f} routed, {bundled_quant_s * 1e3:.3f} shared + dense)",
         f"MLP floor {_op_time(g_old, *_MLP_OPS) * 1e3:.3f} -> "
         f"{_op_time(g_new, *_MLP_OPS) * 1e3:.3f} ms; step floor "
         f"{g_old.total_pred_s * 1e3:.3f} -> {g_new.total_pred_s * 1e3:.3f} ms",
