@@ -47,7 +47,8 @@ provenance:
       detail: >
         595.19 GB summed over the 60 safetensors shards on the Hub (re-read
         2026-09-15 via the Hub tree API: 595.185 GB); model_weight_bytes
-        predicts 594.20 GB (-0.16%), the residual being the unmodelled 0.94 GB
+        predicts 594.20 GB, -0.16% against the index's 595.148 GB total_size
+        (tensor bytes only), the residual being the unmodelled 0.94 GB
         vision tower. An earlier -0.03% came from the dense FFN being counted
         at bytes-per-weight squared. NVFP4 (0.5 + 1/16) and int4 (0.5 + 2/32)
         are both 0.5625 B/weight, so K2.6 predicts the same footprint as K2.5.

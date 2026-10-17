@@ -18,11 +18,11 @@ Each finding is also classified. A **missing modelled cost** is time the hardwar
 |---|---|---|---|
 | Expert storage | `expert_dtype: nvfp4` | shard headers `U8 [2048,3584]` + `F8_E4M3 [2048,448]` per matrix; `hf_quant_config.json` group 16 | agrees |
 | Non-expert precision | attention, shared expert, layer 0, `lm_head` bf16 (`moe_shared` restated) | `hf_quant_config.json` exclude list; `quantization/modelopt.py:186-199` gives excluded modules `UnquantizedLinearMethod` | agrees |
-| Router precision | bf16 (listed as estimated) | `models/deepseek_v2.py:341-346` and `router/gate_linear.py:28-29,110-127`: bf16 weight, `router_gemm_bf16_fp32` on bf16 tensor cores with fp32 output | agrees; can move from estimated to verified |
+| Router precision | bf16 (listed as estimated) | `models/deepseek_v2.py:341-346` and `router/gate_linear.py:28-29,110-127`: bf16 weight, `router_gemm_bf16_fp32` on bf16 tensor cores with fp32 output | agrees; can move from estimated to verified, but the entry still lists it as estimated with the inherited note that engines score in fp32 |
 | Parallelism | priced as TP with experts sharded on the intermediate dim, no EP | NVIDIA's card serves `--tensor-parallel-size 4` with no EP flag; the team's Kimi deployment (`deploy/k8s/mi355x-kimi-loop.yaml`) and its predictions (`scripts/kimi_loop/predict_sweep.py`) are both TP8 with no EP; `fused_moe/layer.py:425-426,873-946` shards experts on the intermediate dim under TP | agrees; no EP-pinned/TP-modelled contradiction for Kimi |
 | KV sharding | cache replicated per rank, not divided by TP | MLA builds one latent (`num_kv_heads=1`); every rank reads the whole cache | agrees |
 | Collectives | two all-reduces per layer plus one logits all-gather | `models/deepseek_v2.py:384-398`, `layers/logits_processor.py:75-86` | agrees on count (see F4 for the norm fused into them) |
-| Footprint | 595.19 GB, entry claims -0.03% | now -0.16%, the gap being the 0.94 GB vision tower (F7) | agrees; the old -0.03% was two errors cancelling |
+| Footprint | 594.20 GB predicted, -0.16% against 595.148 GB | the index's `total_size` and the summed shard headers both give 595.148 GB; the 0.945 GB residual is the 0.942 GB vision tower and projector (F7) | agrees; the old -0.03% was two errors cancelling |
 | Served cache dtype | `kv_dtype: fp8` | `auto` resolves from the checkpoint's `kv_cache_scheme` to fp8 (F1) | agrees |
 
 ## Findings
@@ -31,9 +31,9 @@ Each finding is also classified. A **missing modelled cost** is time the hardwar
 
 - **Evidence.** The entry sets `kv_dtype: fp8`. NVIDIA's model card serves with `--tensor-parallel-size 4 --tool-call-parser kimi_k2 --reasoning-parser kimi_k2 --trust-remote-code` and no `--kv-cache-dtype`. vLLM v0.19.1 resolves `auto` from the checkpoint before building the cache config (`engine/arg_utils.py:1567-1570`, calling `utils/torch_utils.py:324-342`). A modelopt config whose `kv_cache_scheme` is `{dynamic: false, num_bits: 8, type: float}`, as this checkpoint's is, resolves to fp8 (`:262-296`). So the published command stores a one-byte cache, the same as the entry.
 - **What this corrects.** The K2.6 case (engine claim 1.5) said the default cache was bf16. It cited `config/cache.py:49` (the field's default string) and `quantization/modelopt.py:300-311` (the scheme parser), but it did not follow the `auto` resolution in `arg_utils.py`. Every conclusion built on a bf16 default moves:
-  - The attention core at TP4 on B200 is 1.151 ms, not 2.303 ms.
+  - The attention core at TP4 on B200 is 1.151 ms, not 2.303 ms, at the case's 8 TB/s.
   - The step is about 1.15 ms faster.
-  - The recipe's TP4 shape still does not hold 32 x 8,192 with 4.5 GB of workspace: it needs 9.2 GB of KV against 7.0 GB available.
+  - The recipe's TP4 shape still does not hold 32 x 8,192 with 4.5 GB of workspace: it needs 9.2 GB of KV against 7.3 GB available (208,227 tokens, 25 sequences).
 - **Residual caveat.** The checkpoint ships no `k_scale`/`v_scale` tensors, so the fp8 cache runs with scale 1.0 (`quantization/kv_cache.py:71-75`). That is an accuracy question, not a prediction error.
 - **Change made.** `gitm plan --kv-cache-dtype {auto,bf16,fp16,fp8}`. `auto` keeps the catalogue's resolved value, and an explicit dtype prices that cache instead.
 - **Class.** No discrepancy in the entry. The error was in the case note, and the audit records it so that nobody reintroduces it.
@@ -43,21 +43,21 @@ Each finding is also classified. A **missing modelled cost** is time the hardwar
 - **Evidence.** H200 has no FP4 tensor cores. The NVFP4 MoE oracle's only sm90-capable backend is Marlin (`fused_moe/oracle/nvfp4.py:140-146`; `fused_marlin_moe.py:567`), which asserts bf16/fp16 activations (`quantization/utils/marlin_utils_fp4.py:135`) and refuses W4A8 for NVFP4 (`:305-307`).
 - **Affected path.** `roofline.resolve_peak` fell down the ladder from fp4 to fp8, and flagged every H200 prediction as a fallback.
 - **Expected prediction error.** Decode is unchanged, because the expert GEMM is memory-bound at 1.36 rows per expert. Prefill is not. An 8,192-token chunk puts 171 rows on each expert, above the 67-row knee. The routed-expert node's compute time was 21.9 ms and should be 43.8 ms, and that node sets the prefill step.
-- **Correction.** Shipped in `13e4d7f`: `resolve_execution` maps (nvfp4, hopper) to Marlin at bf16. `peak_is_fallback` is now false because the rate is the right one, not a guess.
+- **Correction.** Shipped in #127 (`65a8828`): `resolve_execution` maps (nvfp4, hopper) to Marlin at bf16. `peak_is_fallback` is now false because the rate is the right one, not a guess.
 - **Class.** A missing modelled cost, 2x on prefill expert compute.
 
 ### F3. NVFP4 activation quantisation on Blackwell was unmodelled
 
 - **Evidence.** The entry listed it as unmodelled. The TRT-LLM NVFP4 MoE path launches one `scaled_fp4_quant` per MoE input (`fused_moe/oracle/nvfp4.py:370-381`; `_custom_ops.py:78,1633`).
 - **Expected prediction error.** 60 launches per step: +0.120 ms at B200 TP8 (+1.6%). On H200 it is zero, because Marlin is weight-only.
-- **Correction.** Shipped in `13e4d7f`: an `act_quant` node, gated on the execution's activation format. The entry's `unmodelled` line should be removed.
+- **Correction.** Shipped in #127 (`65a8828`): an `act_quant` node, gated on the execution's activation format. The entry's `unmodelled` line for it was removed in the same change.
 - **Class.** A missing modelled cost.
 
 ### F4. The all-reduce and the following RMSNorm run as one kernel under the default compile level
 
 - **Evidence.** At `-O2`, the default, `fuse_allreduce_rms` is `enable_allreduce_rms_fusion` (`config/vllm.py:203-208`). That is on for TP > 1 on sm90 or the sm100 family with FlashInfer installed (`:116-130`). The fused kernel is used while the all-reduce payload fits the FlashInfer cap (`compilation/passes/fusion/allreduce_rms_fusion.py:54-68,759`): 0.5 MiB at TP8 on sm90. That cap is 36 tokens of hidden 7,168 at bf16. At 32 sequences the payload is 458,752 B and the fusion applies; at 64 it does not.
 - **Affected path.** `glm_graph._emit_layer` emits `rms_norm` as its own node after each collective (`add_rms_norm(with_residual=True)`).
-- **Expected prediction error.** 120 of the 123 norm nodes follow a collective. The planner over-predicts 120 launches, -0.240 ms at H200 TP8 with 32 sequences (2.1%). The error is zero above 36 tokens per step on H200 TP8, and above 73 on B200 TP8.
+- **Expected prediction error.** 122 of the 123 norm nodes follow a collective: 61 follow a layer's attention all-reduce and 61 its MLP all-reduce (after layer 60 that is the final norm before `lm_head`). Only layer 0's input norm follows `embed_tokens`. The planner over-predicts 122 launches, -0.244 ms at H200 TP8 with 32 sequences (2.1%). The error is zero above 36 tokens per step on H200 TP8, and above 73 on B200 TP8.
 - **Proposed correction.** When `hw.arch` is hopper or blackwell, TP > 1, and `rows x hidden x 2` fits the cap for (arch, TP), fold the post-collective `rms_norm` into the collective node. The fused kernel's name then has to classify to the collective in `deviation.classify_op`. That touches the pairing contract, so it is filed for Rahul rather than changed here.
 - **Class.** An over-modelled cost. The fusion is already on by default, so it is not an opportunity.
 
@@ -80,7 +80,7 @@ Each finding is also classified. A **missing modelled cost** is time the hardwar
 
 - **Evidence.** The checkpoint's 595.148 GB includes 0.942 GB of vision tower and projector (summed from the shard headers in the K2.6 case). With `--mm-encoder-tp-mode data` the tower is replicated on every rank.
 - **Affected path.** `model_weight_bytes`, and so `memory_fit`.
-- **Expected prediction error.** The fit overstates KV room by 0.94 GB per rank, 2.0% of the 46.2 GB available at TP8 with 4.5 GB of workspace. Before `a6570bc` this was hidden: the dense FFN was counted twice (0.79 GB), which is why the footprint matched to -0.03%.
+- **Expected prediction error.** The fit overstates KV room by 0.94 GB per rank, 2.0% of the 46.2 GB available at TP8 with 4.5 GB of workspace. Before #127 (`65a8828`) this was hidden: the dense FFN was counted twice (0.79 GB), which is why the footprint matched to -0.03%.
 - **Proposed correction.** A `resident_extra_bytes` field on the entry (0.942e9 for K2.x), added to `model_weight_bytes` unsharded.
 - **Class.** A missing modelled cost, affecting fit only.
 
@@ -89,10 +89,10 @@ Each finding is also classified. A **missing modelled cost** is time the hardwar
 | | Decode floor, H200 TP8, 32 x 8,192 (ms) |
 |---|---:|
 | Entry as catalogued (fp8 cache, which is also vLLM's resolved default) | 11.404 |
-| F4: fused all-reduce + norm | -0.240 |
+| F4: fused all-reduce + norm | -0.244 |
 | F5: absorbed MLA, one extra launch per layer | +0.122 |
 | F6: fused `q_a`/`kv_a` | -0.011 |
-| Corrected estimate | 11.275 |
+| Corrected estimate | 11.271 |
 
 F2, F3 and F7 do not change this row: F2 and F3 affect prefill and Blackwell, and F7 affects fit only. The corrected estimate is still a floor at vendor peak, and no hardware measurement backs it yet.
 

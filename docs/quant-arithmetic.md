@@ -4,6 +4,8 @@ This note is the derivation behind `gitm/planner/roofline.py`'s format and execu
 
 Every engine fact is read from vLLM v0.19.1 (commit `b1388b1f`), the version the K2.6 case pinned. Engine paths are relative to `vllm/model_executor/layers/` unless they start with `vllm/`. CDNA4 facts are read from the AITER tag vLLM's ROCm image pins (`docker/Dockerfile.rocm_base:12`, v0.1.10.post2, commit `c3708fb`) and its composable_kernel submodule (`7b18f5f`); those paths start with `aiter/` or `ck/`.
 
+Note, 2026-10-07: the citations stay pinned to v0.19.1 and are not re-checked against a later release; the MI355X loop now runs v0.29.0 (`deploy/k8s/mi355x-kimi-loop.yaml` pins `vllm/vllm-openai-rocm@sha256:e5e47f6a...`, Docker Hub's `v0.29.0` tag). This note also predates the `glm-5.3-flash` (#128) and `deepseek-v4.1-flash` (#129) catalogue entries.
+
 ## One weight, four numbers
 
 A quantised checkpoint answers one question by itself: how a weight is stored. Three more depend on the engine and the SKU, and the planner now keeps them apart.
@@ -50,7 +52,7 @@ Evidence for each cell is in `_EXECUTION_RULES` and `_FORCED`, with file and lin
 1. **NVFP4 on H200 is W4A16.** The NVFP4 MoE oracle's priority list is TRT-LLM, CuteDSL, FlashInfer CUTLASS, vLLM CUTLASS, then Marlin (`fused_moe/oracle/nvfp4.py:140-146`), and only Marlin accepts sm90 (`fused_moe/fused_marlin_moe.py:567`). Marlin keeps the payload at K x N / 2 bytes (`quantization/utils/marlin_utils_fp4.py:335-344`) and the scales at one byte (`:84-110`). It refuses fp8 or int8 activations for NVFP4 (`:305-307`). The old planner fell down the ladder to the fp8 peak, which is 2x too fast for the MACs.
 2. **MXFP4 on B200 also runs at bf16 by default.** `FLASHINFER_TRTLLM_MXFP4_BF16` is first in the MXFP4 priority list (`fused_moe/oracle/mxfp4.py:174-182`). The MXFP4 x MXFP8 variant is not.
 3. **On MI355X none of the three formats streams anything but the checkpoint's bytes.** `shuffle_weight` (`aiter/ops/shuffle.py:7-26`) is a permute and a view with the same shape and dtype; `e8m0_shuffle` (`aiter/utility/fp4_utils.py:72-92`) pads scale rows to 256 and columns to 8, a no-op at Kimi's shape; the INT4 path only transposes and re-views (`compressed_tensors_moe.py:1824-1839`). What ROCm adds is on the activation side: block fp8 and MXFP4 both quantise activations in their own kernel before the GEMM, and INT4 does not. One open item: for `token x top_k <= n_experts` with shuffled MXFP4 weights, AITER routes to a `cktile` path that takes bf16 activations (`aiter/fused_moe.py:803-827, :944-954`), so small-batch decode may run W4A16 there; whether the `is_shuffled` attribute survives vLLM's custom-op boundary was not verifiable from source, and the rule remains marked estimated until dispatch is verified.
-4. **Padding is a storage-versus-execution cost the format does not show, and it is applied per rank.** vLLM splits the intermediate dim across tensor-parallel ranks first (`fused_moe/layer.py:426`) and then rounds up what each rank holds (`:537-538` calls `maybe_roundup_sizes(hidden_size, intermediate_size_per_partition)`); hidden is not split for the expert GEMM. Marlin rounds hidden to 256 and the per-rank intermediate to 128 (`oracle/mxfp4.py:380-385`), TRT-LLM rounds both to 256 (`:386-388`), and the ROCm MXFP4 path rounds both to 256 (`:395-397`). Only the MXFP4 methods pad the intermediate at all; the base rule (`fused_moe_method_base.py:69-99`) pads hidden only for DeepEP/NIXL expert-parallel kernels and leaves the per-rank intermediate alone, so NVFP4, block fp8 and INT4 under plain TP pad nothing. The order matters: a 2,880-wide expert across eight ranks is 360 per rank, padded to 512 (TRT-LLM) or 384 (Marlin). Padding the whole 2,880 to 3,072 and then splitting gives 384, which the kernel would pad again; that order under-counts each rank's expert bytes by 25%. Kimi (2,048 / 8 = 256) and GLM-5.2 are exact multiples per rank, so their factor is 1 either way, which is how the wrong order survived the first tests.
+4. **Padding is a storage-versus-execution cost the format does not show, and it is applied per rank.** vLLM splits the intermediate dim across tensor-parallel ranks first (`fused_moe/layer.py:426`) and then rounds up what each rank holds (`:537-538` calls `maybe_roundup_sizes(hidden_size, intermediate_size_per_partition)`); hidden is not split for the expert GEMM. Marlin rounds hidden to 256 and the per-rank intermediate to 128 (`oracle/mxfp4.py:380-385`), TRT-LLM rounds both to 256 (`:386-388`), and the ROCm MXFP4 path rounds both to 256 (`:395-397`). Only the MXFP4 methods pad the intermediate at all; the base rule (`fused_moe_method_base.py:69-99`) pads hidden only for DeepEP/NIXL expert-parallel kernels and leaves the per-rank intermediate alone, so NVFP4, block fp8 and INT4 under plain TP pad nothing. The order matters: a 2,880-wide expert across eight ranks is 360 per rank, padded to 512 (TRT-LLM) or 384 (Marlin). Padding the whole 2,880 to 3,072 and then splitting gives 384, which the kernel would pad again; that order under-counts each rank's expert bytes by 25%. Kimi (2,048 / 8 = 256) and GLM-5.2 are exact multiples per rank, so their factor is 1 either way, which is how the wrong order survived the first tests. Expert parallelism skips the split. Under EP each rank owns whole experts: vLLM sets the MoE layer's TP size to 1 (`fused_moe/config.py:1113-1131`), so `fused_moe/layer.py:426` leaves the intermediate dim whole and the round-up applies to the full expert. A 2,880-wide MXFP4 expert under TRT-LLM pads to 3,072 x 3,072 on every rank, 13.8% more bytes at any TP; the planner passes `expert_pad_factor` one shard whenever EP > 1.
 
 ## Temporary traffic
 
@@ -101,16 +103,16 @@ The case's figures are from `analysis/derive.py` and the design note, with B200 
 | KV bytes per token, bf16 | 70,272 | 70,272 | reproduced |
 | KV bytes per token, fp8 | 39,040 | 35,136 | **case wrong** |
 | Cache dtype NVIDIA's command serves | bf16 (claim 1.5) | fp8 | **case wrong** |
-| KV room at TP4 after weights | 10.9 GB | 7.0 GB with 4.5 GB workspace | **case inconsistent** |
+| KV room at TP4 after weights | 10.9 GB | 7.0 GB with 4.5 GB workspace (the case's YAML; the catalogue entry leaves 7.3 GB, see Workspace below) | **case inconsistent** |
 | Footprint vs 595.15 GB | -0.03% (planner) | -0.16%, the gap being the 0.94 GB vision tower | **match was two errors cancelling** |
 | Ridges bf16 / fp8 / fp4 | 281 / 562 / 1,125 | 281 / 562 / 1,125 | reproduced |
 
 The four discrepancies:
 
 - **fp8 KV.** The case priced an fp8 cache as fp8 latent plus bf16 RoPE, 640 B per layer. Dense MLA under `--kv-cache-dtype fp8` uses vLLM's generic layout, which stores all 576 dims at one byte: `head_size = kv_lora_rank + qk_rope_head_dim` (`attention/mla_attention.py:316`) and cache shape `(blocks, block_size, head_size)` (`:1130-1137`). The `fp8_ds_mla` layout that keeps RoPE wide is used only on sparse MLA backends (`:341-362`).
-- **Served cache dtype.** The case said the published command, which passes no `--kv-cache-dtype`, stores bf16. vLLM v0.19.1 resolves `auto` from the checkpoint before it builds the cache config (`vllm/engine/arg_utils.py:1567-1570` calling `vllm/utils/torch_utils.py:324-342`). This checkpoint's modelopt `kv_cache_scheme` (static, 8-bit float) maps to fp8 (`:262-296`). The case cited the field's default string (`vllm/config/cache.py:49`) and the scheme parser, and it stopped there. So NVIDIA's default is an fp8 cache with scale 1.0, and the case's attention-core row (2.303 ms at TP4) is really 1.151 ms. The `kimi-k2.6` entry already had fp8; `docs/audits/kimi-k2.6.md` F1 records this.
-- **Workspace.** The case's fit charged 4.5 GB of workspace, but its "left for KV" line did not. `MemoryFit` keeps one ledger: budget minus weights minus workspace, then KV. At TP4 that leaves 7.0 GB. At bf16 that holds 99 k tokens, 12 sequences at 8K rather than 18. At the fp8 default it holds 199 k tokens, 24 sequences, against a need of 9.2 GB for 32. The recipe's TP4 shape does not hold the baseline under either dtype.
-- **Footprint.** `model_weight_bytes` multiplied the dense FFN by bytes-per-weight twice (fixed in `a6570bc`). That added 0.79 GB to Kimi, which roughly cancelled the 0.94 GB vision tower the planner does not model.
+- **Served cache dtype.** The case said the published command, which passes no `--kv-cache-dtype`, stores bf16. vLLM v0.19.1 resolves `auto` from the checkpoint before it builds the cache config (`vllm/engine/arg_utils.py:1567-1570` calling `vllm/utils/torch_utils.py:324-342`). This checkpoint's modelopt `kv_cache_scheme` (static, 8-bit float) maps to fp8 (`:262-296`). The case cited the field's default string (`vllm/config/cache.py:49`) and the scheme parser, and it stopped there. So NVIDIA's default is an fp8 cache with scale 1.0, and the case's attention-core row (2.303 ms at TP4, at the case's 8 TB/s) is really 1.151 ms. The `kimi-k2.6` entry already had fp8; `docs/audits/kimi-k2.6.md` F1 records this.
+- **Workspace.** The case's fit charged 4.5 GB of workspace, but its "left for KV" line did not. `MemoryFit` keeps one ledger: budget minus weights minus workspace, then KV. With the case's YAML, TP4 leaves 7.0 GB. At bf16 that holds 99 k tokens, 12 sequences at 8K rather than 18. What NVIDIA's command serves is the catalogue entry: an fp8 cache and a bf16 router, whose weights take 0.33 GB per rank less than the case's fp32 router. That leaves 7.3 GB, which holds 208 k tokens, 25 sequences, against a need of 9.2 GB for 32. The recipe's TP4 shape does not hold the baseline under either dtype.
+- **Footprint.** `model_weight_bytes` multiplied the dense FFN by bytes-per-weight twice (fixed in #127, squash commit `65a8828`). That added 0.79 GB to Kimi, which roughly cancelled the 0.94 GB vision tower the planner does not model.
 
 ### The 13.56 ms planner run against the 13.38 ms hand derivation, term by term
 
@@ -148,26 +150,27 @@ On B200 the GLM entries now price 0.2% to 2.2% faster, because the fp32 router r
 
 ## What moved across the catalogue
 
-`gitm plan` totals before (`21348b5`) and after, for every entry at 32 x 8,192 with TP 1 and 8 on H200, B200 and MI355X. 20 of 36 predictions are unchanged. Every change has one of these causes:
+`gitm plan` totals before (`21348b5`) and after, for the six entries catalogued at `21348b5`, at 32 x 8,192 with TP 1 and 8 on H200, B200 and MI355X. 20 of 36 predictions are unchanged. Every change has one of these causes:
 
 | Change | Why |
 |---|---|
 | `glm-5.2`, `glm-5.2-fp8`, `mimo-v2.5` on B200: -0.2% to -3.4% | fp32 peak 75 TF/s replaces 19.5 |
 | `kimi-k2.6` on B200: +0.3% (TP1), +1.6% (TP8) | 60 NVFP4 activation-quant nodes |
-| `kimi-k2.6` on H200: same floor, no longer flagged as fallback | Marlin's bf16 rate is the right rate |
-| `glm-5.2-fp8` on H200: -0.00% | fp8 cache at 1.0 B instead of 1.000244 |
+| `kimi-k2.6` on H200: no longer flagged as fallback | Marlin's bf16 rate is the right rate |
+| `glm-5.2-fp8` on H200 and MI355X, `kimi-k2.6` on H200: -0.00% (at most 0.0005 ms) | fp8 cache at 1.0 B instead of 1.000244 |
+| `kimi-k2.6` on MI355X: 39.698 ms (TP1) and 7.468 ms (TP8) before, now `cannot plan: nvfp4 has no kernel on cdna4` | no NVFP4 MoE backend in vLLM supports ROCm (`oracle/nvfp4.py:261`) |
 
 ## Reproduce
 
 ```bash
 python -m pytest tests/test_quant_arithmetic.py tests/test_hypotheses.py
 gitm plan kimi-k2.6 --gpu H200 --batch 32 --kv-len 8192 --tp 8 --workspace-gb 4.5
-gitm plan kimi-k2.6 --gpu H200 --batch 32 --kv-len 8192 --tp 8 --kv-cache-dtype auto
+gitm plan kimi-k2.6 --gpu H200 --batch 32 --kv-len 8192 --tp 8 --kv-cache-dtype bf16
 gitm plan glm-5.2-fp8 --gpu H200 --batch 32 --kv-len 8192 --tp 8 --ep 8
 ```
 
 ## Validation status
 
-Everything above is validated against source: checkpoint headers and configs, vLLM v0.19.1, AITER v0.1.10.post2 and its CK submodule. None of it is validated against hardware. The efficiency band (0.55 to 0.95), the 2 us launch floor, and the rules still marked estimated (MXFP4 via Triton on Hopper because `triton_kernels` was not read; block fp8 and MXFP4 on MI355X because both assume `VLLM_ROCM_USE_AITER=1`, which the planner cannot see, and MXFP4's small-batch dispatch remains unresolved) are the parts a measurement should replace first. MI355X peaks are not stated anywhere in the AITER or vLLM trees; the catalogue's figures come from AMD's published dense rates. H-001 and H-002 are the first two measurements registered for that.
+Everything above is validated against source: checkpoint headers and configs, vLLM v0.19.1, AITER v0.1.10.post2 and its CK submodule. None of it is validated against hardware. The efficiency band (0.55 to 0.95), the 2 us launch floor, and the rules still marked estimated (MXFP4 via Triton on Hopper because `triton_kernels` was not read; block fp8 on MI355X because it assumes `VLLM_ROCM_USE_AITER=1`, which the planner cannot see; MXFP4 on MI355X because its small-batch dispatch remains unresolved) are the parts a measurement should replace first. MXFP4 on MI355X does not depend on the flag: on gfx950 `quantization/quark/quark_moe.py:737-744` turns emulation off for every `w_mxfp4` scheme whatever `use_rocm_aiter_moe` is, and `apply()` calls `rocm_aiter_fused_experts` directly (`:1031-1036`). MI355X peaks are not stated anywhere in the AITER or vLLM trees; the catalogue's figures come from AMD's published dense rates. H-001 and H-002 are the first two measurements registered for that.
 
 `gitm plan --json` includes requested and resolved KV dtype, utilization, workspace bytes, and the same per-rank `memory_fit` ledger as text output. All ledger sizes are bytes. Families without a fit model return `memory_fit: null` with an explicit reason, and so does a SKU with no HBM capacity in the catalogue (the unknown-SKU fallback), rather than a ledger against zero capacity. Utilization must be finite and in (0, 1]; workspace must be finite and nonnegative.
