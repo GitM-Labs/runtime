@@ -485,6 +485,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{getattr(spec, 'name', '?')} [{family}] on {hw.name}, "
               f"kv_len={args.kv_len}, TP={args.tp} EP={args.ep}")
         print(f"  {'batch':>7s} {'ms/step':>10s} {'tok/s':>12s} {'compute-bound':>14s}")
+        refused = False
         for b in sizes:
             try:
                 g = _predict(spec, family, hw,
@@ -493,12 +494,13 @@ def main(argv: list[str] | None = None) -> int:
                                          acceptance_rate=args.acceptance_rate),
                              sharding)
             except ValueError as e:
-                print(f"cannot plan: {e}")
-                return 2
+                print(f"  {b:7d} cannot plan: {e}")
+                refused = True
+                continue
             cb = sum(1 for n in g.nodes if n.prediction.bound == "compute")
             print(f"  {b:7d} {g.total_pred_s * 1e3:9.3f} "
                   f"{b / g.total_pred_s:12,.0f} {cb:9d}/{len(g.nodes)}")
-        return 0
+        return 2 if refused else 0
 
     batch = BatchConfig(
         batch=args.batch, kv_cache_len=args.kv_len,

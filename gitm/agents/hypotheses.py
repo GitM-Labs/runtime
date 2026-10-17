@@ -42,6 +42,7 @@ from gitm.planner.roofline import (
     BatchConfig,
     HardwareSpec,
     ShardingConfig,
+    UnsupportedExecution,
     _canon_dtype,
     quant_format,
 )
@@ -971,7 +972,10 @@ class HypothesisProposer:
         why = h.applies(self.workload)
         if why is not None:
             return why
-        pred = h.predict(self.workload)
+        try:
+            pred = h.predict(self.workload)
+        except UnsupportedExecution as e:
+            return f"cannot price this workload: {e}"
         self.predictions[h.id] = pred
         if pred.step_delta[1] < self.noise_floor:
             return (f"predicted {pred.step_delta[1]:.1%} step effect is under the "

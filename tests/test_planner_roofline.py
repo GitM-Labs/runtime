@@ -19,7 +19,7 @@ import json
 import pytest
 
 from gitm.planner.registry import main
-from gitm.planner.roofline import HardwareSpec, roofline
+from gitm.planner.roofline import HardwareSpec, UnsupportedExecution, roofline
 
 # ── memory-bound reference: 1 MiB over A100 HBM ──────────────────────────────
 
@@ -261,6 +261,37 @@ def test_an_indivisible_sharding_is_reported_not_raised(capsys):
 def test_a_malformed_sweep_is_reported(capsys):
     assert main(["qwen3.6-35b-a3b", "--sweep", "1,two,3"]) == 2
     assert "comma-separated" in capsys.readouterr().out
+
+
+def test_a_sweep_reports_a_refused_config_per_row_like_a_single_plan(capsys, monkeypatch):
+    """A format with no kernel on the arch raises UnsupportedExecution out of
+    the graph. The single plan says so and exits 2; the sweep raised it after
+    printing its header."""
+    from gitm.planner import registry
+
+    def refuse(*args):
+        raise UnsupportedExecution("these experts have no kernel on this arch")
+
+    monkeypatch.setattr(registry, "_predict", refuse)
+    base = ["kimi-k2.6", "--gpu", "H200", "--tp", "8", "--kv-len", "8192"]
+    assert main([*base, "--batch", "32"]) == 2
+    single = capsys.readouterr().out.strip()
+    assert single == "cannot plan: these experts have no kernel on this arch"
+    assert main([*base, "--sweep", "8,32"]) == 2
+    rows = capsys.readouterr().out.splitlines()[2:]
+    assert [r.split()[0] for r in rows] == ["8", "32"]
+    assert all(r.split(None, 1)[1] == single for r in rows)
+
+
+def test_a_sweep_reports_a_sharding_the_graph_refuses_per_row(capsys):
+    """The graphs refuse a TP that does not divide the heads with a plain
+    ValueError, not UnsupportedExecution. Catching only the latter would turn
+    this sweep back into a traceback."""
+    assert main(["kimi-k2.6", "--gpu", "H200", "--tp", "3", "--sweep", "1,2"]) == 2
+    rows = capsys.readouterr().out.splitlines()[2:]
+    assert [r.split(None, 1) for r in rows] == [
+        [b, "cannot plan: tensor-parallel size 3 does not divide 64 attention heads "
+            "\u2014 every head-sharded op would floor to zero work"] for b in ("1", "2")]
 
 
 def test_no_model_is_a_usage_error(capsys):
