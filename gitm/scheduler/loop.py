@@ -1796,7 +1796,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     if engine_lost is not None and isinstance(applicator, LiveEngineApplicator):
         # The engine was lost before the first candidate (a failed noise
         # calibration): there is nothing to measure them against.
-        n_untried = sum(1 for x in queue if x.rejected_reason is None)
+        n_untried = sum(1 for x in queue
+                        if x.rejected_reason is None and x.baseline_noop is None)
         rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
                         for x in queue if x.rejected_reason is not None)
         queue = []
@@ -1811,7 +1812,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         """
         rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
                         for x in queue if x.rejected_reason is not None)
-        left = sum(1 for x in queue if x.rejected_reason is None)
+        # A known baseline no-op was never going to run: not work the budget prevented.
+        left = sum(1 for x in queue if x.rejected_reason is None and x.baseline_noop is None)
         if left:
             degradations.record(
                 BUDGET_SPENT, used="a Phase 4 that stopped at the budget",
@@ -1920,7 +1922,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             )
         if result.restore_failed:
             engine_lost = result.error or f"restore failed after {c.spec.name}"
-            n_untried = sum(1 for x in queue if x.rejected_reason is None)
+            n_untried = sum(1 for x in queue
+                        if x.rejected_reason is None and x.baseline_noop is None)
             # What the gate rejected is a verdict that needed no engine, so it is
             # still recorded. Breaking here without it left those candidates in
             # neither the rejected list nor the untried count.
@@ -1990,7 +1993,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                         applicator.install(back)
                 if swap_err is not None:
                     engine_lost = f"could not swap engines for re-trace {step}: {swap_err}"
-                    n_untried = sum(1 for x in queue if x.rejected_reason is None)
+                    n_untried = sum(1 for x in queue
+                        if x.rejected_reason is None and x.baseline_noop is None)
                     rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
                                     for x in queue if x.rejected_reason is not None)
                     degradations.record(
@@ -2040,9 +2044,14 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                         engine_now, {k for s in remaining for k in s.knob_values}))
                 # Recorded now, not when the queue reaches them: the budget check
                 # below can end the run before that pop ever happens.
-                for x in queue:
-                    if x.baseline_noop is not None and all(
-                            n.spec.name != x.spec.name for n in baseline_noops):
+                # And dropped when a kept intervention has since changed the knob
+                # back: a lever that is actionable again will run, so reporting it
+                # as skipped would disagree with what the run did.
+                now_noop = {x.spec.name: x for x in queue if x.baseline_noop is not None}
+                actionable = {x.spec.name for x in queue if x.baseline_noop is None}
+                baseline_noops[:] = [n for n in baseline_noops if n.spec.name not in actionable]
+                for name, x in now_noop.items():
+                    if all(n.spec.name != name for n in baseline_noops):
                         baseline_noops.append(x)
             now = [x.spec.name for x in queue]
             reranks.append({
