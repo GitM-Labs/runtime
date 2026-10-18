@@ -49,10 +49,10 @@ gitm plan deepseek-v4.1-flash --gpu B200 --batch 32 --kv-len 8192 --tp 2
 | BF16 tensor peak | **989 TFLOP/s** | **2,250 TFLOP/s** | `gitm/planner/context.py` |
 | FP8 e4m3 tensor peak | **1,979 TFLOP/s** | **4,500 TFLOP/s** | `_QUANT_PEAKS`, dense, no 2:4 sparsity |
 | FP4 tensor peak | **none** | **9,000 TFLOP/s** | Hopper has no fp4 path. fp4 nodes price against the fp8 peak — see below |
-| FP32 CUDA-core peak | 67 TFLOP/s | not in `context.py` | the router casts to float (line 811) |
+| FP32 CUDA-core peak | 67 TFLOP/s | 75 TFLOP/s | `_QUANT_PEAKS`; the router casts to float (line 811) |
 | HBM3e | **4.8 TB/s** | **7.7 TB/s** | `context.py` (HGX B200 per GPU; the GB200 GPU is 8.0) |
 | NVLink | 900 GB/s per GPU | 1,800 GB/s per GPU | `_INTERCONNECT` |
-| Memory | 141 GB × 8 = 1,128 GB | 180 GB × 8 [A1] | B200 capacity is a datasheet assumption, not in `context.py` |
+| Memory | 141 GB × 8 = 1,128 GB | 180 GB × 8 [A1] | `_MEMORY` (HGX B200 1,440 GB / 8) |
 | Kernel launch | ~2 µs graph-replay / ~5 µs eager | same | the planner's `serial_launches` floor |
 
 Two warnings from the H200 plan runs:
@@ -951,7 +951,7 @@ Every gap in §7.1 is left open and stated, because each needs a spec field or a
 
 | # | Assumption | Status | What would falsify it |
 |---|---|---|---|
-| **A1** | H200 141 GB at 4.8 TB/s, B200 180 GB, B300 288 GB, GB200 186 GB | H200 and B200 rates from `context.py`. Capacities outside it are datasheet figures | deployment hardware (Q2) |
+| **A1** | H200 141 GB at 4.8 TB/s, B200 180 GB, B300 288 GB, GB200 186 GB | all in `context.py`: rates from `_PEAKS`, capacities from `_MEMORY` | deployment hardware (Q2) |
 | **A2** | Layouts from the vLLM recipe: H200 TP4 with offload, B200/B300 TP2 or DEP8, GB200 NVL4 1P1D TP4, MI355X TP2, MI325X TP4 with offload | **the vendor's own** | C6 |
 | **A3** | TP split as `inference/model.py` does it, with the shared expert replicated | the reference is the semantics, not the execution | engine source |
 | **A4** | DEP8 splits only routed experts and engram rows, replicating the rest | an inference from DP attention | engine source |

@@ -92,20 +92,20 @@ experts   nvfp4: 0.5625 B/weight stored (11.1% scales) -> marlin, bf16 MACs, 0.5
 
 The case's figures are from `analysis/derive.py` and the design note, with B200 at TP4, 32 x 8,192 and a bf16 cache.
 
-These rows, the 13.56 / 13.38 ms reconciliation below, and the B200 rows of "What moved across the catalogue" use 8 TB/s for B200, the case's figure and the catalogue's value at #127. The catalogue's B200 is now 7.7 TB/s (HGX B200 per-GPU datasheet figure; `context.py` cites it), which adds about 3.9% to every memory-bound B200 term in a live `gitm plan`.
+The 13.56 / 13.38 ms reconciliation below and the B200 rows of "What moved across the catalogue" use 8 TB/s for B200, the case's figure and the catalogue's value at #127. The catalogue's B200 is now 7.7 TB/s (HGX B200 per-GPU datasheet figure; `context.py` cites it), which adds about 3.9% to every memory-bound B200 term in a live `gitm plan`; the two rows below that depend on it give both figures.
 
 | Figure | Case | This code | Verdict |
 |---|---:|---:|---|
 | Bytes per expert (3 x 7,168 x 2,048 at 0.5625) | 24.77 MB | 24,772,608 B | reproduced |
 | Distinct experts per layer, 32 x top-8 of 384 | 188.2 | 188.23 | reproduced |
 | Routed bytes per layer per rank | 1,165.7 MB | 1,165.7 MB (+0.1% activations) | reproduced |
-| Routed-expert time, 60 layers | 8.74 ms | 8.751 ms | reproduced |
+| Routed-expert time, 60 layers | 8.74 ms | 8.751 ms at the case's 8 TB/s (9.092 at the catalogue's 7.7) | reproduced |
 | KV bytes per token, bf16 | 70,272 | 70,272 | reproduced |
 | KV bytes per token, fp8 | 39,040 | 35,136 | **case wrong** |
 | Cache dtype NVIDIA's command serves | bf16 (claim 1.5) | fp8 | **case wrong** |
 | KV room at TP4 after weights | 10.9 GB | 7.0 GB with 4.5 GB workspace | **case inconsistent** |
 | Footprint vs 595.15 GB | -0.03% (planner) | -0.16%, the gap being the 0.94 GB vision tower | **match was two errors cancelling** |
-| Ridges bf16 / fp8 / fp4 | 281 / 562 / 1,125 | 281 / 562 / 1,125 | reproduced |
+| Ridges bf16 / fp8 / fp4 | 281 / 562 / 1,125 | 281 / 562 / 1,125 at 8 TB/s (292 / 584 / 1,169 at 7.7) | reproduced |
 
 The four discrepancies:
 
