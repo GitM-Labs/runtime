@@ -28,6 +28,10 @@ CORPUS = [
     ("_ZN2ck40kernel_gemm_xdl_cshuffle_v3_multi_d_b_preshuffle", "gemm", None),
     ("_ZN5aiter41mla_dec_stage1_bf16_a16w16_subQ128_mqa128E", "attention", "attn_score_value"),
     ("_ZN5aiter42mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_psE", "attention", "attn_score_value"),
+    # AITER's Gluon MLA decode, the bf16 kernel under 16 heads per rank
+    # (aiter/ops/triton/gluon/mla_gluon.py:57, picked by vLLM v0.29.0
+    # rocm_aiter_mla.py:1334-1353).
+    ("_mla_gluon", "attention", "attn_score_value"),
     ("_ZN5aiter44PA_A16W8_BLK256_1TG_4W_16mx1_64nx4_MTP_PS_PBE", "attention", "attn_score_value"),
     ("_ZN5aiter19fmha_fwd_hd128_bf16E", "attention", "attn_score_value"),
     ("paged_attention_ll4mi_QKV_mfma16_kernel", "attention", "attn_score_value"),

@@ -126,9 +126,9 @@ _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # a visible finding, whereas this silently inflated a bucket that gets
     # trusted. Its actual attention kernels are named for what they do, so they
     # are matched by name below.
-    # AMD: AITER MLA decode / paged-attention asm kernels; both vendors: vLLM's
-    # Triton decode attention.
-    ("attention", ("mla_dec", "mla_a16", "mla_a8", "mla_reduce", "mla_stage",
+    # AMD: AITER MLA decode / paged-attention asm kernels and its Gluon MLA
+    # decode (`_mla_gluon`); both vendors: vLLM's Triton decode attention.
+    ("attention", ("mla_dec", "mla_a16", "mla_a8", "mla_reduce", "mla_stage", "mla_gluon",
                    "pa_a16w", "pa_a8w", "pa_bf16", "pa_fp8", "pa_decode",
                    "_fwd_grouped_kernel_stage", "_fwd_kernel_stage",
                    "flash_fwd", "flash_attn", "flashattn", "fmha", "paged_attention",

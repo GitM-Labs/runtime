@@ -9,6 +9,7 @@ wins. A performance verdict needs a measured run on hardware.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import replace
 from pathlib import Path
@@ -601,6 +602,8 @@ def test_h002_refuses_sparse_mla():
         # DCP multiplies the decode heads per rank (rocm_aiter_mla.py:1426-1428).
         ({"VLLM_ROCM_USE_AITER": "1", "decode_context_parallel_size": 2},
          "decode_context_parallel_size=2"),
+        # DP groups step together on a combined token count (forward_context.py:80-99).
+        ({"VLLM_ROCM_USE_AITER": "1", "data_parallel_size": 2}, "data_parallel_size=2"),
     ],
 )
 def test_h002_refuses_configs_the_derivation_does_not_price(serving, fragment):
@@ -611,8 +614,11 @@ def test_h002_refuses_a_speculative_batch_and_accepts_the_off_values():
     spec_batch = replace(_k25(), batch=BatchConfig(batch=64, kv_cache_len=4352,
                                                    speculative_tokens=3))
     assert "speculative decoding" in H002.applies(spec_batch)
+    dp = replace(_k25(), sharding=ShardingConfig(tp=4, dp=2))
+    assert "data_parallel_size=2" in H002.applies(dp)
     off = {"VLLM_ROCM_USE_AITER": "1", "speculative_config": None,
-           "num_speculative_tokens": 0, "decode_context_parallel_size": 1}
+           "num_speculative_tokens": 0, "decode_context_parallel_size": 1,
+           "data_parallel_size": 1}
     assert H002.applies(_k25(serving=off)) is None
 
 
@@ -655,6 +661,23 @@ def test_h002_refuses_cdna4_envs_that_leave_the_priced_kernels(env, fragment):
     assert fragment in H002.applies(_k25(serving=env))
 
 
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"attention_backend": "ROCM_AITER_MLA"},
+        {"VLLM_ROCM_USE_AITER": "1", "VLLM_ROCM_USE_AITER_MLA": "0",
+         "attention_backend": "ROCM_AITER_MLA"},
+    ],
+)
+def test_h002_env_refusal_stays_true_when_the_aiter_backend_is_pinned(env):
+    """A pinned backend is honoured whatever the AITER flags say (vLLM v0.29.0
+    platforms/rocm.py:628-642, _aiter_ops.py:134-146), so the reason cannot
+    say TRITON_MLA is selected. It is still refused: the loop env the
+    derivation prices sets the flag."""
+    why = H002.applies(_k25(serving=env))
+    assert why is not None and "pinned" in why and "selects TRITON_MLA" not in why
+
+
 def test_h002_refuses_the_padding_mode_only_where_it_moves_the_bf16_kernel():
     """use_gluon_decode (vLLM v0.29.0 rocm_aiter_mla.py:1334-1353) reads the
     mode only under 16 heads: auto takes Gluon when 16 is a multiple of the
@@ -668,6 +691,18 @@ def test_h002_refuses_the_padding_mode_only_where_it_moves_the_bf16_kernel():
     assert "ASM_PADDING=gluon moves the bf16 arm off the asm kernel" in H002.applies(
         replace(_k25(serving=gluon), spec=six_heads))
     assert H002.applies(replace(_k25(serving=asm), spec=six_heads)) is None
+    # Gauntlet G11: at 16 or more heads per rank use_gluon_decode returns
+    # before reading the mode (:1334-1338), so neither value changes the kernel.
+    for serving in (gluon, asm):
+        assert H002.applies(replace(_k25(serving=serving), sharding=ShardingConfig(tp=4))) is None
+
+
+def test_h002_refuses_prefill_context_parallelism_only_where_rocm_overrides_the_graph():
+    """Only ROCm's platform override turns full graphs to PIECEWISE under PCP
+    (platforms/rocm.py:902-913); vLLM v0.29.0 has no such override on CUDA."""
+    pcp = {"prefill_context_parallel_size": 2}
+    assert "prefill_context_parallel_size=2" in H002.applies(_k25(serving={**_AITER, **pcp}))
+    assert H002.applies(_k25("H200", batch=32, kv_len=8192, serving=pcp)) is None
 
 
 @pytest.mark.parametrize(
@@ -689,6 +724,23 @@ def test_h002_reads_the_backend_pinned_through_attention_config(serving):
 
 
 @pytest.mark.parametrize(
+    "serving",
+    [
+        {"VLLM_ROCM_USE_AITER": "1", "attention_backend": "auto"},
+        {"VLLM_ROCM_USE_AITER": "1", "attention_config": {"backend": "Auto"}},
+        {"VLLM_ROCM_USE_AITER": "1", "attention_config": '{"backend": "AUTO"}'},
+    ],
+)
+def test_h002_reads_auto_as_no_backend_pin(serving):
+    """Gauntlet G3. vLLM v0.29.0 maps "auto" to None, automatic selection
+    (config/attention.py:162-164; --attention-backend goes through the same
+    validator, engine/arg_utils.py:2496-2498): the default pair the
+    derivation prices."""
+    assert H002.applies(_k25(serving=serving)) is None
+    assert H002.predict(_k25(serving=serving)).op_delta == H002.predict(_k25()).op_delta
+
+
+@pytest.mark.parametrize(
     "env",
     [
         {"VLLM_ROCM_USE_AITER": "1"},  # the loop's manifest: both others at default
@@ -699,6 +751,31 @@ def test_h002_reads_the_backend_pinned_through_attention_config(serving):
 )
 def test_h002_accepts_the_default_aiter_mla_env(env):
     assert H002.applies(_k25(serving=env)) is None
+
+
+def test_h002_is_targeted_from_a_gluon_baseline_trace():
+    """Gauntlet G6. Residual targeting classifies kernels by name
+    (deviation.classify_op), so the MI355X baseline's _mla_gluon must file
+    under attn_score_value, or the largest residual is the MoE and H-002 is
+    never proposed on the workload it was built for."""
+    from gitm.agents.autoresearch import largest_residual
+    from gitm.agents.hypotheses import _executed_kv, _floor
+    from gitm.optimizer.monitor import residuals
+
+    w = _k25()
+    g = _floor(replace(w.spec, kv_dtype=_executed_kv(w), kv_rope_dtype=_executed_kv(w)), w)
+    floor = {op: next(n.prediction.t_pred_s for n in g.nodes if n.op == op)
+             for op in ("attn_score_value", "moe_routed")}
+    events, t = [], 0
+    for _ in range(4):
+        for name, op, over in (("_mla_gluon", "attn_score_value", 3.0), (_MOE, "moe_routed", 1.2)):
+            d = int(floor[op] * over * 1e9)
+            events.append(make_kernel(name, start_ns=t, end_ns=t + d))
+            t += d
+    target = largest_residual(residuals(make_trace(events=events, duration_ns=t, vendor="amd"), g))
+    assert target is not None and target.op == "attn_score_value"
+    specs = _prop(w).propose("memory_bound", target_op=target.op)
+    assert [s.knob for s in specs] == ["kv_cache_dtype"]
 
 
 def test_h002_scope_has_no_needle_for_aiters_triton_reducer():
@@ -807,9 +884,16 @@ _AITER = {"VLLM_ROCM_USE_AITER": "1"}
         {"compilation_config": '{"mode": "STOCK_TORCH_COMPILE"}'},
         {"TORCH_COMPILE_DISABLE": "1"},
         {"optimization_level": 0, "compilation_config": {"cudagraph_mode": "FULL_AND_PIECEWISE"}},
+        # Breakable graphs run MLA attention eagerly between the segments
+        # (mla_attention.py:1319, breakable_cudagraph.py:319-322); vLLM reads
+        # the flag as "1" only (envs.py:757-759).
+        {"VLLM_USE_BREAKABLE_CUDAGRAPH": "1"},
         # ROCm overrides full graphs to PIECEWISE under prefill context
         # parallelism (platforms/rocm.py:902-913).
         {"prefill_context_parallel_size": 2},
+        # A layerwise KV connector overrides them too (config/vllm.py:1556-1581).
+        {"kv_transfer_config": {"kv_connector": "LMCacheConnectorV1", "kv_role": "kv_both",
+                                "kv_connector_extra_config": {"use_layerwise": True}}},
         # A batch above the largest captured size runs without a graph
         # (v1/cudagraph_dispatcher.py:272-280).
         {"max_cudagraph_capture_size": 32},
@@ -824,6 +908,39 @@ def test_h002_refuses_serving_without_graph_replay_at_decode(extra):
     assert why is not None and "graph" in why
 
 
+def test_h002_follows_vllms_capture_ceiling_rules():
+    """Gauntlet G4 and G10. vLLM v0.29.0 drops explicit sizes above
+    max_num_batched_tokens instead of clamping the largest (config/vllm.py:
+    2096-2104); without explicit sizes it captures a grid, 8s below 256 and
+    16s from 256, and truncates an explicit max_cudagraph_capture_size to it
+    (:2117-2129, :2160-2182). The dispatcher sends any larger batch to NONE
+    (v1/cudagraph_dispatcher.py:274-281)."""
+    gap = {**_AITER, "max_num_batched_tokens": 512, "cudagraph_capture_sizes": [8, 16, 600]}
+    assert "largest captured graph size 16" in H002.applies(_k25(serving=gap))
+    nested = {**_AITER, "max_num_batched_tokens": 512,
+              "compilation_config": {"cudagraph_capture_sizes": [8, 16, 600]}}
+    assert "largest captured graph size 16" in H002.applies(_k25(serving=nested))
+    wide = {**_AITER, "max_num_seqs": 512, "max_num_batched_tokens": 8192}
+    assert "largest captured graph size 288" in H002.applies(
+        _k25(batch=290, serving={**wide, "compilation_config": {"max_cudagraph_capture_size": 300}}))
+    assert H002.applies(_k25(batch=288, serving={**wide, "max_cudagraph_capture_size": 300})) is None
+    assert "largest captured graph size 96" in H002.applies(
+        _k25(batch=100, serving={**wide, "max_cudagraph_capture_size": 100}))
+    # The default ceiling sits on the grid too: 2 x 65 = 130 captures up to 128.
+    assert "largest captured graph size 128" in H002.applies(
+        _k25(batch=130, serving={**_AITER, "max_num_seqs": 65}))
+    # A token budget at or under the ceiling is captured itself, on the grid or not.
+    assert H002.applies(_k25(batch=300, serving={**_AITER, "max_num_batched_tokens": 300})) is None
+    assert "largest captured graph size 300" in H002.applies(
+        _k25(batch=301, serving={**_AITER, "max_num_batched_tokens": 300}))
+    assert H002.applies(_k25(batch=100, serving={
+        **_AITER, "max_num_batched_tokens": 100, "max_cudagraph_capture_size": 100})) is None
+    # Under 8 the grid is 1, 2, 4 (:2120-2122).
+    assert "largest captured graph size 4" in H002.applies(
+        _k25(batch=6, serving={**_AITER, "max_cudagraph_capture_size": 6}))
+    assert H002.applies(_k25(batch=4, serving={**_AITER, "max_cudagraph_capture_size": 6})) is None
+
+
 @pytest.mark.parametrize(
     "extra",
     [
@@ -832,20 +949,51 @@ def test_h002_refuses_serving_without_graph_replay_at_decode(extra):
         {"enforce_eager": 0},
         {"compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"}},
         {"compilation_config": '{"cudagraph_mode": "full_and_piecewise"}'},
-        {"optimization_level": 0, "compilation_config": {"cudagraph_mode": "FULL"}},
         {"optimization_level": 3},
         {"compilation_config": {"mode": 3}},
         {"compilation_config": {"mode": "vllm_compile"}},
-        # A full graph needs no piecewise compilation, so mode NONE keeps it.
-        {"compilation_config": {"mode": 0, "cudagraph_mode": "FULL"}},
+        # A full graph needs no piecewise compilation (config/vllm.py:1468-1480).
+        {"compilation_config": {"mode": 1, "cudagraph_mode": "FULL"}},
         {"TORCH_COMPILE_DISABLE": "0"},
+        {"VLLM_USE_BREAKABLE_CUDAGRAPH": "0"},
         {"prefill_context_parallel_size": 1},
         {"max_cudagraph_capture_size": 64},
         {"cudagraph_capture_sizes": [1, 8, 64, 128]},
+        # The op stays disabled, so Inductor compiles it into one kernel.
+        {"compilation_config": {"custom_ops": ["+quant_fp8"]}},
+        {"compilation_config": {"custom_ops": ["all", "-mla_decode_concat_quant_fp8"]}},
+        {"compilation_config": {"backend": "inductor"}},
     ],
 )
 def test_h002_accepts_serving_that_replays_decode_in_a_full_graph(extra):
     assert H002.applies(_k25(serving={**_AITER, **extra})) is None
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        # Enabled, the custom op is torch.cat then AITER's quantise
+        # (mla_attention.py:1419-1445, input_quant_fp8.py:137-160); custom_ops
+        # enables it with all or +name (custom_op.py:285-311).
+        {"compilation_config": {"custom_ops": ["all"]}},
+        {"compilation_config": {"custom_ops": ["+mla_decode_concat_quant_fp8"]}},
+        {"compilation_config": '{"custom_ops": ["none", "+mla_decode_concat_quant_fp8"]}'},
+        # vLLM adds "all" itself when compilation is off or the backend is not
+        # Inductor (config/vllm.py:1444-1451). A full graph needs no
+        # compilation, but mode NONE still splits the op.
+        {"compilation_config": {"mode": 0, "cudagraph_mode": "FULL"}},
+        {"compilation_config": {"mode": "none", "cudagraph_mode": "full_decode_only"}},
+        {"optimization_level": 0, "compilation_config": {"cudagraph_mode": "FULL"}},
+        {"TORCH_COMPILE_DISABLE": "1", "compilation_config": {"cudagraph_mode": "FULL"}},
+        {"compilation_config": {"backend": "eager"}},
+    ],
+)
+def test_h002_refuses_configs_that_split_the_query_quant_into_two_kernels(extra):
+    """Greptile and gauntlet round 2. The fp8-only kernel count prices the
+    query concat-and-quantise as one Inductor kernel; these configs run it as
+    two, 61 more launches than priced."""
+    why = H002.applies(_k25(serving={**_AITER, **extra}))
+    assert why is not None and why.endswith("as one compiled kernel")
 
 
 def test_h002_refuses_batches_above_vllms_default_capture_ceiling():
@@ -862,16 +1010,47 @@ def test_h002_refuses_batches_above_vllms_default_capture_ceiling():
     assert H002.applies(_k25("B200", batch=520, kv_len=8192, serving={})) is None
 
 
-@pytest.mark.parametrize("cc", [3, "3", [2, 3]])
-def test_h002_refuses_rather_than_crashes_on_a_non_dict_compilation_config(cc):
-    """autoresearch proposes compilation_config=3 (autoresearch.py:235, :422),
-    the old -O spelling vLLM v0.29.0 no longer takes; propose() must report it
-    in skipped, not raise AttributeError and lose every other hypothesis."""
-    workload = _k25(serving={**_AITER, "compilation_config": cc})
-    assert "not the dict or JSON object" in H002.applies(workload)
+@pytest.mark.parametrize(
+    ("extra", "fragment"),
+    [
+        # autoresearch proposes compilation_config=3 (autoresearch.py:235, :422),
+        # the old -O spelling vLLM v0.29.0 no longer takes.
+        ({"compilation_config": 3}, "not the dict or JSON object"),
+        ({"compilation_config": "3"}, "not the dict or JSON object"),
+        ({"compilation_config": [2, 3]}, "not the dict or JSON object"),
+        ({"compilation_config": "-O3"}, "is not JSON"),
+        ({"compilation_config": "{'mode': 0}"}, "is not JSON"),
+        ({"attention_config": '"ROCM_AITER_MLA"'}, "not the dict or JSON object"),
+        ({"attention_config": "[1]"}, "not the dict or JSON object"),
+        ({"attention_config": ["ROCM_AITER_MLA"]}, "not the dict or JSON object"),
+        ({"attention_config": "auto"}, "is not JSON"),
+        # CUDAGraphMode and CompilationMode parse a name or an int value
+        # (config/compilation.py:853-876), and the composite graph modes have
+        # tuple values, so 4 names neither.
+        ({"compilation_config": {"cudagraph_mode": ["FULL"]}}, "not a CUDAGraphMode name"),
+        ({"compilation_config": {"cudagraph_mode": "full_graph"}}, "not a CUDAGraphMode name"),
+        ({"compilation_config": {"cudagraph_mode": 4}}, "not a CUDAGraphMode name"),
+        ({"compilation_config": {"mode": [3]}}, "not a CompilationMode name"),
+        ({"compilation_config": {"mode": 4}}, "not a CompilationMode name"),
+        ({"cudagraph_capture_sizes": "64"}, "not the list of ints"),
+        ({"compilation_config": {"cudagraph_capture_sizes": "[1, 64]"}}, "not the list of ints"),
+        ({"compilation_config": {"cudagraph_capture_sizes": ["a"]}}, "not the list of ints"),
+        ({"compilation_config": {"max_cudagraph_capture_size": "abc"}}, "not the positive int"),
+        ({"max_cudagraph_capture_size": 0}, "not the positive int"),
+        ({"max_num_batched_tokens": "8k"}, "not the positive int"),
+        ({"data_parallel_size": "auto"}, "not the positive int"),
+        ({"compilation_config": {"custom_ops": 5}}, "not the list of op names"),
+        ({"attention_config": {"backend_per_kind": "ROCM_AITER_MLA"}}, "not the dict"),
+    ],
+)
+def test_h002_refuses_rather_than_crashes_on_a_malformed_serving_config(extra, fragment):
+    """Gauntlet G1. A value vLLM v0.29.0 would not take is reported in
+    skipped; propose() must not raise and lose every other hypothesis."""
+    workload = _k25(serving={**_AITER, **extra})
+    assert fragment in H002.applies(workload)
     proposer = _prop(workload)
     assert proposer.propose("memory_bound") == []
-    assert "H-002" in dict(proposer.skipped)
+    assert fragment in dict(proposer.skipped)["H-002"]
 
 
 def test_h002_refuses_a_partly_fp8_cache():
@@ -914,7 +1093,7 @@ def test_aiter_partial_tiles_follow_its_persistent_schedule(n_seq, kv_len, tiles
 def test_h002_prices_the_partials_stage_one_writes():
     p = H002.predict(_k25())
     line = _line(p, "split-KV partials")
-    assert "300.34 tiles (mean over 511 lockstep decode steps at 4097 to 4607" in line
+    assert "300.34 tiles (mean over 511 decode steps with the batch at one cached length, 4097 to 4607" in line
     assert "153472 / 511, 256 to 317 per step; 4.69 per sequence" in line
     assert f"= {_PARTIALS_RAG64:.0f} B per layer" in line
     assert ("0.443 ms floor: kernels 0.368 ms / 0.75 = 0.491 ms at lo, mean and hi; "
@@ -977,8 +1156,9 @@ def test_h002_charges_the_reduce_past_its_launch_at_large_batches():
 
 
 def test_h002_refuses_request_lengths_that_miss_the_cache_length():
-    with pytest.raises(ValueError, match="prompt \\+ output // 2"):
-        _k25(lengths=(4096, 1024))
+    for lengths in ((4096, 1024), (4096, 256), (4095, 512)):  # long, short, short
+        with pytest.raises(ValueError, match="prompt \\+ output // 2"):
+            _k25(lengths=lengths)
     with pytest.raises(ValueError, match="at least one decode step"):
         _k25(kv_len=4096, lengths=(4096, 1))
 
@@ -1042,11 +1222,22 @@ def test_h002_rederivation_refuses_times_the_model_cannot_use(t_us, fragment):
 
 
 def test_h002_rederivation_accepts_the_band_edges_and_a_slow_kernel():
+    """A measured time at eff 0.95 or 0.55 pins the bf16 core where the
+    registered lo or hi end already has it, so those ends agree; one ulp above
+    the floor is a time the model can use (the floor itself is not, on every
+    Python version); a kernel under the band widens the saving at every end."""
     from gitm.agents.hypotheses import rederive_h002
 
+    reg = H002.predict(_k25())
     floor_us = _ATTN_RAG64 / 61 * 1e6
-    for t_us in (floor_us * 1.0001, floor_us / 0.95, floor_us / 0.051):
-        assert rederive_h002(_k25(), t_us).step_delta
+    assert rederive_h002(_k25(), floor_us / 0.95).step_delta[0] == pytest.approx(
+        reg.step_delta[0], rel=1e-9)
+    assert rederive_h002(_k25(), floor_us / 0.55).step_delta[2] == pytest.approx(
+        reg.step_delta[2], rel=1e-9)
+    above = rederive_h002(_k25(), math.nextafter(floor_us, math.inf))
+    assert "= eff 1.000, used at every end" in _line(above, "bf16 core per layer")
+    slow = rederive_h002(_k25(), floor_us / 0.051).step_delta
+    assert reg.step_delta[2] < slow[0] < slow[1] < slow[2]
 
 
 @pytest.mark.parametrize(
@@ -1064,3 +1255,25 @@ def test_h002_rederivation_refuses_a_workload_the_hypothesis_refuses(serving, fr
 
     with pytest.raises(ValueError, match=fragment):
         rederive_h002(_k25(serving=serving), 60.0)
+
+
+@pytest.mark.parametrize(
+    "workload",
+    [
+        # 16 heads per rank: asm stage 1 plus a reduce (aiter/mla.py:684-694).
+        lambda: replace(_k25(), sharding=ShardingConfig(tp=4)),
+        # 12 heads: 16 is not a multiple, so the padded asm path too.
+        lambda: replace(_k25(), spec=replace(load_spec("kimi-k2.5"), n_heads=48),
+                        sharding=ShardingConfig(tp=4)),
+        lambda: _k25("H200", batch=32, kv_len=8192),
+        lambda: _k25("B200", batch=32, kv_len=8192),
+    ],
+)
+def test_h002_rederivation_refuses_a_baseline_that_is_not_one_gluon_launch(workload):
+    """The measured time is one _mla_gluon launch per layer (doc, Experiment
+    step 2); a baseline whose bf16 decode is the asm pair, FA3 or FlashInfer
+    has no such kernel, so a time for it is not a band."""
+    from gitm.agents.hypotheses import rederive_h002
+
+    with pytest.raises(ValueError, match="one _mla_gluon launch per layer"):
+        rederive_h002(workload(), 60.0)

@@ -129,9 +129,10 @@ _OP_RULES: dict[str, tuple[str, ...]] = {
     # H200, FLASHINFER on the B200 in the same vLLM build), so a rule set that
     # covers only one of them silently loses the whole attention path on the
     # other machine.
-    # AMD: AITER MLA decode and paged-attention asm kernels (hsa/gfx950/{mla,pa});
-    # both vendors: vLLM's Triton decode attention (`_fwd_*kernel_stage*`).
-    "attn_score_value": ("mla_dec", "mla_a16", "mla_a8", "mla_reduce", "mla_stage",
+    # AMD: AITER MLA decode and paged-attention asm kernels (hsa/gfx950/{mla,pa})
+    # and its Gluon MLA decode (`_mla_gluon`, the bf16 kernel under 16 heads per
+    # rank); both vendors: vLLM's Triton decode attention (`_fwd_*kernel_stage*`).
+    "attn_score_value": ("mla_dec", "mla_a16", "mla_a8", "mla_reduce", "mla_stage", "mla_gluon",
                          "pa_a16w", "pa_a8w", "pa_bf16", "pa_fp8", "pa_decode",
                          "_fwd_grouped_kernel_stage", "_fwd_kernel_stage",
                          "flash_mla", "mla_sparse", "sparse_mla", "cutlass_mla",

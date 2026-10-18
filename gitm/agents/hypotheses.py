@@ -57,9 +57,9 @@ class Workload:
     absent keys mean the engine default.
 
     ``request_lengths`` is (prompt, output) tokens when every request has those
-    lengths and they are admitted together, so the batch decodes in lockstep
-    (``vllm bench serve`` at request rate inf, v0.29.0 benchmarks/serve.py:458-459,
-    :969-975); ``batch.kv_cache_len`` is then prompt + output // 2.
+    lengths and the load keeps the batch full of them (``vllm bench serve`` at
+    request rate inf under ``--max-concurrency``, v0.29.0 benchmarks/serve.py:
+    458-459, :968-976); ``batch.kv_cache_len`` is then prompt + output // 2.
     """
 
     model: str
@@ -142,7 +142,9 @@ def _floor(spec: GlmMoeDsaModelSpec, w: Workload) -> Graph:
 
 
 def _op_time(g: Graph, *ops: str) -> float:
-    return sum(n.prediction.t_pred_s for n in g.nodes if n.op in ops)
+    # fsum: sum() loses an ulp before 3.12, and rederive_h002 compares a time
+    # against this / n_layers.
+    return math.fsum(n.prediction.t_pred_s for n in g.nodes if n.op in ops)
 
 
 def _effect(
@@ -314,16 +316,18 @@ def _env_on(w: Workload, name: str, default: str) -> bool:
 
 
 def _cdna4_refusal(w: Workload) -> str | None:
-    """Why the CDNA4 serving env is not the one the derivation prices, or None:
-    ROCM_AITER_MLA heads the MLA list only with both AITER flags on (v0.29.0
-    _aiter_ops.py:1953-1956, platforms/rocm.py:469-479), else it is TRITON_MLA."""
+    """Why the CDNA4 serving env is not the loop env the derivation prices, or
+    None: ROCM_AITER_MLA heads the MLA list only with both AITER flags on
+    (v0.29.0 _aiter_ops.py:1953-1956, platforms/rocm.py:469-479), else it is
+    TRITON_MLA unless pinned, and a pin needs neither flag (_aiter_ops.py:134-146)."""
     if not _env_on(w, "VLLM_ROCM_USE_AITER", "false"):
-        return ("CDNA4 without VLLM_ROCM_USE_AITER=1 selects TRITON_MLA "
-                "(platforms/rocm.py:469-479); the prediction is for ROCM_AITER_MLA")
+        return ("CDNA4 without VLLM_ROCM_USE_AITER=1 is not the loop env the derivation "
+                "prices: ROCm lists TRITON_MLA first (platforms/rocm.py:469-479), and a "
+                "pinned ROCM_AITER_MLA runs with AITER off everywhere else (_aiter_ops.py:134-146)")
     if not _env_on(w, "VLLM_ROCM_USE_AITER_MLA", "true"):
-        return ("VLLM_ROCM_USE_AITER_MLA is off, so CDNA4 selects TRITON_MLA "
-                "(_aiter_ops.py:1953-1956, platforms/rocm.py:469-479); the "
-                "prediction is for ROCM_AITER_MLA")
+        return ("VLLM_ROCM_USE_AITER_MLA is off, so CDNA4 lists TRITON_MLA first "
+                "(_aiter_ops.py:1953-1956, platforms/rocm.py:469-479) unless ROCM_AITER_MLA "
+                "is pinned; the derivation prices the loop env, which leaves it on")
     padding = str(w.serving.get("VLLM_ROCM_AITER_MLA_ASM_PADDING", "auto")).lower()
     heads = w.spec.n_heads // w.sharding.tp
     # use_gluon_decode reads the mode only under 16 heads; auto takes Gluon
@@ -350,24 +354,33 @@ def _executed_kv(w: Workload) -> str:
     return w.spec.kv_dtype if flag == "auto" else flag
 
 
-def _nested_config(w: Workload, key: str) -> Any:
+def _nested_config(w: Workload, key: str) -> dict[str, Any] | str:
     """A config-object EngineArg (``compilation_config``, ``attention_config``):
-    a dict, or the JSON string the CLI takes (engine/arg_utils.py:815-819)."""
+    a dict, or the JSON string the CLI takes (engine/arg_utils.py:815-819); else
+    why vLLM v0.29.0 would not take it."""
     value = w.serving.get(key)
     if value is None:
         return {}
-    return json.loads(value) if isinstance(value, str) else value
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return f"{key}={value!r} is not JSON (engine/arg_utils.py:815-819)"
+    if not isinstance(value, dict):
+        return (f"{key}={value!r} is not the dict or JSON object vLLM v0.29.0 takes "
+                "(engine/arg_utils.py:815-819)")
+    return value
 
 
-def _forced_backend(w: Workload) -> str:
+def _forced_backend(w: Workload, ac: dict[str, Any]) -> str:
     """The MLA backend the serving config pins, or "": ``--attention-backend`` lands
-    in ``attention_config.backend`` (v0.29.0 engine/arg_utils.py:2489-2498) and
-    ``backend_per_kind`` overrides it per kind (v1/attention/selector.py:175-183)."""
-    ac = _nested_config(w, "attention_config")
+    in ``attention_config.backend`` (v0.29.0 engine/arg_utils.py:2489-2498),
+    ``backend_per_kind`` overrides it per kind (v1/attention/selector.py:175-183),
+    and ``auto`` is vLLM's spelling for no pin (config/attention.py:162-164)."""
     per_kind = ac.get("backend_per_kind") or {}
-    forced = (per_kind.get("mla_attention") or ac.get("backend")
-              or w.serving.get("attention_backend") or "")
-    return str(forced).upper()
+    forced = str(per_kind.get("mla_attention") or ac.get("backend")
+                 or w.serving.get("attention_backend") or "").upper()
+    return "" if forced == "AUTO" else forced
 
 
 def _mla_backends(w: Workload) -> tuple[str, str, bool] | str:
@@ -384,8 +397,15 @@ def _mla_backends(w: Workload) -> tuple[str, str, bool] | str:
         why = _cdna4_refusal(w)
         if why is not None:
             return why
+    ac = _nested_config(w, "attention_config")
+    if isinstance(ac, str):
+        return ac
+    per_kind = ac.get("backend_per_kind")
+    if per_kind is not None and not isinstance(per_kind, dict):
+        return (f"attention_config.backend_per_kind={per_kind!r} is not the dict vLLM "
+                "v0.29.0 takes (config/attention.py:30, :176-199)")
     default, fp8, same = _MLA_BACKENDS[w.hw.arch]
-    forced = _forced_backend(w)
+    forced = _forced_backend(w, ac)
     if forced == default and default != fp8:
         return (f"attention_backend={forced} is explicitly pinned; the fp8 intervention "
                 f"does not switch it to {fp8}")
@@ -425,7 +445,11 @@ def _h002_applies(w: Workload) -> str | None:
         return pair
     if w.batch.is_prefill or w.batch.batch <= 0:
         return "decode-only prediction; prefill steps are out of scope"
-    return _decode_shape_refusal(w) or _graph_refusal(w)
+    cc = _nested_config(w, "compilation_config")
+    if isinstance(cc, str):
+        return cc
+    return (_count_arg_refusal(w) or _decode_shape_refusal(w) or _graph_refusal(w, cc)
+            or _concat_quant_refusal(w, cc))
 
 
 #: Strings pydantic reads as True for a bool field; vLLM's ModelConfig is a
@@ -437,31 +461,45 @@ def _opt_level(w: Workload) -> str:
     return str(w.serving.get("optimization_level", 2)).upper().removeprefix("O")
 
 
-def _decode_cudagraph_mode(w: Workload, cc: dict[str, Any]) -> str:
-    """vLLM v0.29.0's cudagraph mode name: an explicit ``cudagraph_mode`` (name
-    in any case, or enum value; config/compilation.py:53-63, :870-876), else
-    the one ``optimization_level`` supplies (config/vllm.py:255, :278, :301)."""
+#: vLLM v0.29.0's CompilationMode and CUDAGraphMode (config/compilation.py:37-63),
+#: taken as its config does: a name in any case, or the int value (:853-876).
+#: FULL_DECODE_ONLY and FULL_AND_PIECEWISE have tuple values, so no int names them.
+_COMPILATION_MODES = ("NONE", "STOCK_TORCH_COMPILE", "DYNAMO_TRACE_ONCE", "VLLM_COMPILE")
+_CUDAGRAPH_MODES = ("NONE", "PIECEWISE", "FULL", "FULL_DECODE_ONLY", "FULL_AND_PIECEWISE")
+
+
+def _decode_cudagraph_mode(w: Workload, cc: dict[str, Any]) -> str | None:
+    """vLLM v0.29.0's cudagraph mode name: an explicit ``cudagraph_mode``, else
+    the one ``optimization_level`` supplies (config/vllm.py:255, :278, :301);
+    None for a value that names no mode."""
     mode = cc.get("cudagraph_mode")
     if mode is None:
         return {"0": "NONE", "1": "PIECEWISE"}.get(_opt_level(w), "FULL_AND_PIECEWISE")
-    return {0: "NONE", 1: "PIECEWISE", 2: "FULL"}.get(mode, str(mode).upper())
+    if isinstance(mode, int):
+        name = {0: "NONE", 1: "PIECEWISE", 2: "FULL"}.get(mode)
+    else:
+        name = str(mode).upper()
+    return name if name in _CUDAGRAPH_MODES else None
 
 
-def _compile_mode(w: Workload, cc: dict[str, Any]) -> str:
-    """vLLM v0.29.0's CompilationMode name (config/compilation.py:37-50).
-    TORCH_COMPILE_DISABLE=1 forces NONE (config/vllm.py:1390-1395); with no
-    explicit ``mode``, -O0 gives NONE and any other level VLLM_COMPILE
-    (:1431-1435)."""
+def _compile_mode(w: Workload, cc: dict[str, Any]) -> str | None:
+    """vLLM v0.29.0's CompilationMode name. TORCH_COMPILE_DISABLE=1 forces NONE
+    (config/vllm.py:1390-1395); with no explicit ``mode``, -O0 gives NONE and
+    any other level VLLM_COMPILE (:1431-1435). None for a value that names
+    no mode."""
     if str(w.serving.get("TORCH_COMPILE_DISABLE", "")) == "1":
         return "NONE"
     mode = cc.get("mode")
     if mode is None:
         return "NONE" if _opt_level(w) == "0" else "VLLM_COMPILE"
-    names = {0: "NONE", 1: "STOCK_TORCH_COMPILE", 2: "DYNAMO_TRACE_ONCE", 3: "VLLM_COMPILE"}
-    return names.get(mode, str(mode).upper())
+    if isinstance(mode, int):
+        name = _COMPILATION_MODES[mode] if 0 <= mode < 4 else None
+    else:
+        name = str(mode).upper()
+    return name if name in _COMPILATION_MODES else None
 
 
-def _graph_refusal(w: Workload) -> str | None:
+def _graph_refusal(w: Workload, cc: dict[str, Any]) -> str | None:
     """Why decode would not replay one full graph at this batch, or None. The
     extra kernels are priced at the graph-replay launch (2 us); eager is nearer
     5 us, which moves the whole band. PIECEWISE runs attention outside its
@@ -470,14 +508,20 @@ def _graph_refusal(w: Workload) -> str | None:
     why = "the derivation prices graph-replay launches (2 us), not eager ones"
     if str(w.serving.get("enforce_eager", False)).lower() in _PYDANTIC_TRUE:
         return f"enforce_eager runs decode without a graph: {why}"
-    cc = _nested_config(w, "compilation_config")
-    if not isinstance(cc, dict):
-        return (f"compilation_config={cc!r} is not the dict or JSON object vLLM v0.29.0 "
-                "takes (engine/arg_utils.py:815-819); -O levels are optimization_level")
+    if str(w.serving.get("VLLM_USE_BREAKABLE_CUDAGRAPH", "")) == "1":
+        return ("VLLM_USE_BREAKABLE_CUDAGRAPH=1 runs MLA attention eagerly between graph "
+                "segments (mla_attention.py:1319, compilation/breakable_cudagraph.py:319-322): "
+                f"{why}")
     mode = _decode_cudagraph_mode(w, cc)
+    if mode is None:
+        return (f"compilation_config.cudagraph_mode={cc['cudagraph_mode']!r} is not a "
+                "CUDAGraphMode name or value (config/compilation.py:53-63, :870-876)")
     if mode in ("NONE", "PIECEWISE"):
         return f"cudagraph_mode {mode} runs decode attention outside a graph: {why}"
     compile_mode = _compile_mode(w, cc)
+    if compile_mode is None:
+        return (f"compilation_config.mode={cc['mode']!r} is not a CompilationMode name or "
+                "value (config/compilation.py:37-50, :853-868)")
     if mode == "FULL_AND_PIECEWISE" and compile_mode != "VLLM_COMPILE":
         return (f"compilation mode {compile_mode} does no piecewise compilation, so vLLM "
                 f"overrides cudagraph_mode {mode} to NONE (config/vllm.py:1468-1480): {why}")
@@ -486,19 +530,98 @@ def _graph_refusal(w: Workload) -> str | None:
         return (f"prefill_context_parallel_size={pcp}: ROCm overrides full graphs to "
                 f"PIECEWISE (platforms/rocm.py:902-913), so decode attention runs outside "
                 f"a graph: {why}")
-    cap = cc.get("max_cudagraph_capture_size", w.serving.get("max_cudagraph_capture_size"))
-    sizes = cc.get("cudagraph_capture_sizes") or w.serving.get("cudagraph_capture_sizes")
-    if cap is None and sizes:
-        cap = max(int(s) for s in sizes)
-    if cap is None:
-        # vLLM's default ceiling (config/vllm.py:2003-2016); max_num_seqs
-        # defaults to 1024 on every priced SKU (engine/arg_utils.py:2698-2717).
-        cap = min(1024 if w.hw.arch == "blackwell" else 512,
-                  2 * int(w.serving.get("max_num_seqs") or 1024))
-    cap = min(int(cap), int(w.serving.get("max_num_batched_tokens") or cap))
+    if w.serving.get("kv_transfer_config"):
+        return ("kv_transfer_config is set: a KV connector may override full graphs to "
+                "PIECEWISE (config/vllm.py:1556-1581), and its transfers are not priced")
+    cap = _capture_ceiling(w, cc)
+    if isinstance(cap, str):
+        return cap
     if w.batch.batch > cap:
         return (f"batch {w.batch.batch} is above the largest captured graph size {cap}, "
                 f"so decode runs without a graph: {why}")
+    return None
+
+
+def _capture_ceiling(w: Workload, cc: dict[str, Any]) -> int | str:
+    """The largest decode batch vLLM v0.29.0 replays a graph for (config/vllm.py:
+    1996-2182), or why the config gives none. Explicit ``cudagraph_capture_sizes``
+    keep those at or under ``max_num_batched_tokens``. Otherwise the ceiling,
+    ``max_cudagraph_capture_size`` or min(2 x max_num_seqs, 512; 1024 on
+    Blackwell), is capped at that budget and, unless the budget itself is
+    captured, rounded down to the capture grid: 1, 2, 4, then 8s below 256 and
+    16s from 256. ``max_num_seqs`` defaults to 1024 on every priced SKU
+    (engine/arg_utils.py:2698-2717)."""
+    budget = int(w.serving.get("max_num_batched_tokens") or 0)
+    sizes = cc.get("cudagraph_capture_sizes") or w.serving.get("cudagraph_capture_sizes")
+    if sizes:
+        if not isinstance(sizes, list) or not all(_is_count(s) for s in sizes):
+            return (f"cudagraph_capture_sizes={sizes!r} is not the list of ints vLLM v0.29.0 "
+                    "takes (config/compilation.py:648)")
+        return max((int(s) for s in sizes if not budget or int(s) <= budget), default=0)
+    cap = cc.get("max_cudagraph_capture_size", w.serving.get("max_cudagraph_capture_size"))
+    if cap is None:
+        cap = min(1024 if w.hw.arch == "blackwell" else 512,
+                  2 * int(w.serving.get("max_num_seqs") or 1024))
+    elif not _is_count(cap):
+        return (f"max_cudagraph_capture_size={cap!r} is not the positive int vLLM v0.29.0 "
+                "takes (config/compilation.py:692, config/vllm.py:2095-2098)")
+    cap = int(cap)
+    if budget and budget <= cap:
+        return budget
+    if cap < 8:
+        return max(s for s in (1, 2, 4) if s <= cap)
+    return cap - cap % (8 if cap < 256 else 16)
+
+
+def _concat_quant_refusal(w: Workload, cc: dict[str, Any]) -> str | None:
+    """Why the fp8 arm's query concat-and-quantise would not be the one Inductor
+    kernel priced, or None. Enabled, the custom op runs ``torch.cat`` then
+    AITER's quantise, two kernels (mla_attention.py:1419-1445,
+    quantization/input_quant_fp8.py:137-160). ``custom_ops`` enables it with
+    ``all`` or ``+mla_decode_concat_quant_fp8`` (custom_op.py:285-311), and vLLM
+    adds ``all`` itself when compilation is off or the backend is not Inductor
+    (config/vllm.py:1444-1451); off, a disabled op is not compiled either
+    (custom_op.py:222-225)."""
+    why = "the derivation prices the query concat-and-quantise as one compiled kernel"
+    name = "mla_decode_concat_quant_fp8"
+    ops = cc.get("custom_ops") or []
+    if not isinstance(ops, list):
+        return (f"custom_ops={ops!r} is not the list of op names vLLM v0.29.0 takes "
+                "(config/compilation.py:495)")
+    if ("all" in ops or f"+{name}" in ops) and f"-{name}" not in ops:
+        return f"custom_ops={ops} enables {name}, torch.cat plus AITER's quantise: {why}"
+    if _compile_mode(w, cc) == "NONE":
+        return ("compilation mode NONE runs the query concat-and-quantise as its custom op "
+                f"or as uncompiled torch (config/vllm.py:1444-1451, custom_op.py:222-225): {why}")
+    backend = cc.get("backend") or "inductor"
+    if backend != "inductor":
+        return (f"compilation backend {backend!r} turns every custom op on "
+                f"(config/vllm.py:1444-1451), so {name} runs torch.cat plus AITER's "
+                f"quantise: {why}")
+    return None
+
+
+#: Serving keys the checks read as counts; vLLM v0.29.0 types each as an int of
+#: at least 1 (engine/arg_utils.py:493, :518-524, :583-586; config/parallel.py:
+#: 126-129, :349; config/scheduler.py:49, :63).
+_COUNT_ARGS = ("max_num_batched_tokens", "max_num_seqs", "max_cudagraph_capture_size",
+               "data_parallel_size", "decode_context_parallel_size",
+               "prefill_context_parallel_size")
+
+
+def _is_count(value: Any) -> bool:
+    try:
+        return int(value) >= 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _count_arg_refusal(w: Workload) -> str | None:
+    for key in _COUNT_ARGS:
+        value = w.serving.get(key)
+        if value not in (None, "") and not _is_count(value):
+            return (f"{key}={value!r} is not the positive int vLLM v0.29.0 takes "
+                    "(engine/arg_utils.py:493, :518-524, :583-586)")
     return None
 
 
@@ -520,7 +643,20 @@ def _decode_shape_refusal(w: Workload) -> str | None:
         return (f"decode_context_parallel_size={dcp}: each rank decodes {dcp}x the "
                 "query heads (rocm_aiter_mla.py:1426-1428) over its shard of the "
                 "cache (v1/attention/backends/utils.py:1091-1100), which is not priced")
+    dp = max(int(w.serving.get("data_parallel_size") or 1), w.sharding.dp)
+    if dp > 1:
+        return (f"data_parallel_size={dp}: the DP groups step together on their combined "
+                "token count (forward_context.py:80-99, :116-125), which the one TP group "
+                "priced here does not do")
     return None
+
+
+def _gluon_decode(w: Workload) -> bool:
+    """Whether the bf16 arm decodes in AITER's Gluon ``_mla_gluon``: CDNA4 under
+    16 heads per rank with 16 a multiple of the count (rocm_aiter_mla.py:1334-1353)."""
+    heads = w.spec.n_heads // w.sharding.tp
+    return (w.hw.arch == "cdna4" and heads < _AITER_MIN_MLA_HEADS
+            and _AITER_MIN_MLA_HEADS % heads == 0)
 
 
 def _fp8_extra_kernels(
@@ -539,12 +675,10 @@ def _fp8_extra_kernels(
     (:1053-1077). At 16 or more heads both arms take the padded asm path.
     """
     heads = w.spec.n_heads // w.sharding.tp
-    m = _AITER_MIN_MLA_HEADS
-    if w.hw.arch == "cdna4":
-        if heads < m and m % heads == 0:
-            return (("query concat+quant", f"{heads}->{m} head pad", "mla_reduce_v1"),
-                    ("get_mla_metadata_v1",))
-    elif bf16_backend == "FLASH_ATTN_MLA":
+    if _gluon_decode(w):
+        return (("query concat+quant", f"{heads}->{_AITER_MIN_MLA_HEADS} head pad",
+                 "mla_reduce_v1"), ("get_mla_metadata_v1",))
+    if bf16_backend == "FLASH_ATTN_MLA":
         return ("query concat+quant",), ()
     return (), ()
 
@@ -585,9 +719,10 @@ def _aiter_partial_tiles(n_seq: int, kv_len: int, num_splits: int = _GFX950_CUS)
 
 def _h002_mean_tiles(w: Workload) -> tuple[float, str]:
     """AITER's partial tiles per decode step, and how they were counted: with
-    ``request_lengths`` (P, O) the mean over the O - 1 lockstep steps at P + 1 ..
-    P + O - 1 cached tokens (vLLM writes the step's own token before attention,
-    mla_attention.py:703-713), else the count at ``kv_cache_len``."""
+    ``request_lengths`` (P, O) the mean over a request's O - 1 decode steps at
+    P + 1 .. P + O - 1 cached tokens, the batch taken at one length per step
+    (vLLM writes the step's own token before attention, mla_attention.py:703-713),
+    else the count at ``kv_cache_len``."""
     b = w.batch
     if w.request_lengths is None:
         return (float(_aiter_partial_tiles(b.batch, b.kv_cache_len)),
@@ -595,8 +730,8 @@ def _h002_mean_tiles(w: Workload) -> tuple[float, str]:
     prompt, output = w.request_lengths
     counts = [_aiter_partial_tiles(b.batch, n) for n in range(prompt + 1, prompt + output)]
     return (sum(counts) / len(counts),
-            f"mean over {len(counts)} lockstep decode steps at {prompt + 1} to "
-            f"{prompt + output - 1} cached tokens: {sum(counts)} / {len(counts)}, "
+            f"mean over {len(counts)} decode steps with the batch at one cached length, "
+            f"{prompt + 1} to {prompt + output - 1}: {sum(counts)} / {len(counts)}, "
             f"{min(counts)} to {max(counts)} per step")
 
 
@@ -705,10 +840,16 @@ def rederive_h002(w: Workload, bf16_layer_us: float) -> Prediction:
     """H-002's band with the bf16 core at the baseline arm's measured decode kernel
     time per layer (``_mla_gluon`` on MI355X), in microseconds; the fp8 kernel, the
     extra kernels and the rest of the step stay as registered. Refuses a workload
-    H-002 refuses and a time the model cannot use."""
+    H-002 refuses, a baseline whose decode is not one ``_mla_gluon`` launch per
+    layer, and a time the model cannot use."""
     why = _h002_applies(w)
     if why is not None:
         raise ValueError(f"H-002 does not apply: {why}")
+    if not _gluon_decode(w):
+        raise ValueError(
+            f"the bf16 arm at {w.spec.n_heads // w.sharding.tp} heads per rank on {w.hw.name} "
+            "does not decode in one _mla_gluon launch per layer, the kernel time the "
+            "re-derivation reads (doc, Experiment step 2)")
     if not math.isfinite(bf16_layer_us) or bf16_layer_us <= 0:
         raise ValueError(f"bf16 kernel time {bf16_layer_us!r} us is not a positive number")
     executed = replace(w.spec, kv_dtype=_executed_kv(w), kv_rope_dtype=_executed_kv(w))
@@ -759,8 +900,9 @@ H002 = Hypothesis(
         ":129-136), and on MI355X first-chunk prefill runs in fp8 too: gate on the "
         "accuracy sentinel in docs/hypotheses/H-002-mla-kv-fp8.md before keep. On "
         "the pinned image that prefill drops heads 4-7 at 8 heads per rank "
-        "(vllm-project/vllm#60907, open) and AITER v0.1.19's a8w8 decode "
-        "under-weights diffuse attention (ROCm/aiter#5535, open), so a gate failure "
+        "(vllm-project/vllm#60907, fixed on vLLM main 2026-10-14, in no release) and "
+        "AITER v0.1.19's a8w8 decode under-weights diffuse attention (fixed on AITER "
+        "main by ROCm/aiter#6422 on 2026-10-14, in no release), so a gate failure "
         "there is an image defect, not a scale result: record it as blocked."
     ),
 )
