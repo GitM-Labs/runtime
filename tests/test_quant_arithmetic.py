@@ -275,7 +275,7 @@ def test_linear_traffic_splits_payload_scales_and_scratch():
 
 
 def _case_spec():
-    """The submitted YAML's precision: bf16 cache, shared expert bf16, fp32 router."""
+    """The case's precision: bf16 cache, shared expert bf16, fp32 router."""
     return replace(
         load_spec("kimi-k2.6"), kv_dtype="bf16", kv_rope_dtype="bf16",
         op_dtype_overrides=(("moe_router", "fp32"), ("moe_shared", "bf16")),
@@ -332,8 +332,8 @@ def test_case_fit_uses_one_ledger():
     assert tp4.kv_tokens // 8192 == 12
     tp8 = memory_fit(_case_spec(), B200, BASELINE, ShardingConfig(tp=8), workspace_bytes=4.5e9)
     assert tp8.fits
-    # The default NVIDIA's command serves is an fp8 cache (vLLM resolves 'auto'
-    # from the checkpoint's kv_cache_scheme); TP4 still does not hold 32 x 8K.
+    # With the fp8 cache vLLM resolves 'auto' to, the case's fp32-router spec
+    # still misses at TP4 (the served bf16-router entry leaves 7.3 GB, 25 seqs).
     fp8 = replace(_case_spec(), kv_dtype="fp8", kv_rope_dtype="fp8")
     tp4_fp8 = memory_fit(fp8, B200, BASELINE, ShardingConfig(tp=4), workspace_bytes=4.5e9)
     assert not tp4_fp8.fits and tp4_fp8.kv_tokens // 8192 == 24

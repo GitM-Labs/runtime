@@ -43,11 +43,11 @@ def sec_predicted(run, pred):
         return lines + ["_predicted_sweep.json not found_", ""]
     lines += [
         f"- Model: **{pred['model']}**, {pred['tp']}×{pred['sku']}, "
-        "914-node decode graph compiled from config.json alone.",
-        "- Weight footprint: **595.00 GB predicted vs 595.15 GB published "
-        "(−0.03%)**.",
-        "- Decode floor at rag c=64: **11.0 ms/step**, `moe_routed` 85.7% of "
-        "the step, memory-bound (AI 4.8 vs ridge 312).",
+        "1037-node decode graph compiled from config.json alone.",
+        "- Weight footprint: **594.20 GB predicted vs 595.15 GB published "
+        "(−0.16%)**.",
+        "- Decode floor at rag c=64: **11.0 ms/step**, `moe_routed` 60.0% of "
+        "the step, memory-bound (AI 6.4 vs ridge 312).",
         "",
         "Predicted floors (per config × concurrency):",
         "",

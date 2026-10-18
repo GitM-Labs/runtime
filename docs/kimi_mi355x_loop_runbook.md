@@ -49,10 +49,10 @@ python3 scripts/kimi_loop/predict_sweep.py
 
 → `evidence/kimi-mi355x/predicted/`: 18 (config × concurrency) points with
 ITL floor, TTFT floor, throughput floor, plus per-op decode tables. Headline
-prediction: decode floor 11.0 ms/step at rag c=64 (`moe_routed` 86%,
+prediction: decode floor 11.0 ms/step at rag c=64 (`moe_routed` 60%,
 memory-bound) — the number the measured sweep gets compared against.
-Footprint validation is in the catalogue entry itself: predicted 595.00 GB vs
-the published checkpoint's 595.15 GB (−0.03%).
+Footprint validation is in the catalogue entry itself: predicted 594.20 GB vs
+the published checkpoint's 595.15 GB (−0.16%).
 
 ## 2. Execution (inside the gitm sidecar)
 
