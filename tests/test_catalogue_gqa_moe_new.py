@@ -265,7 +265,12 @@ def test_minimax_m3_block_sparse_attention_is_priced_dense():
     s = load_spec("minimax-m3")
     a = predict_hybrid_graph(s, H200, BatchConfig(batch=1, kv_cache_len=4096))
     b = predict_hybrid_graph(s, H200, BatchConfig(batch=1, kv_cache_len=32768))
-    sv = lambda g: next(n.prediction.bytes for n in g.nodes if n.op == "attn_score_value" and n.layer == 30)
+
+    def sv(g):
+        return next(
+            n.prediction.bytes for n in g.nodes if n.op == "attn_score_value" and n.layer == 30
+        )
+
     assert sv(b) / sv(a) == pytest.approx(8.0)
 
 
@@ -287,7 +292,10 @@ def test_op_dtype_overrides_set_compute_dtype_but_not_bytes():
     b = BatchConfig(batch=1, kv_cache_len=128)
     as_is = predict_hybrid_graph(s, H200, b)
     no_override = predict_hybrid_graph(replace(s, op_dtype_overrides=()), H200, b)
-    lm = lambda g: next(n for n in g.nodes if n.op == "lm_head")
+
+    def lm(g):
+        return next(n for n in g.nodes if n.op == "lm_head")
+
     assert lm(as_is).prediction.bytes == lm(no_override).prediction.bytes
     # lm_head moves vocab x hidden at mxfp4 width, not the checkpoint's bf16.
     w = lm(as_is).prediction.bytes

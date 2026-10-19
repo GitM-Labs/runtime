@@ -99,7 +99,7 @@ def test_v4_indexer_only_on_ratio4_layers(model, indexed):
     g, _ = predict(model, batch=BatchConfig(batch=4, kv_cache_len=65536))
     layers = sorted(n.layer for n in g.nodes if n.op == "attn_index_proj")
     assert len(layers) == indexed
-    assert all(l % 2 == 0 and l >= 2 for l in layers)
+    assert all(i % 2 == 0 and i >= 2 for i in layers)
 
 
 @pytest.mark.parametrize("model", [V4_PRO, V4_FLASH])
