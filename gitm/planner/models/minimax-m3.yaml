@@ -1,0 +1,165 @@
+# MiniMaxAI/MiniMax-M3 — MiniMaxM3SparseForConditionalGeneration (model_type
+# minimax_m3_vl, text_config nested): GQA + block-sparse attention + MoE, bf16,
+# with a CLIP-style vision tower.
+# Source: https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/f0e1c1e04d40177e4673a22097036854f536e9c0/config.json
+# Read from config.json, model.safetensors.index.json and ALL 59 safetensors
+# shard headers (HTTP Range) at that revision. No engine source, no trace.
+#
+# Family note: `hybrid` carries the backbone exactly — GQA full attention on
+# all 60 layers, 3 dense-FFN layers, 128 experts top-4 plus one shared expert.
+# It CANNOT express the block-sparse attention on layers 3-59 (an indexer picks
+# top-16 KV blocks of 128 plus the local block per query). Those layers are
+# priced here as dense full attention: decode attention is OVER-priced once
+# context exceeds the ~2,176 tokens the sparse kernel actually reads, and the
+# indexer's own projections, key cache and block scoring are NOT priced at all
+# (under-priced, dominant only at short context). See unmodelled.
+
+name: MiniMaxAI/MiniMax-M3
+family: hybrid
+checkpoint:
+  repository: MiniMaxAI/MiniMax-M3
+  revision: f0e1c1e04d40177e4673a22097036854f536e9c0
+  config_sha256: c9c97ce1e4eece60012d5a10ea87717458bfb1f19c2c7a615a3dbff83d090c6b
+  index_sha256: 54dbde502126d07f6999077437a06b5df1f71e317518956d0aad1c8197df524e
+  tensor_count: 23416
+  shard_count: 59
+  # total_size exceeds the shipped tensors by exactly one MTP layer's bytes —
+  # see provenance.verified. payload_bytes sums every header's data_offsets;
+  # shard files minus that is exactly the 59 JSON headers (3,440,088 B).
+  index_total_size: 869157697024
+  payload_bytes: 854172958720
+description: >
+  60 layers, hidden 6144, GQA 64 query / 4 KV heads at head_dim 128 (q_dim 8192),
+  partial RoPE 64/128, per-head QK RMSNorm. Layers 0-2 dense SwiGLU FFN (12288);
+  layers 3-59 MoE, 128 experts top-4 width 3072 plus one shared expert of 3072,
+  and block-sparse attention (4 index heads x 128, top-16 blocks of 128 + local
+  block). All bf16 except the fp32 router. 7 MTP modules declared, none shipped.
+  32-layer vision tower (hidden 1280). 854.17 GB on disk.
+
+spec:
+  hidden: 6144
+  n_layers: 60
+  vocab: 200064
+
+  # Attention: q_proj BF16 [8192, 6144] = 64 x 128; k/v_proj [512, 6144] =
+  # 4 x 128; o_proj [6144, 8192]. attention_output_gate false. qk_norm_type
+  # per_head (q_norm / k_norm weights are [128]).
+  n_heads: 64
+  num_kv_heads: 4
+  head_dim: 128
+  partial_rotary_factor: 0.5        # rotary_dim 64, partial_rotary_factor 0.5
+  attn_output_gate: false
+
+  # All 60 layers are softmax attention over the full cache. Layers 3-59 are
+  # *block-sparse* (sparse_attention_freq) — not expressible; priced dense.
+  layer_types: {pattern: [full_attention], repeat: 60}
+  full_attention_interval: 1
+
+  # Mixture of experts: num_local_experts 128, num_experts_per_tok 4,
+  # intermediate_size 3072 (= w1 [3072, 6144]), n_shared_experts 1 x
+  # shared_intermediate_size 3072 (shared_experts.gate_proj [3072, 6144]).
+  num_experts: 128
+  num_experts_per_tok: 4
+  moe_intermediate_size: 3072
+  shared_expert_intermediate_size: 3072
+
+  # moe_layer_freq is [0, 0, 0, 1 x 57]: layers 0-2 carry mlp.{gate,up,down}_proj
+  # [12288, 6144] and no expert bank — confirmed in the index.
+  dense_intermediate_size: 12288
+  dense_layers: [0, 1, 2]
+
+  # num_mtp_modules 7 (num_nextn_predict_layers 1) in config.json, but the
+  # weight map has no MTP tensor. 0 is what this checkpoint can run.
+  mtp_num_hidden_layers: 0
+
+  all_reduces_per_layer: 2          # TP convention — estimated
+
+  # No quantization_config; torch_dtype bfloat16 and every linear is BF16 in
+  # the headers. The router (gate.weight) is F32 [128, 6144].
+  weight_dtype: bf16
+  act_dtype: bf16
+  kv_dtype: bf16                    # OPEN — serving decision
+  op_dtype_overrides:
+    - [moe_router, fp32]
+
+provenance:
+  verified:
+    - claim: every spec value is read from text_config and confirmed by shard headers
+      detail: >
+        hidden_size 6144, num_hidden_layers 60, num_attention_heads 64,
+        num_key_value_heads 4, head_dim 128, rotary_dim 64 /
+        partial_rotary_factor 0.5, attention_output_gate false, vocab_size
+        200064, num_local_experts 128, num_experts_per_tok 4,
+        intermediate_size 3072, n_shared_experts 1, shared_intermediate_size
+        3072, dense_intermediate_size 12288, moe_layer_freq [0,0,0,1x57],
+        tie_word_embeddings false. Headers: q_proj [8192, 6144], k/v_proj
+        [512, 6144], o_proj [6144, 8192], experts w1/w3 [3072, 6144], w2
+        [6144, 3072], shared_experts gate/up [3072, 6144], dense mlp gate/up
+        [12288, 6144] on layers 0-2 only, all BF16; gate F32 [128, 6144];
+        index_q_proj [512, 6144] and index_k_proj [128, 6144] BF16 on layers
+        3-59 only.
+    - claim: predicted weight bytes against the shipped payload
+      detail: >
+        model_weight_bytes = 851,899,318,272 B against a header payload of
+        854,172,958,720 B (-0.27%). The residual, 2,273,640,448 B, closes to the
+        byte as: vision tower + patch_merge_mlp + multi_modal_projector
+        (1,734,145,024 B), the indexer projections the family has no term for
+        (448,266,240 B), the fp32 router priced at bf16 (89,653,248 B), and
+        norms + score-correction bias (1,575,936 B). Against index total_size
+        869,157,697,024 B it is -1.99% (the extra 1.72 points are the unshipped
+        MTP layer, next claim).
+    - claim: index total_size counts exactly one MTP layer that was not shipped
+      detail: >
+        total_size - payload = 14,984,738,304 B. One MTP layer built from this
+        config at bf16 — a MoE block (128 x 3 x 6144 x 3072 x 2 =
+        14,495,514,624), sparse attention (q/o 201,326,592 + k/v 12,582,912 +
+        index q/k 7,864,320), shared expert 113,246,208, fp32 gate 3,145,728,
+        eh_proj 2 x 6144 x 6144 x 2 = 150,994,944, and five hidden-size norms
+        plus q/k/index norms and the score bias (62,976) — sums to
+        14,984,738,304 B exactly. So num_nextn_predict_layers 1 describes
+        stripped weights; inferred, as no MTP tensor name survives.
+
+  estimated:
+    - field: all_reduces_per_layer
+      value: 2
+      detail: TP convention, not observed; falsifiable by counting NCCL kernels.
+
+  open:
+    - question: KV cache dtype
+      detail: >
+        Serving decision. bf16: 60 x 4 x 256 = 61,440 elements per token of
+        context, before the indexer's key cache (unmodelled).
+    - question: MTP — 7 modules declared, none shipped
+      detail: >
+        num_mtp_modules 7 and num_nextn_predict_layers 1 disagree with each other
+        and with the shipped weights (none). See the total_size claim.
+    - question: what sparse_disable_index_value means
+      detail: >
+        [0,0,0,1 x 57], same mask as sparse_attention_freq. Read as "the indexer
+        has no value projection" (there is no index_v_proj tensor), but that is
+        an inference, not a documented semantic.
+    - question: TP-only or expert parallel
+      detail: Changes every collective row; resolve from the launch args.
+
+  unmodelled:
+    - >
+      Block-sparse attention on layers 3-59 (sparse_index_dim 128,
+      sparse_num_index_heads 4, sparse_topk_blocks 16, sparse_block_size 128,
+      sparse_local_block 1, sparse_init_block 0, score type max). Priced as
+      dense full attention: attn_score_value reads kv_len entries where the
+      kernel reads ~(16 + 1) x 128 = 2,176, so decode attention on 57 of 60
+      layers is OVER-priced by ~kv_len / 2,176 beyond ~2k context (e.g. ~15x
+      at 32k). Prefill QK pairs likewise over-priced at long prompts.
+    - >
+      The indexer itself: index_q_proj (512 x 6144) and index_k_proj
+      (128 x 6144) GEMMs, their RMSNorms, scoring every cached block's key
+      against 4 index heads, the top-k select, and an index-key cache of 128
+      elements per token per sparse layer (+12.5% on a 4-KV-head layer's 1,024)
+      — all UNDER-priced (absent). 448 MB of weights.
+    - The fp32 router's bytes (priced at bf16, 2x low) — op_dtype_overrides
+      changes compute dtype only.
+    - swigluoai activation with clamp (swiglu_alpha 1.702, limit 7.0) and
+      routed_scaling_factor 2.0 — elementwise, folded into the FFN nodes.
+    - >
+      The vision tower (32 layers, hidden 1280; 1,734,145,024 B incl.
+      patch_merge_mlp and multi_modal_projector). A text decode step never enters it.

@@ -9,7 +9,7 @@ import yaml
 CATALOGUE_DIR = Path(__file__).resolve().parent / "models"
 
 #: Families a catalogue entry may declare, and the spec each one builds.
-_FAMILIES = ("hybrid", "sparse_moe", "glm_moe_dsa")
+_FAMILIES = ("hybrid", "sparse_moe", "glm_moe_dsa", "dense")
 
 
 def available() -> list[str]:
@@ -181,6 +181,8 @@ def load_spec(name_or_path: str | Path):
         from gitm.planner.hybrid_graph import HybridMoEModelSpec as cls
     elif family == "glm_moe_dsa":
         from gitm.planner.glm_graph import GlmMoeDsaModelSpec as cls  # type: ignore[assignment]
+    elif family == "dense":
+        from gitm.planner.roofline import ModelSpec as cls  # type: ignore[assignment]
     else:
         from gitm.planner.roofline import SparseMoEModelSpec as cls  # type: ignore[assignment]
 
@@ -253,6 +255,13 @@ def predict(
         from gitm.planner.glm_graph import predict_glm_graph
 
         return predict_glm_graph(spec, hw, batch, sharding, **kwargs), family
+
+    if family == "dense":
+        from gitm.planner.graph import predict_dense_graph
+
+        if kwargs:
+            raise TypeError(f"the dense graph takes no options, got {sorted(kwargs)}")
+        return predict_dense_graph(spec, hw, batch, sharding), family
 
     from gitm.planner.moe_graph import predict_moe_graph
 

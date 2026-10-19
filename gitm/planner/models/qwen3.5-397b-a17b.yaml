@@ -1,0 +1,136 @@
+# Qwen/Qwen3.5-397B-A17B — hybrid gated-DeltaNet / full-attention MoE, the
+# large sibling of qwen3.6-35b-a3b (same qwen3_5_moe text architecture).
+# Source: https://huggingface.co/Qwen/Qwen3.5-397B-A17B/blob/8472618112abcbd45acbcdc58436aff4233c23f7/config.json
+# Read from config.json, model.safetensors.index.json and the safetensors
+# headers of all 94 shards (HTTP Range) at that revision — no traces.
+#
+# Family note: `hybrid` carries this model field for field — every tensor class
+# in the backbone has a counterpart in the graph. What it does not count in
+# model_weight_bytes is the MTP draft layer (13.19 GB, it carries its own full
+# 512-expert bank), the vision tower, and two small DeltaNet tensors; and it
+# over-counts the DeltaNet input projection (see estimated). Both are listed
+# below with header-derived sizes.
+
+name: Qwen/Qwen3.5-397B-A17B
+family: hybrid
+description: >
+  60 layers, 45 gated-DeltaNet and 15 full-attention (3:1, full attention on
+  layers 3, 7 ... 59), hidden 4096, top-10 of 512 experts plus one shared
+  expert on every layer. Gated attention output, partial RoPE (64 of 256
+  dims). One MTP draft layer. bf16 throughout except fp32 A_log / DeltaNet
+  norm. 806.80 GB on disk. Multimodal wrapper
+  (Qwen3_5MoeForConditionalGeneration); vision out of scope for a text decode
+  step.
+
+spec:
+  hidden: 4096
+  n_layers: 60
+  vocab: 248320
+
+  # Full attention. head_dim 256 against 32 heads: the query projection widens
+  # to 8192, twice hidden. attn_output_gate doubles it again — q_proj in the
+  # header is [16384, 4096] (query + sigmoid gate), o_proj [4096, 8192],
+  # k_proj/v_proj [512, 4096] = 2 KV heads x 256.
+  n_heads: 32
+  num_kv_heads: 2
+  head_dim: 256
+  partial_rotary_factor: 0.25     # rope_parameters.partial_rotary_factor
+  attn_output_gate: true
+
+  # Gated DeltaNet. 16 key heads, 64 value heads (4:1 — Qwen3.6 is 2:1).
+  # Header: in_proj_qkv [12288, 4096] = q 2048 + k 2048 + v 8192, in_proj_z
+  # [8192, 4096], out_proj [4096, 8192], in_proj_a/b [64, 4096], conv1d
+  # [12288, 1, 4], A_log fp32 [64].
+  linear_num_key_heads: 16
+  linear_num_value_heads: 64
+  linear_key_head_dim: 128
+  linear_value_head_dim: 128
+  linear_conv_kernel_dim: 4
+  ssm_state_dtype: fp32           # text_config.mamba_ssm_dtype float32
+  # Convolution state, explicit. The channel count is read: conv1d.weight is
+  # [12288, 1, 4], i.e. q+k+v. The bf16 state dtype is estimated (see
+  # provenance). conv_dim is the legacy fitted field (value width, what
+  # spec_from_hf_config would put there); it is superseded by
+  # linear_conv_channels and prices nothing once that is set.
+  conv_dim: 8192
+  linear_conv_channels: 12288
+  linear_conv_state_dtype: bf16
+
+  # Mixture of experts. moe_intermediate_size 1024; header gate_up_proj is
+  # fused [512, 2048, 4096] and down_proj [512, 4096, 1024] per layer, on all
+  # 60 layers (mlp_only_layers is empty — no dense layer). One shared expert of
+  # width 1024 behind a sigmoid shared_expert_gate [1, 4096].
+  num_experts: 512
+  num_experts_per_tok: 10
+  moe_intermediate_size: 1024
+  shared_expert_intermediate_size: 1024
+
+  # Declared explicitly by the checkpoint; full attention at layer % 4 == 3.
+  layer_types:
+    pattern: [linear_attention, linear_attention, linear_attention, full_attention]
+    repeat: 15
+  full_attention_interval: 4
+
+  # One MTP layer (mtp.layers.0.*): full attention + its own 512-expert MoE.
+  # Emitted only under a speculative config.
+  mtp_num_hidden_layers: 1
+  mtp_layer_kind: full_attention
+
+  weight_dtype: bf16
+  kv_dtype: bf16
+  act_dtype: bf16
+
+provenance:
+  verified:
+    - claim: layer schedule, head geometry and expert bank read from the weight map
+      detail: >
+        Headers carry self_attn.* on exactly the 15 layers 3,7,...,59 and
+        linear_attn.* on the other 45; mlp.experts.{gate_up_proj,down_proj} on
+        all 60. Shapes as commented in the spec. A_log and linear_attn.norm are
+        F32, everything else BF16 (Hub metadata: BF16 403,397,920,304 / F32
+        8,640 params).
+    - claim: predicted weight bytes against the published checkpoint
+      detail: >
+        total_size 806,795,875,168 B (806.80 GB), equal to the sum of the 94
+        shard headers. model_weight_bytes predicts 794.90 GB, -1.47%. The
+        residual decomposes exactly from the headers: -13.19 GB MTP layer,
+        -0.91 GB vision tower, -0.05 GB in_proj_a/b + conv1d + norms (not
+        counted), against +2.26 GB from the DeltaNet query over-count below.
+        Routed experts (773.09 GB, 95.8% of the checkpoint), shared experts,
+        router, attention and embeddings match the headers to the byte.
+
+  estimated:
+    - field: DeltaNet input-projection width (model_weight_bytes / linattn_in_proj)
+      value: graph prices q at linear_num_value_heads x key_dim (8192)
+      detail: >
+        The family's linear_query_dim follows the value-head count, but the
+        header has q at key-head width: in_proj_qkv is 12288 = 2048 + 2048 +
+        8192, not 18432. The graph therefore over-counts each DeltaNet layer by
+        6144 x 4096 weights (50.3 MB bf16), 2.26 GB across 45 layers, and
+        linattn_in_proj bytes/flops by 6144/(12288+8192) = 30%. On Qwen3.6 (2:1
+        heads) the same rule over-counts by 2048 x 2048 per layer; at 4:1 it
+        matters three times more. Needs a shared-code fix (q = key heads), not
+        a catalogue value, so it is recorded rather than compensated.
+    - field: linear_conv_state_dtype
+      value: bf16
+      detail: >
+        vLLM allocates the gated-DeltaNet conv state in the model dtype and only
+        the recurrent (temporal) state in mamba_ssm_dtype. Not read from vLLM
+        source in this pass. Supporting arithmetic: on Qwen3.6 the explicit
+        reading (8192 channels x 3 x 2 B) equals the fitted one (4096 x 3 x 4 B)
+        = 49,152 B, which is why the fitted conv_dim reproduced vLLM's 0.76%
+        page pad there. Here the two readings differ (73,728 B vs 98,304 B per
+        layer per sequence; recurrent state is 4,194,304 B), so the explicit one
+        is used. Verify against the first startup log's mamba page-pad line.
+
+  unmodelled:
+    - The MTP draft layer, 13.19 GB bf16 by header sum — mostly its own
+      512-expert bank (stored per expert, 12.88 GB) plus attention and mtp.fc
+      [4096, 8192]. model_weight_bytes omits it, so fit checks understate
+      resident bytes by that much whether or not speculation is on.
+    - The vision tower (27 ViT blocks, hidden 1152) and merger, 0.91 GB.
+    - in_proj_a / in_proj_b ([64, 4096] each), conv1d weights, A_log, dt_bias
+      and norms — 0.05 GB together. linattn_in_proj does add the 2 x 64
+      scalar columns to its flops/bytes; model_weight_bytes does not.
+    - Prefill (decode only, as with every graph family) and interleaved mRoPE
+      (mrope_section [11, 11, 10]) — the latter prices nothing at decode.

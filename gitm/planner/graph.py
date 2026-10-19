@@ -291,3 +291,135 @@ def predict_graph(
     )
 
     return g
+
+
+# ── dense family: config reader + the catalogue/CLI entry point ─────────────
+
+
+class DenseConfigUnsupported(ValueError, NotImplementedError):
+    """A config the dense graph cannot price without guessing.
+
+    Both bases on purpose: ``ValueError`` is what ``gitm plan`` and the other
+    family readers raise for a config they refuse, and ``NotImplementedError`` is
+    what callers of ``predict_for_config`` caught before the dense family had a
+    reader at all.
+    """
+
+
+#: Config keys whose presence means the checkpoint is *not* a plain dense
+#: transformer. ``detect_family`` returns ``"dense"`` as its fallback for
+#: anything it does not recognise — a Mixtral, a gpt-oss, an MLA model — so the
+#: reader, not the detector, is where those are refused. Pricing one of them as
+#: a dense FFN over full attention would be a graph of a different model.
+_NOT_DENSE_KEYS = (
+    # mixture of experts, under every spelling in the wild
+    "num_local_experts", "num_experts", "n_routed_experts", "moe_intermediate_size",
+    "num_experts_per_tok", "n_shared_experts", "shared_expert_intermediate_size",
+    # MLA / compressed attention
+    "q_lora_rank", "kv_lora_rank",
+    # linear / recurrent attention
+    "linear_num_value_heads", "full_attention_interval", "attn_type_list",
+)
+
+_DTYPE_BYTES = {"bfloat16": 2, "float16": 2, "bf16": 2, "fp16": 2,
+                "float32": 4, "fp32": 4}
+
+
+def spec_from_hf_config(cfg: dict, *, name: str | None = None) -> ModelSpec:
+    """A dense ``ModelSpec`` read from an HF ``config.json`` dict.
+
+    Strict on purpose. Every shape the graph prices must be declared — a
+    missing ``vocab_size`` is a refusal, never the Llama-2-7B default, because a
+    defaulted field produces a confident graph of the wrong model. Configs that
+    carry experts, MLA, linear attention, an active sliding window or a
+    ``quantization_config`` are refused rather than approximated: the dense
+    graph has no term for any of them.
+
+    Raises
+    ------
+    DenseConfigUnsupported
+        On any of the above, naming the key(s).
+    """
+    present = [k for k in _NOT_DENSE_KEYS if cfg.get(k)]
+    if present:
+        raise DenseConfigUnsupported(
+            f"{name or 'this config'} is not a plain dense transformer (declares "
+            f"{present}); the dense graph would price a different model"
+        )
+    layer_types = cfg.get("layer_types")
+    if layer_types and any(t != "full_attention" for t in layer_types):
+        raise DenseConfigUnsupported(
+            f"{name or 'this config'} mixes attention kinds in layer_types "
+            f"({sorted(set(layer_types))}); the dense graph prices full attention only"
+        )
+    if cfg.get("sliding_window") and cfg.get("use_sliding_window", True) is not False:
+        raise DenseConfigUnsupported(
+            f"{name or 'this config'} uses sliding-window attention "
+            f"(sliding_window={cfg['sliding_window']}); the dense graph prices a "
+            "full-context KV read on every layer"
+        )
+    if cfg.get("quantization_config"):
+        raise DenseConfigUnsupported(
+            f"{name or 'this config'} is quantised; the dense graph has no "
+            "per-format weight accounting — add a catalogue entry instead"
+        )
+
+    required = ("hidden_size", "num_hidden_layers", "num_attention_heads",
+                "intermediate_size", "vocab_size")
+    missing = [k for k in required if cfg.get(k) in (None, 0)]
+    if missing:
+        raise DenseConfigUnsupported(
+            f"{name or 'this config'} resolves to the dense family, and the dense "
+            f"graph needs {missing}; it will not substitute another checkpoint's value"
+        )
+
+    dtype = str(cfg.get("torch_dtype") or cfg.get("dtype") or "bfloat16")
+    if dtype not in _DTYPE_BYTES:
+        raise DenseConfigUnsupported(
+            f"{name or 'this config'} declares dtype {dtype!r}; the dense graph "
+            f"knows {sorted(_DTYPE_BYTES)}"
+        )
+
+    hidden = int(cfg["hidden_size"])
+    n_heads = int(cfg["num_attention_heads"])
+    return ModelSpec(
+        name=name or str(cfg.get("model_type") or "dense"),
+        hidden=hidden,
+        n_layers=int(cfg["num_hidden_layers"]),
+        n_heads=n_heads,
+        num_kv_heads=int(cfg.get("num_key_value_heads") or n_heads),
+        head_dim=int(cfg.get("head_dim") or hidden // n_heads),
+        intermediate=int(cfg["intermediate_size"]),
+        dtype_bytes=_DTYPE_BYTES[dtype],
+        vocab=int(cfg["vocab_size"]),
+    )
+
+
+def predict_dense_graph(
+    model: ModelSpec,
+    hw: HardwareSpec | None = None,
+    batch: BatchConfig | None = None,
+    sharding: ShardingConfig | None = None,
+) -> Graph:
+    """:func:`predict_graph` behind the same signature the other families use.
+
+    ``predict_graph`` models one whole-model decode step: no tensor or expert
+    sharding, no prefill chunk, no draft chain. Each of those is refused here
+    rather than silently dropped — a TP=8 request answered with a TP=1 graph
+    reads as an 8x slower rank, and a prefill request answered with a decode
+    step reads as an absurdly fast prefill. DP is accepted: it replicates the
+    model, so per-rank cost is the single-replica step.
+    """
+    batch = batch or BatchConfig()
+    if sharding is not None and (sharding.tp > 1 or sharding.ep > 1):
+        raise ValueError(
+            f"the dense graph models one unsharded rank; tp={sharding.tp} "
+            f"ep={sharding.ep} is not supported yet"
+        )
+    if batch.is_prefill:
+        raise ValueError("the dense graph models a decode step only; prefill is "
+                         "not supported yet")
+    if batch.speculative_tokens > 0:
+        raise ValueError("the dense graph has no draft model; speculative "
+                         "decoding is not supported")
+    return predict_graph(model, hw, batch)

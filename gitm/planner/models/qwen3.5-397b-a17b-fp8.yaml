@@ -1,0 +1,86 @@
+# Qwen/Qwen3.5-397B-A17B-FP8 — Qwen's own block-fp8 release of
+# qwen3.5-397b-a17b. Same architecture; only precision differs.
+# Source: https://huggingface.co/Qwen/Qwen3.5-397B-A17B-FP8/blob/ea5b4f81096f3901c91dea97f81324302495781d/config.json
+# Read from config.json, model.safetensors.index.json and the safetensors
+# headers of all 94 shards (HTTP Range) at that revision — no traces.
+#
+# config.json differs from the bf16 release only by quantization_config:
+# quant_method fp8, weight_block_size [128, 128], activation_scheme dynamic,
+# and a 372-entry modules_to_not_convert list. Every shape field is identical,
+# so everything shape-related (60-layer schedule, DeltaNet geometry, explicit
+# conv state) is inherited. `op_dtype_overrides` is new here, not merged.
+
+name: Qwen/Qwen3.5-397B-A17B-FP8
+extends: qwen3.5-397b-a17b
+description: >
+  Same 60-layer hybrid as Qwen3.5-397B-A17B (45 gated-DeltaNet, 15 full
+  attention, top-10 of 512 experts plus a shared expert). Block fp8 e4m3
+  (128x128, bf16 scale_inv) on every attention / DeltaNet projection and on
+  routed and shared experts; router, shared-expert gate, in_proj_a/b, conv1d,
+  embedding and lm_head stay bf16. 406.13 GB on disk.
+
+spec:
+  weight_dtype: fp8
+  # modules_to_not_convert names lm_head and every layer's mlp.gate (the
+  # router), and the headers agree: lm_head.weight and mlp.gate.weight are BF16
+  # with no weight_scale_inv. The embedding is bf16 too but is a gather, not an
+  # op the graph emits.
+  # NB: in the hybrid family this changes compute dtype only, not weight bytes
+  # (see unmodelled).
+  op_dtype_overrides:
+    - [moe_router, bf16]
+    - [lm_head, bf16]
+
+provenance:
+  verified:
+    - claim: precision layout read from the headers
+      detail: >
+        F8_E4M3 with a BF16 weight_scale_inv of shape [ceil(out/128),
+        ceil(in/128)] on: self_attn.{q,k,v,o}_proj, linear_attn.{in_proj_qkv,
+        in_proj_z,out_proj}, mlp.shared_expert.*, and every routed expert —
+        which this release stores per expert (experts.N.{gate,up,down}_proj,
+        30,720 per projection) instead of the bf16 release's fused
+        gate_up_proj. BF16 without scales: embed_tokens, lm_head, mlp.gate,
+        shared_expert_gate, in_proj_a/b, conv1d, norms, the whole vision tower
+        and mtp.fc. Hub metadata: F8_E4M3 400,719,609,856 / BF16 2,702,768,432
+        / F32 8,640.
+    - claim: predicted weight bytes against the published checkpoint
+      detail: >
+        total_size 406,125,181,280 B (406.13 GB), equal to the 94 shard headers.
+        model_weight_bytes predicts 397.55 GB, -2.11%. Decomposition from the
+        headers: -6.63 GB MTP layer (fp8 experts), -0.91 GB vision (bf16),
+        -2.03 GB because model_weight_bytes prices the bf16 embedding and
+        lm_head at weight_dtype (it does not consult op_dtype_overrides),
+        -0.13 GB router likewise, -0.05 GB
+        small DeltaNet tensors, against +1.13 GB from the DeltaNet query
+        over-count inherited from the parent entry and +0.05 GB from scale
+        accounting (next item); the terms sum to the residual within 0.01 GB.
+
+  estimated:
+    - field: DeltaNet input-projection width
+      value: over-counted by 6144 x 4096 per DeltaNet layer, carried from qwen3.5-397b-a17b
+      detail: 1.13 GB at fp8 across 45 layers; needs the shared-code fix noted in the parent.
+    - field: linear_conv_state_dtype
+      value: bf16, carried from qwen3.5-397b-a17b
+      detail: >
+        The fp8 checkpoint does not change the state dtypes; conv state in the
+        model dtype, recurrent state fp32 (mamba_ssm_dtype).
+    - field: weight scale storage
+      value: fp8_block128 prices a 4-byte scale per 128x128 block
+      detail: >
+        The checkpoint stores weight_scale_inv as BF16 (2 bytes). ~24.5M blocks
+        x 2 B = ~0.05 GB over the whole model, a +0.01% over-count — recorded,
+        not corrected.
+
+  unmodelled:
+    - The MTP draft layer, 6.63 GB by header sum (fp8 per-expert bank + bf16
+      mtp.fc). Not in model_weight_bytes.
+    - Vision tower and merger, 0.91 GB bf16.
+    - Per-op storage width. In this family op_dtype_overrides sets an op's
+      compute dtype only; weight bytes everywhere (model_weight_bytes and the
+      moe_router / lm_head nodes, which take ww = weight_bytes(weight_dtype))
+      stay at fp8 width. So the bf16 embedding/lm_head/router are priced at
+      half their stored bytes — -2.16 GB resident, and the lm_head node's
+      weight read (2.03 GB / tp) under-priced 2x. Needs a shared-code change (stored dtype per op, as
+      glm_graph's stored_dtype_overrides); the overrides here are still the
+      correct declaration for when it lands.

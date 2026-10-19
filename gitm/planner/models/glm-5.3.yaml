@@ -1,0 +1,121 @@
+# zai-org/GLM-5.3 — GlmMoeDsaForCausalLM; the 744B model, NOT GLM-5.3-Flash.
+# Source: https://huggingface.co/zai-org/GLM-5.3/blob/main/config.json
+# Read from config.json, model.safetensors.index.json and the safetensors
+# headers of model-00001, -00081, -00101, -00136 and -00138-of-00141 — no traces.
+#
+# Field-by-field against glm-5.2 / glm-5.2-fp8: config.json is identical to
+# zai-org/GLM-5.2-FP8's in every key except transformers_version (5.12.0 ->
+# 5.15.0) — indexer_types, index_topk_freq 4, index_skip_topk_offset 3,
+# mlp_layer_types, rope_theta 8e6, max_position_embeddings 1,048,576,
+# moe_router_dtype float32 and the whole quantization_config, including the
+# 669-entry modules_to_not_convert list. model.safetensors.index.json is
+# byte-identical to GLM-5.2-FP8's (755,617,140,416 B, 118,629 tensors, 141
+# shards) while all 141 shard LFS oids differ, and the README says it outright:
+# "GLM-5.3 uses the same base model as GLM-5.2 — every gain comes from
+# post-training." There is no bf16 GLM-5.3 and no GLM-5.3-FP8 repo: this repo IS
+# the fp8 release. Hence `extends: glm-5.2-fp8`.
+#
+# One deliberate departure from the base entry, in precision only: the shard
+# headers show the indexer's wq_b and wk as F8_E4M3 with F32 weight_scale_inv
+# (only weights_proj is BF16), and mlp.gate.weight stored BF16. glm-5.2-fp8
+# prices the whole indexer bf16 and stores the router fp32. Both GLM-5.2-FP8 and
+# this checkpoint have the same headers, so this entry writes the header reading
+# and the base entry is the one that wants the same correction.
+
+name: zai-org/GLM-5.3
+family: glm_moe_dsa
+extends: glm-5.2-fp8
+description: >
+  GLM-5.3: post-trained GLM-5.2 on the identical architecture. 78 layers,
+  hidden 6144, MLA with a DSA indexer on 21 layers (IndexShare period 4 past
+  the dense prefix), 256-expert top-8 MoE after 3 dense layers, one MTP head.
+  FP8 e4m3 128x128 blocks for the backbone, experts and the indexer's wq_b/wk;
+  lm_head, embeddings, eh_proj and the indexer gate bf16; router computed fp32
+  from bf16 storage.
+
+spec:
+  # Replaces the inherited list (extends merges spec keys, so a list is
+  # replaced, not appended). Dropped vs glm-5.2-fp8: [attn_index_proj, bf16] —
+  # modules_to_not_convert names "indexers_proj" and indexer.k_norm, not wq_b or
+  # wk, and the headers show those two F8_E4M3. Kept: the bf16 skip-list ops
+  # and the fp32 router compute (moe_router_dtype float32).
+  op_dtype_overrides:
+    - [embed_tokens, bf16]
+    - [lm_head, bf16]
+    - [mtp_eh_proj, bf16]
+    - [moe_router, fp32]
+  # Storage, from the headers: the router weight is BF16 [256, 6144] (cast to
+  # fp32 at run time), the indexer gate weights_proj BF16 [32, 6144].
+  stored_dtype_overrides:
+    - [moe_router, bf16]
+    - [attn_index_weights_proj, bf16]
+  # Inherited unchanged and worth naming: indexer_types (21 full / 57 shared),
+  # index_topk_freq 4, first_k_dense_replace 3, index_share_for_mtp_iteration
+  # true, weight/expert dtype fp8, act bf16, kv_dtype fp8 (a serving choice
+  # taken from the GLM-5.2-FP8 recipe; see estimated).
+
+provenance:
+  verified:
+    - claim: config and weight map are GLM-5.2-FP8's
+      detail: >
+        config.json diff against zai-org/GLM-5.2-FP8: transformers_version only
+        (modules_to_not_convert compared as sets). model.safetensors.index.json
+        is byte-identical (cmp). All 141 shard oids differ — new weights.
+    - claim: IndexShare is read from the weight map
+      detail: >
+        *.indexer.* tensors on exactly layers 0,1,2,6,10,...,74 and MTP layer
+        78 — the 21 'full' entries of indexer_types plus the MTP block — and on
+        none of the 57 'shared' layers.
+    - claim: precision per tensor kind is read from real headers
+      detail: >
+        F8_E4M3 + F32 weight_scale_inv: q_a_proj, kv_b_proj [28672, 512],
+        o_proj [6144, 16384], experts, indexer.wq_b [4096, 2048],
+        indexer.wk [128, 6144] (layers 0, 6, MTP 78). BF16: lm_head,
+        embed_tokens, eh_proj [6144, 12288], indexer.weights_proj, k_norm,
+        mlp.gate.weight. F32: e_score_correction_bias.
+    - claim: predicted weight bytes vs the published checkpoint
+      detail: >
+        total_size 755,617,140,416 B across 141 shards. model_weight_bytes
+        predicts 755,454,083,168 B: -0.022%. The inherited glm-5.2-fp8 dtypes
+        would predict 755,885,787,296 B (+0.036%); the 431.7 MB between them is
+        the router stored bf16 not fp32 (-239.1 MB) and 21 indexers' wq_b/wk at
+        fp8 not bf16 (-192.6 MB). Both readings are inside 0.05%, so the total
+        alone cannot pick between them; the headers do.
+
+  estimated:
+    - field: kv_dtype
+      value: fp8 (inherited from glm-5.2-fp8)
+      detail: >
+        A deployment choice, not in the checkpoint. The GLM-5.2-FP8 recipe sets
+        --kv-cache-dtype fp8; the GLM-5.3 vLLM recipe page was not read
+        line-by-line for this model's command. Set bf16 for the conservative
+        cache.
+    - field: index_share_for_mtp_iteration
+      value: true, as config.json states
+      detail: >
+        The MTP layer nonetheless ships its own indexer tensors (as on
+        GLM-5.2); priced as reusing the main model's selection.
+    - field: MLA absorption (attn_kv_b vs attn_out_proj width)
+      value: unabsorbed — kv_b runs as its own GEMM, o_proj narrow
+      detail: Same reading as glm-5.2-fp8; resident weights unchanged.
+
+  open:
+    - question: what index_skip_topk_offset 3 does
+      detail: >
+        Present (=3) on both GLM-5.2 and GLM-5.3; not a spec field and not
+        read by this family. 3 equals first_k_dense_replace and the length of
+        the all-'full' prefix, so a plausible reading is that the first 3
+        layers bypass top-k selection (attend densely), but no modeling code
+        was read to confirm it. If so, layers 0-2 attention cost grows with
+        context instead of capping at 2048 — a long-context underestimate on 3
+        of 78 layers.
+
+  unmodelled:
+    - index_skip_topk_offset (see open). The family caps every layer's core
+      read at index_topk.
+    - rope_theta 8e6 / max_position_embeddings 1,048,576 — not spec fields.
+    - The indexer gate runs bf16 but the graph prices all three indexer
+      projections at the attn_index_proj dtype (fp8). Under 2% of indexer bytes.
+    - MTP eh_proj weight bytes (151 MB bf16), absent from model_weight_bytes.
+    - index_topk_freq as temporal reuse across decode steps; absorbed-MLA
+      decode; MTP acceptance rate; expert-capacity padding.

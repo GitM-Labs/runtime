@@ -1,0 +1,260 @@
+# moonshotai/Kimi-K3 — KimiK3ForConditionalGeneration; text_config is
+# KimiLinearForCausalLM (model_type kimi_linear): KDA linear attention + gated
+# MLA + latent MoE + Attention Residuals.
+# Source: https://huggingface.co/moonshotai/Kimi-K3/blob/f831ab66814297da540d832a5235f8e904f29d06/config.json
+# Read from config.json, README.md, configuration_kimi_k3.py,
+# modeling_kimi_linear.py, model.safetensors.index.json (497,220 tensors, 96
+# shards) and the safetensors headers of shards 00001, 00002, 00004, 00094,
+# 00095 and 00096 at that revision — no traces.
+#
+# Family note: NO family fits. 69 of 93 layers are KDA linear attention (fixed
+# recurrent state, no KV cache) and 24 are gated MLA; the routed experts run in
+# a 3584-wide latent space behind a per-token down/up projection pair. `hybrid`
+# has the linear layers but GQA instead of MLA and no expert precision (it
+# would price 1.45 TB of MXFP4 experts at bf16, 3.76x). `glm_moe_dsa` has MLA,
+# per-op precision and MXFP4 experts but no linear layer kind on this branch
+# (the fix exists only on origin/fix/glm53-flash-kda-layers, c51462d). This
+# entry takes `glm_moe_dsa` with the Kimi-K2.5 no-indexer trick and prices
+# every layer as MLA. The latent MoE is carried by two STAND-IN fields that are
+# exact for weight bytes and FLOPs (see moe_intermediate_size below). Every
+# known error is under provenance.unmodelled, with size and sign; the full
+# ledger and the code-change proposal are in docs/kimi-k3/DESIGN-NOTE.md.
+#
+# DO NOT use this entry's KV rate, long-context output, or batch-1 decode time
+# for this model until the KDA layer kind lands (design note §5).
+
+name: moonshotai/Kimi-K3
+family: glm_moe_dsa
+description: >
+  93 layers, hidden 7168, 2.78T total / ~104B active per token (README: 2.8T /
+  104B; re-derived 2,779.9B incl. the 0.45B vision tower and projector, 104.2B
+  active excluding the input embedding). 69 KDA
+  linear-attention layers and 24 gated MLA layers (0-indexed 3, 7, ..., 91,
+  92 — the config lists are 1-indexed). Layer 0 dense FFN (33792), layers 1-92
+  MoE: 896 routed experts, sigmoid top-16, two shared experts (6144 wide at
+  hidden 7168). Routed experts are latent: a per-layer 7168->3584 down-proj,
+  experts at 3584 x 3072, RMSNorm, 3584->7168 up-proj. Attention Residuals
+  (block 12). SiTU-GLU activation. Routed experts MXFP4 (e2m1, e8m0 scale per
+  32); attention, shared experts, dense FFN, latent projections, router,
+  embeddings and lm_head bf16. No MTP. Vision tower out of scope for a text
+  decode step.
+
+spec:
+  hidden: 7168
+  n_layers: 93
+  vocab: 163840
+
+  # Gated MLA, on the 24 MLA layers only (this family applies it to all 93 —
+  # see unmodelled). kv_a_proj_with_mqa is [576, 7168] in the shard-00004
+  # header, so the cached entry is the 512 latent plus a 64-wide decoupled key.
+  # mla_use_nope is true and the code asserts it (rotary_emb = None): the 64
+  # "rope" dims are cached but never rotated. q_b_proj [18432, 1536] = 96 x 192,
+  # kv_b_proj [24576, 512] = 96 x (128 + 128). num_key_value_heads 96 is the
+  # usual MLA red herring. The output gate g_proj [12288, 7168] has no field
+  # here (unmodelled).
+  n_heads: 96
+  q_lora_rank: 1536
+  kv_lora_rank: 512
+  qk_nope_head_dim: 128
+  qk_rope_head_dim: 64
+  v_head_dim: 128
+
+  # No DeepSeek Sparse Attention. Same trick as kimi-k2.5: zero indexer heads,
+  # every layer 'shared' (no indexer node, weights or index keys — the weight
+  # map has no indexer tensors), and index_topk = max_position_embeddings
+  # (1,048,576) so min(kv_len, index_topk) never binds and attention is dense.
+  index_n_heads: 0
+  index_head_dim: 0
+  index_topk: 1048576
+  indexer_types: [
+    shared, shared, shared, shared, shared, shared, shared, shared, shared, shared,
+    shared, shared, shared, shared, shared, shared, shared, shared, shared, shared,
+    shared, shared, shared, shared, shared, shared, shared, shared, shared, shared,
+    shared, shared, shared, shared, shared, shared, shared, shared, shared, shared,
+    shared, shared, shared, shared, shared, shared, shared, shared, shared, shared,
+    shared, shared, shared, shared, shared, shared, shared, shared, shared, shared,
+    shared, shared, shared, shared, shared, shared, shared, shared, shared, shared,
+    shared, shared, shared, shared, shared, shared, shared, shared, shared, shared,
+    shared, shared, shared, shared, shared, shared, shared, shared, shared, shared,
+    shared, shared, shared,
+  ]
+
+  # Mixture of experts — LATENT. Read from the shard-00002 header:
+  #   routed_expert_down_proj  [3584, 7168] bf16   once per token, 7168 -> 3584
+  #   experts.N.w1/w3          [3072, 3584] mxfp4  (packed U8 [3072, 1792])
+  #   experts.N.w2             [3584, 3072] mxfp4  (packed U8 [3584, 1536])
+  #   routed_expert_norm       [3584]              RMSNorm on the combined output
+  #   routed_expert_up_proj    [7168, 3584] bf16   once per token, 3584 -> 7168
+  #   shared_experts.*         [6144, 7168] / [7168, 6144] bf16 — FULL width
+  #
+  # The family has one width (`hidden`) for every expert. STAND-IN: the routed
+  # expert is 3 x 3584 x 3072 = 33,030,144 weights; 3 x 7168 x 1536 is the same
+  # number, and so is 6 x 3584 x 3072 = 6 x 7168 x 1536 FLOPs per token per
+  # expert. moe_intermediate_size 1536 is therefore exact for the routed
+  # experts' weight bytes and MACs — but it is NOT the model's 3072, and the
+  # activation-side terms (dispatch/combine width, intermediate) are priced at
+  # the wrong shape (unmodelled). The shared expert is one 6144-wide MLP
+  # (moe_intermediate_size 3072 x num_shared_experts 2) at hidden 7168; the
+  # family prices shared as n_shared x 3 x hidden x moe_intermediate, so
+  # n_shared_experts 4 x 1536 = 6144 reproduces it exactly. Both fields
+  # revert to 3072 / 2 once the family carries routed_expert_hidden_size.
+  n_routed_experts: 896
+  n_shared_experts: 4               # STAND-IN for 2 x 3072 (exact, see above)
+  num_experts_per_tok: 16
+  moe_intermediate_size: 1536       # STAND-IN for 3072 in a 3584-wide latent (exact bytes/FLOPs)
+  intermediate_size: 33792
+  first_k_dense_replace: 1
+  routed_scaling_factor: 1.0
+
+  # num_nextn_predict_layers 0 and the weight map carries no nextn/mtp tensors.
+  num_nextn_predict_layers: 0
+
+  # Precision, read from the headers. Routed experts: compressed-tensors
+  # mxfp4-pack-quantized, weight_packed U8 (2 e2m1 per byte) + weight_scale U8
+  # (e8m0) per 32 = 0.53125 B/weight, exactly the roofline `mxfp4` entry. The
+  # quantization_config ignore list keeps self_attn, shared_experts, the dense
+  # mlp, lm_head and the vision tower out; the header confirms BF16 for those
+  # plus the router, latent projections and attn_res vectors (F32: A_log,
+  # dt_bias, convs, o_norm, e_score_correction_bias). The README says "MXFP8
+  # activations (QAT)" — the activation side is the engine's choice; act_dtype
+  # stays bf16 and roofline.resolve_execution decides the expert MAC peak.
+  weight_dtype: bf16
+  expert_dtype: mxfp4
+  kv_dtype: bf16                    # kv_cache_scheme null; no deployment recipe pinned
+  act_dtype: bf16
+  op_dtype_overrides:
+    - [moe_shared, bf16]
+
+provenance:
+  verified:
+    - claim: stored bytes close exactly against total_size
+      detail: >
+        model.safetensors.index.json total_size is 1,560,860,324,864 B across
+        96 shards (1.561 TB, 1,453.7 GiB). Shapes and dtypes from the headers of
+        shards 00001 (layer 0: KDA + dense FFN), 00002 (layer 1: KDA + MoE),
+        00004 (layer 3: MLA + MoE), 00094 (embed, lm_head, final norms), 00095
+        (mm_projector) and 00096 (vision tower), applied per layer kind to all
+        497,220 tensors in the weight map, sum to 1,560,860,324,864 B: residual
+        0 B. Routed experts are 92.67% of it. Ledger in the design note, §2.
+    - claim: the layer schedule is 69 KDA + 24 MLA; config lists are 1-indexed
+      detail: >
+        configuration_kimi_k3.py is_kda_layer tests (layer_idx + 1) in
+        kda_layers. The weight map agrees: self_attn.A_log on 0-indexed layers
+        {0,1,2,4,5,6,...,90} (69) and kv_a_proj_with_mqa on {3,7,...,91,92} (24)
+        — exactly the config lists minus one. Layer 0 is KDA, not absent; both
+        lists omit 0 only because they count from 1. The last two layers (91,
+        92) are both MLA — the 3:1 pattern breaks at the end.
+    - claim: latent MoE shapes and the stand-in are exact for weights and FLOPs
+      detail: >
+        Header shard 00002: w1/w3 [3072, 3584], w2 [3584, 3072] (logical, from
+        packed U8 [.., 1792]/[.., 1536]); routed_expert_down_proj [3584, 7168],
+        routed_expert_up_proj [7168, 3584], routed_expert_norm [3584]; shared
+        experts [6144, 7168]. modeling_kimi_linear.py KimiSparseMoeBlock runs
+        down_proj once per token before dispatch and norm + up_proj once after
+        combine; shared experts see the full-width input. Planner routed expert
+        bytes with the stand-in: 1,446,456,066,048 B = the ledger's routed
+        expert class to the byte.
+    - claim: total and active parameters reproduce the README
+      detail: >
+        2,779.93B total: 2,722.74B routed experts (logical, 2 e2m1 per packed
+        byte), 56.74B other text weights, 0.447B vision tower + mm_projector
+        (README "2.8T", vision "401M"). Active per token: 16/896 of the experts
+        (48.62B) + the text non-expert weights (attention 36.19B — KDA 30.62B,
+        MLA 5.57B — shared 12.16B, latent proj 4.73B, embed + lm_head 2.35B,
+        dense 0.95B, router 0.59B) = 105.36B, or 104.19B without the input
+        embedding table (README "104B").
+    - claim: predicted weight bytes (model_weight_bytes) and what the gap is made of
+      detail: >
+        1,504,904,085,504 B (-3.585% against total_size). The
+        -55,956,239,360 B breaks down exactly, to the byte: KDA priced as MLA
+        on 69 layers (-41,370,571,776), the MLA output gate g_proj plus the two
+        MLA norms on 24 layers (-4,227,956,736), the latent down/up projections
+        and norm (-9,454,620,672), the vision tower and mm_projector
+        (-894,717,952), attn_res vectors, layer norms and final norms
+        (-8,042,496), and the router's F32 e_score_correction_bias
+        (-329,728). Routed experts, shared experts, dense FFN, embed and
+        lm_head are exact. Design note §3.
+
+  estimated:
+    - field: kv_dtype
+      value: bf16
+      detail: >
+        The checkpoint declares no KV scheme and no deployment recipe is
+        pinned. An fp8 KV engine halves the MLA latent bytes.
+    - field: moe_router precision
+      value: bf16 (follows weight_dtype)
+      detail: >
+        gate.weight is BF16 [896, 7168] in the header; the config names no
+        router dtype. Engines typically score in fp32; 6.4M weights per layer.
+    - field: MLA absorption (attn_kv_b vs attn_out_proj width)
+      value: unabsorbed — kv_b runs as its own GEMM, o_proj narrow
+      detail: >
+        Same reading as kimi-k2.5. Resident weights do not change.
+    - field: expert MAC precision
+      value: whatever roofline.resolve_execution picks for mxfp4 on the SKU
+      detail: >
+        README says MXFP4 weights / MXFP8 activations (QAT). A W4A8 engine path
+        would run fp8 MACs; a Marlin-style W4A16 path bf16. Settle against the
+        first capture.
+
+  open:
+    - question: engine, version, parallelism, GPU type
+      detail: >
+        UNVERIFIED. 1.56 TB of weights needs >= 16 x H200 / 8 x B300 / 8 x
+        MI355X (288 GB) before KV and KDA state. No vendor recipe was read.
+    - question: how the engine lays out Attention Residuals
+      detail: >
+        The reference keeps a [tokens, n_blocks, 7168] block_residual tensor
+        (up to 9 blocks at block size 12 over 93 layers + embedding) and does a
+        softmax over n_blocks+1 vectors twice per layer, in fp32. A fused
+        engine kernel may never materialise it. Decode cost is negligible;
+        prefill cost depends on this (design note §4).
+    - question: KDA state precision in the engine
+      detail: >
+        Reference keeps the recurrent state fp32 (96 x 128 x 128 x 4 B =
+        6.29 MB per layer per sequence, 434 MB over 69 layers). A bf16 state
+        halves it.
+
+  unmodelled:
+    - >
+      KDA linear attention on 69 layers, priced as MLA. Weights: a KDA layer
+      is 887.8 MB bf16 (q/k/v/g/o 5 x 12288 x 7168, f_a/f_b low-rank forget
+      gate, b_proj, three depthwise convs) against the 288.2 MB this family
+      prices for an ungated MLA layer: -599.6 MB/layer, -41.37 GB total
+      (-2.65% of the checkpoint). At decode that weight traffic is paid every
+      step: batch-1 decode bytes come out 82.9 GB against a hand ledger of
+      138.1 GB (-40%); -7.6% at batch 32 and -5.0% at batch 256 (8k context),
+      where the exact expert term dominates (design note §3.2).
+      KV: the latent KV rate comes out 93/24 = 3.875x too high (107,136 vs
+      27,648 B/token at bf16), and the fixed KDA state (434.1 MB recurrent
+      fp32 + 15.3 MB conv per sequence) is absent. Per-sequence memory from
+      this entry is too low below ~5.7k tokens of context and too high above
+      it (3.8x at 1M); at batch 32 / 128k context decode bytes come out +28%.
+    - >
+      Gated MLA output gate. g_proj [12288, 7168] bf16 on all 24 MLA layers
+      (176.2 MB/layer, -4.23 GB) and its GEMM (2 x 7168 x 12288 FLOPs/token)
+      are absent.
+    - >
+      Latent MoE projections. routed_expert_down_proj and up_proj (2 x 3584 x
+      7168 bf16 = 102.8 MB/layer, 9.45 GB over 92 layers) are absent from the
+      weights and from the graph (2 x 2 x 3584 x 7168 = 102.8 MFLOP/token per
+      layer). The stand-in fields price the expert dispatch/combine and EP
+      all-to-all at 7168 wide where the model moves 3584 (2x over on those
+      activation terms), and the per-expert intermediate at 1536 where it is
+      3072 (2x under). With hw set, expert_pad_factor sees (7168, 1536/shards)
+      instead of (3584, 3072/shards): identical at TP 1, 2, 8 and under EP,
+      but +33% resident expert bytes at TP4 (384 pads to 512; the real 768
+      does not) and 2x at TP16 (96 -> 256 against 192 -> 256).
+    - >
+      Attention Residuals (attn_res_block_size 12). Two softmax-weighted sums
+      over up to 9 stored block states per layer, plus an output one; 5.3 MB of
+      weights. No node exists. Negligible at decode (0.42 GB of a ~780 GB step at batch
+      32); the reference layout streams 906 hidden vectors = 13.0 MB of bf16
+      activations per token over the stack, 106 GB per 8,192-token prefill
+      chunk.
+    - >
+      SiTU-GLU (beta 4, linear_beta 25) is priced as SwiGLU. Same FLOP class
+      (tanh + sigmoid vs sigmoid); no byte effect.
+    - >
+      The vision tower (MoonViT-V2, 27 blocks, hidden 1024, 802.4 MB) and
+      mm_projector (92.3 MB). A text decode step never enters them.

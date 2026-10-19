@@ -1,0 +1,99 @@
+# zai-org/GLM-5-FP8 — the vendor's FP8 release of GLM-5.
+# Source: https://huggingface.co/zai-org/GLM-5-FP8/blob/main/config.json
+# Read from config.json (quantization_config), model.safetensors.index.json and
+# the safetensors headers of model-00001, -00081 and -00138-of-00142 — no traces.
+#
+# Identical architecture to `glm-5`, which this extends: config.json differs
+# from the bf16 release only by quantization_config, and the weight map names
+# the same tensors plus one weight_scale_inv per quantised matrix. Everything
+# not listed below is inherited.
+
+name: zai-org/GLM-5-FP8
+family: glm_moe_dsa
+extends: glm-5
+description: >
+  GLM-5 quantised to FP8 e4m3 with 128x128 weight blocks. Backbone MLA
+  projections (including kv_b_proj and o_proj), the dense FFN, shared and
+  routed experts AND the indexer's wq_b / wk are fp8; lm_head, embed_tokens,
+  the MTP eh_proj, the indexer's weights_proj and the router stay bf16.
+  No IndexShare: every layer runs its own indexer.
+
+spec:
+  # FP8 e4m3, 128x128 block-scaled, dynamic activation scaling.
+  weight_dtype: fp8
+  expert_dtype: fp8
+
+  # NOT overridden: kv_dtype stays bf16, inherited. The vendor's own vLLM and
+  # SGLang commands in the GLM-5-FP8 README pass no --kv-cache-dtype, so the
+  # cache runs at the model dtype. (glm-5.2-fp8 sets fp8 because ITS recipe
+  # does.) act_dtype stays bf16 as well: activation_scheme "dynamic".
+
+  # From the shard headers, which settle what modules_to_not_convert leaves
+  # ambiguous. modules_to_not_convert names "indexers_proj" and indexer.k_norm
+  # — not indexer.wq_b or indexer.wk — and the header agrees: wq_b
+  # F8_E4M3 [4096, 2048] and wk F8_E4M3 [128, 6144], each with an F32
+  # weight_scale_inv; weights_proj BF16 [32, 6144]. So attn_index_proj runs fp8
+  # (no override) and only the per-head gate is stored wide.
+  # mlp.gate is in the skip list and BF16 on disk; the config declares no
+  # moe_router_dtype, so the router is bf16 — not glm-5.2's fp32.
+  op_dtype_overrides:
+    - [embed_tokens, bf16]
+    - [lm_head, bf16]
+    - [mtp_eh_proj, bf16]
+    - [moe_router, bf16]
+  stored_dtype_overrides:
+    - [attn_index_weights_proj, bf16]
+
+provenance:
+  verified:
+    - claim: predicted weight bytes match the published FP8 checkpoint
+      detail: >
+        total_size 756,162,687,872 B across 142 shards (119,028 tensors, 59,158
+        of them weight_scale_inv). model_weight_bytes predicts 756,009,171,936 B:
+        -0.020%. weight_bytes('fp8') carries one fp32 scale per 128x128 block,
+        which is what the F32 weight_scale_inv tensors are.
+    - claim: the indexer projections are fp8, proven by a byte difference
+      detail: >
+        GLM-5-FP8 minus GLM-5.2-FP8 published totals is 545,547,456 B, and 57
+        indexers with wq_b and wk at 1 B/elem, weights_proj and k_norm at 2 B,
+        and the two F32 scale tensors ([32,16] + [1,48]) is exactly
+        545,547,456 B. Had wq_b/wk been bf16 the difference would be 1.06 GB.
+        (The same headers on GLM-5.2-FP8 show the same fp8 wq_b/wk; the
+        glm-5.2-fp8 entry's attn_index_proj bf16 override does not match them.)
+    - claim: no IndexShare, same as the bf16 release
+      detail: >
+        *.indexer.* tensors on all 78 layers and MTP layer 78 — 79 layers.
+        Inherited schedule; see glm-5.
+    - claim: GLM-5.1-FP8 is shape-identical
+      detail: >
+        zai-org/GLM-5.1-FP8's model.safetensors.index.json is byte-identical
+        to this one, config differs only in transformers_version, all 142
+        shard hashes differ. The glm-5.1-fp8 entry extends this one.
+
+  estimated:
+    - field: kv_dtype
+      value: bf16
+      detail: >
+        Neither the checkpoint nor the vendor's serving commands set an fp8 KV
+        cache. An operator passing --kv-cache-dtype fp8 halves the latent half
+        of each 576-element entry; set kv_dtype fp8 to price that.
+    - field: index_share_for_mtp_iteration
+      value: false (inherited)
+      detail: >
+        The MTP layer ships its own fp8 indexer and the config has no sharing
+        key. See glm-5.
+    - field: MLA absorption (attn_kv_b vs attn_out_proj width)
+      value: unabsorbed — kv_b runs as its own GEMM, o_proj narrow
+      detail: >
+        Same reading as glm-5.2-fp8; resident weights unchanged either way.
+    - field: expert-parallel imbalance
+      value: 1.0 (perfect balance)
+      detail: Trace-calibrated by design; no traces under this constraint.
+
+  unmodelled:
+    - The indexer gate (weights_proj) runs bf16 on the engine but the graph
+      prices all three indexer projections at one op dtype (fp8 here). The gate
+      is 32 x 6144 — under 2% of the indexer's weight bytes.
+    - rope_theta 1e6 / max_position_embeddings 202,752 — not spec fields.
+    - MTP eh_proj weight bytes (151 MB bf16), absent from model_weight_bytes.
+    - Absorbed-MLA decode; MTP acceptance rate; expert-capacity padding.

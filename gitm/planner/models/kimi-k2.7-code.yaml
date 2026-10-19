@@ -1,0 +1,82 @@
+# moonshotai/Kimi-K2.7-Code — the same text model as Kimi K2.5
+# (KimiK25ForConditionalGeneration wrapping DeepseekV3ForCausalLM, model_type
+# kimi_k2), same int4 g32 compressed-tensors precision. New weights, same
+# architecture and same storage layout.
+# Source: https://huggingface.co/moonshotai/Kimi-K2.7-Code/blob/74797c9c62378b951a1f6fcf5c4631024e9b8bef/config.json
+# Read from config.json, model.safetensors.index.json and the safetensors
+# headers of all 64 shards (HTTP Range) at that revision, diffed against
+# moonshotai/Kimi-K2.5 at 4d01dfe0332d63057c186e0b262165819efb6611 — no traces.
+#
+# Field-by-field diff of the two config.json files (keys sorted): exactly three
+# differences, none of them shape or precision:
+#   - eos_token_id 163585 (K2.5) -> 163586 (K2.7-Code), top level and
+#     text_config. A tokenizer /
+#     chat-template fact; prices nothing.
+#   - quantization_config.ignore: K2.5's "re:vision_tower.*" / "re:mm_projector.*"
+#     became "re:.*vision_tower.*" / "re:.*mm_projector.*". Both match the same
+#     tensors (they are top-level names), and the vision tower is bf16 in the
+#     headers either way.
+# rope_scaling (yarn, factor 64, original 4096, beta 32/1, mscale 1/1),
+# rope_theta 50000, max_position_embeddings 262144, every MLA/MoE dimension,
+# routed_scaling_factor 2.827, num_nextn_predict_layers 0 and the int4 group-32
+# quant scheme are identical. So the entry is `extends: kimi-k2.5` with no spec
+# override at all, including the exact DSA switch-off (index_topk = 262144,
+# every layer 'shared') — no 61-entry schedule duplicated here.
+
+name: moonshotai/Kimi-K2.7-Code
+extends: kimi-k2.5
+description: >
+  Code-tuned Kimi checkpoint with the K2.5 text architecture verbatim: 61
+  layers, hidden 7168, dense MLA (kv_lora_rank 512, no sparse-attention
+  indexer), layer 0 dense FFN, layers 1-60 MoE (384 experts, sigmoid top-8,
+  one shared). Routed experts int4 (compressed-tensors W4A16, group 32);
+  attention, shared expert, dense FFN and lm_head bf16. No MTP head. Vision
+  tower out of scope for a text decode step.
+
+spec: {}
+
+provenance:
+  verified:
+    - claim: text shape and quantisation are identical to kimi-k2.5
+      detail: >
+        Sorted-key diff of config.json against Kimi-K2.5 shows only eos_token_id
+        (163586 here vs 163585) and the anchoring of two vision ignore regexes.
+        text_config hidden_size 7168, num_hidden_layers 61, num_attention_heads
+        64, q_lora_rank 1536, kv_lora_rank 512, qk_nope/rope/v 128/64/128,
+        n_routed_experts 384, num_experts_per_tok 8, n_shared_experts 1,
+        moe_intermediate_size 2048, intermediate_size 18432,
+        first_k_dense_replace 1, vocab_size 163840, num_nextn_predict_layers 0,
+        rope_scaling yarn factor 64 — all equal.
+    - claim: identical tensor inventory and per-dtype parameter counts
+      detail: >
+        model.safetensors.index.json lists the same 208,550 tensor names in the
+        same 64 shards as K2.5 (the files differ only in key order); no
+        indexer, nextn or eh_proj tensors. Hub safetensors metadata: I32
+        1,014,686,023,680 / BF16 12,193,329,648 / F32 23,040 — equal to K2.5's
+        to the parameter. Shard headers: experts.*.{gate,up}_proj.weight_packed
+        I32 [2048, 896] and down_proj [7168, 256] (8 int4 per int32), bf16
+        weight_scale [2048, 224] / [7168, 64] (one per 32 inputs).
+    - claim: predicted weight bytes match the published checkpoint
+      detail: >
+        total_size 595,148,192,736 B (595.15 GB), equal to K2.5's and to the
+        sum of the 64 shard headers. model_weight_bytes predicts 594.20 GB
+        (-0.16%), identical to kimi-k2.5's prediction since the spec is
+        inherited unchanged. The residual is the unmodelled 0.94 GB vision
+        tower + mm_projector (summed from the headers).
+
+  estimated:
+    - field: MLA absorption (attn_kv_b vs attn_out_proj width)
+      value: unabsorbed, carried from kimi-k2.5
+      detail: >
+        Same reading and same caveat as kimi-k2.5: right for prefill, decode
+        engines absorb W_UK/W_UV and launch no kv_b GEMM.
+    - field: moe_router precision
+      value: bf16 (follows weight_dtype; no override), carried from kimi-k2.5
+      detail: Engines typically score in fp32 at run time; ~2.75M weights per layer.
+
+  unmodelled:
+    - The vision tower (MoonViT, 27 layers, hidden 1152) and mm_projector,
+      0.94 GB bf16 by header sum. Resident but idle for text requests.
+    - Anything code-specific about how this checkpoint is served (longer
+      typical prompts, different speculative drafts). The architecture is
+      unchanged, so differences show up in the workload, not the graph.

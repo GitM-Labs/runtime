@@ -87,9 +87,12 @@ def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None):
         from gitm.planner.moe_graph import spec_from_hf_config as _sparse
 
         return _sparse(cfg, name=name)
-    raise NotImplementedError(
-        "no config reader for the dense family yet — build a ModelSpec directly"
-    )
+    # The dense reader refuses (DenseConfigUnsupported, a ValueError and a
+    # NotImplementedError) anything it cannot price exactly: detect_family's
+    # "dense" is a fallback, not a positive identification.
+    from gitm.planner.graph import spec_from_hf_config as _dense
+
+    return _dense(cfg, name=name)
 
 
 def predict_for_config(
@@ -105,7 +108,9 @@ def predict_for_config(
     Raises
     ------
     NotImplementedError
-        For the dense family, which has no config reader. Deliberately an
+        For a config that falls through to the dense family but is not a plain
+        dense transformer (or omits a shape the dense graph needs). The raised
+        ``DenseConfigUnsupported`` is also a ``ValueError``. Deliberately an
         exception rather than a silently generic graph: a dense prediction for a
         checkpoint whose shape was never read would produce residuals against a
         model of something else.
@@ -127,12 +132,10 @@ def predict_for_config(
         from gitm.planner.moe_graph import spec_from_hf_config as _sparse
 
         return predict_moe_graph(_sparse(cfg, name=name), hw, batch, sharding), family
-    raise NotImplementedError(
-        f"{name or 'this checkpoint'} is neither a hybrid linear-attention MoE, a "
-        "GLM-5.2-class glm_moe_dsa, nor a DeepSeek-V4-class sparse-MoE checkpoint. The "
-        "dense graph models it, but has no config reader — construct a ModelSpec and "
-        "call predict_graph directly."
-    )
+    from gitm.planner.graph import predict_dense_graph
+    from gitm.planner.graph import spec_from_hf_config as _dense
+
+    return predict_dense_graph(_dense(cfg, name=name), hw, batch, sharding), family
 
 
 # ── ``gitm plan``: the CLI front for everything above ───────────────────────
@@ -249,8 +252,6 @@ def _load(model: str) -> tuple[Any, str, str]:
     if cfg_path.suffix == ".json" and cfg_path.is_file():
         cfg = json.loads(cfg_path.read_text())
         family = detect_family(cfg)
-        if family == "dense":
-            return None, family, "config.json (no provenance)"
         # Named by what the caller asked for, not by the file that answered. A
         # directory is how a local checkpoint is identified; reporting every one
         # of them as `.../config.json` makes two of them indistinguishable in the
@@ -273,6 +274,10 @@ def _predict(spec, family: str, hw, batch, sharding):
         from gitm.planner.glm_graph import predict_glm_graph
 
         return predict_glm_graph(spec, hw, batch, sharding)
+    if family == "dense":
+        from gitm.planner.graph import predict_dense_graph
+
+        return predict_dense_graph(spec, hw, batch, sharding)
     from gitm.planner.moe_graph import predict_moe_graph
 
     return predict_moe_graph(spec, hw, batch, sharding)
@@ -442,11 +447,6 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, ValueError) as e:
         print(f"cannot plan: {e}")
         return 2
-    if family == "dense":
-        print(f"cannot plan: {args.model} resolves to the dense family, which has no "
-              "config reader. Build a ModelSpec and call predict_graph directly.")
-        return 2
-
     if args.kv_cache_dtype != "auto":
         from dataclasses import fields as _fields
         from dataclasses import replace as _replace_spec
@@ -486,11 +486,15 @@ def main(argv: list[str] | None = None) -> int:
               f"kv_len={args.kv_len}, TP={args.tp} EP={args.ep}")
         print(f"  {'batch':>7s} {'ms/step':>10s} {'tok/s':>12s} {'compute-bound':>14s}")
         for b in sizes:
-            g = _predict(spec, family, hw,
-                         BatchConfig(batch=b, kv_cache_len=args.kv_len,
-                                     speculative_tokens=args.spec_tokens,
-                                     acceptance_rate=args.acceptance_rate),
-                         sharding)
+            try:
+                g = _predict(spec, family, hw,
+                             BatchConfig(batch=b, kv_cache_len=args.kv_len,
+                                         speculative_tokens=args.spec_tokens,
+                                         acceptance_rate=args.acceptance_rate),
+                             sharding)
+            except ValueError as e:
+                print(f"cannot plan: {e}")
+                return 2
             cb = sum(1 for n in g.nodes if n.prediction.bound == "compute")
             print(f"  {b:7d} {g.total_pred_s * 1e3:9.3f} "
                   f"{b / g.total_pred_s:12,.0f} {cb:9d}/{len(g.nodes)}")

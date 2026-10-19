@@ -1,0 +1,162 @@
+# openai/gpt-oss-120b — GptOssForCausalLM (model_type gpt_oss): alternating
+# sliding-window (128) / full GQA attention with learned sinks, 128-expert MoE,
+# MXFP4 experts and bf16 everything else.
+# Source: https://huggingface.co/openai/gpt-oss-120b/blob/b5c939de8f754692c1647ca79fbf85e8c1e70f8a/config.json
+# Read from config.json, model.safetensors.index.json and ALL 15 safetensors
+# shard headers (HTTP Range) at that revision. No engine source, no trace.
+#
+# Family note — READ BEFORE TRUSTING A DECODE NUMBER. The hybrid family prices
+# every weight's BYTES at one `weight_dtype`; `op_dtype_overrides` changes only
+# an op's compute dtype (its roofline ceiling), never its bytes, and there is no
+# expert_dtype field. This checkpoint is 93% MXFP4 experts by bytes and 7% bf16,
+# so one dtype must be wrong somewhere:
+#   * weight_dtype mxfp4 (chosen): experts exact (60.91 GB), the bf16 attention,
+#     router, embedding and lm_head priced at 0.53 B instead of 2 B — 3.76x low.
+#     Weight footprint -4.9%; decode attention-projection and lm_head node bytes
+#     3.76x low.
+#   * weight_dtype bf16: non-experts exact, experts 3.76x high. Footprint +258%.
+# The overrides below at least put those ops on the right compute ceiling. The
+# code change that removes the compromise is a per-op stored dtype (or an
+# expert_dtype) consumed by model_weight_bytes, _emit_moe, _emit_full_attention
+# and emit_lm_head — see tests/test_catalogue_gqa_moe_new.py.
+
+name: openai/gpt-oss-120b
+family: hybrid
+checkpoint:
+  repository: openai/gpt-oss-120b
+  revision: b5c939de8f754692c1647ca79fbf85e8c1e70f8a
+  config_sha256: 933aeb666a3fd851133ddd7686414f369bc564c4185fb5704416550879f10566
+  index_sha256: ede2655fdc05008561983b6e0829c600727c28d591e071077377059f03a6c00e
+  tensor_count: 687
+  shard_count: 15
+  # Equal to the summed header payload to the byte; shard files add only their
+  # 15 JSON headers (77,440 B).
+  index_total_size: 65248815744
+  payload_bytes: 65248815744
+description: >
+  36 layers, hidden 2880, alternating sliding-window (W=128, even layers) and
+  full attention (odd layers), GQA 64 query / 8 KV heads at head_dim 64 (q_dim
+  4096, wider than hidden), full-width YaRN RoPE, qkv/o biases and a learned
+  attention sink per head on every layer. 128 experts top-4 width 2880, no
+  shared expert, no dense layer. Experts MXFP4 (e2m1 + e8m0 scale per 32, bf16
+  biases); attention, router, embedding and lm_head bf16. 65.25 GB on disk.
+
+spec:
+  hidden: 2880
+  n_layers: 36
+  vocab: 201088
+
+  # Attention: q_proj BF16 [4096, 2880] = 64 x 64, k/v_proj [512, 2880] =
+  # 8 x 64, o_proj [2880, 4096]; every one also has a bias (unmodelled, 576 KB).
+  n_heads: 64
+  num_kv_heads: 8
+  head_dim: 64
+  # No rotary_dim / partial_rotary_factor key: transformers' gpt_oss rotates
+  # the whole head (YaRN, factor 32 over 4096 original positions).
+  partial_rotary_factor: 1.0
+  attn_output_gate: false
+
+  # Sliding window 128 on the even layers; layer_types read verbatim from
+  # config.json (sliding first). Same KV geometry on both kinds, so no swa_*
+  # head overrides.
+  sliding_window: 128
+  layer_types: {pattern: [sliding_attention, full_attention], repeat: 18}
+  full_attention_interval: 2
+  # self_attn.sinks BF16 [64] exists on ALL 36 layers, full ones included. The
+  # field is named for SWA layers only; it prices nothing either way (one add
+  # inside the softmax), so it is recorded for the model's sake.
+  swa_attention_sink: true
+
+  # Mixture of experts. num_local_experts 128, experts_per_token 4,
+  # intermediate_size 2880. gate_up_proj_blocks U8 [128, 5760, 90, 16] — gate
+  # and up fused (2 x 2880 rows), 90 blocks of 32 e2m1 per 2880-wide row — and
+  # down_proj_blocks [128, 2880, 90, 16]: three hidden x 2880 matrices/expert.
+  num_experts: 128
+  num_experts_per_tok: 4
+  moe_intermediate_size: 2880
+  shared_expert_intermediate_size: 0
+
+  mtp_num_hidden_layers: 0          # no MTP in config or weight map
+
+  all_reduces_per_layer: 2          # TP convention — estimated
+
+  # See the family note. mxfp4 = 4-bit payload + one 1-byte e8m0 scale per 32
+  # = 0.53125 B/weight, which is exactly blocks + scales in the headers
+  # (U8 [.., 90, 16] + U8 [.., 90]).
+  weight_dtype: mxfp4
+  act_dtype: bf16
+  kv_dtype: bf16                    # OPEN — serving decision
+  op_dtype_overrides:
+    # quantization_config.modules_to_not_convert: model.layers.*.self_attn,
+    # model.layers.*.mlp.router, model.embed_tokens, lm_head — all BF16 in the
+    # headers. Compute ceiling only; bytes stay at mxfp4 (3.76x low).
+    - [qkv_proj, bf16]
+    - [attn_out_proj, bf16]
+    - [moe_router, bf16]
+    - [lm_head, bf16]
+    - [attn_score_value, bf16]
+
+provenance:
+  verified:
+    - claim: every spec value is read from config.json and confirmed by shard headers
+      detail: >
+        hidden_size 2880, num_hidden_layers 36, num_attention_heads 64,
+        num_key_value_heads 8, head_dim 64, vocab_size 201088,
+        num_local_experts 128, num_experts_per_tok 4 (experts_per_token 4),
+        intermediate_size 2880, sliding_window 128, layer_types alternating
+        sliding/full starting sliding, attention_bias true,
+        tie_word_embeddings false, quant_method mxfp4. Headers: q_proj BF16
+        [4096, 2880], k/v_proj BF16 [512, 2880], o_proj BF16 [2880, 4096],
+        sinks BF16 [64] on all 36 layers, router BF16 [128, 2880] + bias,
+        experts gate_up_proj_blocks U8 [128, 5760, 90, 16] + scales U8
+        [128, 5760, 90] + bias BF16 [128, 5760], down_proj_blocks U8
+        [128, 2880, 90, 16] + scales [128, 2880, 90] + bias [128, 2880],
+        embed_tokens and lm_head BF16 [201088, 2880].
+    - claim: predicted weight bytes against the published checkpoint
+      detail: >
+        model_weight_bytes = 62,044,070,400 B against total_size
+        65,248,815,744 B (-4.91%). The expert term is exact
+        (60,914,073,600 B = blocks + scales in the headers). The residual is
+        the bf16 non-expert weights priced at mxfp4: embed + lm_head
+        2,316,533,760 B priced 615,329,280; attention 1,911,029,760 priced
+        507,617,280; router 26,542,080 priced 7,050,240. The remaining
+        80,636,544 B is exactly the unmodelled bf16 expert biases (79,626,240),
+        qkv/o biases (576,000), norms (420,480), router bias (9,216) and sinks
+        (4,608) — the ledger closes to the byte.
+
+  estimated:
+    - field: weight_dtype
+      value: mxfp4
+      detail: >
+        A forced choice, not a reading: the checkpoint has two storage dtypes
+        and the family has one byte width. mxfp4 keeps the dominant term (93%)
+        exact. See the family note for the direction of every error.
+    - field: all_reduces_per_layer
+      value: 2
+      detail: TP convention, not observed; falsifiable by counting NCCL kernels.
+
+  open:
+    - question: KV cache dtype
+      detail: >
+        Serving decision. bf16: 18 full layers x 8 x 128 = 18,432 elements per
+        token of context, plus 18 windowed layers x 128 x 1,024 fixed per
+        sequence.
+    - question: what kernel runs the MXFP4 experts on a given SKU
+      detail: >
+        Native fp4 on Blackwell; on Hopper vLLM dequantises (W4A16-style), so
+        bytes are mxfp4 but compute is bf16. The roofline's execution-dtype
+        fallback decides the ceiling; not verified against a trace.
+    - question: TP-only or expert parallel
+      detail: Changes every collective row; resolve from the launch args.
+
+  unmodelled:
+    - >
+      Per-op byte precision (the family note): qkv_proj, attn_out_proj,
+      moe_router and lm_head node bytes are 3.76x low; at batch 1 that is
+      3.07 GB of real attention + lm_head weight reads (1.91 + 1.16) priced at
+      0.82 GB.
+    - Attention-sink logits on the FULL-attention layers (field covers SWA only;
+      free either way).
+    - qkv / o_proj / router / expert biases (bias adds, ~80 MB of weights).
+    - swiglu_limit 7.0 clamped SwiGLU and the fused gate_up layout — elementwise
+      and layout, folded into moe_routed.

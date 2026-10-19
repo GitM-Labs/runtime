@@ -1,0 +1,175 @@
+# deepseek-ai/DeepSeek-V4-Flash-0731 — DeepseekV4ForCausalLM (model_type deepseek_v4):
+# compressed sparse attention (CSA ratio 4 + HCA ratio 128) + MoE + mHC, with a
+# three-block DSpark speculative-decoding module attached.
+# Source: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/blob/7872f01b1d1fe23eabc4c98b48bffcef5a386062/config.json
+# Read from config.json, inference/{config.json,model.py}, model.safetensors.index.json
+# and the safetensors headers of all 48 shards at that revision — no traces.
+#
+# NOT the same model as `deepseek-v4.1-flash` (DeepseekV41ForCausalLM: hidden
+# 5120, 40 layers, 384 experts, engram tables, cross-layer KV sharing). This is
+# the official V4-Flash release, structurally DeepSeek-V4-Flash-DSpark.
+#
+# Family note: the SparseMoEModelSpec defaults ARE this backbone — hidden 4096,
+# 43 layers, 64 heads, q_lora_rank 1024, o_lora_rank 1024, o_groups 8, 256
+# experts top-6, moe_intermediate_size 2048, index 64 x 128 top-512, window
+# 128, vocab 129280, fp8/fp4. Only compress_ratios, num_nextn_predict_layers,
+# the mHC fields and num_hash_layers differ from the defaults. Every value is
+# still written out so the entry does not silently follow a default change.
+#
+# Routed experts (94.3% of bytes) are priced exactly; the -2.25% residual is a
+# net of the same offsetting small-term formula errors as the Pro entry,
+# itemised under unmodelled.
+
+name: deepseek-ai/DeepSeek-V4-Flash-0731
+family: sparse_moe
+checkpoint:
+  repository: deepseek-ai/DeepSeek-V4-Flash-0731
+  revision: 7872f01b1d1fe23eabc4c98b48bffcef5a386062
+  config_sha256: 6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023
+  index_sha256: 98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b
+  tensor_count: 72317
+  shard_count: 48
+  index_total_size: 166878536440
+  payload_bytes: 166878536440   # sum of all header data_offsets; equals total_size
+description: >
+  Official release of DeepSeek-V4-Flash (supersedes the Flash preview); a
+  different model from deepseek-v4.1-flash. 43 layers, hidden 4096, 64 query
+  heads over one 512-wide KV head, 256 routed experts top-6 plus one shared
+  expert on every layer; layers 0-2 hash-routed. Layers 0-1 window only, then
+  CSA (ratio 4, indexer top-512) on even layers 2-42 and HCA (ratio 128) on odd
+  layers 3-41. Three DSpark draft blocks (window-only, full 256-expert MoE each)
+  fed by hidden-state taps on layers 40-42. Routed experts fp4 (e2m1, e8m0 per
+  32); attention, shared expert and DSpark main_proj fp8 e4m3 with e8m0
+  128x128 block scales; compressor, router, embedding, lm_head and Markov head
+  bf16; mHC fns fp32. 166.88 GB on disk. Native context 1,048,576.
+
+spec:
+  hidden: 4096
+  n_layers: 43
+  vocab: 129280
+
+  # Attention. head_dim 512 includes the 64 RoPE dims (model.py); headers show
+  # wq_b [32768, 1024] = 64 x 512, wkv [512, 4096], wo_a [8192, 4096] = 8 groups
+  # x 1024 out by 64*512/8 in, wo_b [4096, 8192]. o_lora_rank is per group;
+  # the planner reads it as a total (see unmodelled).
+  n_heads: 64
+  num_kv_heads: 1
+  head_dim: 512
+  qk_rope_head_dim: 64
+  q_lora_rank: 1024
+  o_lora_rank: 1024
+  o_groups: 8
+
+  # Mixture of experts. Routed experts I8-packed fp4 [2048, 2048] / [4096, 1024]
+  # + F8_E8M0 scales per 32 = 0.53125 B/weight, the planner's fp4 rate.
+  n_routed_experts: 256
+  n_shared_experts: 1
+  num_experts_per_tok: 6
+  moe_intermediate_size: 2048
+
+  # Hash routing: layers 0-2 carry tid2eid [129280, 6] and no gate.bias;
+  # gate.weight is stored on all 43.
+  num_hash_layers: 3
+
+  # All 46 ratios kept: 43 layers plus the three window-only DSpark blocks
+  # (layers 43-45 in code). Compressors on layers 2-42 (41), indexers on the 21
+  # ratio-4 layers 2, 4, ..., 42, none on 0-1 or mtp.*.
+  index_n_heads: 64
+  index_head_dim: 128
+  index_topk: 512
+  sliding_window: 128
+  compress_ratios: [
+    0, 0, 4, 128, 4, 128, 4, 128, 4, 128,
+    4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+    4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+    4, 128, 4, 128, 4, 128, 4, 128, 4, 128,
+    4, 128, 4, 0, 0, 0,
+  ]
+
+  # Three DSpark blocks. config.json num_nextn_predict_layers 1 is contradicted
+  # by inference/config.json n_mtp_layers 3, the mtp.0-2 tensors (768 expert
+  # triples = 3 x 256) and three trailing compress_ratios slots.
+  num_nextn_predict_layers: 3
+
+  hc_width: 4
+  hc_sinkhorn_iters: 20
+  hc_blocks_per_layer: 2
+
+  # Empty on purpose: dspark_target_layer_ids [40, 41, 42] are hidden-state taps
+  # concatenated into mtp.0.main_proj [4096, 12288 = 3 x 4096]; layers 40-42
+  # carry no extra tensors. dspark_markov_rank 256 is the Markov head width
+  # (markov_w1/w2 [129280, 256]), not a per-layer rank.
+  dspark_layer_ids: []
+  dspark_markov_rank: 0
+
+  weight_dtype: fp8
+  expert_dtype: fp4
+  kv_dtype: fp8                     # serving assumption, not a checkpoint fact
+  act_dtype: bf16
+
+provenance:
+  verified:
+    - claim: every spec value is read from config.json at the pinned revision
+      detail: >
+        hidden_size 4096, num_hidden_layers 43, num_attention_heads 64,
+        num_key_value_heads 1, head_dim 512, qk_rope_head_dim 64, q_lora_rank
+        1024, o_lora_rank 1024, o_groups 8, vocab_size 129280,
+        n_routed_experts 256, n_shared_experts 1, num_experts_per_tok 6,
+        moe_intermediate_size 2048, num_hash_layers 3, index_n_heads 64,
+        index_head_dim 128, index_topk 512, sliding_window 128, hc_mult 4,
+        hc_sinkhorn_iters 20, compress_ratios (46 entries), expert_dtype fp4,
+        quantization_config fp8 e4m3 [128,128] ue8m0. inference/config.json
+        agrees, except n_mtp_layers 3 vs num_nextn_predict_layers 1.
+    - claim: shapes and dtypes read from every shard header; ledger closes exactly
+      detail: >
+        All 48 headers, 72,317 tensors, sum to 166,878,536,440 B — the index
+        total_size, zero residual. Classes: routed experts 157.44 GB, embed +
+        head 2.12 (BF16), q_b / wo_a / wo_b 1.54 each, shared expert 1.16
+        (F8_E4M3), compressors 0.53 (BF16), indexer 0.28, q_a 0.19, DSpark extras
+        0.18, mHC fns 0.15, router 0.10, wkv 0.10, tid2eid 0.02.
+    - claim: model_weight_bytes vs published total_size
+      detail: >
+        163,128,207,232 B predicted against 166,878,536,440 B published
+        (-2.25%, -3.75 GB). Routed experts match exactly (157.437 GB both).
+        With one MTP block instead of three it would be 156.08 GB (-6.47%) —
+        the same 156 GB moe_graph.model_weight_bytes' docstring quotes for the
+        base V4-Flash. The ~7 GB this checkpoint adds over that base is mostly
+        the two extra blocks' experts, not DSpark-specific tensors (0.18 GB);
+        the docstring's "shape is not public" no longer holds — model.py
+        publishes it.
+
+  estimated:
+    - field: kv_dtype
+      value: fp8
+      detail: >
+        Engine assumption. Reference code: window latent fp8 with bf16 RoPE
+        dims, compressed CSA KV fp4-simulated, indexer keys bf16.
+    - field: num_nextn_predict_layers
+      value: "3"
+      detail: >
+        Weights verified; execution estimated. DSpark drafts dspark_block_size
+        5 positions through all three blocks per step; the graph runs one
+        position per sequence per MTP layer.
+
+  open:
+    - question: serving engine, layout and GPU type
+      detail: >
+        No engine pin, recipe or trace supplied. On Hopper (no fp4 path) the
+        planner falls back for the expert GEMMs and flags it — UNVERIFIED.
+
+  unmodelled:
+    - Grouped output projection. wo_a and wo_b are each 8x low in the planner
+      (o_lora_rank read as a total, not per group), -2.70 GB of weights and
+      attn_out_proj decode traffic under-priced 8x. Fix belongs in moe_graph.
+    - head_dim includes RoPE in this code; q_b and kv_a priced at 576, +12.5%
+      (+0.21 GB).
+    - Indexer weights charged hidden x 64 x 128 on all 46 layers; real indexer
+      (wq_b from the q latent, bf16 weights_proj and compressor) is on 21
+      layers (+1.27 GB over).
+    - Main-attention compressors (bf16, 0.53 GB) have no weight term.
+    - Shared expert fp8 priced fp4 (-0.54 GB); router, embedding, lm_head bf16
+      priced fp8 (-1.11 GB). No per-op dtype override in SparseMoEModelSpec.
+    - DSpark main_proj, Markov and confidence heads (0.18 GB) and the per-draft
+      Markov logit-bias pass; mHC fns (0.15 GB) and tid2eid (0.02 GB).
+    - fp8 scale rate. 1-byte e8m0 per 128x128 block vs the planner's 4-byte
+      assumption (0.02% on fp8 bytes).

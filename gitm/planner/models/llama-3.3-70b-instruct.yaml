@@ -1,0 +1,89 @@
+# meta-llama/Llama-3.3-70B-Instruct — LlamaForCausalLM: plain dense GQA
+# transformer, the reference point every sparse entry here is a departure from.
+# Source: https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct (gated).
+# Read from the ungated byte-identical mirror unsloth/Llama-3.3-70B-Instruct at
+# revision 99cd0d2c829e92a67c844f9144c2509632e5c87f: config.json and
+# model.safetensors.index.json only — no traces.
+#
+# Family note: `dense` is ModelSpec + predict_graph — full softmax attention on
+# every layer, gate/up/down SiLU FFN, untied lm_head. Every structural term of
+# this checkpoint is one that graph already prices; nothing is approximated.
+
+name: meta-llama/Llama-3.3-70B-Instruct
+family: dense
+description: >
+  80 layers, hidden 8192, ~70.6B parameters, all active per token. GQA
+  attention: 64 query heads sharing 8 KV heads, head_dim 128. Dense SiLU-gated
+  FFN, intermediate 28672. 128256-token vocabulary, untied embeddings. bf16
+  throughout, no quantization_config. 128k context via llama3 RoPE scaling
+  (factor 8 over an 8k original window).
+
+spec:
+  hidden: 8192
+  n_layers: 80
+  vocab: 128256
+
+  # GQA 8:1. num_key_value_heads 8 is what the KV cache holds per token per
+  # layer: 2 x 8 x 128 x 2 B = 4 KiB, 320 KiB across 80 layers — the term that
+  # dominates decode at long context once the 141 GB weight read is amortised.
+  # head_dim is declared (128) and equals hidden / n_heads, so attention width
+  # matches the residual width; q_proj is 8192 -> 8192, k/v_proj 8192 -> 1024.
+  n_heads: 64
+  num_kv_heads: 8
+  head_dim: 128
+
+  # gate_proj, up_proj, down_proj on every layer — 3 x 8192 x 28672 = 704.6M
+  # weights per layer, 82% of each layer's parameters. mlp_bias false.
+  intermediate: 28672
+
+  # torch_dtype bfloat16, no quantization_config: weights, activations and the
+  # default (auto) KV cache are all two bytes. weight_dtype_bytes is left unset
+  # so it follows dtype_bytes.
+  dtype_bytes: 2
+
+provenance:
+  verified:
+    - claim: shape fields read from the mirror's config.json
+      detail: >
+        unsloth/Llama-3.3-70B-Instruct@99cd0d2c config.json: 80 layers, hidden
+        8192, 64q/8kv, head_dim 128, intermediate 28672, vocab 128256,
+        tie_word_embeddings false, torch_dtype bfloat16, llama3 rope_scaling.
+        gitm plan on that config.json (no catalogue entry involved) builds the
+        identical ModelSpec.
+    - claim: tensor map is a plain dense Llama
+      detail: >
+        model.safetensors.index.json lists 723 tensors in 30 shards: per layer
+        exactly q/k/v/o_proj, gate/up/down_proj and the two RMSNorms (9 x 80 =
+        720), plus embed_tokens, model.norm and a separate lm_head (tied
+        embeddings would have no lm_head tensor). No biases, no experts.
+    - claim: predicted weight bytes match the published checkpoint
+      detail: >
+        total_size is 141,107,412,992 B (141.107 GB). ModelSpec.total_params x
+        2 B predicts 141,104,775,168 B — -0.0019%. The 2,637,824 B residual is
+        exactly the RMSNorm weights the dense accounting omits:
+        (2 x 80 + 1) x 8192 x 2 B. Nothing else is missing or extra.
+
+  estimated:
+    - field: mirror identity (all shape fields)
+      value: unsloth mirror == meta-llama gated release
+      detail: >
+        The gated repo could not be read without a Hub token, so every number
+        above comes from the unsloth mirror. Its only non-upstream config
+        fields are pad_token_id 128004 and an `unsloth_fixed` marker, neither of
+        which changes a shape. Not byte-compared against upstream. Re-check against the gated config.json and index
+        when a token is available.
+
+  unmodelled:
+    - Tensor parallelism. The dense graph models one unsharded rank and gitm
+      plan refuses --tp > 1 for this family; at 141 GB of bf16 weights this
+      checkpoint does not fit a single 80 GB or 141 GB GPU, so every real
+      deployment is TP-sharded (TP=2 on H200, TP=4 on H100). The single-rank
+      step is the whole-model floor, not a deployable configuration.
+    - Prefill and speculative decoding. predict_graph models a decode step;
+      both are refused rather than priced as one.
+    - RMSNorm, RoPE, SiLU and residual adds — elementwise ops with no node in
+      the dense graph (~2.6 MB of norm weights; their activation traffic is
+      batch-proportional and small next to the weight read at decode).
+    - FP8 serving variants. This entry is the bf16 release; an fp8 checkpoint
+      would need its own entry with weight_dtype_bytes 1 (lm_head left bf16
+      is already how predict_graph prices it).
