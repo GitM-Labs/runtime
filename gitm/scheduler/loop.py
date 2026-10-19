@@ -97,8 +97,8 @@ from gitm.optimizer.verification_export import (
 )
 from gitm.optimizer.vllm_knobs import (
     KNOB_PREREQUISITES,
-    engine_kwargs,
     current_knob_values,
+    engine_kwargs,
     expand_relative_candidates,
     knob_kind,
     unmet_prerequisite,
