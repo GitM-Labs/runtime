@@ -22,7 +22,7 @@ Companion: [`deploy/h200/README.md`](../deploy/h200/README.md).
 | Signal | Command | Healthy output | Flips when |
 |---|---|---|---|
 | thermal | `nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits` | every GPU `< 83` °C | any GPU `≥ 83` °C |
-| clocks | `nvidia-smi --query-gpu=clocks_throttle_reasons.sw_thermal_slowdown,hw_thermal_slowdown,hw_slowdown,hw_power_brake_slowdown --format=csv,noheader` | every field `Not Active` | any field `Active` (hex `.active` bitmask fallback also decoded) |
+| clocks | `nvidia-smi --query-gpu=clocks_throttle_reasons.sw_thermal_slowdown,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.hw_slowdown,clocks_throttle_reasons.hw_power_brake_slowdown --format=csv,noheader` | every field `Not Active` | any field `Active` (hex `.active` bitmask fallback also decoded) |
 | power cap state | `nvidia-smi --query-gpu=power.limit,power.max_limit,clocks_throttle_reasons.sw_power_cap --format=csv,noheader,nounits` | `power.limit == power.max_limit` and SW power-cap throttle inactive on every GPU | limit below max **or** SW power-cap active |
 | dmesg XID | `sudo -n /usr/local/libexec/gitm-dmesg-xid` (else `dmesg -T`); lines matching `NVRM: Xid` | no new XID lines vs pre in any sample/post | any new XID mid-window, or log unreadable (never passes) |
 | vLLM liveness | in-window sampler: real server cmdline (`python…vllm` / `vllm::`), not `srun`/`bash -c` | process present for every sample after serve start | any post-start sample with no real server |

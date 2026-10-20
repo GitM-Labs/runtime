@@ -45,16 +45,13 @@ def _healthy_snap(**overrides) -> dict:
         "job_id": "42",
         "temps_c": [60.0] * 8,
         "throttle_reasons": ["Not Active"] * 8,
-        "power": [
-            {"limit": 700.0, "max_limit": 700.0, "sw_power_cap": "Not Active"}
-            for _ in range(8)
-        ],
+        "power": [["700", "700", "Not Active"] for _ in range(8)],
         "xid_lines": [],
         "xid_error": None,
-        "shm": {"size_g": 64.0, "avail_g": 60.0, "used_pct": 5.0},
+        "shm": ["64G", "60G", "5%"],
         "nvlink": {
-            "nvlink_s": "GPU0: link 0 Active\n",
-            "nvlink_rc": 0,
+            "links": "GPU0: link 0 Active\n",
+            "links_rc": 0,
             "topo": (
                 "\tGPU0\tGPU1\tGPU2\tGPU3\tGPU4\tGPU5\tGPU6\tGPU7\n"
                 "GPU0\tX\tNV18\tNV18\tNV18\tNV18\tNV18\tNV18\tNV18\tCPU Affinity\n"
@@ -110,6 +107,16 @@ def test_print_thresholds_matches_doc_keys():
     assert "thermal_max_c" in health.THRESHOLDS
     assert health.THRESHOLDS["thermal_max_c"] == 83.0
     assert health.THRESHOLDS["shm_min_size_g"] == 16
+
+
+def test_dmesg_helper_filters_before_returning_and_is_group_scoped():
+    setup = (ROOT / "deploy" / "h200" / "setup-node.sh").read_text()
+    helper = setup.split(
+        "cat > /usr/local/libexec/gitm-dmesg-xid <<'EOF'\n", 1
+    )[1].split("\nEOF", 1)[0]
+    assert "grep -i 'NVRM:[[:space:]]*Xid'" in helper
+    assert "%gitm-health ALL=(root) NOPASSWD:" in setup
+    assert "ALL ALL=(root) NOPASSWD:" not in setup
 
 
 def test_throttled_node_caught(tmp_path: Path):
@@ -213,7 +220,7 @@ def test_missing_post_is_unhealthy():
 
 def test_nvlink_requires_status_output():
     snap = _healthy_snap(
-        nvlink={"nvlink_s": "", "nvlink_rc": 1, "topo": "GPU0 X\n", "topo_rc": 0}
+        nvlink={"links": "", "links_rc": 1, "topo": "GPU0 X\n", "topo_rc": 0}
     )
     assert "nvlink" in health.eval_snapshot(snap)
 
@@ -316,7 +323,7 @@ def test_gate_discards_and_requeues(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
     monkeypatch.setattr(health, "RUN", fake_run)
-    rc = health.cmd_gate(
+    rc = health.gate(
         Namespace(window=str(wpath), results=str(results), job="99")
     )
     assert rc == 1

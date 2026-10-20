@@ -167,14 +167,23 @@ install -m 755 "$HERE/gitm-node-report" /usr/local/bin/gitm-node-report
 install -m 755 "$HERE/gitm-node-health" /usr/local/bin/gitm-node-health
 mkdir -p /var/lib/gitm-gpu /usr/local/libexec
 chmod 1777 /var/lib/gitm-gpu
-# Narrow dmesg reader for XID checks when kernel.dmesg_restrict=1 (job users
-# cannot call dmesg). sudo -n only; no shell args.
+# Narrow dmesg reader for XID checks when kernel.dmesg_restrict=1. The helper
+# filters while privileged, so callers never receive unrelated kernel logs.
+getent group gitm-health >/dev/null || groupadd --system gitm-health
+getent passwd | awk -F: '$3>=1000 && $3<60000 {print $1}' | while read -r user; do
+  usermod -a -G gitm-health "$user"
+done
 cat > /usr/local/libexec/gitm-dmesg-xid <<'EOF'
 #!/bin/bash
-exec /bin/dmesg -T
+out=$(/bin/dmesg -T) || exit $?
+printf '%s\n' "$out" | /usr/bin/grep -i 'NVRM:[[:space:]]*Xid'
+rc=${PIPESTATUS[1]}
+[[ $rc -eq 1 ]] && exit 0
+exit "$rc"
 EOF
-chmod 755 /usr/local/libexec/gitm-dmesg-xid
-echo 'ALL ALL=(root) NOPASSWD: /usr/local/libexec/gitm-dmesg-xid' \
+chown root:gitm-health /usr/local/libexec/gitm-dmesg-xid
+chmod 750 /usr/local/libexec/gitm-dmesg-xid
+echo '%gitm-health ALL=(root) NOPASSWD: /usr/local/libexec/gitm-dmesg-xid' \
   > /etc/sudoers.d/gitm-dmesg-xid
 chmod 440 /etc/sudoers.d/gitm-dmesg-xid
 touch /etc/gitm-gpu/config
