@@ -22,10 +22,10 @@ Companion: [`deploy/h200/README.md`](../deploy/h200/README.md).
 | Signal | Command | Healthy output | Flips when |
 |---|---|---|---|
 | thermal | `nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits` | every GPU `< 83` °C | any GPU `≥ 83` °C |
-| clocks | `nvidia-smi --query-gpu=clocks_throttle_reasons.active --format=csv,noheader` | only Not Active / Idle / Applications Clocks Setting / Sync Boost / Display Clock Setting | any of SW Thermal Slowdown, HW Thermal Slowdown, HW Slowdown, HW Power Brake Slowdown |
+| clocks | `nvidia-smi --query-gpu=clocks_throttle_reasons.sw_thermal_slowdown,hw_thermal_slowdown,hw_slowdown,hw_power_brake_slowdown --format=csv,noheader` | every field `Not Active` | any field `Active` (hex `.active` bitmask fallback also decoded) |
 | power cap state | `nvidia-smi --query-gpu=power.limit,power.max_limit,clocks_throttle_reasons.sw_power_cap --format=csv,noheader,nounits` | `power.limit == power.max_limit` and SW power-cap throttle inactive on every GPU | limit below max **or** SW power-cap active |
-| dmesg XID | `dmesg -T` (pre vs post); lines matching `NVRM: Xid` | no new XID lines in the job window | any new `NVRM: Xid` line between pre and post (or dmesg unreadable) |
-| vLLM liveness | in-window sampler: `pgrep -af '[v]llm'` every ~5 s after first sighting | process present for every sample after serve start | any post-start sample with no vLLM process |
+| dmesg XID | `sudo -n /usr/local/libexec/gitm-dmesg-xid` (else `dmesg -T`); lines matching `NVRM: Xid` | no new XID lines vs pre in any sample/post | any new XID mid-window, or log unreadable (never passes) |
+| vLLM liveness | in-window sampler: real server cmdline (`python…vllm` / `vllm::`), not `srun`/`bash -c` | process present for every sample after serve start | any post-start sample with no real server |
 | `/dev/shm` | `df -BG --output=size,avail,pcent /dev/shm \| tail -1` | size `≥ 16G` and used `< 90%` | size `< 16G` or used `≥ 90%` |
 | NVLink | `nvidia-smi nvlink -s` and `nvidia-smi topo -m` | all reported links Active; every GPU pair among 0–7 is `NV*` | any link inactive/down, or any pair not `NV*` |
 

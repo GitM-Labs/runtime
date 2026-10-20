@@ -113,12 +113,17 @@ def test_print_thresholds_matches_doc_keys():
 
 
 def test_throttled_node_caught(tmp_path: Path):
+    # Per-field Active values (what nvidia-smi returns for bad reason fields).
     pre = _healthy_snap(
         phase="pre",
-        throttle_reasons=["SW Thermal Slowdown"] * 8,
+        throttle_reasons=["Active", "Not Active", "Not Active", "Not Active"] * 2,
         temps_c=[85.0] * 8,
     )
-    post = _healthy_snap(phase="post", ts=2.0, throttle_reasons=["SW Thermal Slowdown"] * 8)
+    post = _healthy_snap(
+        phase="post",
+        ts=2.0,
+        throttle_reasons=["0x0000000000000020"] * 8,  # SW thermal bitmask
+    )
     window = health.eval_window([pre, post])
     assert window["healthy"] is False
     assert "clocks" in window["failed_signals"] or "thermal" in window["failed_signals"]
@@ -134,14 +139,23 @@ def test_throttled_node_caught(tmp_path: Path):
     )
 
 
+def test_clocks_bad_decodes_hex_and_active():
+    assert health._clocks_bad("Active") is True
+    assert health._clocks_bad("Not Active") is False
+    assert health._clocks_bad("0x0000000000000020") is True  # SW thermal
+    assert health._clocks_bad("0x0000000000000000") is False
+
+
 def test_xid_mid_run_caught(tmp_path: Path):
     pre = _healthy_snap(phase="pre", xid_lines=[])
-    post = _healthy_snap(
-        phase="post",
-        ts=2.0,
+    # XID only in a mid-window sample (rolled out of dmesg before post).
+    mid = _healthy_snap(
+        phase="sample",
+        ts=1.5,
         xid_lines=["[123] NVRM: Xid (PCI:0000:00): 79, pid=1, name=vllm"],
     )
-    window = health.eval_window([pre, post])
+    post = _healthy_snap(phase="post", ts=2.0, xid_lines=[])
+    window = health.eval_window([pre, mid, post])
     assert window["healthy"] is False
     assert "dmesg_xid" in window["failed_signals"]
 
@@ -169,6 +183,39 @@ def test_dead_vllm_caught(tmp_path: Path):
     assert result.verdict == "invalid_run"
     nh = next(c for c in result.checks if c.name == "node_health_window")
     assert "vllm_liveness" in nh.evidence["failed_signals"]
+
+
+def test_vllm_alive_ignores_srun_wrapper(monkeypatch: pytest.MonkeyPatch):
+    def fake_run(cmd, **kwargs):
+        out = (
+            "1234 srun --container-image=x bash -c 'vllm serve foo'\n"
+            "5678 python3 -m vllm.entrypoints.openai.api_server\n"
+        )
+        return type("P", (), {"returncode": 0, "stdout": out, "stderr": ""})()
+
+    monkeypatch.setattr(health, "RUN", fake_run)
+    assert health._vllm_alive() is True
+
+    def only_srun(cmd, **kwargs):
+        out = "1234 srun --container-image=x bash -c 'vllm serve foo'\n"
+        return type("P", (), {"returncode": 0, "stdout": out, "stderr": ""})()
+
+    monkeypatch.setattr(health, "RUN", only_srun)
+    assert health._vllm_alive() is False
+
+
+def test_missing_post_is_unhealthy():
+    pre = _healthy_snap(phase="pre")
+    window = health.eval_window([pre])
+    assert window["healthy"] is False
+    assert "window_incomplete" in window["failed_signals"]
+
+
+def test_nvlink_requires_status_output():
+    snap = _healthy_snap(
+        nvlink={"nvlink_s": "", "nvlink_rc": 1, "topo": "GPU0 X\n", "topo_rc": 0}
+    )
+    assert "nvlink" in health.eval_snapshot(snap)
 
 
 def test_healthy_window_passes_qualify(tmp_path: Path):
@@ -260,11 +307,12 @@ def test_gate_discards_and_requeues(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     wpath = out / "node_health_window.json"
     wpath.write_text(json.dumps(window), encoding="utf-8")
 
-    monkeypatch.setattr(health, "STATE_DIR", str(tmp_path / "state"))
     calls: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
+        if cmd[:3] == ["scontrol", "show", "job"]:
+            return type("P", (), {"returncode": 0, "stdout": "JobId=99 Restarts=0\n", "stderr": ""})()
         return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
     monkeypatch.setattr(health, "RUN", fake_run)

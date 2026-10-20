@@ -165,8 +165,18 @@ setfacl -d -m u::rwx,g::rwx,o::rwx "$HF_CACHE"
 install -m 755 "$HERE/gitm-job" /usr/local/bin/gitm-job
 install -m 755 "$HERE/gitm-node-report" /usr/local/bin/gitm-node-report
 install -m 755 "$HERE/gitm-node-health" /usr/local/bin/gitm-node-health
-mkdir -p /var/lib/gitm-gpu
+mkdir -p /var/lib/gitm-gpu /usr/local/libexec
 chmod 1777 /var/lib/gitm-gpu
+# Narrow dmesg reader for XID checks when kernel.dmesg_restrict=1 (job users
+# cannot call dmesg). sudo -n only; no shell args.
+cat > /usr/local/libexec/gitm-dmesg-xid <<'EOF'
+#!/bin/bash
+exec /bin/dmesg -T
+EOF
+chmod 755 /usr/local/libexec/gitm-dmesg-xid
+echo 'ALL ALL=(root) NOPASSWD: /usr/local/libexec/gitm-dmesg-xid' \
+  > /etc/sudoers.d/gitm-dmesg-xid
+chmod 440 /etc/sudoers.d/gitm-dmesg-xid
 touch /etc/gitm-gpu/config
 setkey() { grep -q "^$1=" /etc/gitm-gpu/config && sed -i "s#^$1=.*#$1=$2#" /etc/gitm-gpu/config || echo "$1=$2" >> /etc/gitm-gpu/config; }
 setkey RESULTS_DIR "$RESULTS_DIR"

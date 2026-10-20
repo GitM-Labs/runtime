@@ -37,25 +37,23 @@ THRESHOLDS: dict[str, Any] = {
     "shm_max_used_pct": 90.0,
     "sampler_period_s": 5.0,
     "max_requeues": 2,
-    # Active throttle reasons that flip "clocks" (substring match, case-insensitive).
-    "clocks_bad_substrings": (
-        "sw thermal",
-        "hw thermal",
-        "hw slowdown",
-        "hw power brake",
-    ),
-    # Active reasons that are OK (idle / operator clocks / display).
-    "clocks_ok_substrings": (
-        "not active",
-        "idle",
-        "applications clocks",
-        "sync boost",
-        "display clock",
+    # NVML throttle bits that flip "clocks" (nvmlClocksThrottleReasons*).
+    "clocks_bad_bits": 0x0000000000000008 | 0x0000000000000020
+    | 0x0000000000000040 | 0x0000000000000080,  # HW slowdown, SW/HW thermal, power brake
+    # Per-field nvidia-smi queries (Active / Not Active) — preferred over .active bitmask.
+    "clocks_bad_fields": (
+        "clocks_throttle_reasons.sw_thermal_slowdown",
+        "clocks_throttle_reasons.hw_thermal_slowdown",
+        "clocks_throttle_reasons.hw_slowdown",
+        "clocks_throttle_reasons.hw_power_brake_slowdown",
     ),
 }
 
 STATE_DIR = "/var/lib/gitm-gpu"
+DMESG_HELPER = "/usr/local/libexec/gitm-dmesg-xid"
 XID_RE = re.compile(r"NVRM:\s*Xid", re.IGNORECASE)
+# Host wrappers that mention vllm but are not the server.
+_VLLM_SKIP = ("gitm-node-health", "srun ", "bash -c", "enroot", "pyxis")
 RunFn = Callable[..., subprocess.CompletedProcess]
 
 
@@ -108,14 +106,23 @@ def _temps() -> list[float]:
 
 
 def _throttle_reasons() -> list[str]:
-    p = RUN(
-        [
-            "nvidia-smi",
-            "--query-gpu=clocks_throttle_reasons.active",
-            "--format=csv,noheader",
-        ]
-    )
-    return [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()]
+    """Per-GPU Active/Not Active for bad throttle fields (not the .active bitmask)."""
+    q = ",".join(THRESHOLDS["clocks_bad_fields"])
+    p = RUN(["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader"])
+    if p.returncode != 0 or not (p.stdout or "").strip():
+        # Fallback: bitmask / name blob from .active
+        p2 = RUN(
+            [
+                "nvidia-smi",
+                "--query-gpu=clocks_throttle_reasons.active",
+                "--format=csv,noheader",
+            ]
+        )
+        return [ln.strip() for ln in (p2.stdout or "").splitlines() if ln.strip()]
+    cells: list[str] = []
+    for line in (p.stdout or "").splitlines():
+        cells.extend(x.strip() for x in line.split(",") if x.strip())
+    return cells
 
 
 def _power_rows() -> list[dict[str, Any]]:
@@ -140,12 +147,21 @@ def _power_rows() -> list[dict[str, Any]]:
 
 
 def _dmesg_xid_lines() -> tuple[list[str], str | None]:
-    """Return (xid lines, error). error set when dmesg is unreadable."""
-    p = RUN(["dmesg", "-T"], timeout=60)
-    if p.returncode != 0:
-        return [], (p.stderr or p.stdout or "dmesg failed").strip()[:200] or "dmesg failed"
-    lines = [ln for ln in (p.stdout or "").splitlines() if XID_RE.search(ln)]
-    return lines, None
+    """Return (xid lines, error). Prefer the setup-node sudo helper when dmesg is restricted."""
+    cmds = (
+        ["sudo", "-n", DMESG_HELPER],
+        [DMESG_HELPER],
+        ["dmesg", "-T"],
+    )
+    last_err = "dmesg unreadable"
+    for cmd in cmds:
+        p = RUN(cmd, timeout=60)
+        if p.returncode != 0:
+            last_err = (p.stderr or p.stdout or last_err).strip()[:200] or last_err
+            continue
+        lines = [ln for ln in (p.stdout or "").splitlines() if XID_RE.search(ln)]
+        return lines, None
+    return [], last_err
 
 
 def _shm_stats() -> dict[str, float] | None:
@@ -177,18 +193,15 @@ def _nvlink_status() -> dict[str, Any]:
 
 
 def _vllm_alive() -> bool:
+    """True only for a real vLLM server process — not srun/bash wrappers that mention vllm."""
     p = RUN(["pgrep", "-af", "[v]llm"])
-    # pgrep exit 1 = no match
     if p.returncode not in (0, 1):
         return False
-    text = (p.stdout or "").strip()
-    if not text:
-        return False
-    # Ignore our own checker / grep noise.
-    for line in text.splitlines():
-        if "gitm-node-health" in line:
+    for line in (p.stdout or "").splitlines():
+        low = line.lower()
+        if any(s in low for s in _VLLM_SKIP):
             continue
-        if re.search(r"\bvllm\b", line, re.IGNORECASE):
+        if re.search(r"(python\S*.*\bvllm\b|\bvllm::| -m vllm\b|/bin/vllm\b)", line, re.I):
             return True
     return False
 
@@ -215,10 +228,21 @@ def take_snapshot(*, phase: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _clocks_bad(reason: str) -> bool:
-    r = reason.lower()
-    if any(bad in r for bad in THRESHOLDS["clocks_bad_substrings"]):
+    """True for Active per-field values, bad-name strings, or NVML hex bitmasks."""
+    r = reason.strip().lower()
+    if r.startswith("0x"):
+        try:
+            return bool(int(r, 16) & int(THRESHOLDS["clocks_bad_bits"]))
+        except ValueError:
+            return True
+    if "not active" in r:
+        return False
+    if r == "active":
         return True
-    return False
+    return any(
+        s in r
+        for s in ("sw thermal", "hw thermal", "hw slowdown", "hw power brake")
+    )
 
 
 def eval_snapshot(snap: dict[str, Any]) -> list[str]:
@@ -245,9 +269,6 @@ def eval_snapshot(snap: dict[str, Any]) -> list[str]:
     if power_bad:
         failed.append("power_cap")
 
-    if snap.get("xid_error"):
-        failed.append("dmesg_xid")
-
     shm = snap.get("shm")
     if (
         shm is None
@@ -264,13 +285,14 @@ def eval_snapshot(snap: dict[str, Any]) -> list[str]:
 
 
 def _nvlink_ok(nv: dict[str, Any]) -> bool:
-    text = (nv.get("nvlink_s") or "").lower()
-    if text and re.search(r"\b(inactive|down|disabled)\b", text):
+    text = (nv.get("nvlink_s") or "").strip()
+    if nv.get("nvlink_rc") != 0 or not text:
+        return False
+    if re.search(r"\b(inactive|down|disabled)\b", text.lower()):
         return False
     topo = nv.get("topo") or ""
-    if not topo.strip() or nv.get("topo_rc") not in (0, None):
+    if not topo.strip() or nv.get("topo_rc") != 0:
         return False
-    # Parse GPU rows: "GPU0  X  NV18 NV18 ..." (self + peers, then CPU columns).
     rows: dict[int, list[str]] = {}
     for line in topo.splitlines():
         m = re.match(r"GPU(\d+)\s+(.*)$", line.strip())
@@ -294,9 +316,7 @@ def _nvlink_ok(nv: dict[str, Any]) -> bool:
             if b == a:
                 continue
             col = indices.index(b)
-            if col >= len(cells):
-                return False
-            if not cells[col].startswith("NV"):
+            if col >= len(cells) or not cells[col].startswith("NV"):
                 return False
     return True
 
@@ -308,21 +328,26 @@ def eval_window(records: list[dict[str, Any]]) -> dict[str, Any]:
     post = next((r for r in records if r.get("phase") == "post"), None)
     samples = [r for r in records if r.get("phase") == "sample"]
 
+    if pre is None or post is None:
+        failed.add("window_incomplete")
+
     for snap in records:
         if snap.get("phase") in ("pre", "post", "sample"):
-            # Skip vLLM and XID-diff here; handled below.
             for sig in eval_snapshot(snap):
-                if sig == "dmesg_xid":
-                    continue  # window diff below
                 failed.add(sig)
 
-    # XID: new lines in post vs pre.
+    # XID: any new line vs pre across samples and post; unreadable log never passes.
     pre_xids = set(pre.get("xid_lines") or []) if pre else set()
-    post_xids = set(post.get("xid_lines") or []) if post else set()
-    if (pre and pre.get("xid_error")) or (post and post.get("xid_error")):
+    if pre and pre.get("xid_error"):
         failed.add("dmesg_xid")
-    elif post is not None and (post_xids - pre_xids):
-        failed.add("dmesg_xid")
+    for snap in samples + ([post] if post else []):
+        if not snap:
+            continue
+        if snap.get("xid_error"):
+            failed.add("dmesg_xid")
+            continue
+        if set(snap.get("xid_lines") or []) - pre_xids:
+            failed.add("dmesg_xid")
 
     # vLLM: once seen alive in a sample, later samples must stay alive.
     seen_alive = False
@@ -380,52 +405,6 @@ def _sampler_pid_path(out: Path) -> Path:
     return out.with_suffix(out.suffix + ".sampler.pid")
 
 
-def cmd_pre(args: argparse.Namespace) -> int:
-    out = Path(args.out)
-    snap = take_snapshot(phase="pre")
-    snap["job_id"] = args.job
-    _append(out, snap)
-    # Start background sampler.
-    period = THRESHOLDS["sampler_period_s"]
-    script = Path(__file__).resolve()
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            str(script),
-            "_sample",
-            "--job",
-            str(args.job),
-            "--out",
-            str(out),
-            "--period",
-            str(period),
-        ],
-        start_new_session=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    _sampler_pid_path(out).write_text(str(proc.pid), encoding="utf-8")
-    fails = [s for s in eval_snapshot(snap) if s != "dmesg_xid"]
-    # Unreadable dmesg at pre still counts.
-    if snap.get("xid_error"):
-        fails.append("dmesg_xid")
-    if fails:
-        print(f"gitm-node-health: pre unhealthy: {','.join(sorted(set(fails)))}", file=sys.stderr)
-        return 1
-    print(f"gitm-node-health: pre ok on {snap['node']}")
-    return 0
-
-
-def cmd_sample(args: argparse.Namespace) -> int:
-    out = Path(args.out)
-    period = float(args.period)
-    while True:
-        snap = take_snapshot(phase="sample")
-        snap["job_id"] = args.job
-        _append(out, snap)
-        time.sleep(period)
-
-
 def _stop_sampler(out: Path) -> None:
     pid_path = _sampler_pid_path(out)
     try:
@@ -442,6 +421,54 @@ def _stop_sampler(out: Path) -> None:
         pass
 
 
+def _start_sampler(out: Path, job: str) -> None:
+    period = THRESHOLDS["sampler_period_s"]
+    script = Path(__file__).resolve()
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(script),
+            "_sample",
+            "--job",
+            str(job),
+            "--out",
+            str(out),
+            "--period",
+            str(period),
+        ],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    _sampler_pid_path(out).write_text(str(proc.pid), encoding="utf-8")
+
+
+def cmd_pre(args: argparse.Namespace) -> int:
+    out = Path(args.out)
+    snap = take_snapshot(phase="pre")
+    snap["job_id"] = args.job
+    _append(out, snap)
+    # Pre does not hard-fail on dmesg alone (restrict=1); window still fails if unread.
+    fails = [s for s in eval_snapshot(snap)]
+    if fails:
+        _stop_sampler(out)
+        print(f"gitm-node-health: pre unhealthy: {','.join(sorted(set(fails)))}", file=sys.stderr)
+        return 1
+    _start_sampler(out, str(args.job))
+    print(f"gitm-node-health: pre ok on {snap['node']}")
+    return 0
+
+
+def cmd_sample(args: argparse.Namespace) -> int:
+    out = Path(args.out)
+    period = float(args.period)
+    while True:
+        snap = take_snapshot(phase="sample")
+        snap["job_id"] = args.job
+        _append(out, snap)
+        time.sleep(period)
+
+
 def cmd_post(args: argparse.Namespace) -> int:
     out = Path(args.out)
     _stop_sampler(out)
@@ -454,6 +481,7 @@ def cmd_post(args: argparse.Namespace) -> int:
 
 def cmd_summarize(args: argparse.Namespace) -> int:
     out = Path(args.out)
+    _stop_sampler(out)
     records = _read_jsonl(out)
     for r in records:
         if args.job and not r.get("job_id"):
@@ -472,8 +500,11 @@ def cmd_summarize(args: argparse.Namespace) -> int:
     return 0 if window["healthy"] else 1
 
 
-def _requeue_count_path(job: str) -> Path:
-    return Path(STATE_DIR) / f"requeue-{job}.count"
+def _slurm_restarts(job: str) -> int:
+    """Cluster-wide restart count (survives landing on the other node)."""
+    p = RUN(["scontrol", "show", "job", str(job), "-o"], timeout=30)
+    m = re.search(r"Restarts=(\d+)", p.stdout or "")
+    return int(m.group(1)) if m else 0
 
 
 def cmd_gate(args: argparse.Namespace) -> int:
@@ -491,11 +522,11 @@ def cmd_gate(args: argparse.Namespace) -> int:
     results = Path(args.results)
     job = str(args.job)
     out_host = results / job
+    _stop_sampler(out_host / "node_health.jsonl")
     discarded = results / "discarded" / job
     if out_host.is_dir():
         discarded.parent.mkdir(parents=True, exist_ok=True)
         if discarded.exists():
-            # Keep the latest discard unique.
             discarded = results / "discarded" / f"{job}-{int(time.time())}"
         try:
             out_host.rename(discarded)
@@ -503,20 +534,14 @@ def cmd_gate(args: argparse.Namespace) -> int:
         except OSError as exc:
             print(f"gitm-node-health: discard failed: {exc}", file=sys.stderr)
 
-    count_path = _requeue_count_path(job)
-    try:
-        n = int(count_path.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        n = 0
+    n = _slurm_restarts(job)
     if n >= int(THRESHOLDS["max_requeues"]):
         print(
             f"gitm-node-health: requeue cap ({THRESHOLDS['max_requeues']}) reached "
-            f"for job {job}; not requeuing",
+            f"for job {job} (Restarts={n}); not requeuing",
             file=sys.stderr,
         )
         return 1
-    count_path.parent.mkdir(parents=True, exist_ok=True)
-    count_path.write_text(str(n + 1), encoding="utf-8")
     p = RUN(["scontrol", "requeue", job], timeout=60)
     if p.returncode != 0:
         print(
@@ -524,7 +549,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     else:
-        print(f"gitm-node-health: requeued job {job} (attempt {n + 1})")
+        print(f"gitm-node-health: requeued job {job} (Restarts were {n})")
     return 1
 
 
