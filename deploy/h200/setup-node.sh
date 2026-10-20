@@ -84,6 +84,9 @@ echo "enroot $(enroot version)"
 # a job ends. Nothing goes into home directories.
 mkdir -p /var/lib/enroot/{cache,data} /run/enroot
 chmod 1777 /var/lib/enroot/cache /var/lib/enroot/data /run/enroot
+# /run is tmpfs: without this, every job fails after a reboot with
+# "pyxis: mkdir: Permission denied" because /run/enroot is gone.
+echo 'd /run/enroot 1777 root root -' > /etc/tmpfiles.d/enroot.conf
 # Enroot bind-mounts the host's /etc/hostname into every container; some
 # images (GCP Ubuntu) never write one, and then every container start fails.
 [[ -f /etc/hostname ]] || hostname > /etc/hostname
