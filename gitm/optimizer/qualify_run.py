@@ -43,6 +43,10 @@ _SOURCE_GLOBS: dict[str, tuple[str, ...]] = {
     "merged_trace": ("**/trace.jsonl", "**/*capture*/**/*.jsonl", "**/*.jsonl"),
     "amdsmi": ("amdsmi.jsonl", "**/amdsmi*.jsonl", "telemetry/amdsmi.jsonl"),
     "metrics": ("**/metrics*.txt", "**/vllm_metrics*", "**/scrape_metrics*"),
+    "node_health": (
+        "node_health_window.json",
+        "**/node_health_window.json",
+    ),
 }
 
 
@@ -376,6 +380,7 @@ def _find_source_path(artifacts_dir: Path, source: str) -> Path | None:
     exact_names = {
         "amdsmi": ("amdsmi.jsonl",),
         "metrics": ("metrics.txt", "vllm_metrics.txt", "scrape_metrics.txt"),
+        "node_health": ("node_health_window.json",),
     }.get(source, (f"{source}.jsonl",))
 
     for root in _ancestor_dirs(artifacts_dir, max_up=4):
@@ -387,14 +392,15 @@ def _find_source_path(artifacts_dir: Path, source: str) -> Path | None:
                 if candidate.is_file() and candidate.stat().st_size > 0:
                     return candidate
         # Non-recursive prefix match in the run root only (e.g. amdsmi.ROLE.jsonl).
-        for hit in sorted(root.glob(f"{source}*.jsonl")):
-            if hit.is_file() and hit.stat().st_size > 0:
-                return hit
-        tel = root / "telemetry"
-        if tel.is_dir():
-            for hit in sorted(tel.glob(f"{source}*.jsonl")):
+        if source != "node_health":
+            for hit in sorted(root.glob(f"{source}*.jsonl")):
                 if hit.is_file() and hit.stat().st_size > 0:
                     return hit
+            tel = root / "telemetry"
+            if tel.is_dir():
+                for hit in sorted(tel.glob(f"{source}*.jsonl")):
+                    if hit.is_file() and hit.stat().st_size > 0:
+                        return hit
     return None
 
 
@@ -537,6 +543,8 @@ def qualify_run(
                     {"source": source, "note": "empty_or_absent"},
                 )
             )
+        elif source == "node_health":
+            checks.append(_check_node_health_window(path))
         else:
             checks.append(
                 CheckResult(
@@ -1614,6 +1622,54 @@ def _extract_flag_int(
     if m:
         return int(m.group(1))
     return None
+
+
+def _check_node_health_window(path: Path) -> CheckResult:
+    """Pass only when the host pre/post window row reports healthy=true."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return CheckResult(
+            "node_health_window",
+            "unknown",
+            {"path": str(path), "error": str(exc)},
+        )
+    if not isinstance(data, dict):
+        return CheckResult(
+            "node_health_window",
+            "unknown",
+            {"path": str(path), "note": "not_an_object"},
+        )
+    healthy = data.get("healthy")
+    if healthy is True:
+        return CheckResult(
+            "node_health_window",
+            "pass",
+            {
+                "path": str(path),
+                "healthy": True,
+                "failed_signals": data.get("failed_signals") or [],
+                "node": data.get("node"),
+                "job_id": data.get("job_id"),
+            },
+        )
+    if healthy is False:
+        return CheckResult(
+            "node_health_window",
+            "fail",
+            {
+                "path": str(path),
+                "healthy": False,
+                "failed_signals": data.get("failed_signals") or [],
+                "node": data.get("node"),
+                "job_id": data.get("job_id"),
+            },
+        )
+    return CheckResult(
+        "node_health_window",
+        "unknown",
+        {"path": str(path), "note": "missing_healthy_bool", "raw_keys": sorted(data)},
+    )
 
 
 def _aggregate(checks: list[CheckResult]) -> Verdict:

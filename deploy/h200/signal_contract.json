@@ -1,0 +1,19 @@
+{
+  "version": "v0",
+  "capture_backend": "cupti-inject",
+  "required_sources": ["merged_trace", "node_health"],
+  "require_kernel_events": true,
+  "require_named_kernels": true,
+  "max_dropped_records": 0,
+  "require_pid_on_kernels": true,
+  "require_device_on_kernels": true,
+  "require_rank_on_kernels": false,
+  "require_node_on_kernels": false,
+  "allow_truncated_names": false,
+  "require_nonempty_header": true,
+  "require_capture_window": true,
+  "expected_sample_period_ns": 1000000000,
+  "max_sample_gap_factor": 2.5,
+  "max_clock_skew_ns": 5000000000,
+  "require_deployment_identity": true
+}

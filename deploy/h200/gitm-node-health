@@ -1,0 +1,580 @@
+#!/usr/bin/env python3
+"""gitm-node-health: pre/post H200 node gate for gitm-submit / gitm-job.
+
+    gitm-node-health --print-thresholds
+    gitm-node-health pre  --job "$SLURM_JOB_ID" --out "$OUT_HOST/node_health.jsonl"
+    gitm-node-health post --job "$SLURM_JOB_ID" --out "$OUT_HOST/node_health.jsonl"
+    gitm-node-health summarize --job "$SLURM_JOB_ID" --out "$OUT_HOST/node_health.jsonl"
+    gitm-node-health gate --window "$OUT_HOST/node_health_window.json" \
+        --results "$RESULTS" --job "$SLURM_JOB_ID"
+
+Writes sample lines to node_health.jsonl and one window row to
+node_health_window.json (healthy yes/no + failed_signals). Stdlib only.
+Thresholds are the single source of truth for docs/h200_node_health.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+# ---------------------------------------------------------------------------
+# Thresholds — keep docs/h200_node_health.md in sync (print with --print-thresholds)
+# ---------------------------------------------------------------------------
+
+THRESHOLDS: dict[str, Any] = {
+    "thermal_max_c": 83.0,
+    "shm_min_size_g": 16,
+    "shm_max_used_pct": 90.0,
+    "sampler_period_s": 5.0,
+    "max_requeues": 2,
+    # Active throttle reasons that flip "clocks" (substring match, case-insensitive).
+    "clocks_bad_substrings": (
+        "sw thermal",
+        "hw thermal",
+        "hw slowdown",
+        "hw power brake",
+    ),
+    # Active reasons that are OK (idle / operator clocks / display).
+    "clocks_ok_substrings": (
+        "not active",
+        "idle",
+        "applications clocks",
+        "sync boost",
+        "display clock",
+    ),
+}
+
+STATE_DIR = "/var/lib/gitm-gpu"
+XID_RE = re.compile(r"NVRM:\s*Xid", re.IGNORECASE)
+RunFn = Callable[..., subprocess.CompletedProcess]
+
+
+def _run(
+    cmd: list[str],
+    *,
+    timeout: float = 30,
+    check: bool = False,
+) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=check
+        )
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(cmd, 127, "", f"not found: {cmd[0]}")
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", "timeout")
+
+
+# Overridable in tests.
+RUN: RunFn = _run
+
+
+def print_thresholds() -> None:
+    print(json.dumps(THRESHOLDS, indent=2, sort_keys=True))
+
+
+# ---------------------------------------------------------------------------
+# Collectors
+# ---------------------------------------------------------------------------
+
+def _temps() -> list[float]:
+    p = RUN(
+        [
+            "nvidia-smi",
+            "--query-gpu=temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    out: list[float] = []
+    for line in (p.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(float(line.split(",")[0].strip()))
+        except ValueError:
+            continue
+    return out
+
+
+def _throttle_reasons() -> list[str]:
+    p = RUN(
+        [
+            "nvidia-smi",
+            "--query-gpu=clocks_throttle_reasons.active",
+            "--format=csv,noheader",
+        ]
+    )
+    return [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()]
+
+
+def _power_rows() -> list[dict[str, Any]]:
+    p = RUN(
+        [
+            "nvidia-smi",
+            "--query-gpu=power.limit,power.max_limit,clocks_throttle_reasons.sw_power_cap",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    rows: list[dict[str, Any]] = []
+    for line in (p.stdout or "").splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) < 3:
+            continue
+        try:
+            lim, mx = float(parts[0]), float(parts[1])
+        except ValueError:
+            continue
+        rows.append({"limit": lim, "max_limit": mx, "sw_power_cap": parts[2]})
+    return rows
+
+
+def _dmesg_xid_lines() -> tuple[list[str], str | None]:
+    """Return (xid lines, error). error set when dmesg is unreadable."""
+    p = RUN(["dmesg", "-T"], timeout=60)
+    if p.returncode != 0:
+        return [], (p.stderr or p.stdout or "dmesg failed").strip()[:200] or "dmesg failed"
+    lines = [ln for ln in (p.stdout or "").splitlines() if XID_RE.search(ln)]
+    return lines, None
+
+
+def _shm_stats() -> dict[str, float] | None:
+    p = RUN(["df", "-BG", "--output=size,avail,pcent", "/dev/shm"])
+    lines = [ln for ln in (p.stdout or "").splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    parts = lines[-1].split()
+    if len(parts) < 3:
+        return None
+    try:
+        size_g = float(parts[0].rstrip("G"))
+        avail_g = float(parts[1].rstrip("G"))
+        used_pct = float(parts[2].rstrip("%"))
+    except ValueError:
+        return None
+    return {"size_g": size_g, "avail_g": avail_g, "used_pct": used_pct}
+
+
+def _nvlink_status() -> dict[str, Any]:
+    st = RUN(["nvidia-smi", "nvlink", "-s"])
+    topo = RUN(["nvidia-smi", "topo", "-m"])
+    return {
+        "nvlink_s": st.stdout or "",
+        "nvlink_rc": st.returncode,
+        "topo": topo.stdout or "",
+        "topo_rc": topo.returncode,
+    }
+
+
+def _vllm_alive() -> bool:
+    p = RUN(["pgrep", "-af", "[v]llm"])
+    # pgrep exit 1 = no match
+    if p.returncode not in (0, 1):
+        return False
+    text = (p.stdout or "").strip()
+    if not text:
+        return False
+    # Ignore our own checker / grep noise.
+    for line in text.splitlines():
+        if "gitm-node-health" in line:
+            continue
+        if re.search(r"\bvllm\b", line, re.IGNORECASE):
+            return True
+    return False
+
+
+def take_snapshot(*, phase: str) -> dict[str, Any]:
+    xid_lines, xid_err = _dmesg_xid_lines()
+    return {
+        "ts": time.time(),
+        "phase": phase,
+        "node": socket.gethostname(),
+        "temps_c": _temps(),
+        "throttle_reasons": _throttle_reasons(),
+        "power": _power_rows(),
+        "xid_lines": xid_lines,
+        "xid_error": xid_err,
+        "shm": _shm_stats(),
+        "nvlink": _nvlink_status(),
+        "vllm_alive": _vllm_alive(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+def _clocks_bad(reason: str) -> bool:
+    r = reason.lower()
+    if any(bad in r for bad in THRESHOLDS["clocks_bad_substrings"]):
+        return True
+    return False
+
+
+def eval_snapshot(snap: dict[str, Any]) -> list[str]:
+    """Return failed signal names for a single snapshot (no XID-diff / vLLM window)."""
+    failed: list[str] = []
+    temps = snap.get("temps_c") or []
+    if not temps or any(t >= THRESHOLDS["thermal_max_c"] for t in temps):
+        failed.append("thermal")
+
+    reasons = snap.get("throttle_reasons") or []
+    if not reasons or any(_clocks_bad(r) for r in reasons):
+        failed.append("clocks")
+
+    power = snap.get("power") or []
+    power_bad = False
+    if not power:
+        power_bad = True
+    for row in power:
+        if abs(float(row["limit"]) - float(row["max_limit"])) > 0.5:
+            power_bad = True
+        cap = str(row.get("sw_power_cap", "")).lower()
+        if cap and "not active" not in cap and "active" in cap:
+            power_bad = True
+    if power_bad:
+        failed.append("power_cap")
+
+    if snap.get("xid_error"):
+        failed.append("dmesg_xid")
+
+    shm = snap.get("shm")
+    if (
+        shm is None
+        or shm["size_g"] < THRESHOLDS["shm_min_size_g"]
+        or shm["used_pct"] >= THRESHOLDS["shm_max_used_pct"]
+    ):
+        failed.append("dev_shm")
+
+    nv = snap.get("nvlink") or {}
+    if not _nvlink_ok(nv):
+        failed.append("nvlink")
+
+    return failed
+
+
+def _nvlink_ok(nv: dict[str, Any]) -> bool:
+    text = (nv.get("nvlink_s") or "").lower()
+    if text and re.search(r"\b(inactive|down|disabled)\b", text):
+        return False
+    topo = nv.get("topo") or ""
+    if not topo.strip() or nv.get("topo_rc") not in (0, None):
+        return False
+    # Parse GPU rows: "GPU0  X  NV18 NV18 ..." (self + peers, then CPU columns).
+    rows: dict[int, list[str]] = {}
+    for line in topo.splitlines():
+        m = re.match(r"GPU(\d+)\s+(.*)$", line.strip())
+        if not m:
+            continue
+        idx = int(m.group(1))
+        cells = m.group(2).split()
+        link_cells = []
+        for c in cells:
+            if re.match(r"^(NV\d+|PIX|PXB|PHB|NODE|SYS|X|SOC)$", c):
+                link_cells.append(c)
+            else:
+                break
+        rows[idx] = link_cells
+    if len(rows) < 2:
+        return False
+    indices = sorted(rows)
+    for a in indices:
+        cells = rows[a]
+        for b in indices:
+            if b == a:
+                continue
+            col = indices.index(b)
+            if col >= len(cells):
+                return False
+            if not cells[col].startswith("NV"):
+                return False
+    return True
+
+
+def eval_window(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fold pre/sample/post records into one healthy / failed_signals row."""
+    failed: set[str] = set()
+    pre = next((r for r in records if r.get("phase") == "pre"), None)
+    post = next((r for r in records if r.get("phase") == "post"), None)
+    samples = [r for r in records if r.get("phase") == "sample"]
+
+    for snap in records:
+        if snap.get("phase") in ("pre", "post", "sample"):
+            # Skip vLLM and XID-diff here; handled below.
+            for sig in eval_snapshot(snap):
+                if sig == "dmesg_xid":
+                    continue  # window diff below
+                failed.add(sig)
+
+    # XID: new lines in post vs pre.
+    pre_xids = set(pre.get("xid_lines") or []) if pre else set()
+    post_xids = set(post.get("xid_lines") or []) if post else set()
+    if (pre and pre.get("xid_error")) or (post and post.get("xid_error")):
+        failed.add("dmesg_xid")
+    elif post is not None and (post_xids - pre_xids):
+        failed.add("dmesg_xid")
+
+    # vLLM: once seen alive in a sample, later samples must stay alive.
+    seen_alive = False
+    for s in samples:
+        alive = bool(s.get("vllm_alive"))
+        if alive:
+            seen_alive = True
+        elif seen_alive and not alive:
+            failed.add("vllm_liveness")
+            break
+
+    node = (
+        (post or pre or (samples[-1] if samples else {})).get("node")
+        or socket.gethostname()
+    )
+    return {
+        "job_id": (pre or post or {}).get("job_id"),
+        "node": node,
+        "healthy": not failed,
+        "failed_signals": sorted(failed),
+        "pre_ts": pre.get("ts") if pre else None,
+        "post_ts": post.get("ts") if post else None,
+        "n_samples": len(samples),
+    }
+
+
+# ---------------------------------------------------------------------------
+# JSONL I/O + sampler
+# ---------------------------------------------------------------------------
+
+def _append(path: Path, obj: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(obj, sort_keys=True) + "\n")
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    out: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+
+def _sampler_pid_path(out: Path) -> Path:
+    return out.with_suffix(out.suffix + ".sampler.pid")
+
+
+def cmd_pre(args: argparse.Namespace) -> int:
+    out = Path(args.out)
+    snap = take_snapshot(phase="pre")
+    snap["job_id"] = args.job
+    _append(out, snap)
+    # Start background sampler.
+    period = THRESHOLDS["sampler_period_s"]
+    script = Path(__file__).resolve()
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(script),
+            "_sample",
+            "--job",
+            str(args.job),
+            "--out",
+            str(out),
+            "--period",
+            str(period),
+        ],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    _sampler_pid_path(out).write_text(str(proc.pid), encoding="utf-8")
+    fails = [s for s in eval_snapshot(snap) if s != "dmesg_xid"]
+    # Unreadable dmesg at pre still counts.
+    if snap.get("xid_error"):
+        fails.append("dmesg_xid")
+    if fails:
+        print(f"gitm-node-health: pre unhealthy: {','.join(sorted(set(fails)))}", file=sys.stderr)
+        return 1
+    print(f"gitm-node-health: pre ok on {snap['node']}")
+    return 0
+
+
+def cmd_sample(args: argparse.Namespace) -> int:
+    out = Path(args.out)
+    period = float(args.period)
+    while True:
+        snap = take_snapshot(phase="sample")
+        snap["job_id"] = args.job
+        _append(out, snap)
+        time.sleep(period)
+
+
+def _stop_sampler(out: Path) -> None:
+    pid_path = _sampler_pid_path(out)
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        pid_path.unlink()
+    except OSError:
+        pass
+
+
+def cmd_post(args: argparse.Namespace) -> int:
+    out = Path(args.out)
+    _stop_sampler(out)
+    snap = take_snapshot(phase="post")
+    snap["job_id"] = args.job
+    _append(out, snap)
+    print(f"gitm-node-health: post recorded on {snap['node']}")
+    return 0
+
+
+def cmd_summarize(args: argparse.Namespace) -> int:
+    out = Path(args.out)
+    records = _read_jsonl(out)
+    for r in records:
+        if args.job and not r.get("job_id"):
+            r["job_id"] = args.job
+    window = eval_window(records)
+    if args.job:
+        window["job_id"] = args.job
+    window_path = Path(args.window) if args.window else out.parent / "node_health_window.json"
+    window_path.parent.mkdir(parents=True, exist_ok=True)
+    window_path.write_text(json.dumps(window, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    status = "healthy" if window["healthy"] else "unhealthy"
+    print(
+        f"gitm-node-health: window {status} "
+        f"failed_signals={window['failed_signals']} → {window_path}"
+    )
+    return 0 if window["healthy"] else 1
+
+
+def _requeue_count_path(job: str) -> Path:
+    return Path(STATE_DIR) / f"requeue-{job}.count"
+
+
+def cmd_gate(args: argparse.Namespace) -> int:
+    """If window unhealthy: move results aside, requeue (capped), exit 1."""
+    window_path = Path(args.window)
+    try:
+        window = json.loads(window_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"gitm-node-health: gate cannot read window: {exc}", file=sys.stderr)
+        return 1
+    if window.get("healthy"):
+        print("gitm-node-health: gate pass")
+        return 0
+
+    results = Path(args.results)
+    job = str(args.job)
+    out_host = results / job
+    discarded = results / "discarded" / job
+    if out_host.is_dir():
+        discarded.parent.mkdir(parents=True, exist_ok=True)
+        if discarded.exists():
+            # Keep the latest discard unique.
+            discarded = results / "discarded" / f"{job}-{int(time.time())}"
+        try:
+            out_host.rename(discarded)
+            print(f"gitm-node-health: discarded {out_host} → {discarded}")
+        except OSError as exc:
+            print(f"gitm-node-health: discard failed: {exc}", file=sys.stderr)
+
+    count_path = _requeue_count_path(job)
+    try:
+        n = int(count_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        n = 0
+    if n >= int(THRESHOLDS["max_requeues"]):
+        print(
+            f"gitm-node-health: requeue cap ({THRESHOLDS['max_requeues']}) reached "
+            f"for job {job}; not requeuing",
+            file=sys.stderr,
+        )
+        return 1
+    count_path.parent.mkdir(parents=True, exist_ok=True)
+    count_path.write_text(str(n + 1), encoding="utf-8")
+    p = RUN(["scontrol", "requeue", job], timeout=60)
+    if p.returncode != 0:
+        print(
+            f"gitm-node-health: scontrol requeue failed: {(p.stderr or p.stdout).strip()}",
+            file=sys.stderr,
+        )
+    else:
+        print(f"gitm-node-health: requeued job {job} (attempt {n + 1})")
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument(
+        "--print-thresholds",
+        action="store_true",
+        help="print THRESHOLDS JSON and exit",
+    )
+    sub = ap.add_subparsers(dest="cmd")
+
+    def add_job_out(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--job", required=True, help="Slurm job id")
+        p.add_argument("--out", required=True, help="path to node_health.jsonl")
+
+    p_pre = sub.add_parser("pre", help="snapshot + start sampler")
+    add_job_out(p_pre)
+    p_post = sub.add_parser("post", help="stop sampler + snapshot")
+    add_job_out(p_post)
+    p_sum = sub.add_parser("summarize", help="write node_health_window.json")
+    add_job_out(p_sum)
+    p_sum.add_argument(
+        "--window",
+        default="",
+        help="output path (default: <out-dir>/node_health_window.json)",
+    )
+    p_gate = sub.add_parser("gate", help="discard + requeue if unhealthy")
+    p_gate.add_argument("--window", required=True)
+    p_gate.add_argument("--results", required=True, help="RESULTS_DIR")
+    p_gate.add_argument("--job", required=True)
+    p_sample = sub.add_parser("_sample", help=argparse.SUPPRESS)
+    add_job_out(p_sample)
+    p_sample.add_argument("--period", type=float, default=THRESHOLDS["sampler_period_s"])
+
+    args = ap.parse_args(argv)
+    if args.print_thresholds:
+        print_thresholds()
+        return 0
+    if not args.cmd:
+        ap.print_help()
+        return 2
+    return {
+        "pre": cmd_pre,
+        "post": cmd_post,
+        "summarize": cmd_summarize,
+        "gate": cmd_gate,
+        "_sample": cmd_sample,
+    }[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -164,6 +164,9 @@ command -v setfacl >/dev/null || apt-get install -y -qq acl >/dev/null
 setfacl -d -m u::rwx,g::rwx,o::rwx "$HF_CACHE"
 install -m 755 "$HERE/gitm-job" /usr/local/bin/gitm-job
 install -m 755 "$HERE/gitm-node-report" /usr/local/bin/gitm-node-report
+install -m 755 "$HERE/gitm-node-health" /usr/local/bin/gitm-node-health
+mkdir -p /var/lib/gitm-gpu
+chmod 1777 /var/lib/gitm-gpu
 touch /etc/gitm-gpu/config
 setkey() { grep -q "^$1=" /etc/gitm-gpu/config && sed -i "s#^$1=.*#$1=$2#" /etc/gitm-gpu/config || echo "$1=$2" >> /etc/gitm-gpu/config; }
 setkey RESULTS_DIR "$RESULTS_DIR"

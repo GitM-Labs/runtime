@@ -16,9 +16,13 @@ one queue. Live status: <https://gitm-labs.github.io/gpu-status/>.
 |---|---|---|
 | `setup-controller.sh` | gitmachine-2 | Adds node 2 to `slurm.conf`, makes the `gpu` partition whole-node (`OverSubscribe=EXCLUSIVE`), turns on job history, installs containers here, makes the join bundle, starts the status pusher |
 | `setup-join.sh` | node 2 | Installs matching Slurm + munge, copies accounts with the same UIDs, joins the cluster, installs containers |
-| `setup-node.sh` | (called by both) | nvidia-container hook, Enroot 4.2.1, Pyxis v0.24.0, pre-imported vLLM image, reporter |
+| `setup-node.sh` | (called by both) | nvidia-container hook, Enroot 4.2.1, Pyxis v0.24.0, pre-imported vLLM image, reporter, node-health checker |
 | `gitm-job` | everywhere | Team CLI; also the status pusher |
 | `gitm-node-report` | every node | GPU readings + job log tails for the page |
+| `gitm-node-health` | every node (job prolog/epilog) | Pre/post thermal, clocks, power cap, XID, vLLM, `/dev/shm`, NVLink; one window row per job; discard + requeue on fail |
+| `signal_contract.json` | laptop / qualify_run | H200 contract requiring `node_health` + `merged_trace` |
+
+Node-health signals and thresholds: [`docs/h200_node_health.md`](../../docs/h200_node_health.md).
 
 ## Setup
 

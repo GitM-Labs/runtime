@@ -92,6 +92,14 @@ def default_signal_contract() -> SignalContract:
     return SignalContract()
 
 
+def default_h200_signal_contract() -> SignalContract:
+    """H200 Slurm queue: CUPTI capture + host node-health window row."""
+    return SignalContract(
+        capture_backend="cupti-inject",
+        required_sources=["merged_trace", "node_health"],
+    )
+
+
 def load_deployment_spec(path: Path) -> DeploymentSpec:
     data = json.loads(path.read_text(encoding="utf-8"))
     return DeploymentSpec.model_validate(data)
