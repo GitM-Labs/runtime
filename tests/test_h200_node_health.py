@@ -109,14 +109,15 @@ def test_print_thresholds_matches_doc_keys():
     assert health.THRESHOLDS["shm_min_size_g"] == 16
 
 
-def test_dmesg_helper_filters_before_returning_and_is_group_scoped():
+def test_dmesg_helper_filters_before_returning_and_is_user_scoped():
     setup = (ROOT / "deploy" / "h200" / "setup-node.sh").read_text()
     helper = setup.split(
         "cat > /usr/local/libexec/gitm-dmesg-xid <<'EOF'\n", 1
     )[1].split("\nEOF", 1)[0]
     assert "grep -i 'NVRM:[[:space:]]*Xid'" in helper
-    assert "%gitm-health ALL=(root) NOPASSWD:" in setup
-    assert "ALL ALL=(root) NOPASSWD:" not in setup
+    assert '"$HEALTH_USER ALL=(root) NOPASSWD:' in setup
+    assert "getent passwd | awk" not in setup
+    assert "usermod -a -G gitm-health" not in setup
 
 
 def test_throttled_node_caught(tmp_path: Path):
@@ -242,6 +243,16 @@ def test_healthy_window_passes_qualify(tmp_path: Path):
     assert result.verdict != "invalid_run"
 
 
+@pytest.mark.parametrize("contents", [None, "{", "[]", "{}"])
+def test_missing_or_malformed_node_health_is_invalid(tmp_path: Path, contents: str | None):
+    art = tmp_path / "run"
+    art.mkdir()
+    if contents is not None:
+        (art / "node_health_window.json").write_text(contents, encoding="utf-8")
+    result = qualify_run(art, _spec(), _nh_contract())
+    assert result.verdict == "invalid_run"
+
+
 def test_h200_contract_requires_node_health():
     c = default_h200_signal_contract()
     assert "node_health" in c.required_sources
@@ -271,6 +282,7 @@ def test_gitm_submit_dry_run_wires_health(tmp_path: Path, monkeypatch: pytest.Mo
     assert 'post --job "$SLURM_JOB_ID"' in script
     assert "summarize" in script
     assert "gate --window" in script
+    assert 'if [ ! -x "$HEALTH_BIN" ]; then' in script
 
 
 def test_gitm_job_dry_run_wires_health():
@@ -298,6 +310,7 @@ def test_gitm_job_dry_run_wires_health():
     assert "gitm-node-health" in script
     assert "pre --job" in script
     assert "post --job" in script
+    assert 'if [ ! -x "$HEALTH_BIN" ]; then' in script
 
 
 def test_gate_discards_and_requeues(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

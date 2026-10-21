@@ -136,7 +136,8 @@ mkdir -p /etc/gitm-gpu
 install -m 644 "$B/gitm/config" /etc/gitm-gpu/config
 RES=$(grep '^RESULTS_DIR=' /etc/gitm-gpu/config | cut -d= -f2-)
 HF=$(grep '^HF_CACHE=' /etc/gitm-gpu/config | cut -d= -f2-)
-NODE_ARGS=(--report-key "$(cat "$B/gitm/report_key.pub")" --results-dir "$RES" --hf-cache "$HF")
+HEALTH_USER=$(grep '^HEALTH_USER=' /etc/gitm-gpu/config | cut -d= -f2-)
+NODE_ARGS=(--report-key "$(cat "$B/gitm/report_key.pub")" --health-user "$HEALTH_USER" --results-dir "$RES" --hf-cache "$HF")
 [[ $SKIP_IMAGE -eq 1 ]] && NODE_ARGS+=(--skip-image)
 "$HERE/setup-node.sh" "${NODE_ARGS[@]}"   # also restarts slurmd if Pyxis was added
 

@@ -155,6 +155,10 @@ if [ -r /etc/gitm-gpu/hf_token ]; then export HF_TOKEN="$(cat /etc/gitm-gpu/hf_t
 echo "job $SLURM_JOB_ID on $(hostname) | image $IMAGE"
 HEALTH_BIN=$(command -v gitm-node-health 2>/dev/null || true)
 HEALTH_BIN=${{HEALTH_BIN:-/usr/local/bin/gitm-node-health}}
+if [ ! -x "$HEALTH_BIN" ]; then
+  echo "gitm-submit: required node-health checker is not executable: $HEALTH_BIN" >&2
+  exit 1
+fi
 NH_OUT="$OUT_HOST/node_health.jsonl"
 NH_WINDOW="$OUT_HOST/node_health_window.json"
 if [ -x "$HEALTH_BIN" ]; then

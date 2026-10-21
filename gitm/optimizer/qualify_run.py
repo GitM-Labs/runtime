@@ -539,7 +539,7 @@ def qualify_run(
             checks.append(
                 CheckResult(
                     f"source:{source}",
-                    "unknown",
+                    "fail" if source == "node_health" else "unknown",
                     {"source": source, "note": "empty_or_absent"},
                 )
             )
@@ -1631,13 +1631,13 @@ def _check_node_health_window(path: Path) -> CheckResult:
     except (OSError, json.JSONDecodeError) as exc:
         return CheckResult(
             "node_health_window",
-            "unknown",
+            "fail",
             {"path": str(path), "error": str(exc)},
         )
     if not isinstance(data, dict):
         return CheckResult(
             "node_health_window",
-            "unknown",
+            "fail",
             {"path": str(path), "note": "not_an_object"},
         )
     healthy = data.get("healthy")
@@ -1667,7 +1667,7 @@ def _check_node_health_window(path: Path) -> CheckResult:
         )
     return CheckResult(
         "node_health_window",
-        "unknown",
+        "fail",
         {"path": str(path), "note": "missing_healthy_bool", "raw_keys": sorted(data)},
     )
 

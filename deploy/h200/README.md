@@ -30,7 +30,8 @@ On node 2, note its name and internal IP: `hostname -s; hostname -I`.
 
 ```bash
 # 1. gitmachine-2
-sudo ./setup-controller.sh --add-node NODE2NAME=NODE2_IP --status-repo GitM-Labs/gpu-status
+sudo ./setup-controller.sh --health-user JOB_SERVICE_USER --add-node NODE2NAME=NODE2_IP \
+  --status-repo GitM-Labs/gpu-status
 
 # 2. node 2 (copy this folder + the bundle it printed)
 sudo ./setup-join.sh --bundle ~/gitm-join.tgz && rm ~/gitm-join.tgz

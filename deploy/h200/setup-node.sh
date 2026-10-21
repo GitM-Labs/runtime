@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Prepare one 8x H200 Slurm node to run gitm jobs in throwaway containers.
 #
-#   sudo ./setup-node.sh --report-key "ssh-ed25519 AAAA... gitm-report"
+#   sudo ./setup-node.sh --health-user gitm \
+#        --report-key "ssh-ed25519 AAAA... gitm-report"
 #
 # Run on EVERY GPU node (gitmachine-2 included). The report key is printed by
 # setup-controller.sh; it lets the status pusher read GPU readings and job log
@@ -17,6 +18,7 @@ ENROOT_VERSION="4.2.1"
 PYXIS_VERSION="v0.24.0"
 
 REPORT_KEY=""
+HEALTH_USER=""
 RESULTS_DIR="/var/lib/gitm/results"
 HF_CACHE="/var/lib/gitm/hf-cache"
 IMAGE_DIR="/var/lib/gitm/images"
@@ -25,6 +27,7 @@ SKIP_IMAGE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --report-key)  REPORT_KEY="$2"; shift 2 ;;
+    --health-user) HEALTH_USER="$2"; shift 2 ;;
     --results-dir) RESULTS_DIR="$2"; shift 2 ;;
     --hf-cache)    HF_CACHE="$2"; shift 2 ;;
     --image)       DEFAULT_IMAGE_REF="$2"; shift 2 ;;
@@ -34,6 +37,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ $EUID -eq 0 ]] || { echo "run as root (sudo)" >&2; exit 1; }
+[[ -n "$HEALTH_USER" ]] || { echo "--health-user USER is required (the account that runs health hooks)" >&2; exit 1; }
+id "$HEALTH_USER" >/dev/null 2>&1 || { echo "--health-user account does not exist: $HEALTH_USER" >&2; exit 1; }
+[[ "$HEALTH_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || { echo "invalid --health-user: $HEALTH_USER" >&2; exit 1; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[33mWARNING: %s\033[0m\n' "$*"; }
@@ -169,10 +175,7 @@ mkdir -p /var/lib/gitm-gpu /usr/local/libexec
 chmod 1777 /var/lib/gitm-gpu
 # Narrow dmesg reader for XID checks when kernel.dmesg_restrict=1. The helper
 # filters while privileged, so callers never receive unrelated kernel logs.
-getent group gitm-health >/dev/null || groupadd --system gitm-health
-getent passwd | awk -F: '$3>=1000 && $3<60000 {print $1}' | while read -r user; do
-  usermod -a -G gitm-health "$user"
-done
+# Only the account running the health hook may invoke it.
 cat > /usr/local/libexec/gitm-dmesg-xid <<'EOF'
 #!/bin/bash
 out=$(/bin/dmesg -T) || exit $?
@@ -181,9 +184,9 @@ rc=${PIPESTATUS[1]}
 [[ $rc -eq 1 ]] && exit 0
 exit "$rc"
 EOF
-chown root:gitm-health /usr/local/libexec/gitm-dmesg-xid
-chmod 750 /usr/local/libexec/gitm-dmesg-xid
-echo '%gitm-health ALL=(root) NOPASSWD: /usr/local/libexec/gitm-dmesg-xid' \
+chown root:root /usr/local/libexec/gitm-dmesg-xid
+chmod 700 /usr/local/libexec/gitm-dmesg-xid
+echo "$HEALTH_USER ALL=(root) NOPASSWD: /usr/local/libexec/gitm-dmesg-xid" \
   > /etc/sudoers.d/gitm-dmesg-xid
 chmod 440 /etc/sudoers.d/gitm-dmesg-xid
 touch /etc/gitm-gpu/config
