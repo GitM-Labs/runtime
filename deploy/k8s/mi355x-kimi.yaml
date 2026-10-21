@@ -1,5 +1,9 @@
 # Kimi K2.5 on 8x MI355X with the GITM ROCm tracer — one `kubectl apply -f` unit.
 #
+# SUPERSEDED by mi355x-kimi-loop.yaml (vLLM, TP8), which is what runs. The
+# NEXTN flags below draft with nothing: Kimi-K2.5 ships no MTP head
+# (gitm/planner/models/kimi-k2.5.yaml).
+#
 # Architecture (one pod, because the tracer's arming protocol requires it):
 #
 #   initContainer  gitm-tool     copies libgitm_rocm_inject.so (built into the
@@ -113,7 +117,7 @@ spec:
             - --trust-remote-code
             - --host=0.0.0.0
             - --port=8000
-            # Kimi K2.5's MTP head, via SGLang's NextN-style speculative path.
+            # Meant for an MTP head via SGLang's NextN path; K2.5 has none.
             # Without these the server decodes autoregressively and streams
             # avg_decoded_tokens_per_iter: 1.0 — plain decode, no spec decode
             # experiment. Acceptance shows up in that same field (>1.0).
