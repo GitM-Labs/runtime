@@ -125,6 +125,10 @@ def _expand_layer_types(value: Any, n_layers: int) -> tuple[str, ...]:
     return expanded
 
 
+# Per-checkpoint facts that `extends` never copies from the base entry.
+_NOT_INHERITED = frozenset({"provenance", "checkpoint", "deployment"})
+
+
 def load_entry(name_or_path: str | Path, _seen: frozenset[str] = frozenset()) -> dict[str, Any]:
     """The raw catalogue entry, validated for structure but not yet a spec.
 
@@ -134,8 +138,10 @@ def load_entry(name_or_path: str | Path, _seen: frozenset[str] = frozenset()) ->
     78-entry indexer schedule and a 78-entry MLP schedule verbatim. Copying those
     into both files is 158 lines of duplicated evidence that can drift apart
     silently, and it hides the thing worth seeing: the two entries differ only in
-    their dtypes. ``provenance`` is deliberately *not* merged — each checkpoint
-    was validated against its own published size and has its own open questions.
+    their dtypes. ``provenance``, ``checkpoint`` and ``deployment`` are
+    deliberately *not* merged: each checkpoint was validated against its own
+    published size, is pinned at its own revision, and is served (or not) on its
+    own; inheriting them would hand a child its parent's pin and deployment.
     """
     path = _resolve(name_or_path)
     data = yaml.safe_load(path.read_text()) or {}
@@ -150,7 +156,7 @@ def load_entry(name_or_path: str | Path, _seen: frozenset[str] = frozenset()) ->
         base = load_entry(key, _seen | {key})
         merged = dict(base.get("spec") or {})
         merged.update(data.get("spec") or {})
-        data = {**{k: v for k, v in base.items() if k != "provenance"}, **data}
+        data = {**{k: v for k, v in base.items() if k not in _NOT_INHERITED}, **data}
         data["spec"] = merged
 
     family = data.get("family")

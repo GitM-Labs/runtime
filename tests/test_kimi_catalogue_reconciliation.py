@@ -89,8 +89,19 @@ def test_deployment_gaps_are_recorded():
     assert "engine_version" in k26["unverified"]
 
 
-def test_undeployed_nvfp4_does_not_inherit_a_deployment():
-    assert load_entry("kimi-k2.6")["deployment"] is None
+@pytest.mark.parametrize("entry", ["kimi-k2.6", "kimi-k2.7-code"])
+def test_children_do_not_inherit_the_k25_pin_or_deployment(entry):
+    # `extends` shares architecture only. kimi-k2.7-code sets neither block, so
+    # it must come back with none, not K2.5's revision and MI355X run.
+    e = load_entry(entry)
+    assert e.get("deployment") is None
+    assert (e.get("checkpoint") or {}).get("revision") != load_entry("kimi-k2.5")["checkpoint"]["revision"]
+
+
+def test_k27_code_registry_note_claims_no_deployment():
+    from gitm.planner.registry import _load
+
+    assert "deployment verified" not in _load("kimi-k2.7-code")[2]
 
 
 def test_registry_note_reports_the_deployment():

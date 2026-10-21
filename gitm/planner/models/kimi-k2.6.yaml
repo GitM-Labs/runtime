@@ -24,8 +24,6 @@ checkpoint:
   tensor_count: 277670
   shard_count: 60
   index_total_size: 595148146656
-# Not deployed here; null stops kimi-k2.5's MI355X deployment being inherited.
-deployment: null
 description: >
   61 layers, hidden 7168, dense MLA (kv_lora_rank 512, no sparse-attention
   indexer), layer 0 dense FFN, layers 1-60 MoE (384 experts, top-8, one
