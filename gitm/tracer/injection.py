@@ -29,6 +29,7 @@ import math
 import os
 import time
 import warnings
+from collections import Counter
 from pathlib import Path
 
 from gitm.tracer.schema import TraceEvent
@@ -373,6 +374,7 @@ def read_shards_with_loss(
     collector_drops = 0
     collectors: set[str] = set()
     no_direct_dispatch = False
+    ranges_requested = False
     stamp_faults: dict[str, int] = {}
     shards = shard_paths()
     # No shard at all is a collector that never loaded, not a capture with no loss.
@@ -449,6 +451,8 @@ def read_shards_with_loss(
                         loss_known = False  # not a count at all
                 if rec.get("collector"):
                     collectors.add(str(rec["collector"]))
+                if rec.get("identity"):
+                    ranges_requested = True
                 if rec.get("identity") and rec.get("direct_dispatch") == 0:
                     no_direct_dispatch = True
                 for key in ("graph_stamp_overflow", "graph_untracked_launch"):
@@ -492,6 +496,22 @@ def read_shards_with_loss(
         warnings.warn(
             f"injected trace shards come from more than one collector "
             f"({sorted(collectors)}); stale shards from another run are mixed in",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    # Ranges asked for (the ROCm collector's meta says so; on NVIDIA the env
+    # does) and kernels recorded, but not one range arrived: every kernel
+    # decodes with range_op None and nothing else says why.
+    ranges_requested = ranges_requested or os.environ.get(ENV_NVTX, "0") not in ("", "0")
+    kinds = Counter(r.get("kind") for r in records)
+    if ranges_requested and kinds["kernel"] and not kinds["marker"]:
+        warnings.warn(
+            f"injected trace identity: ranges were requested ({ENV_NVTX}) but none "
+            f"reached the collector, so none of {kinds['kernel']} kernel(s) carries a "
+            "layer or op. vLLM >= 0.29's default V2 model runner accepts "
+            "--enable-layerwise-nvtx-tracing and never pushes them: set "
+            "VLLM_USE_V2_MODEL_RUNNER=0. On AMD the roctx shim must also be "
+            "preloaded (run_env(nvtx=True) does).",
             RuntimeWarning,
             stacklevel=2,
         )

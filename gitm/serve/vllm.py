@@ -762,6 +762,30 @@ def apply_tracing_env(env, trace_path, *, nvtx: bool, no_trace: bool) -> None:
                 if k not in process})
 
 
+#: vLLM's switch between its V1 and V2 model runners.
+ENV_VLLM_V2_RUNNER = "VLLM_USE_V2_MODEL_RUNNER"
+
+
+def pin_layerwise_runner(env) -> bool:
+    """Run vLLM's V1 model runner, unless the operator chose one. True if pinned.
+
+    vLLM 0.29 defaults to its V2 model runner, which accepts
+    ``--enable-layerwise-nvtx-tracing`` and never registers the hooks: they live
+    only in ``v1/worker/gpu_model_runner.py``. The server serves, the collector
+    collects, and no kernel carries a layer or op. Seen on MI355X: zero markers
+    in a run whose log said ``Using V2 Model Runner``.
+
+    The pin changes the runner as well as the ranges, so an overhead measured
+    between a ``--nvtx`` arm and a plain one includes the switch. Export
+    ``VLLM_USE_V2_MODEL_RUNNER=0`` for every arm to measure NVTX alone; an
+    exported value is kept.
+    """
+    if ENV_VLLM_V2_RUNNER in env:
+        return False
+    env[ENV_VLLM_V2_RUNNER] = "0"
+    return True
+
+
 def launch_and_capture(args, serve_argv: list[str] | None = None):
     """Launch ``vllm serve`` under the collector, capture a window, tear it down.
 
@@ -862,6 +886,8 @@ def launch_and_capture(args, serve_argv: list[str] | None = None):
     # overhead measurement.
     if nvtx and "--enable-layerwise-nvtx-tracing" not in cmd:
         cmd += ["--enable-layerwise-nvtx-tracing"]
+    if "--enable-layerwise-nvtx-tracing" in cmd and pin_layerwise_runner(os.environ):
+        print("==> VLLM_USE_V2_MODEL_RUNNER=0 (the V2 runner never pushes layerwise ranges)")
     if not _arg_of(cmd, "--port"):
         cmd += ["--port", str(args.port)]
     if not _arg_of(cmd, "--host"):

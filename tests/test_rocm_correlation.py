@@ -333,6 +333,46 @@ def test_read_shards_warns_when_direct_dispatch_is_off(tmp_path, monkeypatch):
         injection.read_shards()
 
 
+_RANGES_ON = {"kind": "meta", "collector": "rocprofiler-sdk", "identity": 1,
+              "direct_dispatch": 1}
+
+
+def test_read_shards_warns_when_ranges_were_requested_and_none_arrived(tmp_path,
+                                                                       monkeypatch):
+    """vLLM 0.29's V2 runner takes --enable-layerwise-nvtx-tracing and pushes
+    nothing: on MI355X a whole run decoded with range_op None and no warning."""
+    monkeypatch.setenv(injection.ENV_OUT, str(tmp_path / "trace.jsonl"))
+    monkeypatch.delenv(injection.ENV_NVTX, raising=False)
+    recs = [_RANGES_ON, _rt(1, 0, 5), _k(1, t=10)]
+    (tmp_path / "trace.jsonl.1").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+    with pytest.warns(RuntimeWarning, match="VLLM_USE_V2_MODEL_RUNNER=0"):
+        injection.read_shards()
+
+
+def test_read_shards_is_quiet_when_ranges_arrive(tmp_path, monkeypatch):
+    monkeypatch.setenv(injection.ENV_OUT, str(tmp_path / "trace.jsonl"))
+    halves = [{"kind": "marker", "marker_id": 7, "name": "L0/qkv_proj", "timestamp_ns": 0,
+               "marker_flags": 0, "thread_id": 1},
+              {"kind": "marker", "marker_id": 7, "timestamp_ns": 20, "marker_flags": 1,
+               "thread_id": 1}]
+    recs = [_RANGES_ON, *halves, _rt(1, 2, 5), _k(1, t=10)]
+    (tmp_path / "trace.jsonl.1").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        (ev,) = injection.read_shards()
+    assert (ev.range_op, ev.range_layer) == ("qkv_proj", 0)
+
+
+def test_read_shards_does_not_ask_for_ranges_nobody_requested(tmp_path, monkeypatch):
+    monkeypatch.setenv(injection.ENV_OUT, str(tmp_path / "trace.jsonl"))
+    monkeypatch.delenv(injection.ENV_NVTX, raising=False)
+    recs = [{**_RANGES_ON, "identity": 0}, _rt(1, 0, 5), _k(1, t=10)]
+    (tmp_path / "trace.jsonl.1").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        injection.read_shards()
+
+
 def test_cupti_node_records_sharing_an_id_merge_and_the_captured_name_wins():
     """CUPTI can report one node twice (created, then cloned into an exec); a
     clone must never override the range its original was captured under."""

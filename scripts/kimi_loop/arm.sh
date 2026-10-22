@@ -11,7 +11,7 @@
 #   L  lever, clean: A + caller-supplied vllm args, no tool loaded — the
 #                  untraced twin of I (the P1 experiment's off arm)
 #
-# Writes /scratch/arm.env (ALL five variables, every time — the supervisor
+# Writes /scratch/arm.env (EVERY variable, every time — the supervisor
 # re-sources with `set -a`, so an omitted variable would leak from the previous
 # arm), kills the server (shared pid namespace), and waits for /health to go
 # down and come back. ROCP_TOOL_LIBRARIES is read at HIP init, so a process
@@ -40,10 +40,20 @@ case "$ARM" in
   *) echo "unknown arm: $ARM" >&2; exit 2 ;;
 esac
 
+# vLLM >= 0.29 defaults to its V2 model runner, which accepts
+# --enable-layerwise-nvtx-tracing and never registers the hooks (they exist only
+# in v1/worker/gpu_model_runner.py): arm C would serve with no ranges at all.
+# Every other arm unsets it, so no arm inherits C's runner. Not an empty
+# export: vLLM parses the variable with int(), and "" fails.
+case "$ARM" in
+  C) RUNNER="export VLLM_USE_V2_MODEL_RUNNER=0" ;;
+  *) RUNNER="unset VLLM_USE_V2_MODEL_RUNNER" ;;
+esac
+
 # Idempotent: if this exact arm is already written AND the server is healthy,
 # don't pay a model reload for nothing.
-WANT=$(printf 'export GITM_ARM=%s\nexport ROCP_TOOL_LIBRARIES=%s\nexport GITM_TRACE_OUT=%s\nexport GITM_TRACE_NVTX=%s\nexport GITM_EXTRA_VLLM_ARGS="%s"\nexport LD_PRELOAD=%s\n' \
-  "$ARM" "$ROCP" "$OUT" "$NVTX" "$EXTRA" "$PRELOAD")
+WANT=$(printf 'export GITM_ARM=%s\nexport ROCP_TOOL_LIBRARIES=%s\nexport GITM_TRACE_OUT=%s\nexport GITM_TRACE_NVTX=%s\nexport GITM_EXTRA_VLLM_ARGS="%s"\nexport LD_PRELOAD=%s\n%s\n' \
+  "$ARM" "$ROCP" "$OUT" "$NVTX" "$EXTRA" "$PRELOAD" "$RUNNER")
 if [ -f /scratch/arm.env ] && [ "$(cat /scratch/arm.env)" = "$WANT" ] \
    && curl -sf -o /dev/null http://localhost:8000/health; then
   echo "==> arm $ARM already active and serving — no restart"
@@ -57,6 +67,7 @@ export GITM_TRACE_OUT=$OUT
 export GITM_TRACE_NVTX=$NVTX
 export GITM_EXTRA_VLLM_ARGS="$EXTRA"
 export LD_PRELOAD=$PRELOAD
+$RUNNER
 EOF
 echo "==> arm $ARM written: ROCP_TOOL_LIBRARIES='$ROCP' NVTX=$NVTX extra='$EXTRA'"
 

@@ -472,6 +472,24 @@ def test_serve_keeps_a_start_method_the_operator_chose(monkeypatch):
     assert env["VLLM_WORKER_MULTIPROC_METHOD"] == "fork"
 
 
+def test_layerwise_ranges_pin_the_v1_runner():
+    """vLLM 0.29's default V2 runner accepts --enable-layerwise-nvtx-tracing and
+    never registers the hooks; without the pin a --nvtx run names no kernel."""
+    from gitm.serve.vllm import pin_layerwise_runner
+
+    env: dict[str, str] = {}
+    assert pin_layerwise_runner(env) is True
+    assert env["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+
+
+def test_a_runner_the_operator_chose_is_kept():
+    from gitm.serve.vllm import pin_layerwise_runner
+
+    env = {"VLLM_USE_V2_MODEL_RUNNER": "1"}
+    assert pin_layerwise_runner(env) is False
+    assert env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+
+
 def test_serve_leaves_the_start_method_alone_on_nvidia(monkeypatch):
     from gitm.serve.vllm import apply_tracing_env
     from gitm.tracer import injection
