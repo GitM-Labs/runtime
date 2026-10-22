@@ -217,7 +217,10 @@ def _is_sampler(pid: int, path: Path) -> bool:
     return (
         any(Path(arg).name == "gitm-node-health" for arg in args)
         and "sample" in args
-        and any(args[i : i + 2] == ["--out", str(path)] for i in range(len(args) - 1))
+        and any(
+            args[i] == "--out" and Path(args[i + 1]) == path
+            for i in range(len(args) - 1)
+        )
     )
 
 
