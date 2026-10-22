@@ -109,15 +109,35 @@ def test_print_thresholds_matches_doc_keys():
     assert health.THRESHOLDS["shm_min_size_g"] == 16
 
 
-def test_dmesg_helper_filters_before_returning_and_is_user_scoped():
+def test_dmesg_helper_filters_before_returning_and_is_explicitly_scoped():
     setup = (ROOT / "deploy" / "h200" / "setup-node.sh").read_text()
     helper = setup.split(
         "cat > /usr/local/libexec/gitm-dmesg-xid <<'EOF'\n", 1
     )[1].split("\nEOF", 1)[0]
     assert "grep -i 'NVRM:[[:space:]]*Xid'" in helper
-    assert '"$HEALTH_USER ALL=(root) NOPASSWD:' in setup
+    assert '"$user ALL=(root) NOPASSWD:' in setup
+    assert 'HEALTH_USERS+=("$2")' in setup
     assert "getent passwd | awk" not in setup
     assert "usermod -a -G gitm-health" not in setup
+
+
+def test_xid_reader_falls_back_after_permission_error(monkeypatch: pytest.MonkeyPatch):
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "sudo":
+            return type("P", (), {"returncode": 1, "stdout": "", "stderr": "denied"})()
+        if cmd == [health.HELPER]:
+            raise PermissionError("not executable")
+        return type(
+            "P",
+            (),
+            {"returncode": 0, "stdout": "[1] NVRM: Xid 79\n", "stderr": ""},
+        )()
+
+    monkeypatch.setattr(health.subprocess, "run", fake_run)
+    monkeypatch.setattr(health, "RUN", health._run)
+    lines, error = health._xids()
+    assert error is None
+    assert lines == ["[1] NVRM: Xid 79"]
 
 
 def test_throttled_node_caught(tmp_path: Path):
@@ -177,10 +197,12 @@ def test_xid_mid_run_caught(tmp_path: Path):
 
 
 def test_dead_vllm_caught(tmp_path: Path):
-    pre = _healthy_snap(phase="pre")
-    s1 = _healthy_snap(phase="sample", ts=1.5, vllm_alive=True)
-    s2 = _healthy_snap(phase="sample", ts=1.6, vllm_alive=False)
-    post = _healthy_snap(phase="post", ts=2.0, vllm_alive=False)
+    pre = _healthy_snap(phase="pre", require_vllm=True)
+    s1 = _healthy_snap(phase="sample", ts=1.5, vllm_alive=True, require_vllm=True)
+    s2 = _healthy_snap(phase="sample", ts=1.6, vllm_alive=False, require_vllm=True)
+    post = _healthy_snap(
+        phase="post", ts=2.0, vllm_alive=False, require_vllm=True
+    )
     window = health.eval_window([pre, s1, s2, post])
     assert window["healthy"] is False
     assert "vllm_liveness" in window["failed_signals"]
@@ -191,6 +213,17 @@ def test_dead_vllm_caught(tmp_path: Path):
     assert result.verdict == "invalid_run"
     nh = next(c for c in result.checks if c.name == "node_health_window")
     assert "vllm_liveness" in nh.evidence["failed_signals"]
+
+
+def test_custom_job_does_not_require_vllm():
+    records = [
+        _healthy_snap(phase="pre"),
+        _healthy_snap(phase="sample", ts=1.5, vllm_alive=False),
+        _healthy_snap(phase="post", ts=2.0, vllm_alive=False),
+    ]
+    window = health.eval_window(records)
+    assert window["healthy"] is True
+    assert "vllm_liveness" not in window["failed_signals"]
 
 
 def test_vllm_alive_ignores_srun_wrapper(monkeypatch: pytest.MonkeyPatch):
@@ -219,11 +252,82 @@ def test_missing_post_is_unhealthy():
     assert "window_incomplete" in window["failed_signals"]
 
 
+def test_stop_ignores_stale_sampler_pid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    evidence = tmp_path / "node_health.jsonl"
+    pidfile = health._pidfile(evidence)
+    pidfile.write_text("123")
+    monkeypatch.setattr(health, "_is_sampler", lambda pid, path: False)
+
+    def must_not_kill(pid, sig):
+        pytest.fail(f"killed unrelated pid {pid}")
+
+    monkeypatch.setattr(health.os, "kill", must_not_kill)
+    health._stop(evidence)
+    assert pidfile == tmp_path / "node_health.jsonl.sampler.pid"
+    assert not pidfile.exists()
+
+
+def test_sampler_pid_requires_matching_command(monkeypatch: pytest.MonkeyPatch):
+    evidence = Path("/tmp/node_health.jsonl")
+    monkeypatch.setattr(
+        health.Path,
+        "read_bytes",
+        lambda self: (
+            b"/usr/bin/python3\0/usr/local/bin/gitm-node-health\0sample\0"
+            b"--job\0" b"99\0--out\0/tmp/node_health.jsonl\0"
+        ),
+    )
+    assert health._is_sampler(123, evidence) is True
+    assert health._is_sampler(123, Path("/tmp/other.jsonl")) is False
+
+
+def test_stop_kills_matching_sampler(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    evidence = tmp_path / "node_health.jsonl"
+    pidfile = health._pidfile(evidence)
+    pidfile.write_text("123")
+    killed = []
+    monkeypatch.setattr(health, "_is_sampler", lambda pid, path: True)
+    monkeypatch.setattr(health.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    health._stop(evidence)
+    assert killed == [(123, health.signal.SIGTERM)]
+    assert not pidfile.exists()
+
+
 def test_nvlink_requires_status_output():
     snap = _healthy_snap(
         nvlink={"links": "", "links_rc": 1, "topo": "GPU0 X\n", "topo_rc": 0}
     )
     assert "nvlink" in health.eval_snapshot(snap)
+
+
+def test_nvlink_ignores_nic_columns():
+    snap = _healthy_snap()
+    lines = snap["nvlink"]["topo"].splitlines()
+    lines[0] += "\tNIC0"
+    lines[1:] = [line + "\tPIX" for line in lines[1:]]
+    snap["nvlink"]["topo"] = "\n".join(lines)
+    assert "nvlink" not in health.eval_snapshot(snap)
+
+
+def test_nvlink_accepts_live_h200_topology():
+    topo = """\
+        GPU0    GPU1    GPU2    GPU3    GPU4    GPU5    GPU6    GPU7      CPU Affinity    NUMA Affinity   GPU NUMA ID
+GPU0     X      NV18    NV18    NV18    NV18    NV18    NV18    NV18      0-55,112-167    0               N/A
+GPU1    NV18     X      NV18    NV18    NV18    NV18    NV18    NV18      0-55,112-167    0               N/A
+GPU2    NV18    NV18     X      NV18    NV18    NV18    NV18    NV18      0-55,112-167    0               N/A
+GPU3    NV18    NV18    NV18     X      NV18    NV18    NV18    NV18      0-55,112-167    0               N/A
+GPU4    NV18    NV18    NV18    NV18     X      NV18    NV18    NV18      56-111,168-223  1               N/A
+GPU5    NV18    NV18    NV18    NV18    NV18     X      NV18    NV18      56-111,168-223  1               N/A
+GPU6    NV18    NV18    NV18    NV18    NV18    NV18     X      NV18      56-111,168-223  1               N/A
+GPU7    NV18    NV18    NV18    NV18    NV18    NV18    NV18     X        56-111,168-223  1               N/A
+"""
+    status = {
+        "links": "GPU 0: NVIDIA H200\n         Link 0: 26.562 GB/s\n",
+        "links_rc": 0,
+        "topo": topo,
+        "topo_rc": 0,
+    }
+    assert health._nvlink_ok(status) is True
 
 
 def test_healthy_window_passes_qualify(tmp_path: Path):
@@ -283,6 +387,10 @@ def test_gitm_submit_dry_run_wires_health(tmp_path: Path, monkeypatch: pytest.Mo
     assert "summarize" in script
     assert "gate --window" in script
     assert 'if [ ! -x "$HEALTH_BIN" ]; then' in script
+    assert "--require-vllm" in script
+
+    args.command = ["echo", "ok"]
+    assert "--require-vllm" not in mod.build_script(args)
 
 
 def test_gitm_job_dry_run_wires_health():
@@ -311,6 +419,27 @@ def test_gitm_job_dry_run_wires_health():
     assert "pre --job" in script
     assert "post --job" in script
     assert 'if [ ! -x "$HEALTH_BIN" ]; then' in script
+    assert "--require-vllm" in script
+
+    args.command = ["echo", "ok"]
+    assert "--require-vllm" not in mod.build_script(args, cfg)
+
+
+@pytest.mark.parametrize("contents", [None, "{"])
+def test_summarize_writes_unhealthy_window_for_bad_evidence(
+    tmp_path: Path, contents: str | None
+):
+    evidence = tmp_path / "node_health.jsonl"
+    window = tmp_path / "node_health_window.json"
+    if contents is not None:
+        evidence.write_text(contents, encoding="utf-8")
+    rc = health.summarize(
+        Namespace(out=str(evidence), window=str(window), job="99")
+    )
+    result = json.loads(window.read_text())
+    assert rc == 1
+    assert result["healthy"] is False
+    assert "window_incomplete" in result["failed_signals"]
 
 
 def test_gate_discards_and_requeues(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -341,5 +470,35 @@ def test_gate_discards_and_requeues(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     )
     assert rc == 1
     assert not out.exists()
+    assert (results / "discarded" / "99").is_dir()
+    assert any(c[:2] == ["scontrol", "requeue"] for c in calls)
+
+
+def test_gate_requeues_when_window_is_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    results = tmp_path / "results"
+    (results / "99").mkdir(parents=True)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return type(
+            "P",
+            (),
+            {
+                "returncode": 0,
+                "stdout": "JobId=99 Restarts=0\n" if cmd[:3] == ["scontrol", "show", "job"] else "",
+                "stderr": "",
+            },
+        )()
+
+    monkeypatch.setattr(health, "RUN", fake_run)
+    rc = health.gate(
+        Namespace(
+            window=str(results / "99" / "node_health_window.json"),
+            results=str(results),
+            job="99",
+        )
+    )
+    assert rc == 1
     assert (results / "discarded" / "99").is_dir()
     assert any(c[:2] == ["scontrol", "requeue"] for c in calls)

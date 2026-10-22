@@ -25,7 +25,7 @@ Companion: [`deploy/h200/README.md`](../deploy/h200/README.md).
 | clocks | `nvidia-smi --query-gpu=clocks_throttle_reasons.sw_thermal_slowdown,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.hw_slowdown,clocks_throttle_reasons.hw_power_brake_slowdown --format=csv,noheader` | every field `Not Active` | any field `Active` (hex `.active` bitmask fallback also decoded) |
 | power cap state | `nvidia-smi --query-gpu=power.limit,power.max_limit,clocks_throttle_reasons.sw_power_cap --format=csv,noheader,nounits` | `power.limit == power.max_limit` and SW power-cap throttle inactive on every GPU | limit below max **or** SW power-cap active |
 | dmesg XID | `sudo -n /usr/local/libexec/gitm-dmesg-xid` (else `dmesg -T`); lines matching `NVRM: Xid` | no new XID lines vs pre in any sample/post | any new XID mid-window, or log unreadable (never passes) |
-| vLLM liveness | in-window sampler: real server cmdline (`python…vllm` / `vllm::`), not `srun`/`bash -c` | process present for every sample after serve start | any post-start sample with no real server |
+| vLLM liveness | default serve jobs only; in-window sampler checks a real server cmdline (`python…vllm` / `vllm::`), not `srun`/`bash -c` | process present for every sample after serve start | any post-start sample with no real server; skipped for custom commands |
 | `/dev/shm` | `df -BG --output=size,avail,pcent /dev/shm \| tail -1` | size `≥ 16G` and used `< 90%` | size `< 16G` or used `≥ 90%` |
 | NVLink | `nvidia-smi nvlink -s` and `nvidia-smi topo -m` | all reported links Active; every GPU pair among 0–7 is `NV*` | any link inactive/down, or any pair not `NV*` |
 

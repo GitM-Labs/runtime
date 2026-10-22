@@ -37,7 +37,7 @@ RUN: Callable[..., subprocess.CompletedProcess]
 def _run(cmd: list[str], *, timeout: float = 30) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
 
@@ -94,12 +94,17 @@ def _nvlink_ok(status: dict[str, Any]) -> bool:
         return False
     if re.search(r"\b(inactive|down|disabled)\b", links, re.I):
         return False
-    rows = []
+    rows = {}
     for line in topo.splitlines():
-        if re.match(r"GPU\d+\s+(X|NV\d+|PIX|PXB|PHB|NODE|SYS)\b", line.strip()):
-            rows.append([x for x in line.split()[1:] if re.match(r"^(X|NV\d+|PIX|PXB|PHB|NODE|SYS)$", x)])
-    return len(rows) == 8 and all(
-        cell.startswith("NV") for row in rows for cell in row if cell != "X"
+        parts = line.split()
+        match = re.fullmatch(r"GPU([0-7])", parts[0]) if parts else None
+        cells = parts[1:9]
+        if match and len(cells) == 8 and all(re.fullmatch(r"X|NV\d+", x) for x in cells):
+            rows[int(match.group(1))] = cells
+    return set(rows) == set(range(8)) and all(
+        cell == "X" if column == gpu else cell.startswith("NV")
+        for gpu, row in rows.items()
+        for column, cell in enumerate(row)
     )
 
 
@@ -169,14 +174,15 @@ def eval_window(records: list[dict[str, Any]]) -> dict[str, Any]:
     for row in records:
         if row.get("xid_error") or set(row.get("xid_lines", [])) - baseline:
             failed.add("dmesg_xid")
-    seen_vllm = False
-    for row in samples:
-        if row.get("vllm_alive"):
-            seen_vllm = True
-        elif seen_vllm:
+    if any(row.get("require_vllm") for row in records):
+        seen_vllm = False
+        for row in samples:
+            if row.get("vllm_alive"):
+                seen_vllm = True
+            elif seen_vllm:
+                failed.add("vllm_liveness")
+        if samples and not seen_vllm:
             failed.add("vllm_liveness")
-    if samples and not seen_vllm:
-        failed.add("vllm_liveness")
     source = post or pre or (samples[-1] if samples else {})
     return {
         "job_id": source.get("job_id"),
@@ -196,27 +202,51 @@ def _append(path: Path, row: dict[str, Any]) -> None:
 
 
 def _pidfile(path: Path) -> Path:
-    return path.with_suffix(".sampler.pid")
+    return Path(f"{path}.sampler.pid")
+
+
+def _is_sampler(pid: int, path: Path) -> bool:
+    try:
+        args = [
+            os.fsdecode(arg)
+            for arg in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if arg
+        ]
+    except OSError:
+        return False
+    return (
+        any(Path(arg).name == "gitm-node-health" for arg in args)
+        and "sample" in args
+        and any(args[i : i + 2] == ["--out", str(path)] for i in range(len(args) - 1))
+    )
 
 
 def _stop(path: Path) -> None:
+    pidfile = _pidfile(path)
     try:
-        os.kill(int(_pidfile(path).read_text()), signal.SIGTERM)
-        _pidfile(path).unlink(missing_ok=True)
+        pid = int(pidfile.read_text())
+        if _is_sampler(pid, path):
+            os.kill(pid, signal.SIGTERM)
     except (OSError, ValueError):
         pass
+    finally:
+        pidfile.unlink(missing_ok=True)
 
 
 def pre(args: argparse.Namespace) -> int:
     row = snapshot("pre")
     row["job_id"] = args.job
+    row["require_vllm"] = args.require_vllm
     _append(Path(args.out), row)
     failed = eval_snapshot(row)
     if failed:
         print("unhealthy: " + ",".join(failed), file=sys.stderr)
         return 1
+    command = [sys.executable, __file__, "sample", "--job", args.job, "--out", args.out]
+    if args.require_vllm:
+        command.append("--require-vllm")
     proc = subprocess.Popen(
-        [sys.executable, __file__, "sample", "--job", args.job, "--out", args.out],
+        command,
         start_new_session=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -229,6 +259,7 @@ def sample(args: argparse.Namespace) -> int:
     while True:
         row = snapshot("sample")
         row["job_id"] = args.job
+        row["require_vllm"] = args.require_vllm
         _append(Path(args.out), row)
         time.sleep(THRESHOLDS["sampler_period_s"])
 
@@ -237,6 +268,7 @@ def post(args: argparse.Namespace) -> int:
     _stop(Path(args.out))
     row = snapshot("post")
     row["job_id"] = args.job
+    row["require_vllm"] = args.require_vllm
     _append(Path(args.out), row)
     return 0
 
@@ -244,18 +276,34 @@ def post(args: argparse.Namespace) -> int:
 def summarize(args: argparse.Namespace) -> int:
     path = Path(args.out)
     _stop(path)
-    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-    result = eval_window(rows)
-    result["job_id"] = args.job
     output = Path(args.window) if args.window else path.with_name("node_health_window.json")
+    try:
+        rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        result = eval_window(rows)
+        result["job_id"] = args.job
+    except (OSError, json.JSONDecodeError) as exc:
+        result = {
+            "job_id": args.job,
+            "node": socket.gethostname(),
+            "healthy": False,
+            "failed_signals": ["monitoring_coverage", "window_incomplete"],
+            "pre_ts": None,
+            "post_ts": None,
+            "n_samples": 0,
+            "evidence_error": str(exc)[:200],
+        }
+    output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))
     return 0 if result["healthy"] else 1
 
 
 def gate(args: argparse.Namespace) -> int:
-    if json.loads(Path(args.window).read_text()).get("healthy"):
-        return 0
+    try:
+        if json.loads(Path(args.window).read_text()).get("healthy"):
+            return 0
+    except (OSError, json.JSONDecodeError):
+        pass
     results, job = Path(args.results), str(args.job)
     source, dest = results / job, results / "discarded" / job
     if dest.exists():
@@ -278,6 +326,8 @@ def main() -> int:
         p = sub.add_parser(name)
         p.add_argument("--job", required=True)
         p.add_argument("--out", required=True)
+        if name in ("pre", "post", "sample"):
+            p.add_argument("--require-vllm", action="store_true")
         if name == "summarize":
             p.add_argument("--window", default="")
     p = sub.add_parser("gate")

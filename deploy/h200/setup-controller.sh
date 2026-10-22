@@ -16,7 +16,7 @@ PARTITION="gpu"
 STATUS_REPO=""
 RESULTS_DIR="/var/lib/gitm/results"
 HF_CACHE="/var/lib/gitm/hf-cache"
-HEALTH_USER=""
+HEALTH_USERS=()
 ADD_NODES=()
 SMOKE=0
 SKIP_IMAGE=0
@@ -27,7 +27,7 @@ while [[ $# -gt 0 ]]; do
     --partition)   PARTITION="$2"; shift 2 ;;
     --results-dir) RESULTS_DIR="$2"; shift 2 ;;
     --hf-cache)    HF_CACHE="$2"; shift 2 ;;
-    --health-user) HEALTH_USER="$2"; shift 2 ;;
+    --health-user) HEALTH_USERS+=("$2"); shift 2 ;;
     --skip-image)  SKIP_IMAGE=1; shift ;;
     --smoke)       SMOKE=1; shift ;;
     -h|--help)     sed -n '2,13p' "$0"; exit 0 ;;
@@ -35,8 +35,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ $EUID -eq 0 ]] || { echo "run as root (sudo)" >&2; exit 1; }
-if [[ $SMOKE -eq 0 && -z "$HEALTH_USER" ]]; then
-  echo "--health-user USER is required (the account that runs health hooks)" >&2
+if [[ $SMOKE -eq 0 && ${#HEALTH_USERS[@]} -eq 0 ]]; then
+  echo "at least one --health-user USER is required" >&2
   exit 1
 fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -223,11 +223,13 @@ setkey GRES "$GRES"
 setkey JOBCOMP_LOG "${JOBCOMP_LOG:-}"
 setkey RESULTS_DIR "$RESULTS_DIR"
 setkey HF_CACHE "$HF_CACHE"
-setkey HEALTH_USER "$HEALTH_USER"
+HEALTH_USERS_CSV=$(IFS=,; echo "${HEALTH_USERS[*]}")
+setkey HEALTH_USERS "$HEALTH_USERS_CSV"
 
 # ---------------------------------------------------------------------------
 step "Containers on $THIS (Enroot + Pyxis)"
-NODE_ARGS=(--report-key "$(cat "$CONF_DIR/report_key.pub")" --health-user "$HEALTH_USER" --results-dir "$RESULTS_DIR" --hf-cache "$HF_CACHE")
+NODE_ARGS=(--report-key "$(cat "$CONF_DIR/report_key.pub")" --results-dir "$RESULTS_DIR" --hf-cache "$HF_CACHE")
+for user in "${HEALTH_USERS[@]}"; do NODE_ARGS+=(--health-user "$user"); done
 [[ $SKIP_IMAGE -eq 1 ]] && NODE_ARGS+=(--skip-image)
 "$HERE/setup-node.sh" "${NODE_ARGS[@]}"
 
@@ -283,7 +285,9 @@ NODES="$(for a in "${ADD_NODES[@]}"; do echo -n "${a%%=*} "; done)"
 EOF
 # Accounts that run jobs must exist with the same UID/GID on every node.
 getent passwd | awk -F: '$3>=1000 && $3<60000' > "$B/passwd"
-grep -q "^$HEALTH_USER:" "$B/passwd" || getent passwd "$HEALTH_USER" >> "$B/passwd"
+for user in "${HEALTH_USERS[@]}"; do
+  cut -d: -f1 "$B/passwd" | grep -Fxq "$user" || getent passwd "$user" >> "$B/passwd"
+done
 cut -d: -f4 "$B/passwd" | sort -u | while read -r g; do getent group "$g"; done > "$B/group"
 BUNDLE="/root/gitm-join.tgz"
 tar -C "$B" -czf "$BUNDLE" .; rm -rf "$B"; chmod 600 "$BUNDLE"

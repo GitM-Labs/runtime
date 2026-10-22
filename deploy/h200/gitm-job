@@ -300,6 +300,7 @@ def build_script(args, cfg: dict[str, str]) -> str:
              "mkdir -p \"$HOME\"\n" + body)
 
     node = f"#SBATCH --nodelist={args.node}\n" if args.node else ""
+    health_vllm = "" if args.command else " --require-vllm"
     return f"""#!/bin/bash
 #SBATCH --job-name={safe_name(args.name)}
 #SBATCH --partition={cfg['PARTITION']}
@@ -336,7 +337,7 @@ NH_OUT="$OUT_HOST/node_health.jsonl"
 NH_WINDOW="$OUT_HOST/node_health_window.json"
 if [ -x "$HEALTH_BIN" ]; then
   set +e
-  "$HEALTH_BIN" pre --job "$SLURM_JOB_ID" --out "$NH_OUT"
+  "$HEALTH_BIN" pre --job "$SLURM_JOB_ID" --out "$NH_OUT"{health_vllm}
   pre_rc=$?
   set -e
   if [ "$pre_rc" -ne 0 ]; then
@@ -355,7 +356,7 @@ srun --container-image={shlex.quote(image)} \\
 rc=$?
 set -e
 if [ -x "$HEALTH_BIN" ]; then
-  "$HEALTH_BIN" post --job "$SLURM_JOB_ID" --out "$NH_OUT" || true
+  "$HEALTH_BIN" post --job "$SLURM_JOB_ID" --out "$NH_OUT"{health_vllm} || true
   set +e
   "$HEALTH_BIN" summarize --job "$SLURM_JOB_ID" --out "$NH_OUT" --window "$NH_WINDOW"
   sum_rc=$?

@@ -139,6 +139,7 @@ def build_script(args) -> str:
             sys.exit(f"gitm-submit: --env expects KEY=VALUE, got {kv!r}")
         extra.append(f"export {k}={shlex.quote(v)}")
     image = args.image or ""
+    health_vllm = "" if args.command else " --require-vllm"
     # Node paths come from the node's own /etc/gitm-gpu/config at run time, so
     # each node uses its own Hugging Face cache and results folder.
     return f"""#!/bin/bash
@@ -163,7 +164,7 @@ NH_OUT="$OUT_HOST/node_health.jsonl"
 NH_WINDOW="$OUT_HOST/node_health_window.json"
 if [ -x "$HEALTH_BIN" ]; then
   set +e
-  "$HEALTH_BIN" pre --job "$SLURM_JOB_ID" --out "$NH_OUT"
+  "$HEALTH_BIN" pre --job "$SLURM_JOB_ID" --out "$NH_OUT"{health_vllm}
   pre_rc=$?
   set -e
   if [ "$pre_rc" -ne 0 ]; then
@@ -180,7 +181,7 @@ srun --container-image="$IMAGE" \\
 rc=$?
 set -e
 if [ -x "$HEALTH_BIN" ]; then
-  "$HEALTH_BIN" post --job "$SLURM_JOB_ID" --out "$NH_OUT" || true
+  "$HEALTH_BIN" post --job "$SLURM_JOB_ID" --out "$NH_OUT"{health_vllm} || true
   set +e
   "$HEALTH_BIN" summarize --job "$SLURM_JOB_ID" --out "$NH_OUT" --window "$NH_WINDOW"
   sum_rc=$?
