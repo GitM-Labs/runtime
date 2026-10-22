@@ -19,6 +19,7 @@ one queue. Live status: <https://gitm-labs.github.io/gpu-status/>.
 | `setup-node.sh` | (called by both) | nvidia-container hook, Enroot 4.2.1, Pyxis v0.24.0, pre-imported vLLM image, reporter |
 | `gitm-job` | everywhere | Team CLI; also the status pusher |
 | `gitm-node-report` | every node | GPU readings + job log tails for the page |
+| `gitm-slack-notify` | every node | Live Slack feed: queue events + off-scheduler GPU use |
 
 ## Setup
 
@@ -77,6 +78,31 @@ and run `gitm capture serve --out /out -- vllm serve $MODEL --tensor-parallel-si
 `--node`, or a custom command after `--`. `--dry-run` prints the batch script.
 Results: `/var/lib/gitm/results/<jobid>/` (+ `<jobid>.log`) on the node that ran
 it. Raw `sbatch --exclusive --container-image=...` works too and shows on the page.
+
+## Live Slack feed
+
+`gitm-slack-notify` (stdlib Python, no deps) posts cluster activity to Slack via
+an Incoming Webhook at `/etc/gitm-gpu/slack_webhook` (one line, `0600 root`).
+Event-driven (30 s poll, posts only on changes, seeds silently on restart):
+
+```bash
+install -m 0755 gitm-slack-notify /usr/local/bin/
+install -m 0644 gitm-slack-scheduler.service gitm-slack-direct.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now gitm-slack-direct.service                      # every node
+systemctl enable --now gitm-slack-scheduler.service                   # controller only
+```
+
+- **scheduler** (controller): diffs `squeue` → queued / started / finished /
+  failed / cancelled; failure alerts attach a 25-line log tail.
+- **direct** (every node): flags GPU processes with no Slurm cgroup =
+  off-scheduler / SSH use.
+- On-demand snapshot: `gitm-slack-notify snapshot`. Webhook check:
+  `gitm-slack-notify test`.
+
+Integrating this feed with the node-health gate (`gitm-node-health`, PR #189) —
+thermal / throttle / XID / NVLink surfaced live — is reviewed in
+[`node-health-integration.md`](node-health-integration.md).
 
 ## Notes
 

@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""gitm-slack-notify: post H200 cluster activity to a Slack channel.
+
+Modes:
+  scheduler  -- diff `squeue`, post queued / started / finished / failed / cancelled
+                (run on the Slurm controller)
+  direct     -- flag GPU processes that have no Slurm job = someone running
+                directly over SSH, outside the scheduler (run on each GPU node)
+  snapshot   -- post the current queue + off-scheduler state once (on-demand)
+  test       -- post a one-off message (webhook check)
+
+Reads the webhook URL from /etc/gitm-gpu/slack_webhook (one line, 0600 root).
+Event-driven: last-seen state is cached under
+/var/lib/gitm-gpu/slack-notify/<mode>.json, so only transitions are posted and
+the first run after (re)start seeds silently instead of replaying everything.
+Stdlib only.
+
+  gitm-slack-notify scheduler [--interval 30] [--once]
+  gitm-slack-notify direct    [--interval 30] [--once]
+  gitm-slack-notify snapshot
+  gitm-slack-notify test "message"
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+WEBHOOK_FILE = os.environ.get("SLACK_WEBHOOK_FILE", "/etc/gitm-gpu/slack_webhook")
+STATE_DIR = Path(os.environ.get("SLACK_STATE_DIR", "/var/lib/gitm-gpu/slack-notify"))
+NODE = socket.gethostname().split(".")[0]
+
+FINAL_ICON = {
+    "COMPLETED": "✅", "FAILED": "❌", "CANCELLED": "🚫", "TIMEOUT": "⏱️",
+    "OUT_OF_MEMORY": "❌", "NODE_FAIL": "❌", "PREEMPTED": "🔁",
+}
+
+
+def _run(cmd: list[str], timeout: float = 30) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return subprocess.CompletedProcess(cmd, 127, "", str(e))
+
+
+def _webhook() -> str:
+    try:
+        return Path(WEBHOOK_FILE).read_text().strip()
+    except OSError:
+        return ""
+
+
+def post(text: str) -> bool:
+    url = _webhook()
+    if not url:
+        print("no webhook configured at " + WEBHOOK_FILE, file=sys.stderr)
+        return False
+    data = json.dumps({"text": text}).encode()
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            r.read()
+        return True
+    except urllib.error.URLError as e:
+        print(f"slack post failed: {e}", file=sys.stderr)
+        return False
+
+
+def _load_state(mode: str):
+    p = STATE_DIR / f"{mode}.json"
+    if not p.exists():
+        return None  # never run -> seed silently
+    try:
+        return json.loads(p.read_text())
+    except ValueError:
+        return {}
+
+
+def _save_state(mode: str, state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (STATE_DIR / f"{mode}.json").write_text(json.dumps(state))
+
+
+# ---------------- job log tail (for failures) ----------------
+
+TAIL_N = 25
+REPORT_KEY = "/etc/gitm-gpu/report_key"
+
+
+def _results_dir() -> str:
+    try:
+        for line in Path("/etc/gitm-gpu/config").read_text().splitlines():
+            if line.startswith("RESULTS_DIR="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return "/var/lib/gitm/results"
+
+
+def _local_tail(path: str, n: int) -> list[str]:
+    try:
+        with open(path, errors="replace") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 262144))  # bound work on huge logs
+            return f.read().splitlines()[-n:]
+    except OSError:
+        return []
+
+
+def _node_addr(name: str) -> str:
+    m = re.search(r"NodeAddr=(\S+)", _run(["scontrol", "show", "node", name, "-o"]).stdout)
+    return m.group(1) if m else name
+
+
+def _log_tail(jobid: str, nodelist: str, n: int = TAIL_N) -> list[str]:
+    """Last n lines of a job's log, from whichever node ran it. Local read here,
+    else the same restricted gitm-report SSH the status pusher uses."""
+    rd = _results_dir()
+    here = socket.gethostname().split(".")[0]
+    target = next((x for x in re.split(r"[,\s]+", nodelist or "") if x), here)
+    if target == here:
+        return _local_tail(f"{rd}/{jobid}.log", n)
+    if not Path(REPORT_KEY).exists():
+        return []
+    p = _run(["ssh", "-i", REPORT_KEY, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+              "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new",
+              "-o", f"UserKnownHostsFile={STATE_DIR}/known_hosts",
+              f"gitm-report@{_node_addr(target)}", "gitm-node-report", jobid], timeout=30)
+    if p.returncode != 0:
+        return []
+    try:
+        return (json.loads(p.stdout).get("logs", {}).get(jobid) or [])[-n:]
+    except ValueError:
+        return []
+
+
+# ---------------- scheduler ----------------
+
+def _squeue():
+    fmt = "%i|%P|%j|%u|%T|%N|%l"  # jobid|partition|name|user|state|nodelist|timelimit
+    p = _run(["squeue", "-h", "-a", "-o", fmt])
+    if p.returncode != 0:
+        return None  # transient (controller unreachable) -> skip tick, keep prev
+    jobs = {}
+    for line in p.stdout.splitlines():
+        f = line.split("|")
+        if len(f) < 7:
+            continue
+        jobs[f[0].strip()] = {
+            "part": f[1].strip(), "name": f[2].strip(), "user": f[3].strip(),
+            "state": f[4].strip(), "nodes": f[5].strip(), "limit": f[6].strip(),
+        }
+    return jobs
+
+
+def _final_state(jid: str):
+    p = _run(["scontrol", "show", "job", jid, "-o"])
+    if p.returncode != 0:
+        return None
+    m = re.search(r"JobState=(\S+)", p.stdout)
+    return m.group(1) if m else None
+
+
+def scheduler_tick() -> None:
+    prev = _load_state("scheduler")
+    seeding = prev is None
+    prev = prev or {}
+    cur = _squeue()
+    if cur is None:
+        return
+    msgs = []
+    for jid, j in cur.items():
+        if jid not in prev:
+            if j["state"] == "PENDING":
+                msgs.append(f"🟢 *Job {jid} queued* — `{j['user']}` · {j['name']} · {j['part']} · limit {j['limit']}")
+            elif j["state"] == "RUNNING":
+                msgs.append(f"▶️ *Job {jid} running* — `{j['user']}` · {j['name']} · {j['nodes']}")
+        elif prev[jid].get("state") == "PENDING" and j["state"] == "RUNNING":
+            msgs.append(f"▶️ *Job {jid} started* on {j['nodes']} — `{j['user']}` · {j['name']}")
+    for jid, j in prev.items():
+        if jid not in cur:
+            st = _final_state(jid)
+            icon = FINAL_ICON.get(st or "", "⏹️")
+            label = st.lower() if st else "finished"
+            extra = ""
+            if st and st != "COMPLETED":  # something went wrong -> attach the error tail
+                lines = _log_tail(jid, j.get("nodes", ""))
+                if lines:
+                    body = "\n".join(ln[:240] for ln in lines)
+                    extra = f"\n_last {len(lines)} log lines ({j.get('nodes', '?')}):_\n```\n{body}\n```"
+            msgs.append(f"{icon} *Job {jid} {label}* — `{j.get('user', '?')}` · {j.get('name', '?')}{extra}")
+    if not seeding:
+        for m in msgs:
+            post(m)
+    _save_state("scheduler", {jid: {"state": j["state"], "name": j["name"],
+                                    "user": j["user"], "nodes": j["nodes"]}
+                              for jid, j in cur.items()})
+
+
+# ---------------- direct (off-scheduler GPU use) ----------------
+
+def _uuid_index() -> dict:
+    p = _run(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"])
+    m = {}
+    for line in p.stdout.splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) >= 2:
+            m[f[1]] = f[0]
+    return m
+
+
+def _compute_apps() -> list[dict]:
+    p = _run(["nvidia-smi",
+              "--query-compute-apps=gpu_uuid,pid,used_memory,process_name",
+              "--format=csv,noheader,nounits"])
+    apps = []
+    for line in p.stdout.splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) >= 4 and f[1].isdigit():
+            apps.append({"uuid": f[0], "pid": f[1], "mem": f[2], "name": f[3]})
+    return apps
+
+
+def _is_slurm_pid(pid: str) -> bool:
+    try:
+        cg = Path(f"/proc/{pid}/cgroup").read_text().lower()
+    except OSError:
+        return True  # process gone or unreadable: don't false-alarm
+    if "slurm" in cg:
+        return True
+    # Fallback: ask slurmd whether this pid belongs to a job. Covers Pyxis/Enroot
+    # cases where the container cgroup path may not literally contain "slurm".
+    p = _run(["scontrol", "pidinfo", pid], timeout=10)
+    return p.returncode == 0 and bool(re.search(r"[Ss]lurm job id\s+\d+", p.stdout))
+
+
+def _owner(pid: str) -> str:
+    return (_run(["ps", "-o", "user=", "-p", pid]).stdout.strip() or "?")
+
+
+def direct_tick() -> None:
+    prev = _load_state("direct")
+    seeding = prev is None
+    prev = prev or {}
+    idx = _uuid_index()
+    off: dict = {}
+    for a in _compute_apps():
+        if _is_slurm_pid(a["pid"]):
+            continue
+        e = off.setdefault(a["pid"], {"user": _owner(a["pid"]), "name": a["name"],
+                                      "gpus": set(), "mem": 0})
+        e["gpus"].add(idx.get(a["uuid"], "?"))
+        try:
+            e["mem"] += int(float(a["mem"]))
+        except ValueError:
+            pass
+    msgs = []
+    for pid, e in off.items():
+        if pid not in prev:
+            gpus = ",".join(sorted(e["gpus"]))
+            msgs.append(f"⚠️ *Off-scheduler GPU use on {NODE}* — `{e['user']}` running "
+                        f"`{e['name']}` (pid {pid}) on GPU [{gpus}], {e['mem']} MiB, no Slurm job")
+    for pid, e in prev.items():
+        if pid not in off:
+            msgs.append(f"🔹 Off-scheduler process on {NODE} cleared — "
+                        f"`{e.get('user', '?')}` `{e.get('name', '?')}` (pid {pid})")
+    if not seeding:
+        for m in msgs:
+            post(m)
+    _save_state("direct", {pid: {"user": e["user"], "name": e["name"],
+                                 "gpus": sorted(e["gpus"]), "mem": e["mem"]}
+                           for pid, e in off.items()})
+
+
+# ---------------- snapshot / test ----------------
+
+def snapshot_cmd() -> int:
+    jobs = _squeue() or {}
+    running = [j for j in jobs.values() if j["state"] == "RUNNING"]
+    pending = [j for j in jobs.values() if j["state"] == "PENDING"]
+    lines = [f"*GPU cluster snapshot* — running {len(running)} · queued {len(pending)}"]
+    for jid, j in jobs.items():
+        lines.append(f"• `{jid}` {j['state']} — `{j['user']}` · {j['name']} · {j['nodes'] or j['part']}")
+    if not jobs:
+        lines.append("_queue empty_")
+    return 0 if post("\n".join(lines)) else 1
+
+
+def run_loop(mode: str, interval: float, once: bool) -> int:
+    fn = {"scheduler": scheduler_tick, "direct": direct_tick}[mode]
+    while True:
+        try:
+            fn()
+        except Exception as e:  # never let one bad tick kill the service
+            print(f"{mode} tick error: {e}", file=sys.stderr)
+        if once:
+            return 0
+        time.sleep(interval)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("scheduler", "direct"):
+        s = sub.add_parser(name)
+        s.add_argument("--interval", type=float, default=30)
+        s.add_argument("--once", action="store_true")
+    sub.add_parser("snapshot")
+    t = sub.add_parser("test")
+    t.add_argument("message", nargs="?", default="gitm-slack-notify webhook test ✅")
+    lt = sub.add_parser("logtail")  # debug/ops: print a job's log tail, no Slack post
+    lt.add_argument("jobid")
+    lt.add_argument("node", nargs="?", default="")
+    args = ap.parse_args()
+    if args.cmd in ("scheduler", "direct"):
+        return run_loop(args.cmd, args.interval, args.once)
+    if args.cmd == "snapshot":
+        return snapshot_cmd()
+    if args.cmd == "test":
+        return 0 if post(args.message) else 1
+    if args.cmd == "logtail":
+        lines = _log_tail(args.jobid, args.node)
+        print("\n".join(lines) if lines else "(no log found)")
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
