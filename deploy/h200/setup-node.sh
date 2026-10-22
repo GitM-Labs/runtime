@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Prepare one 8x H200 Slurm node to run gitm jobs in throwaway containers.
 #
-#   sudo ./setup-node.sh --report-key "ssh-ed25519 AAAA... gitm-report"
+#   sudo ./setup-node.sh --health-user alice --health-user bob \
+#        --report-key "ssh-ed25519 AAAA... gitm-report"
 #
 # Run on EVERY GPU node (gitmachine-2 included). The report key is printed by
 # setup-controller.sh; it lets the status pusher read GPU readings and job log
@@ -17,6 +18,7 @@ ENROOT_VERSION="4.2.1"
 PYXIS_VERSION="v0.24.0"
 
 REPORT_KEY=""
+HEALTH_USERS=()
 RESULTS_DIR="/var/lib/gitm/results"
 HF_CACHE="/var/lib/gitm/hf-cache"
 IMAGE_DIR="/var/lib/gitm/images"
@@ -25,6 +27,7 @@ SKIP_IMAGE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --report-key)  REPORT_KEY="$2"; shift 2 ;;
+    --health-user) HEALTH_USERS+=("$2"); shift 2 ;;
     --results-dir) RESULTS_DIR="$2"; shift 2 ;;
     --hf-cache)    HF_CACHE="$2"; shift 2 ;;
     --image)       DEFAULT_IMAGE_REF="$2"; shift 2 ;;
@@ -34,6 +37,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ $EUID -eq 0 ]] || { echo "run as root (sudo)" >&2; exit 1; }
+[[ ${#HEALTH_USERS[@]} -gt 0 ]] || { echo "at least one --health-user USER is required" >&2; exit 1; }
+for user in "${HEALTH_USERS[@]}"; do
+  id "$user" >/dev/null 2>&1 || { echo "--health-user account does not exist: $user" >&2; exit 1; }
+  [[ "$user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || { echo "invalid --health-user: $user" >&2; exit 1; }
+done
 HERE="$(cd "$(dirname "$0")" && pwd)"
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[33mWARNING: %s\033[0m\n' "$*"; }
@@ -84,6 +92,12 @@ echo "enroot $(enroot version)"
 # a job ends. Nothing goes into home directories.
 mkdir -p /var/lib/enroot/{cache,data} /run/enroot
 chmod 1777 /var/lib/enroot/cache /var/lib/enroot/data /run/enroot
+# /run is tmpfs and wiped on every boot; without this, Pyxis fails with
+# "mkdir: Permission denied" until someone recreates /run/enroot by hand.
+cat > /etc/tmpfiles.d/enroot.conf <<'EOF'
+d /run/enroot 1777 root root
+EOF
+systemd-tmpfiles --create /etc/tmpfiles.d/enroot.conf >/dev/null
 # Enroot bind-mounts the host's /etc/hostname into every container; some
 # images (GCP Ubuntu) never write one, and then every container start fails.
 [[ -f /etc/hostname ]] || hostname > /etc/hostname
@@ -158,6 +172,28 @@ command -v setfacl >/dev/null || apt-get install -y -qq acl >/dev/null
 setfacl -d -m u::rwx,g::rwx,o::rwx "$HF_CACHE"
 install -m 755 "$HERE/gitm-job" /usr/local/bin/gitm-job
 install -m 755 "$HERE/gitm-node-report" /usr/local/bin/gitm-node-report
+install -m 755 "$HERE/gitm-node-health" /usr/local/bin/gitm-node-health
+mkdir -p /var/lib/gitm-gpu /usr/local/libexec
+chmod 1777 /var/lib/gitm-gpu
+# Narrow dmesg reader for XID checks when kernel.dmesg_restrict=1. The helper
+# filters while privileged, so callers never receive unrelated kernel logs.
+# Only explicitly configured job accounts may invoke it.
+cat > /usr/local/libexec/gitm-dmesg-xid <<'EOF'
+#!/bin/bash
+out=$(/bin/dmesg -T) || exit $?
+printf '%s\n' "$out" | /usr/bin/grep -i 'NVRM:[[:space:]]*Xid'
+rc=${PIPESTATUS[1]}
+[[ $rc -eq 1 ]] && exit 0
+exit "$rc"
+EOF
+chown root:root /usr/local/libexec/gitm-dmesg-xid
+chmod 700 /usr/local/libexec/gitm-dmesg-xid
+: > /etc/sudoers.d/gitm-dmesg-xid
+for user in "${HEALTH_USERS[@]}"; do
+  echo "$user ALL=(root) NOPASSWD: /usr/local/libexec/gitm-dmesg-xid" \
+    >> /etc/sudoers.d/gitm-dmesg-xid
+done
+chmod 440 /etc/sudoers.d/gitm-dmesg-xid
 touch /etc/gitm-gpu/config
 setkey() { grep -q "^$1=" /etc/gitm-gpu/config && sed -i "s#^$1=.*#$1=$2#" /etc/gitm-gpu/config || echo "$1=$2" >> /etc/gitm-gpu/config; }
 setkey RESULTS_DIR "$RESULTS_DIR"

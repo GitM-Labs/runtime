@@ -139,6 +139,7 @@ def build_script(args) -> str:
             sys.exit(f"gitm-submit: --env expects KEY=VALUE, got {kv!r}")
         extra.append(f"export {k}={shlex.quote(v)}")
     image = args.image or ""
+    health_vllm = "" if args.command else " --require-vllm"
     # Node paths come from the node's own /etc/gitm-gpu/config at run time, so
     # each node uses its own Hugging Face cache and results folder.
     return f"""#!/bin/bash
@@ -153,10 +154,44 @@ export MODEL={shlex.quote(args.model)}
 if [ -r /etc/gitm-gpu/hf_token ]; then export HF_TOKEN="$(cat /etc/gitm-gpu/hf_token)"; fi
 {chr(10).join(extra)}
 echo "job $SLURM_JOB_ID on $(hostname) | image $IMAGE"
+HEALTH_BIN=$(command -v gitm-node-health 2>/dev/null || true)
+HEALTH_BIN=${{HEALTH_BIN:-/usr/local/bin/gitm-node-health}}
+if [ ! -x "$HEALTH_BIN" ]; then
+  echo "gitm-submit: required node-health checker is not executable: $HEALTH_BIN" >&2
+  exit 1
+fi
+NH_OUT="$OUT_HOST/node_health.jsonl"
+NH_WINDOW="$OUT_HOST/node_health_window.json"
+if [ -x "$HEALTH_BIN" ]; then
+  set +e
+  "$HEALTH_BIN" pre --job "$SLURM_JOB_ID" --out "$NH_OUT"{health_vllm}
+  pre_rc=$?
+  set -e
+  if [ "$pre_rc" -ne 0 ]; then
+    "$HEALTH_BIN" summarize --job "$SLURM_JOB_ID" --out "$NH_OUT" --window "$NH_WINDOW" || true
+    "$HEALTH_BIN" gate --window "$NH_WINDOW" --results "$RESULTS" --job "$SLURM_JOB_ID" || true
+    exit 1
+  fi
+fi
+set +e
 srun --container-image="$IMAGE" \\
      --container-mounts="$HF:/hf,$OUT_HOST:/out" \\
      --container-workdir=/out --container-writable --no-container-mount-home \\
      bash -c {shlex.quote(inner)}
+rc=$?
+set -e
+if [ -x "$HEALTH_BIN" ]; then
+  "$HEALTH_BIN" post --job "$SLURM_JOB_ID" --out "$NH_OUT"{health_vllm} || true
+  set +e
+  "$HEALTH_BIN" summarize --job "$SLURM_JOB_ID" --out "$NH_OUT" --window "$NH_WINDOW"
+  sum_rc=$?
+  set -e
+  if [ "$sum_rc" -ne 0 ]; then
+    "$HEALTH_BIN" gate --window "$NH_WINDOW" --results "$RESULTS" --job "$SLURM_JOB_ID" || true
+    exit 1
+  fi
+fi
+exit "$rc"
 """
 
 

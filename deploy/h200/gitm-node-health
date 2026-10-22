@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""Pre/post H200 health window for gitm-submit. Stdlib only."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+THRESHOLDS: dict[str, Any] = {
+    "thermal_max_c": 83.0,
+    "shm_min_size_g": 16,
+    "shm_max_used_pct": 90.0,
+    "sampler_period_s": 5.0,
+    "max_requeues": 2,
+    "clocks_bad_bits": 0xE8,  # HW slowdown, SW/HW thermal, HW power brake
+    "clocks_bad_fields": (
+        "clocks_throttle_reasons.sw_thermal_slowdown",
+        "clocks_throttle_reasons.hw_thermal_slowdown",
+        "clocks_throttle_reasons.hw_slowdown",
+        "clocks_throttle_reasons.hw_power_brake_slowdown",
+    ),
+}
+HELPER = "/usr/local/libexec/gitm-dmesg-xid"
+XID = re.compile(r"NVRM:\s*Xid", re.I)
+RUN: Callable[..., subprocess.CompletedProcess]
+
+
+def _run(cmd: list[str], *, timeout: float = 30) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
+
+
+RUN = _run
+
+
+def _command(cmd: list[str]) -> tuple[int, str]:
+    p = RUN(cmd)
+    return p.returncode, p.stdout or ""
+
+
+def _csv(query: str, nounits: bool = False) -> list[list[str]]:
+    fmt = "csv,noheader" + (",nounits" if nounits else "")
+    rc, out = _command(["nvidia-smi", f"--query-gpu={query}", f"--format={fmt}"])
+    if rc:
+        return []
+    return [[x.strip() for x in line.split(",")] for line in out.splitlines() if line.strip()]
+
+
+def _xids() -> tuple[list[str], str | None]:
+    for cmd in (["sudo", "-n", HELPER], [HELPER], ["dmesg", "-T"]):
+        p = RUN(cmd)
+        if p.returncode == 0:
+            return [line for line in p.stdout.splitlines() if XID.search(line)], None
+    return [], (p.stderr or "dmesg unreadable").strip()[:200]
+
+
+def _vllm_alive() -> bool:
+    _, out = _command(["pgrep", "-af", "[v]llm"])
+    wrappers = ("gitm-node-health", "srun ", "bash -c", "enroot", "pyxis")
+    return any(
+        not any(w in line.lower() for w in wrappers)
+        and re.search(r"(python\S*.*\bvllm\b|\bvllm::| -m vllm\b|/bin/vllm\b)", line, re.I)
+        for line in out.splitlines()
+    )
+
+
+def _clocks_bad(value: str) -> bool:
+    value = value.strip().lower()
+    if value.startswith("0x"):
+        try:
+            return bool(int(value, 16) & THRESHOLDS["clocks_bad_bits"])
+        except ValueError:
+            return True
+    return "not active" not in value and (
+        value == "active"
+        or any(x in value for x in ("sw thermal", "hw thermal", "hw slowdown", "hw power brake"))
+    )
+
+
+def _nvlink_ok(status: dict[str, Any]) -> bool:
+    links, topo = status.get("links", ""), status.get("topo", "")
+    if status.get("links_rc") != 0 or not links.strip() or status.get("topo_rc") != 0:
+        return False
+    if re.search(r"\b(inactive|down|disabled)\b", links, re.I):
+        return False
+    rows = {}
+    for line in topo.splitlines():
+        parts = line.split()
+        match = re.fullmatch(r"GPU([0-7])", parts[0]) if parts else None
+        cells = parts[1:9]
+        if match and len(cells) == 8 and all(re.fullmatch(r"X|NV\d+", x) for x in cells):
+            rows[int(match.group(1))] = cells
+    return set(rows) == set(range(8)) and all(
+        cell == "X" if column == gpu else cell.startswith("NV")
+        for gpu, row in rows.items()
+        for column, cell in enumerate(row)
+    )
+
+
+def snapshot(phase: str) -> dict[str, Any]:
+    temps = _csv("temperature.gpu", nounits=True)
+    clocks = _csv(",".join(THRESHOLDS["clocks_bad_fields"]))
+    if not clocks:
+        clocks = _csv("clocks_throttle_reasons.active")
+    power = _csv(
+        "power.limit,power.max_limit,clocks_throttle_reasons.sw_power_cap", nounits=True
+    )
+    rc_links, links = _command(["nvidia-smi", "nvlink", "-s"])
+    rc_topo, topo = _command(["nvidia-smi", "topo", "-m"])
+    _, df = _command(["df", "-BG", "--output=size,avail,pcent", "/dev/shm"])
+    parts = df.splitlines()[-1].split() if len(df.splitlines()) >= 2 else []
+    xids, xid_error = _xids()
+    return {
+        "phase": phase,
+        "ts": time.time(),
+        "node": socket.gethostname(),
+        "temps_c": [float(row[0]) for row in temps] if temps else [],
+        "throttle_reasons": [value for row in clocks for value in row],
+        "power": power,
+        "xid_lines": xids,
+        "xid_error": xid_error,
+        "shm": parts,
+        "nvlink": {"links": links, "links_rc": rc_links, "topo": topo, "topo_rc": rc_topo},
+        "vllm_alive": _vllm_alive(),
+    }
+
+
+def eval_snapshot(snap: dict[str, Any]) -> list[str]:
+    failed = []
+    if not snap["temps_c"] or max(snap["temps_c"]) >= THRESHOLDS["thermal_max_c"]:
+        failed.append("thermal")
+    if not snap["throttle_reasons"] or any(map(_clocks_bad, snap["throttle_reasons"])):
+        failed.append("clocks")
+    try:
+        if not snap["power"] or any(
+            abs(float(limit) - float(maximum)) > 0.5 or "not active" not in cap.lower()
+            for limit, maximum, cap in snap["power"]
+        ):
+            failed.append("power_cap")
+    except (TypeError, ValueError):
+        failed.append("power_cap")
+    try:
+        size, used = float(snap["shm"][0].rstrip("G")), float(snap["shm"][2].rstrip("%"))
+        if size < THRESHOLDS["shm_min_size_g"] or used >= THRESHOLDS["shm_max_used_pct"]:
+            failed.append("dev_shm")
+    except (IndexError, TypeError, ValueError):
+        failed.append("dev_shm")
+    if not _nvlink_ok(snap["nvlink"]):
+        failed.append("nvlink")
+    return failed
+
+
+def eval_window(records: list[dict[str, Any]]) -> dict[str, Any]:
+    pre = next((r for r in records if r.get("phase") == "pre"), None)
+    post = next((r for r in records if r.get("phase") == "post"), None)
+    samples = [r for r in records if r.get("phase") == "sample"]
+    failed = {signal for row in records for signal in eval_snapshot(row)}
+    if pre is None or post is None:
+        failed.add("window_incomplete")
+    if not samples:
+        failed.add("monitoring_coverage")
+    baseline = set(pre.get("xid_lines", [])) if pre else set()
+    for row in records:
+        if row.get("xid_error") or set(row.get("xid_lines", [])) - baseline:
+            failed.add("dmesg_xid")
+    if any(row.get("require_vllm") for row in records):
+        seen_vllm = False
+        for row in samples:
+            if row.get("vllm_alive"):
+                seen_vllm = True
+            elif seen_vllm:
+                failed.add("vllm_liveness")
+        if samples and not seen_vllm:
+            failed.add("vllm_liveness")
+    source = post or pre or (samples[-1] if samples else {})
+    return {
+        "job_id": source.get("job_id"),
+        "node": source.get("node", socket.gethostname()),
+        "healthy": not failed,
+        "failed_signals": sorted(failed),
+        "pre_ts": pre.get("ts") if pre else None,
+        "post_ts": post.get("ts") if post else None,
+        "n_samples": len(samples),
+    }
+
+
+def _append(path: Path, row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as fh:
+        fh.write(json.dumps(row) + "\n")
+
+
+def _pidfile(path: Path) -> Path:
+    return Path(f"{path}.sampler.pid")
+
+
+def _is_sampler(pid: int, path: Path) -> bool:
+    try:
+        args = [
+            os.fsdecode(arg)
+            for arg in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if arg
+        ]
+    except OSError:
+        return False
+    return (
+        any(Path(arg).name == "gitm-node-health" for arg in args)
+        and "sample" in args
+        and any(
+            args[i] == "--out" and Path(args[i + 1]) == path
+            for i in range(len(args) - 1)
+        )
+    )
+
+
+def _stop(path: Path) -> None:
+    pidfile = _pidfile(path)
+    try:
+        pid = int(pidfile.read_text())
+        if _is_sampler(pid, path):
+            os.kill(pid, signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+    finally:
+        pidfile.unlink(missing_ok=True)
+
+
+def pre(args: argparse.Namespace) -> int:
+    row = snapshot("pre")
+    row["job_id"] = args.job
+    row["require_vllm"] = args.require_vllm
+    _append(Path(args.out), row)
+    failed = eval_snapshot(row)
+    if failed:
+        print("unhealthy: " + ",".join(failed), file=sys.stderr)
+        return 1
+    command = [sys.executable, __file__, "sample", "--job", args.job, "--out", args.out]
+    if args.require_vllm:
+        command.append("--require-vllm")
+    proc = subprocess.Popen(
+        command,
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    _pidfile(Path(args.out)).write_text(str(proc.pid))
+    return 0
+
+
+def sample(args: argparse.Namespace) -> int:
+    while True:
+        row = snapshot("sample")
+        row["job_id"] = args.job
+        row["require_vllm"] = args.require_vllm
+        _append(Path(args.out), row)
+        time.sleep(THRESHOLDS["sampler_period_s"])
+
+
+def post(args: argparse.Namespace) -> int:
+    _stop(Path(args.out))
+    row = snapshot("post")
+    row["job_id"] = args.job
+    row["require_vllm"] = args.require_vllm
+    _append(Path(args.out), row)
+    return 0
+
+
+def summarize(args: argparse.Namespace) -> int:
+    path = Path(args.out)
+    _stop(path)
+    output = Path(args.window) if args.window else path.with_name("node_health_window.json")
+    try:
+        rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        result = eval_window(rows)
+        result["job_id"] = args.job
+    except (OSError, json.JSONDecodeError) as exc:
+        result = {
+            "job_id": args.job,
+            "node": socket.gethostname(),
+            "healthy": False,
+            "failed_signals": ["monitoring_coverage", "window_incomplete"],
+            "pre_ts": None,
+            "post_ts": None,
+            "n_samples": 0,
+            "evidence_error": str(exc)[:200],
+        }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(result))
+    return 0 if result["healthy"] else 1
+
+
+def gate(args: argparse.Namespace) -> int:
+    try:
+        if json.loads(Path(args.window).read_text()).get("healthy"):
+            return 0
+    except (OSError, json.JSONDecodeError):
+        pass
+    results, job = Path(args.results), str(args.job)
+    source, dest = results / job, results / "discarded" / job
+    if dest.exists():
+        dest = dest.with_name(f"{job}-{int(time.time())}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if source.exists():
+        source.rename(dest)
+    rc, out = _command(["scontrol", "show", "job", job, "-o"])
+    restarts = int(re.search(r"Restarts=(\d+)", out).group(1)) if rc == 0 and "Restarts=" in out else 0
+    if restarts < THRESHOLDS["max_requeues"]:
+        RUN(["scontrol", "requeue", job])
+    return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--print-thresholds", action="store_true")
+    sub = parser.add_subparsers(dest="command")
+    for name in ("pre", "post", "sample", "summarize"):
+        p = sub.add_parser(name)
+        p.add_argument("--job", required=True)
+        p.add_argument("--out", required=True)
+        if name in ("pre", "post", "sample"):
+            p.add_argument("--require-vllm", action="store_true")
+        if name == "summarize":
+            p.add_argument("--window", default="")
+    p = sub.add_parser("gate")
+    p.add_argument("--job", required=True)
+    p.add_argument("--window", required=True)
+    p.add_argument("--results", required=True)
+    args = parser.parse_args()
+    if args.print_thresholds:
+        print(json.dumps(THRESHOLDS, indent=2))
+        return 0
+    return {"pre": pre, "post": post, "sample": sample, "summarize": summarize, "gate": gate}[
+        args.command
+    ](args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

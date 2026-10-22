@@ -189,7 +189,8 @@ def test_h002_predicted_step_is_the_fp8_floor_plus_its_extra_kernels():
         p.baseline_step_s - _ATTN_RAG64 / 2 + _EXTRA_MI355X * 0.75, rel=1e-9)
 
 
-_ATTN_32X8192_B200 = 32 * 8192 * 1152 * 61 / 8.0e12
+# HGX B200 HBM is 7.7 TB/s per GPU (gitm/planner/context.py); not GB200's 8.
+_ATTN_32X8192_B200 = 32 * 8192 * 1152 * 61 / 7.7e12
 
 
 @pytest.mark.parametrize(
