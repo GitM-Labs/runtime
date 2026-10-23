@@ -248,6 +248,67 @@ def test_admission_backlog_fires_when_nothing_admitted():
     assert any(c.signal == "admission_backlog" for c in scheduler_causes(s))
 
 
+def test_full_kv_cache_with_work_waiting_argues_for_cache_room_not_admission():
+    """H200 job 99: 99 running against a cap of 1024, 506 waiting, cache at 100%.
+
+    The cap never bound, so admission levers cannot help; only KV room can.
+    """
+    from gitm.tracer.vllm_stats import SchedulerStatsSummary
+
+    s = SchedulerStatsSummary(
+        n_samples=5161, duration_s=265.6, peak_queue_depth=506, mean_running=65.2,
+        peak_running=99, mean_batch_occupancy=0.064, total_preemptions=17,
+        peak_gpu_cache_usage=1.0, peak_swapped=None, max_num_seqs=1024,
+        peak_cache_usage_while_waiting=1.0,
+    )
+    by = {c.signal: c.motivates_knobs for c in scheduler_causes(s)}
+    for signal in ("under_filled_batch", "admission_backlog"):
+        assert by[signal] == ["gpu_memory_utilization", "kv_cache_dtype"]
+
+    # The same queue with room left in the cache is still an admission problem.
+    roomy = SchedulerStatsSummary(
+        n_samples=5161, duration_s=265.6, peak_queue_depth=506, mean_running=65.2,
+        peak_running=99, mean_batch_occupancy=0.064, total_preemptions=0,
+        peak_gpu_cache_usage=0.5, peak_swapped=None, max_num_seqs=1024,
+        peak_cache_usage_while_waiting=0.5,
+    )
+    by = {c.signal: c.motivates_knobs for c in scheduler_causes(roomy)}
+    assert by["admission_backlog"] == ["max_num_seqs", "max_num_batched_tokens"]
+    assert "max_num_seqs" in by["under_filled_batch"]
+
+
+def test_kv_bound_needs_a_full_cache_while_waiting_and_a_known_cap():
+    """Peaks from different moments, or a cap that could not be read, keep the
+    admission advice: either may mean the cache never held the queue back."""
+    from gitm.tracer.vllm_stats import SchedulerStatsSummary
+
+    base = dict(n_samples=100, duration_s=10.0, peak_queue_depth=200, mean_running=60.0,
+                peak_running=99, mean_batch_occupancy=0.06, total_preemptions=0,
+                peak_gpu_cache_usage=1.0, peak_swapped=None)
+    admission = ["max_num_seqs", "max_num_batched_tokens"]
+
+    # The queue drained before the cache filled: waiting samples peaked at 40%.
+    apart = SchedulerStatsSummary(**base, max_num_seqs=1024, peak_cache_usage_while_waiting=0.4)
+    by = {c.signal: c.motivates_knobs for c in scheduler_causes(apart)}
+    assert by["admission_backlog"] == admission
+
+    # The cap is unknown, so it may be what stopped admission.
+    unread = SchedulerStatsSummary(**base, max_num_seqs=None, peak_cache_usage_while_waiting=1.0)
+    by = {c.signal: c.motivates_knobs for c in scheduler_causes(unread)}
+    assert by["admission_backlog"] == admission
+
+
+def test_summary_records_cache_usage_only_from_samples_with_work_waiting():
+    from gitm.tracer.vllm_stats import SchedulerSample
+
+    samples = [
+        SchedulerSample(t_ns=0, num_running=50, num_waiting=30, gpu_cache_usage=0.4),
+        SchedulerSample(t_ns=1, num_running=60, num_waiting=0, gpu_cache_usage=1.0),
+    ]
+    assert summarize(samples, max_num_seqs=256).peak_cache_usage_while_waiting == 0.4
+    assert summarize(samples[1:]).peak_cache_usage_while_waiting is None
+
+
 def test_occupancy_clamped_under_multiple_schedulers():
     """Summed running across schedulers must not push occupancy above 1.0."""
     class _Sch:

@@ -82,6 +82,11 @@ class SchedulerStatsSummary:
     #: of 17, not 32). ``None`` without a capacity to bound against.
     mean_bounded_inflight: float | None = None
     max_num_seqs: int | None = None
+    #: The fullest the KV cache got in a sample that also had requests waiting.
+    #: The two peaks above can come from different moments (a queue during
+    #: prefill, a full cache after it drained); this one says whether waiting
+    #: work and a full cache happened together. ``None`` when no sample had both.
+    peak_cache_usage_while_waiting: float | None = None
 
 
 # SLO defaults for goodput. Serving-shaped starting points, not tuned: a request
@@ -618,6 +623,8 @@ def summarize(
     occ = _vals("batch_occupancy")
     preempt = _vals("preemptions_cumulative")
     cache = _vals("gpu_cache_usage")
+    cache_waiting = [s.gpu_cache_usage for s in samples
+                     if s.gpu_cache_usage is not None and s.num_waiting]
     swapped = _vals("num_swapped")
     busy = [v for v in _vals("num_unfinished") if v >= 1]
     duration_s = max(samples[-1].t_ns - samples[0].t_ns, 0) / 1e9
@@ -643,6 +650,7 @@ def summarize(
             if busy and max_num_seqs else None
         ),
         max_num_seqs=max_num_seqs,
+        peak_cache_usage_while_waiting=max(cache_waiting) if cache_waiting else None,
     )
 
 

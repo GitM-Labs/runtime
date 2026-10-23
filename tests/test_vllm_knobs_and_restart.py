@@ -434,10 +434,23 @@ def test_preemption_cause():
 
 
 def test_under_filled_batch_cause():
-    causes = scheduler_causes(_summary(mean_batch_occupancy=0.1))
+    causes = scheduler_causes(_summary(mean_batch_occupancy=0.1, peak_queue_depth=3))
     occ = next(c for c in causes if c.signal == "under_filled_batch")
     assert "max_num_seqs" in occ.motivates_knobs
     assert occ.severity > 0.5  # 0.1 vs 0.6 floor is a big deficit
+
+
+def test_an_under_filled_batch_with_nothing_waiting_is_demand_not_admission():
+    """Nothing ever waited: the batch is as big as the traffic, and raising the
+    scheduler's caps cannot fill it. Only cutting per-step overhead can help."""
+    occ = next(c for c in scheduler_causes(_summary(mean_batch_occupancy=0.04,
+                                                    peak_queue_depth=0))
+               if c.signal == "under_filled_batch")
+    assert occ.motivates_knobs == ["enforce_eager"]
+    unknown = next(c for c in scheduler_causes(_summary(mean_batch_occupancy=0.04,
+                                                        peak_queue_depth=None))
+                   if c.signal == "under_filled_batch")
+    assert "max_num_seqs" in unknown.motivates_knobs
 
 
 def test_admission_backlog_cause():
@@ -469,7 +482,9 @@ class _ModelCfgBf16:
 
 class _LowOccScheduler:
     running = [0, 1]  # 2 running
-    waiting: list = []
+    # gitm submits every prompt at once, so a real run starts with a queue; an
+    # empty one would read as demand-limited, where max_num_seqs cannot help.
+    waiting: list = [2, 3]
     swapped: list = []
 
 
