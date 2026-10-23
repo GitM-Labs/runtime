@@ -56,7 +56,7 @@ interventions:
     applicability:
       workloads: [vllm-decode]
       requires_dtype: [fp16, bf16]
-      requires_hardware: [A100, H100, L40S]
+      requires_hardware: [A100, H100, H200, B200, L40S]
     safety:
       tier: moderate
       requires_rollback_window_s: 120
@@ -288,7 +288,7 @@ interventions:
     source: https://docs.vllm.ai/en/latest/serving/engine_args.html
     applicability:
       workloads: [vllm-decode]
-      requires_hardware: [A100, H100]
+      requires_hardware: [A100, H100, H200, B200]
       requires_dtype: [fp16, bf16]
     safety:
       tier: high_risk
@@ -330,7 +330,7 @@ interventions:
     source: https://docs.vllm.ai/en/latest/serving/distributed_serving.html
     applicability:
       workloads: [vllm-decode]
-      requires_hardware: [A100, H100]
+      requires_hardware: [A100, H100, H200, B200]
       other: Adds all-reduce per layer; only wins when memory-bound, not compute-bound.
     safety:
       tier: high_risk
@@ -409,7 +409,7 @@ interventions:
     source: https://docs.vllm.ai/en/latest/serving/distributed_serving.html
     applicability:
       workloads: [vllm-decode]
-      requires_hardware: [A100, H100]
+      requires_hardware: [A100, H100, H200, B200]
       other: Pipeline bubbles hurt low-batch decode; mainly a memory-fit lever.
     safety:
       tier: high_risk
