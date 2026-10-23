@@ -1009,6 +1009,20 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         # budget without the thing it asked for, and say nothing.
         raise ValueError(
             f"rerank must be one of {RERANK_MODES}, got {cfg.rerank!r}")
+    # GITM_TOP_N: how many ranked rows the run may try. A lever with a value grid
+    # takes one row per step, so at the default 5 a single sweep can fill the list.
+    # Checked here rather than at ranking, which comes after the opening trace: a
+    # bad value should stop the run before it spends an hour capturing.
+    _top_n_raw = os.environ.get("GITM_TOP_N")
+    try:
+        top_n = int(_top_n_raw) if _top_n_raw is not None else cfg.top_n_interventions
+    except ValueError:
+        top_n = 0
+    if top_n < 1:
+        # ranked[:top_n] reads a negative count as "all but the last few", so a
+        # typo would try nearly the whole catalogue instead of failing.
+        raise ValueError(
+            f"GITM_TOP_N must be a whole number of at least 1, got {_top_n_raw!r}")
 
     # Never prompts. Deciding that is the CLI's job, because a library entry
     # point that can block on stdin is one an embedded caller cannot use.
@@ -1568,7 +1582,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     _recoverable = recoverable_by_op(res) if _floors_priced_for_this_run else None
     # Knob -> the cause observed in this run that argues for it (S-3).
     _motivated = _motivation(sched_causes, coll_causes)
-    ranked = select_interventions(trace, library, policy, top_n=cfg.top_n_interventions,
+    ranked = select_interventions(trace, library, policy, top_n=top_n,
                                   ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
                                   fingerprint=qual.fingerprint, recoverable=_recoverable,
                                   motivated=_motivated,
