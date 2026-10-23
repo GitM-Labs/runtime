@@ -19,6 +19,7 @@ from gitm.planner.glm_graph import (
     kv_entry_bytes,
     memory_fit,
     model_weight_bytes,
+    moe_routed_knee,
     predict_glm_graph,
 )
 from gitm.planner.model_catalogue import load_spec
@@ -445,6 +446,121 @@ def test_plan_prices_an_explicit_cache_dtype_over_the_resolved_default(capsys):
     assert "serial proxy 11.404 ms/step" in default and "35,136 B/token" in default
     assert "serial proxy 13.323 ms/step" in wide and "70,272 B/token" in wide
     assert "4.5 GB workspace" in default and "46.2 GB for KV" in default
+
+
+_KNEE_PHASES = {
+    "decode": (["--batch", "32", "--kv-len", "8192"], 32,
+               lambda rows: BatchConfig(batch=rows, kv_cache_len=8192)),
+    "prefill": (["--batch", "0", "--kv-len", "0", "--prefill-tokens", "8192",
+                 "--prefill-requests", "1"], 8192,
+                lambda rows: BatchConfig(batch=0, kv_cache_len=0, prefill_tokens=rows,
+                                         prefill_requests=1)),
+}
+
+
+def _rows_per_expert(spec, rows):
+    k, e = spec.num_experts_per_tok, spec.n_routed_experts
+    return rows * k / (e * (1 - (1 - k / e) ** rows))
+
+
+def _first_rows_above(spec, target):
+    lo, hi = 1, 10**7
+    while lo < hi:
+        mid = (lo + hi) // 2
+        lo, hi = (lo, mid) if _rows_per_expert(spec, mid) > target else (mid + 1, hi)
+    return lo
+
+
+def _moe_routed_bounds(g):
+    return {n.prediction.bound for n in g.nodes if n.op == "moe_routed"}
+
+
+@pytest.mark.parametrize("phase", _KNEE_PHASES)
+@pytest.mark.parametrize("tp,ep", [(1, 1), (8, 1), (8, 8)], ids=["tp1", "tp8", "ep8"])
+@pytest.mark.parametrize("model,gpu", [("kimi-k2.6", "H200"), ("glm-5.2-fp8", "B200")])
+def test_plan_expert_knee_is_where_the_graphs_moe_routed_node_flips(capsys, model, gpu,
+                                                                     tp, ep, phase):
+    """The printed knee is where the graph's own moe_routed node flips: memory-
+    bound just below the printed value's rounding interval, compute-bound just
+    above. The line printed critical_rows' per-GEMM form instead, 67 for K2.6 on
+    H200 at every TP, and 0.00 rows/expert for a prefill-only step."""
+    from gitm.planner.registry import _hardware, _load, _predict, main
+
+    argv, rows_now, step = _KNEE_PHASES[phase]
+    assert main([model, "--gpu", gpu, "--tp", str(tp), "--ep", str(ep), *argv]) == 0
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if "rows/expert" in ln)
+    spec, family, _ = _load(model)
+
+    def bounds(rows):
+        return _moe_routed_bounds(
+            _predict(spec, family, _hardware(gpu), step(rows), ShardingConfig(tp=tp, ep=ep)))
+
+    assert line.split()[0] == f"{_rows_per_expert(spec, rows_now):.2f}"
+    knee = float(line.split()[-1])
+    below = _first_rows_above(spec, knee - 0.05) - 1
+    above = _first_rows_above(spec, knee + 0.05)
+    assert bounds(below) == {"memory"}
+    assert bounds(above) == {"compute"}
+
+
+def test_expert_knee_moves_with_the_padding_of_the_rank_slice():
+    """TRT-LLM pads each rank's intermediate slice, so a 2,880-wide MXFP4 expert
+    on B200 carries more padding per weight at TP8 (360 per rank) than at TP1.
+    The knee follows that w; the catalogue entries are exact multiples, so their
+    knees cannot tell a knee priced at the wrong sharding from the right one."""
+    spec = replace(load_spec("kimi-k2.6"), hidden=2880, moe_intermediate_size=2880,
+                   expert_dtype="mxfp4")
+    knees = {tp: moe_routed_knee(spec, B200, ShardingConfig(tp=tp)) for tp in (1, 8)}
+    assert knees[8] > knees[1]
+    for tp, knee in knees.items():
+        above = _first_rows_above(spec, knee)
+        bounds = [_moe_routed_bounds(predict_glm_graph(
+            spec, B200, BatchConfig(batch=rows, kv_cache_len=8192), ShardingConfig(tp=tp)))
+            for rows in (above - 1, above)]
+        assert bounds == [{"memory"}, {"compute"}]
+
+
+def test_plan_knee_line_prices_the_runs_sharding(capsys, monkeypatch):
+    """The same padded expert through `gitm plan`: the printed knee is the one
+    at the run's TP, which the catalogue entries cannot show."""
+    from gitm.planner import registry
+
+    spec = replace(load_spec("kimi-k2.6"), hidden=2880, moe_intermediate_size=2880,
+                   expert_dtype="mxfp4")
+    _, family, note = registry._load("kimi-k2.6")
+    monkeypatch.setattr(registry, "_load", lambda model: (spec, family, note))
+    for tp in (1, 8):
+        assert registry.main(["kimi-k2.6", "--gpu", "B200", "--tp", str(tp)]) == 0
+        line = next(ln for ln in capsys.readouterr().out.splitlines() if "rows/expert" in ln)
+        knee = moe_routed_knee(spec, B200, ShardingConfig(tp=tp))
+        assert line.endswith(f"compute-bound above {knee:.1f}")
+
+
+def test_plan_knee_line_without_routed_experts_per_token(capsys, monkeypatch):
+    """With no routed expert per token the node never turns compute-bound, and
+    the line says so rather than dividing by zero."""
+    from gitm.planner import registry
+
+    spec = replace(load_spec("kimi-k2.6"), num_experts_per_tok=0)
+    _, family, note = registry._load("kimi-k2.6")
+    monkeypatch.setattr(registry, "_load", lambda model: (spec, family, note))
+    assert registry.main(["kimi-k2.6", "--gpu", "H200", "--tp", "8"]) == 0
+    assert "moe_routed is compute-bound above never" in capsys.readouterr().out
+
+
+def test_plan_knee_line_says_so_when_the_node_is_launch_bound_at_the_knee(capsys):
+    """A launch cost of 1 ms puts moe_routed on its launch floor at the knee and
+    far above it, where the table says launch, so the line must not say
+    "compute-bound above". The default 2 us leaves the line as it was."""
+    from gitm.planner.registry import main
+
+    argv = ["kimi-k2.6", "--gpu", "H200", "--tp", "8", "--batch", "4096"]
+    assert main([*argv, "--launch-overhead", "1e-3"]) == 0
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if "rows/expert" in ln)
+    assert line.endswith("moe_routed is launch-bound at its 60.3-row knee at this launch cost")
+    assert main(argv) == 0
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if "rows/expert" in ln)
+    assert line.endswith("compute-bound above 60.3")
 
 
 def test_plan_kv_cache_dtype_applies_to_every_family(capsys):

@@ -22,7 +22,7 @@ Both 4-bit formats Kimi ships spend the same bytes on scales. NVIDIA's NVFP4 sto
 | INT4 g32 (bf16 / 32) | 0.5 | 0.0625 | 0.5625 | 11.1% |
 | MXFP4 (e8m0 / 32) | 0.5 | 0.03125 | 0.53125 | 5.9% |
 
-Decode on Kimi is memory-bound on the routed experts. At the registered 128 sequences, 358 of 384 experts wake per layer with 2.86 rows each, against a compute knee near 67 rows on H200 and higher on MI355X. The expert kernels' time should therefore follow their bytes.
+Decode on Kimi is memory-bound on the routed experts. At the registered 128 sequences, 358 of 384 experts wake per layer with 2.86 rows each, against a compute knee near 60 rows on H200 (the `moe_routed` node's; 67 for one 7,168 x 2,048 GEMM) and higher on MI355X. The expert kernels' time should therefore follow their bytes.
 
 The AMD checkpoint bundles a second change: it also quantises the shared expert and the dense layer-0 MLP, which are bf16 in both NVIDIA's and Moonshot's releases. Its `quantization_config.exclude` list names exactly the attention projections, `mlp.gate` and `lm_head` (61 x 5 + 60 + 1 entries for the text model). That bundled precision change is not scale recovery, so it is priced separately below.
 

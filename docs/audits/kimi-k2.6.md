@@ -42,7 +42,7 @@ Each finding is also classified. A **missing modelled cost** is time the hardwar
 
 - **Evidence.** H200 has no FP4 tensor cores. The NVFP4 MoE oracle's only sm90-capable backend is Marlin (`fused_moe/oracle/nvfp4.py:140-146`; `fused_marlin_moe.py:567`), which asserts bf16/fp16 activations (`quantization/utils/marlin_utils_fp4.py:135`) and refuses W4A8 for NVFP4 (`:305-307`).
 - **Affected path.** `roofline.resolve_peak` fell down the ladder from fp4 to fp8, and flagged every H200 prediction as a fallback.
-- **Expected prediction error.** Decode is unchanged, because the expert GEMM is memory-bound at 1.36 rows per expert. Prefill is not. An 8,192-token chunk puts 171 rows on each expert, above the 67-row knee. The routed-expert node's compute time was 21.9 ms and should be 43.8 ms, and that node sets the prefill step.
+- **Expected prediction error.** Decode is unchanged, because the expert GEMM is memory-bound at 1.36 rows per expert. Prefill is not. An 8,192-token chunk puts 171 rows on each expert, above the knee (60.3 rows for the `moe_routed` node, 67 for one 7,168 x 2,048 GEMM). The routed-expert node's compute time was 21.9 ms and should be 43.8 ms, and that node sets the prefill step.
 - **Correction.** Shipped in #127 (`65a8828`): `resolve_execution` maps (nvfp4, hopper) to Marlin at bf16. `peak_is_fallback` is now false because the rate is the right one, not a guess.
 - **Class.** A missing modelled cost, 2x on prefill expert compute.
 

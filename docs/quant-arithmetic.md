@@ -83,11 +83,11 @@ r* = R w k n / (2kn - R a (k + n)), which is about R w / 2 when k and n are much
 
 Decode is two orders of magnitude below the knee. A prefill chunk of 8,192 tokens puts 171 rows on each expert, above the knee, so the expert GEMM is compute-bound there. The MAC rate that was wrong in the old planner therefore matters for prefill.
 
-`gitm plan` prints the expert line for every `glm_moe_dsa` entry:
+`gitm plan` prints the expert line for every `glm_moe_dsa` entry. Its knee is where the graph's own `moe_routed` node turns compute-bound (`glm_graph.moe_routed_knee`), not the formula above: that node runs gate_up, SwiGLU and down as one op, charges the intermediate activations but not the hidden-width ones (`moe_permute` and `moe_combine` carry those), and divides FLOPs, weight bytes and activation bytes by the same shard count, so r* = 3 h w R / (6h + 4 - 4aR), the same at every TP and EP degree unless the backend pads a rank's slice (w then includes the padding) or an EP layout sets `ep_imbalance`, which `gitm plan` leaves at 1. For K2.6 NVFP4 on H200 (h 7,168, w 0.5625, a 2, R 206.04) that is 60.3.
 
 ```
 experts   nvfp4: 0.5625 B/weight stored (11.1% scales) -> marlin, bf16 MACs, 0.5625 B/weight per use
-          1.36 rows/expert at this batch; compute-bound above 67
+          1.36 rows/expert this step; moe_routed is compute-bound above 60.3
 ```
 
 ## Reproduction 1: the Kimi K2.6 NVFP4 case
