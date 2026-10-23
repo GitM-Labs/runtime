@@ -189,7 +189,14 @@ def test_h002_predicted_step_is_the_fp8_floor_plus_its_extra_kernels():
         p.baseline_step_s - _ATTN_RAG64 / 2 + _EXTRA_MI355X * 0.75, rel=1e-9)
 
 
-_ATTN_32X8192_B200 = 32 * 8192 * 1152 * 61 / 8.0e12
+# B200's bandwidth is read from the planner, not written here. This line used
+# to say 8.0e12: #186 (ENG-59) wrote it while the planner priced B200 at
+# GB200's 8.0 TB/s, and #184 (ENG-57) moved the planner to HGX B200's 7.7 TB/s
+# the same day. Each passed CI on its own; merged together, the prediction
+# priced attention at 7.7 TB/s and this expectation at 8.0, and the B200 case
+# below failed on main by 0.06 ms (3.9%, 8.0 / 7.7). Asking the planner keeps
+# the two from disagreeing again when a figure changes.
+_ATTN_32X8192_B200 = 32 * 8192 * 1152 * 61 / peak_for_sku("B200").peak_bw_bytes_s
 
 
 @pytest.mark.parametrize(
