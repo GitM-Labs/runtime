@@ -9,6 +9,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic.json_schema import SkipJsonSchema
 
 SafetyTier = Literal["low_risk", "moderate", "high_risk"]
+#: ENG-79. 1: accuracy-neutral (scheduling, batching, attention backend,
+#: parallelism). 2: changes numerics (quantization, KV cache, CPU offload).
+#: 3: topology-aware scheduling, runtime realignment.
+LeverClass = Literal[1, 2, 3]
+#: ENG-79. none: applied through the engine's live API. restart: a new engine
+#: that reuses the weights. rebuild: weights re-sharded (TP/PP, dtype,
+#: quantization).
+RestartCost = Literal["none", "restart", "rebuild"]
 
 
 class Applicability(BaseModel):
@@ -103,6 +111,10 @@ class InterventionSpec(BaseModel):
     applicability: Applicability = Field(default_factory=Applicability)
     safety: SafetyGate = Field(default_factory=SafetyGate)
     review: str | None = None  # reviewer sign-off note (None until reviewed)
+    # Required on every library.yaml entry (tests/test_lever_classes.py). Optional
+    # here so a spec built in code, e.g. by autoresearch, still validates.
+    lever_class: LeverClass | None = None
+    restart_cost: RestartCost | None = None
     # An accuracy sentinel the apply path runs after measuring and before
     # keeping: None to pass, else the reason. The live keep gate sees throughput
     # alone, so a lever that can change model output carries its own check here

@@ -26,6 +26,8 @@ _relative_sweep: &sweep_grid [0.5, 2.0, 4.0]
 interventions:
   # --- Tier 1: low-effort levers --------------------------------------------
   - name: kv_cache_block_size_16
+    lever_class: 1
+    restart_cost: restart
     summary: Set PagedAttention block size to 16 for short-context decode.
     knob: block_size
     value: 16
@@ -45,6 +47,8 @@ interventions:
     review: null
 
   - name: kv_cache_dtype_fp8
+    lever_class: 2  # open, for Sebastian: restart or rebuild? ENG-79 lists "dtype" under rebuild
+    restart_cost: restart
     summary: Store the KV cache in fp8 to roughly double cache capacity.
     knob: kv_cache_dtype
     value: fp8
@@ -64,6 +68,8 @@ interventions:
     review: null
 
   - name: max_num_batched_tokens_dynamic
+    lever_class: 1
+    restart_cost: restart
     summary: Sweep the per-step token budget relative to whatever this engine
       is already running (not one hardcoded number) to fill decode batches.
     knob: max_num_batched_tokens
@@ -84,6 +90,8 @@ interventions:
     review: null
 
   - name: max_num_seqs_dynamic
+    lever_class: 1
+    restart_cost: restart
     summary: Sweep concurrent-sequence concurrency relative to whatever this
       engine already allows (not one hardcoded 256) to raise decode concurrency.
     knob: max_num_seqs
@@ -104,6 +112,8 @@ interventions:
     review: null
 
   - name: swap_space_dynamic
+    lever_class: 1
+    restart_cost: restart
     summary: Sweep CPU swap relative to whatever this engine already has
       configured (not one hardcoded 4 GiB) to avoid preemption stalls.
     knob: swap_space
@@ -124,6 +134,8 @@ interventions:
     review: null
 
   - name: gpu_memory_utilization_dynamic
+    lever_class: 1
+    restart_cost: restart
     summary: Sweep gpu_memory_utilization relative to whatever this engine
       already runs at (not one hardcoded 0.92) to permit larger batch slots.
     knob: gpu_memory_utilization
@@ -147,6 +159,8 @@ interventions:
     review: null
 
   - name: cpu_offload_gb_4
+    lever_class: 2  # open, for Sebastian: restart or rebuild? weights move to host memory
+    restart_cost: rebuild
     summary: Offload cold weights to host RAM to free HBM for a larger KV cache.
     knob: cpu_offload_gb
     value: 4
@@ -165,6 +179,8 @@ interventions:
     review: null
 
   - name: preemption_mode_swap
+    lever_class: 1
+    restart_cost: restart
     summary: Swap preempted KV blocks to host instead of recomputing them under memory pressure.
     knob: preemption_mode
     value: swap
@@ -184,6 +200,8 @@ interventions:
 
   # --- Tier 2: medium-effort levers -----------------------------------------
   - name: async_scheduling
+    lever_class: 1
+    restart_cost: restart
     summary: Overlap CPU-side request scheduling with GPU execution to close
       idle/launch-bound gaps between decode steps.
     knob: async_scheduling
@@ -203,6 +221,8 @@ interventions:
     review: null
 
   - name: enable_chunked_prefill
+    lever_class: 1
+    restart_cost: restart
     summary: Chunk prefill so it overlaps with decode instead of stalling it.
     knob: enable_chunked_prefill
     value: true
@@ -220,6 +240,8 @@ interventions:
     review: null
 
   - name: enable_prefix_caching
+    lever_class: 1
+    restart_cost: restart
     summary: Cache shared prompt prefixes to skip repeated prefill work.
     knob: enable_prefix_caching
     value: true
@@ -238,6 +260,8 @@ interventions:
     review: null
 
   - name: speculative_decode_ngram_5
+    lever_class: 1  # open, for Sebastian: class 1 or 2? lossless in theory, but gated on output equivalence
+    restart_cost: restart
     summary: Enable 5-token n-gram speculative decoding to cut decode steps.
     knob: num_speculative_tokens
     value: 5
@@ -257,6 +281,8 @@ interventions:
     review: null
 
   - name: scheduling_policy_priority
+    lever_class: 1
+    restart_cost: restart
     summary: Switch the scheduler to priority policy for mixed-SLO traffic.
     knob: scheduling_policy
     value: priority
@@ -275,6 +301,8 @@ interventions:
     review: null
 
   - name: attention_backend_flashinfer
+    lever_class: 1  # open, for Sebastian: ENG-79 says backends are class 1, but kernels round differently
+    restart_cost: restart
     summary: Swap the attention backend to FlashInfer for fused decode attention.
     knob: VLLM_ATTENTION_BACKEND
     value: FLASHINFER
@@ -297,6 +325,8 @@ interventions:
     review: null
 
   - name: disable_custom_all_reduce
+    lever_class: 1
+    restart_cost: restart
     summary: Fall back to NCCL all-reduce when custom all-reduce stalls comm overlap.
     knob: disable_custom_all_reduce
     value: true
@@ -320,6 +350,8 @@ interventions:
 
   # --- Tier 3: higher-effort levers -----------------------------------------
   - name: tensor_parallel_size_2
+    lever_class: 1
+    restart_cost: rebuild
     summary: Reshape to TP=2 to fit larger batches / longer context per replica.
     knob: tensor_parallel_size
     value: 2
@@ -340,6 +372,8 @@ interventions:
     review: null
 
   - name: quantization_awq
+    lever_class: 2
+    restart_cost: rebuild
     summary: Load AWQ 4-bit weights to shrink the model and free KV-cache memory.
     knob: quantization
     value: awq
@@ -360,6 +394,8 @@ interventions:
     review: null
 
   - name: cuda_graphs_enable
+    lever_class: 1
+    restart_cost: restart
     summary: Disable enforce_eager so CUDA graphs capture and replay the decode step.
     knob: enforce_eager
     value: false
@@ -378,6 +414,8 @@ interventions:
     review: null
 
   - name: max_seq_len_to_capture_dynamic
+    lever_class: 1
+    restart_cost: restart
     summary: Sweep CUDA-graph capture length relative to whatever this engine
       already captures (not one hardcoded 8192) so long contexts stay graphed.
     knob: max_seq_len_to_capture
@@ -399,6 +437,8 @@ interventions:
     review: null
 
   - name: pipeline_parallel_size_2
+    lever_class: 1
+    restart_cost: rebuild
     summary: Split layers across 2 pipeline stages to fit a model that won't shard on TP alone.
     knob: pipeline_parallel_size
     value: 2
@@ -419,6 +459,8 @@ interventions:
     review: null
 
   - name: distributed_executor_ray
+    lever_class: 1  # open, for Sebastian: class 1 or 3? multi-node executor
+    restart_cost: restart
     summary: Use the Ray executor backend for multi-node distributed decode.
     knob: distributed_executor_backend
     value: ray
@@ -448,6 +490,8 @@ interventions:
   # MoE model) rather than every op.
 
   - name: moe_backend_deep_gemm
+    lever_class: 2  # open, for Sebastian: class 1 or 2? fp8 accumulation order changes
+    restart_cost: restart
     summary: Select the DeepGEMM fused-MoE backend for the fp8 expert GEMMs.
     knob: moe_backend
     value: deep_gemm
@@ -482,6 +526,8 @@ interventions:
     review: null
 
   - name: enable_expert_parallel
+    lever_class: 1  # open, for Sebastian: class 1 or 3? places experts across GPUs
+    restart_cost: rebuild
     summary: Shard whole experts across ranks (EP) instead of slicing each one (TP).
     knob: enable_expert_parallel
     value: true
@@ -509,6 +555,8 @@ interventions:
     review: null
 
   - name: enable_eplb
+    lever_class: 3  # open, for Sebastian: class 1 or 3? moves experts at run time
+    restart_cost: restart
     summary: Rebalance expert placement across ranks to cut routing-induced stragglers.
     knob: enable_eplb
     value: true
@@ -539,6 +587,8 @@ interventions:
     review: null
 
   - name: enable_dbo
+    lever_class: 1
+    restart_cost: restart
     summary: Overlap two micro-batches so collectives hide behind compute.
     knob: enable_dbo
     value: true
@@ -567,6 +617,8 @@ interventions:
   # catalog workloads levels, workload tagged load_library + the gate keep them scoped
   # the measure delta still comes from each benchmarks A/B
   - name: edge_fp16_autocast
+    lever_class: 2  # open, for Sebastian: not vLLM: does restart_cost apply?
+    restart_cost: restart
     summary: Run PointPillars/CenterPoint inference under fp16 autocast, gated on
       detection-equivalence (count + sorted scores within tolerance).
     knob: edge.inference_dtype
@@ -585,6 +637,8 @@ interventions:
     review: null
 
   - name: edge_frame_batching
+    lever_class: 1  # open, for Sebastian: not vLLM: does restart_cost apply?
+    restart_cost: restart
     summary: Run inference on batches of frames in one forward pass instead of one
       frame at a time.
     knob: edge.batch_size
@@ -603,6 +657,8 @@ interventions:
     review: null
 
   - name: hft_top_of_book_fewer_scans
+    lever_class: 1  # open, for Sebastian: not vLLM: does restart_cost apply?
+    restart_cost: restart
     summary: Carry per-symbol top-of-book in 2 grouped scans instead of 4, gated on
       byte-identical VWAP/microprice output.
     knob: hft.top_of_book_grouped_scans
