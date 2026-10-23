@@ -119,7 +119,7 @@ provenance:
         96,085 in all. Ledger in the design note, section 2.
     - claim: model_weight_bytes on this entry, and why it is far off
       detail: >
-        316,399,407,824 B against 510,286,023,000 B (-38.0%). Most of the gap
+        319,240,693,712 B against 510,286,023,000 B (-37.4%). Most of the gap
         is the engram tables (203.07 GB), which the family has no term for. Do
         not read the remainder as validation; its itemised errors are in
         unmodelled.
@@ -149,7 +149,7 @@ provenance:
 
   unmodelled:
     - Engram tables and their projections, 203.07 GB (39.8% of bytes). This is
-      most of the -38.0% in model_weight_bytes.
+      most of the -37.4% in model_weight_bytes.
     - Cross-layer KV and indexer sharing. kv_bytes_per_token charges every
       ratio-1 and ratio-2 layer its own cache and index keys, 22,276.5 B per
       token, against 1,600 B for the four real sources at fp8 (13.9x).

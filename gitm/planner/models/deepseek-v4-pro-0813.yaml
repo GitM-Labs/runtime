@@ -16,9 +16,9 @@
 # therefore spelled out below.
 #
 # The routed experts (96.6% of the checkpoint) are priced exactly. The
-# remaining -1.48% in model_weight_bytes is a net of offsetting formula errors
-# in the small terms (wo_a/wo_b 16x low, indexer 6x high, q_b 12.5% high,
-# shared expert / embeddings at the wrong dtype), itemised under unmodelled.
+# remaining -0.24% in model_weight_bytes is a net of offsetting formula errors
+# in the small terms (indexer 6x high, q_b 12.5% high, shared expert /
+# embeddings at the wrong dtype), itemised under unmodelled.
 # Do not read the total as closure.
 
 name: deepseek-ai/DeepSeek-V4-Pro-0813
@@ -157,8 +157,8 @@ provenance:
         0.35 (BF16), wkv 0.24, tid2eid 0.02 (I64 on disk, int32 in model.py).
     - claim: model_weight_bytes vs published total_size
       detail: >
-        879,475,223,424 B predicted against 892,727,580,904 B published
-        (-1.48%, -13.25 GB). Routed experts match to the byte class (862.483
+        890,550,889,344 B predicted against 892,727,580,904 B published
+        (-0.24%, -2.18 GB). Routed experts match to the byte class (862.483
         vs 862.483 GB). The residual is the sum of the itemised formula errors
         under unmodelled, which partly cancel; it is not a calibration.
 
@@ -189,12 +189,6 @@ provenance:
         fp4 path; the planner falls back and flags it) — UNVERIFIED.
 
   unmodelled:
-    - Grouped output projection. wo_a carries o_lora_rank per group
-      (n_heads*head_dim*o_lora_rank weights) and wo_b takes o_groups*o_lora_rank
-      inputs; the planner divides wo_a by o_groups and gives wo_b o_lora_rank
-      inputs, so both are 16x low — 11.07 GB of weights missing, and
-      attn_out_proj's decode traffic under-priced 16x (~184 MB/layer real at
-      fp8). Fix belongs in moe_graph (model_weight_bytes and _emit_layer).
     - head_dim includes the RoPE dims in this code. The planner prices q_b and
       kv_a at head_dim + qk_rope_head_dim (576), 12.5% high (+0.84 GB).
     - Indexer weights. The planner charges hidden x 64 x 128 on all 64 layers;

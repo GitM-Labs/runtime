@@ -156,8 +156,8 @@ def model_weight_bytes(
     Counts experts at ``expert_dtype`` and everything else at ``weight_dtype``,
     since collapsing the two is a ~3x error on the dominant term.
 
-    Validated against ground truth: ``DeepSeek-V4-Flash`` predicts 156 GB against
-    a published 160 GB checkpoint (-2.4%), the residual being norms, biases and
+    Validated against ground truth: ``DeepSeek-V4-Flash`` predicts 158.7 GB against
+    a published 160 GB checkpoint (-0.8%), the residual being norms, biases and
     per-tensor metadata this does not enumerate.
 
     The DSpark variant is the known gap. ``DeepSeek-V4-Flash-0731`` publishes at
@@ -182,8 +182,11 @@ def model_weight_bytes(
         + spec.q_lora_rank * spec.n_heads * spec.q_head_dim / tp
         + h * spec.kv_latent_dim  # kv_a, replicated
         + h * spec.index_n_heads * spec.index_head_dim / tp
-        + spec.n_heads * spec.head_dim * spec.o_lora_rank / (spec.o_groups * tp)
-        + spec.o_lora_rank * h
+        # o_lora_rank is per group: wo_a is o_groups x [n_heads*head_dim/o_groups,
+        # o_lora_rank], column-split by group, and wo_b takes o_groups*o_lora_rank
+        # inputs, row-split (vLLM v0.32.0 models/deepseek_v4/attention.py:265-284).
+        + spec.n_heads * spec.head_dim * spec.o_lora_rank / tp
+        + spec.o_groups * spec.o_lora_rank * h / tp
         + h * spec.n_routed_experts  # router, replicated
     )
     embed = 2 * spec.vocab * h / tp  # input embedding + untied lm_head
@@ -401,13 +404,16 @@ def _emit_layer(
         spec.act_dtype,
     )
 
-    # Output projection, grouped and low-rank. ``o_groups`` partitions the head
-    # dimension so each group carries its own slice of the rank — modelled as an
-    # even split, which is the documented reading of the config and not a
-    # published shape, hence ``estimated``.
-    o_in = spec.n_heads * spec.head_dim // tp
-    f_a, b_a = _linear(positions, o_in, max(1, spec.o_lora_rank // spec.o_groups), aw, ww)
-    f_b, b_b = _linear(positions, spec.o_lora_rank, h, aw, ww)
+    # Output projection, grouped and low-rank. ``o_groups`` partitions the heads,
+    # and each group projects its heads to its own ``o_lora_rank`` (a batched
+    # matmul over this rank's groups); wo_b then reads every local group's rank
+    # (vLLM v0.32.0 models/deepseek_v4/attention.py:265-284). Still
+    # ``estimated``: the shapes are read from vLLM, not from a trace.
+    groups = max(1, spec.o_groups // tp)
+    f_a, b_a = _linear(positions, spec.n_heads * spec.head_dim // spec.o_groups,
+                       spec.o_lora_rank, aw, ww)
+    f_a, b_a = groups * f_a, groups * b_a
+    f_b, b_b = _linear(positions, groups * spec.o_lora_rank, h, aw, ww)
     # Named to match the dense graph's output projection: it is the same op in
     # the same place, so residuals for it stay comparable across model families.
     add("attn_out_proj", f_a + f_b, b_a + b_b, wd, estimated=True)

@@ -2016,7 +2016,7 @@ def test_v41_flash_catalogue_entry_loads_and_predicts():
 
 
 def test_v41_flash_footprint_gap_is_the_engram_tables():
-    """510.29 GB published; the entry predicts 316.40 GB (-38%).
+    """510.29 GB published; the entry predicts 319.24 GB (-37%).
 
     The shortfall is the engram tables the family cannot express: 203.07 GB,
     read from the shard headers. Pinning the gap to that term, not the total to

@@ -12,6 +12,8 @@ known formula errors listed under ``unmodelled`` — not a fit.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from gitm.planner import glm_graph, moe_graph
@@ -121,34 +123,49 @@ def test_v4_routed_expert_bytes_are_exact(model, routed):
 
 
 def test_v4_pro_weight_bytes_vs_published():
-    """879.48 GB predicted vs 892.73 GB published: -1.48%, within 2%."""
+    """890.55 GB predicted vs 892.73 GB published: -0.24%, within 2%."""
     pred = moe_graph.model_weight_bytes(load_spec(V4_PRO))
     delta = pred / V4_PRO_PAYLOAD - 1.0
-    assert delta == pytest.approx(-0.0148, abs=0.0005)
+    assert delta == pytest.approx(-0.0024, abs=0.0005)
     assert abs(delta) < 0.02
 
 
 def test_v4_flash_weight_bytes_vs_published():
-    """163.13 GB predicted vs 166.88 GB published: -2.25%, within 3%."""
+    """165.83 GB predicted vs 166.88 GB published: -0.63%, within 3%."""
     pred = moe_graph.model_weight_bytes(load_spec(V4_FLASH))
     delta = pred / V4_FLASH_PAYLOAD - 1.0
-    assert delta == pytest.approx(-0.0225, abs=0.0005)
+    assert delta == pytest.approx(-0.0063, abs=0.0005)
     assert abs(delta) < 0.03
 
 
-def test_v4_pro_grouped_out_proj_is_known_low():
-    """wo_a + wo_b are 11.81 GB on disk (fp8); the planner's formula gives 1/16th.
-
-    Pinned so the day the grouped projection is fixed in moe_graph, this test
-    (and the provenance) has to change with it.
-    """
+def test_v4_pro_grouped_out_proj_is_priced_per_group():
+    """wo_a + wo_b are 11.81 GB on disk (fp8). o_lora_rank is per group: wo_a is
+    o_groups x [n_heads*head_dim/o_groups, o_lora_rank] and wo_b takes
+    o_groups*o_lora_rank inputs. Reading it as a total gave 1/16th of this."""
     s = load_spec(V4_PRO)
     layers = s.n_layers + s.num_nextn_predict_layers
-    planner = layers * (s.n_heads * s.head_dim * s.o_lora_rank / s.o_groups
-                        + s.o_lora_rank * s.hidden)
-    real = layers * (s.n_heads * s.head_dim * s.o_lora_rank
-                     + s.o_groups * s.o_lora_rank * s.hidden)
-    assert real / planner == pytest.approx(16.0)
+    pair = layers * (s.n_heads * s.head_dim * s.o_lora_rank
+                     + s.o_groups * s.o_lora_rank * s.hidden) * weight_bytes(s.weight_dtype)
+    assert pair / 1e9 == pytest.approx(11.81, abs=0.01)
+    without = moe_graph.model_weight_bytes(replace(s, o_lora_rank=0))
+    assert moe_graph.model_weight_bytes(s) - without == pytest.approx(pair, rel=1e-9)
+
+
+@pytest.mark.parametrize("tp", [1, 8])
+def test_v4_pro_out_proj_node_reads_the_whole_pair_per_rank(tp):
+    """At batch 1, attn_out_proj reads this rank's share of wo_a and wo_b (both
+    split by TP) plus one row of activations in and out of each."""
+    s = load_spec(V4_PRO)
+    hw = hardware_spec_for(peak_for_sku("H200"))
+    g, _ = predict(V4_PRO, hw, BatchConfig(batch=1, kv_cache_len=1024),
+                   ShardingConfig(tp=tp))
+    node = next(n for n in g.nodes if n.op == "attn_out_proj")
+    groups = s.o_groups // tp
+    weights = groups * (s.n_heads * s.head_dim // s.o_groups + s.hidden) * s.o_lora_rank
+    acts = groups * (s.n_heads * s.head_dim // s.o_groups + 2 * s.o_lora_rank) + s.hidden
+    expected = (weights * weight_bytes(s.weight_dtype)
+                + acts * weight_bytes(s.act_dtype))
+    assert node.prediction.bytes == pytest.approx(expected, rel=1e-9)
 
 
 # ── DeepSeek-V4-Flash-0731 ───────────────────────────────────────────────────

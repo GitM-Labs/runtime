@@ -16,7 +16,7 @@
 # the mHC fields and num_hash_layers differ from the defaults. Every value is
 # still written out so the entry does not silently follow a default change.
 #
-# Routed experts (94.3% of bytes) are priced exactly; the -2.25% residual is a
+# Routed experts (94.3% of bytes) are priced exactly; the -0.63% residual is a
 # net of the same offsetting small-term formula errors as the Pro entry,
 # itemised under unmodelled.
 
@@ -129,10 +129,10 @@ provenance:
         0.18, mHC fns 0.15, router 0.10, wkv 0.10, tid2eid 0.02.
     - claim: model_weight_bytes vs published total_size
       detail: >
-        163,128,207,232 B predicted against 166,878,536,440 B published
-        (-2.25%, -3.75 GB). Routed experts match exactly (157.437 GB both).
-        With one MTP block instead of three it would be 156.08 GB (-6.47%) —
-        the same 156 GB moe_graph.model_weight_bytes' docstring quotes for the
+        165,829,998,464 B predicted against 166,878,536,440 B published
+        (-0.63%, -1.05 GB). Routed experts match exactly (157.437 GB both).
+        With one MTP block instead of three it would be 158.67 GB (-4.92%) —
+        the same 158.7 GB moe_graph.model_weight_bytes' docstring quotes for the
         base V4-Flash. The ~7 GB this checkpoint adds over that base is mostly
         the two extra blocks' experts, not DSpark-specific tensors (0.18 GB);
         the docstring's "shape is not public" no longer holds — model.py
@@ -158,9 +158,6 @@ provenance:
         planner falls back for the expert GEMMs and flags it — UNVERIFIED.
 
   unmodelled:
-    - Grouped output projection. wo_a and wo_b are each 8x low in the planner
-      (o_lora_rank read as a total, not per group), -2.70 GB of weights and
-      attn_out_proj decode traffic under-priced 8x. Fix belongs in moe_graph.
     - head_dim includes RoPE in this code; q_b and kv_a priced at 576, +12.5%
       (+0.21 GB).
     - Indexer weights charged hidden x 64 x 128 on all 46 layers; real indexer
