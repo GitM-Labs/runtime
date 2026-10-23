@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Mock dmesg driven by env:
+#   MOCK_DMESG_UNREADABLE=1  -> exit nonzero (simulates no CAP_SYSLOG)
+#   MOCK_STATE/FAULTED exists -> emit a kiq-fence fault line (fresh fault)
+#   MOCK_DMESG_OLDFAULT=1    -> always emit one OLD fault line (baseline already has it)
+[ "${MOCK_DMESG_UNREADABLE:-0}" = 1 ] && { echo "dmesg: read kernel buffer failed: Operation not permitted" >&2; exit 1; }
+echo "[Thu Oct 23 06:00:00 2026] boot: normal kernel line"
+[ "${MOCK_DMESG_OLDFAULT:-0}" = 1 ] && echo "[Thu Oct 23 05:00:00 2026] amdgpu 0000:2f:00.0: amdgpu: timeout waiting for kiq fence"
+if [ -n "${MOCK_STATE:-}" ] && [ -f "$MOCK_STATE/FAULTED" ]; then
+  echo "[Thu Oct 23 06:30:00 2026] amdgpu 0000:2f:00.0: amdgpu: timeout waiting for kiq fence"
+fi
+exit 0

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Portable `timeout` so the harness runs on hosts without GNU coreutils timeout.
+# Usage: timeout SECONDS cmd args...   (returns 124 if the command was killed for time)
+dur="$1"; shift
+"$@" & cmdpid=$!
+( sleep "$dur" 2>/dev/null; kill -TERM "$cmdpid" 2>/dev/null ) & killer=$!
+wait "$cmdpid" 2>/dev/null; rc=$?
+if kill -0 "$cmdpid" 2>/dev/null; then kill -KILL "$cmdpid" 2>/dev/null; rc=124; fi
+kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null
+# if the process was signaled by our killer, report 124
+[ "$rc" -ge 143 ] && rc=124
+exit "$rc"

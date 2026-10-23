@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+echo "pid $$ current affinity list: 0-255"
+exit 0
