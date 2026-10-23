@@ -202,6 +202,8 @@ Only one engine is ever on the GPU. Parallel mode, where both are resident, is u
    - the factor is the exact noise of that mean, since neighbouring rounds share a build (two rounds give 0.87, not 1/√2);
    - the minimum effect is `GITM_MIN_EFFECT`, 1% by default;
    - until the first A/A sample exists, the threshold is 2%.
+
+   [`noise-floor.md`](noise-floor.md) works through the arithmetic with a real H200 run.
 4. **Autoresearch candidates always get at least 2 rounds:** it tries many guesses, so a lucky single A/B is likelier there.
 
 On an RTX 4050 (Qwen2.5-0.5B, 256 × 512), identical builds differ by about 0.45%, so the threshold is about 1%. The previous rule, "keep if ≥ 0", kept 8 of 15 changes that did nothing.
