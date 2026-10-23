@@ -126,7 +126,7 @@ If earlier runs left results, the CLI asks whether to rank this run from them, u
 - On NVIDIA it's CUPTI, via `CUDA_INJECTION64_PATH`. On AMD it's rocprofiler-sdk, via `ROCP_TOOL_LIBRARIES`.
 - The driver reads these once, when a process starts using the GPU. So they must be exported before `gitm run` starts; nothing can add them to a running engine.
 - On AMD the engine workers start with spawn rather than fork: a forked worker keeps the GPU runtime but loses the profiler.
-- **On AMD, run the opening capture eager** (`GITM_VLLM_ENFORCE_EAGER=1`). rocprofiler's queue interposition can deadlock against graph replay. It's a ROCm bug (vLLM #56506, ROCm #11623), and this setting avoids it.
+- **Traced engines always run eager,** the opening capture as well as every re-trace. Graph replay hides decode kernels from the tracer, and on AMD rocprofiler's queue interposition can deadlock against it (vLLM #56506, ROCm #11623). The A/B baseline is not traced, so it keeps vLLM's defaults (graphs, compile), and a keep has to beat stock vLLM. `GITM_VLLM_ENFORCE_EAGER=1` makes the baseline eager too, which only makes builds faster.
 
 **The scheduler** is sampled over the same window through `LLM.get_metrics()`. On vLLM 0.30 the scheduler runs in a separate EngineCore process, so its state is only visible there. It records:
 - running and queued requests;
@@ -180,6 +180,10 @@ Only one engine is ever on the GPU. Parallel mode, where both are resident, is u
 
 **No A/B engine carries the tracer.** After the opening capture, the traced engine is replaced by an untraced baseline, and every candidate is built untraced too. That keeps tracer overhead off one side of the comparison, and keeps the AMD deadlock's trigger out of every engine that replays graphs.
 
+**Traced engines name each kernel's layer and op.** The opening capture and each re-trace are built with vLLM's layerwise NVTX ranges (`enable_layerwise_nvtx_tracing`), so a kernel carries the module it ran in. By name alone, library GEMMs (cuBLAS, hipBLASLt) and MLA attention map to no op: the first Kimi K2.5 run left 71% of its launches unmodelled and could target nothing. vLLM 0.30 emits the ranges only from its V1 model runner, so traced engines run it (unless `VLLM_USE_V2_MODEL_RUNNER` is set); its V2 default accepts the flag and ignores it. The ranges cost host time on every module call, so A/B engines never carry them and keep vLLM's default runner. `GITM_VLLM_NVTX=0` turns them off.
+
+**Off by default on AMD.** Two Kimi K2.5 runs on MI355X with the labels on hung at the first traced decode: rocprofiler reported stuck signals, kernels stopped after 37 s, and vLLM timed out. The labels did arrive, with correct module names. Which part hangs (marker tracing, per-call HIP API tracing, the roctx shim or the V1 runner) is not isolated yet. `GITM_VLLM_NVTX=1` opts in.
+
 **Failures don't freeze or crash the run.**
 - **A hang:** a build or decode that runs past its deadline is killed (`GITM_BUILD_TIMEOUT_S`, default 3600; `GITM_DECODE_TIMEOUT_S`, default 1800). If killing frees nothing, the call is abandoned 60 s later.
 - **A failed candidate** is rolled back.
@@ -187,6 +191,7 @@ Only one engine is ever on the GPU. Parallel mode, where both are resident, is u
   - candidates stop, and the run records "engine lost";
   - the report is still written;
   - the run exits 5.
+- **An opening run that fails on the engine** (a hang the watchdog kills, a crash) stops the run the same way, before any candidate. There is no measured baseline, and the trace is a fragment, so nothing is A/B-tested or ranked from it.
 - **Results are saved as they happen:** `verification.json` is rewritten after every A/B, so a run that's killed keeps what it measured.
 
 **Re-ranking** (`--rerank recapture`):
@@ -203,6 +208,9 @@ Only one engine is ever on the GPU. Parallel mode, where both are resident, is u
    - the minimum effect is `GITM_MIN_EFFECT`, 1% by default;
    - until the first A/A sample exists, the threshold is 2%.
 4. **Autoresearch candidates always get at least 2 rounds:** it tries many guesses, so a lucky single A/B is likelier there.
+**Rebuild or re-measure?** Two builds of the same configuration don't decode at exactly the same speed (memory layout, auto-tuned kernels, graph capture). `--validation` rebuilds between rounds, so a lucky or unlucky build can't carry a decision: the stronger test, one build per extra round. `--reps` decodes several times on the engine already up: no build cost, and steadier against run-to-run noise, but it repeats whatever luck that build had. Use `--validation` for results, and `--reps` (with `--validation 1`) for quick exploration where builds are expensive. Both are recorded in the summary and `noise_floor.json`.
+
+5. **The run ends with one end-to-end A/B.** Each keep was judged against whatever was running then, so kept gains were never measured together, and their sum is not a result. After the last candidate, the original configuration is rebuilt and the final one is tried against it as a single candidate, with the same rounds and threshold. That number goes in the summary (`final_check`), the report and `final_check.json`. It runs only when something was kept and the budget allows; `GITM_FINAL_CHECK=0` turns it off.
 
 On an RTX 4050 (Qwen2.5-0.5B, 256 × 512), identical builds differ by about 0.45%, so the threshold is about 1%. The previous rule, "keep if ≥ 0", kept 8 of 15 changes that did nothing.
 
@@ -250,6 +258,7 @@ Everything lands in `$GITM_SCRATCH/runs/<run_id>/`.
 | `rerank.json` | 4 | Each re-rank: order before and after, causes, whether lost time was used |
 | `autoresearch.json` | 4b | Proposals, outcomes, why it stopped |
 | `collective_health.json` | 0 | The GPU health check's result |
+| `final_check.json` | 4b | The run's end-to-end A/B: the configuration it started from against the one it ends with |
 | `noise_floor.json` | 4 | The A/A samples, the floor, and the threshold for 1 round and for this run's validation level |
 | `verification.json` | 4–5 | The A/B behind every claim |
 | `degradations.json`, `report.md` | 5 | Every fallback the run took, and the summary |
@@ -260,7 +269,6 @@ Everything lands in `$GITM_SCRATCH/runs/<run_id>/`.
 export CUDA_INJECTION64_PATH=...           # NVIDIA tracer, or ROCP_TOOL_LIBRARIES on AMD; before the run
 export GITM_TRACE_OUT=/path/to/fresh.jsonl # a fresh path per capture: shared, two runs' shards mix
 export GITM_VLLM_MODEL=Qwen/Qwen2.5-0.5B-Instruct
-export GITM_VLLM_ENFORCE_EAGER=1           # required on AMD for the traced opening capture
 
 gitm run --workload vllm-decode --budget 2h --rerank recapture --validation 2
 ```
@@ -271,7 +279,8 @@ Useful switches:
 |---|---|
 | `--no-history` / `--use-history` | Skip the question in Phase 0 |
 | `--skip-lever PATTERN` | Exclude levers by name or setting (also `GITM_SKIP_LEVERS`) |
-| `--validation N` | Noise calibration pairs and paired rounds per candidate (default 2, also `GITM_VALIDATION`) |
+| `--validation N` | Noise calibration pairs and paired rounds per candidate, rebuilding the engines between rounds (default 2, also `GITM_VALIDATION`) |
+| `--reps N` | Decodes per engine in each measurement, averaged, with no rebuild (default 1, also `GITM_AB_REPS`) |
 | `GITM_MIN_EFFECT` | Smallest mean gain worth keeping (default 0.01) |
 | `GITM_AB_REPS=N` | Decodes per side of each A/B (default 1) |
 | `GITM_RESTART_MODE` | Force `serial` or `parallel`; serial is the default |

@@ -31,6 +31,7 @@ from gitm.agents.autoresearch import (
 from gitm.agents.policy import Policy, select_interventions
 from gitm.agents.targeting import targets_from_recoverable
 from gitm.kernels.library import load_library, parse_skips, skipped_by
+from gitm.kernels.spec import InterventionSpec
 from gitm.optimizer.apply import (
     Applicator,
     DryRunApplicator,
@@ -169,6 +170,190 @@ def _next_cycle_overruns(elapsed_s: float, budget_s: float,
             return (f"{left / 60:.0f} min left, and a candidate has taken "
                     f"{mean / 60:.0f} min on average")
     return None
+
+
+#: EngineArgs fragments that configure linear-attention or state-space layers
+#: (Mamba, gated DeltaNet, Kimi delta attention, short convolutions). They exist
+#: only in hybrid models; on any other model they build an identical engine.
+_LINEAR_ATTENTION_KNOBS = ("mamba", "gdn_", "kda_", "linear_attn", "short_conv")
+
+
+#: Config fields and model names that declare layers other than softmax
+#: attention: linear attention, Mamba/SSM, short convolutions, or a per-layer
+#: hybrid pattern. Read from the model's own config, not from the planner's
+#: family, which is ``hybrid`` only for models that also have experts.
+_LINEAR_LAYER_FIELDS = ("linear_", "mamba", "ssm_", "conv_kernel", "short_conv",
+                        "attn_layer_period", "attn_layer_indices",
+                        "full_attention_interval", "hybrid_override_pattern",
+                        "layers_block_type", "block_types")
+_LINEAR_LAYER_NAMES = ("mamba", "jamba", "zamba", "falcon_h1", "nemotron_h", "lfm2",
+                       "kimi_linear", "qwen3_next", "hybrid", "rwkv", "recurrent")
+_SOFTMAX_LAYER_TYPES = ("full_attention", "attention", "sliding_attention",
+                        "chunked_attention", "global", "local")
+
+
+def _declares_linear_layers(engine: Any) -> bool | None:
+    """Whether the engine's model declares any non-softmax-attention layer, or
+    ``None`` when its config cannot be read (then nothing is ruled out)."""
+    from gitm.planner.registry import text_config
+
+    hf = _hf_config_from_engine(engine)
+    if hf is None:
+        return None
+    outer = _hf_config_dict(hf)
+    for cfg in (outer, text_config(outer)):
+        layer_types = cfg.get("layer_types") or ()
+        if any(str(t).lower() not in _SOFTMAX_LAYER_TYPES for t in layer_types):
+            return True
+        if any(str(k).lower().startswith(_LINEAR_LAYER_FIELDS) for k in cfg):
+            return True
+        names = " ".join([str(cfg.get("model_type") or "")]
+                         + [str(a) for a in cfg.get("architectures") or ()]).lower()
+        if any(n in names for n in _LINEAR_LAYER_NAMES):
+            return True
+    return False
+
+
+def _not_for_this_model(spec: Any, has_linear_layers: bool | None) -> str | None:
+    """Why ``spec`` configures layers this model does not have, or ``None``.
+
+    Autoresearch proposes from every EngineArgs field. On Qwen2.5-0.5B, 8 of 15
+    proposals were gdn_/kda_ prefill backends: linear-attention settings on a
+    model with none, each an engine rebuild that can only measure noise, and the
+    source of an earlier false keep. The answer comes from the model's own
+    config (_declares_linear_layers); when that cannot be read, nothing is
+    ruled out.
+    """
+    if has_linear_layers is not False:
+        return None
+    hits = [k for k in spec.knob_values if any(n in k.lower() for n in _LINEAR_ATTENTION_KNOBS)]
+    if not hits:
+        return None
+    return (f"{', '.join(hits)} configures linear-attention or state-space layers, and "
+            "this model's config declares none")
+
+
+def _engine_arg_default(knob: str) -> Any:
+    """vLLM's own default for an engine argument, or ``None`` when it has none
+    or decides at run time (vLLM's ``None``), or vLLM is not installed."""
+    try:
+        import dataclasses
+
+        from vllm.engine.arg_utils import EngineArgs
+    except Exception:  # noqa: BLE001 - no vLLM: nothing to compare against
+        return None
+    for f in dataclasses.fields(EngineArgs):
+        if f.name == knob:
+            return None if f.default is dataclasses.MISSING else f.default
+    return None
+
+
+def _already_set(engine: Any, spec: Any) -> str | None:
+    """Why ``spec`` would change nothing on ``engine``, or ``None``.
+
+    A candidate that sets what the engine already runs builds an identical
+    engine and measures noise: with the baseline at vLLM's defaults,
+    cuda_graphs_enable (enforce_eager=False) is exactly that, and on Kimi a
+    candidate costs two or three engine builds. The engine's recorded
+    configuration answers for what it states; vLLM's own EngineArgs default for
+    what it does not. A default vLLM resolves at run time (``None``), a relative
+    value, and an engine with no recorded configuration are never skipped.
+    """
+    kwargs = getattr(engine, "gitm_llm_kwargs", None)
+    if kwargs is None or getattr(spec, "value_multiplier", None) is not None:
+        return None
+    values = spec.knob_values
+    for k, v in values.items():
+        current = kwargs[k] if k in kwargs else _engine_arg_default(k)
+        if current is None or v is None or current != v:
+            return None
+    return "the engine already runs " + ", ".join(f"{k}={v}" for k, v in values.items())
+
+
+def _final_check(applicator: LiveEngineApplicator, original: dict[str, Any]) -> dict[str, Any]:
+    """The run's one end-to-end number: the configuration it started from
+    against the one it ends with, measured as a single A/B.
+
+    Each keep was judged against whatever was running at the time, so kept
+    gains were never measured together, and a sum of them is not a result.
+    Here the original configuration is rebuilt and the final one is tried
+    against it as one joint candidate, with the same alternating rounds and
+    noise threshold as every other candidate. The engine left running is the
+    final configuration if it held up, the original if it did not.
+    """
+    engine = applicator.engine
+    final = dict(getattr(engine, "gitm_llm_kwargs", None) or {})
+    changed = {k: v for k, v in final.items() if original.get(k) != v}
+    if not changed:
+        return {"skipped": "the final configuration is the original one"}
+    if any(k not in final for k in original):
+        return {"skipped": "a kept change removed a setting, which a candidate cannot express"}
+    rebuild = getattr(engine, "gitm_untraced_rebuild_fn", None)
+    if not callable(rebuild):
+        return {"skipped": "the engine cannot rebuild a configuration"}
+    import types
+
+    LiveEngineApplicator._shutdown(engine)
+    try:
+        original_engine = rebuild(types.SimpleNamespace(gitm_llm_kwargs=dict(original)))
+    except Exception as exc:  # noqa: BLE001 - reported as the engine being lost
+        # The final engine is already released, so there is none left.
+        applicator.engine = None
+        return {"changed": changed,
+                "engine_lost": f"could not rebuild the original configuration: "
+                               f"{type(exc).__name__}: {exc}"}
+    applicator.rebase(original_engine)
+    label = ",".join(f"{k}={v}" for k, v in sorted(changed.items()))
+    spec = InterventionSpec(
+        name="final_check", summary="the final configuration against the original one",
+        knob=label, knobs=changed, expected_delta_mean=0.0, expected_delta_lo=0.0,
+        expected_delta_hi=0.0, source="final_check")
+    result = apply_intervention(spec, applicator, min_keep_delta=0.0)
+    ab = applicator.last_result
+    out: dict[str, Any] = {"changed": changed, "error": result.error}
+    if result.restore_failed:
+        # apply_intervention reports a lost engine as a flag, not an exception.
+        out["engine_lost"] = result.error or "restore failed during the final check"
+    if ab is not None and result.measured_delta is not None:
+        # measure() returns the margin over the bar; the change itself is that
+        # margin plus the bar, the mean of the rounds' ratios.
+        bar = ab.threshold or 0.0
+        out.update(
+            original_tps=ab.baseline_tps, final_tps=ab.candidate_tps,
+            delta=result.measured_delta + bar, threshold=bar, rounds=ab.rounds,
+            holds=bool(result.kept))
+    # Which configuration the run is left on, read off the engine actually
+    # running rather than inferred from the verdict: a combination that does not
+    # hold up is rolled back, and the original is what the run returns.
+    running = dict(getattr(applicator.engine, "gitm_llm_kwargs", None) or {})
+    out["ends_on"] = ("final" if running == final else
+                      "original" if running == original else "unknown")
+    return out
+
+
+def _final_check_md(final_check: dict[str, Any]) -> str:
+    """The report's final-check section, or ``""`` when nothing was measured.
+
+    The measured numbers are the kept changes *together* against the starting
+    configuration. When they do not hold up, the original configuration is
+    restored, and the section says so: printing the combination's speed as
+    "the configuration this run ends with" read as the speed of the engine the
+    run returned.
+    """
+    if not final_check or "delta" not in final_check:
+        return ""
+    ab = (f"{final_check['original_tps']:.1f} -> {final_check['final_tps']:.1f} tok/s, "
+          f"{final_check['delta']:+.1%} (threshold {final_check['threshold']:.1%})")
+    if final_check.get("holds"):
+        verdict = "holds, and the run ends on the combined configuration."
+    elif final_check.get("ends_on") == "original":
+        verdict = ("does not clear the noise, so the combined change was rolled back and "
+                   "the run ends on the configuration it started from.")
+    else:
+        verdict = ("does not clear the noise; which configuration the engine was left on "
+                   "could not be confirmed.")
+    return ("\n## Final check\n\nThe changes this run kept, together, against the "
+            f"configuration it started from, as one A/B: {ab}: {verdict}\n")
 
 
 _BUDGET_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd])\s*$")
@@ -354,6 +539,11 @@ class LoopConfig:
     #: over this many paired A/B rounds. ``None`` reads ``GITM_VALIDATION``,
     #: else 2. Autoresearch candidates always get at least 2.
     validation: int | None = None
+    #: Decodes per engine in each A/B measurement, averaged, with no rebuild.
+    #: Where ``validation`` rebuilds between rounds (catching build-to-build
+    #: luck), this steadies run-to-run noise on the engine already up, at no
+    #: build cost. ``None`` reads ``GITM_AB_REPS``, else 1.
+    reps: int | None = None
     # Optional explicit driver for the embedded/engine path. When unset, the
     # loop looks up ``workload`` in the workload registry (gitm.workloads).
     workload_runner: WorkloadRunner | None = None
@@ -1071,8 +1261,13 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # carries it as ``.engine`` (see the vllm-decode factory). Without this the
     # loop stays predict-only (DryRunApplicator, live=False) — the engine is
     # built but never handed to the applicator.
+    # Whether this run owns the engine: the loop built the runner from the
+    # workload registry, and the engine came with it. A runner the caller
+    # passed is the caller's, and so is any engine it carries.
+    engine_built_here = False
     if cfg.engine is None and runner is not None:
         cfg.engine = getattr(runner, "engine", None)
+        engine_built_here = cfg.engine is not None and cfg.workload_runner is None
 
     # A factory-built runner may know its own workload id better than the
     # guessed/default one above (e.g. a caller passed ``workload_runner``
@@ -1099,6 +1294,9 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # trace can't see. A no-op when no engine is attached (empty series).
     run_out: Any = None
     runner_s: float | None = None
+    # The runner ran and raised with a live engine under it: unlike a runner
+    # that was never available, this leaves no measured baseline to A/B against.
+    run_failed_on_engine = False
     with (
         capture(trace_path, workload_id=workload, run_id=run_id) as trace,
         sample_scheduler_stats(cfg.engine) as sched_stats,
@@ -1110,6 +1308,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 sync_device()  # ensure all kernels land in the trace before stop
             except Exception as exc:
                 runner_error = f"workload run failed: {exc}"
+                run_failed_on_engine = cfg.engine is not None
             runner_s = time.perf_counter() - _t_run
     if runner_error is not None:
         # Carried on every path, not only the no-data one: a runner that failed
@@ -1370,6 +1569,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # rather than defaulting.
     _batch, _batch_source = _batch_config_from_stats(sched_summary)
     graph, family, graph_default_why = _execution_graph_basis(cfg.engine, _hw, _batch)
+    # Read once: whether the model has layers that linear-attention settings act on.
+    _has_linear_layers = _declares_linear_layers(cfg.engine)
     # The engine the floors are priced for, as it describes itself. A re-rank
     # compares the running engine with this (see _floors_hold).
     _priced_config = dict(getattr(cfg.engine, "gitm_llm_kwargs", None) or {})
@@ -1638,6 +1839,21 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # One extra engine build, once.
     tracing_swaps: list[dict[str, Any]] = []
     early_engine_lost: str | None = None
+    if run_failed_on_engine:
+        # The opening run failed on the live engine, so no baseline was measured
+        # and the trace is a fragment. Every A/B would be judged against an
+        # engine that just failed, and ranked from that fragment: two Kimi K2.5
+        # runs on MI355X hung at the opening decode, and the loop built a fresh
+        # engine and carried on into an hours-long Phase 4. Stop instead, with
+        # the report saying why.
+        early_engine_lost = f"the opening workload run failed: {runner_error}"
+        degradations.record(
+            ENGINE_LOST, used="no live A/B (predict-only)",
+            reason=early_engine_lost, severity=APPROXIMATE,
+            affects=(AFFECTS_CLAIMS,))
+        if engine_built_here:
+            LiveEngineApplicator._shutdown(cfg.engine)
+        cfg.engine = None
     if cfg.engine is not None and getattr(cfg.engine, "gitm_traced", False):
         untraced = getattr(cfg.engine, "gitm_untraced_rebuild_fn", None)
         if callable(untraced):
@@ -1658,6 +1874,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     _validation = max(1, int(cfg.validation if cfg.validation is not None
                              else os.environ.get("GITM_VALIDATION", "2")))
     _min_effect = float(os.environ.get("GITM_MIN_EFFECT", "0.01"))
+    _reps = max(1, int(cfg.reps if cfg.reps is not None
+                       else os.environ.get("GITM_AB_REPS", "1")))
     noise_calibration: list[float] = []
     calibration_lost: str | None = None
     if cfg.engine is not None:
@@ -1673,7 +1891,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             restart_fn=live_restart_fn,
             baseline_restart_fn=getattr(cfg.engine, "gitm_baseline_restart_fn", None),
             restart_mode=_restart_mode,
-            reps=int(os.environ.get("GITM_AB_REPS", "1")),
+            reps=_reps,
             # Compatibility escape hatch for custom scheduling-classified knobs
             # that should still be measured through engine rebuild.
             force_restart=os.environ.get("GITM_KNOBS_VIA_RESTART") == "1",
@@ -1811,6 +2029,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # which is what a re-rank has to re-order — and a candidate already popped,
     # applied or rejected, cannot return.
     queue = list(ranked)
+    # The configuration every candidate is first measured against, for the
+    # end-to-end check after the last one (_final_check).
+    original_config = dict(getattr(getattr(applicator, "engine", None),
+                                   "gitm_llm_kwargs", None) or {})
     reranks: list[dict[str, Any]] = []
     # Set when a candidate's rollback failed. From then on there is no baseline
     # to measure against, so the run stops trying candidates and goes straight
@@ -1821,9 +2043,12 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # how many re-traces in a row were skipped (see _retrace_skip_reason).
     causes_seen = bool(_motivated)
     retrace_skips = 0
-    if engine_lost is not None and isinstance(applicator, LiveEngineApplicator):
-        # The engine was lost before the first candidate (a failed noise
-        # calibration): there is nothing to measure them against.
+    if engine_lost is not None:
+        # The engine was lost before the first candidate (a failed opening run,
+        # tracer swap or noise calibration): there is nothing to measure them
+        # against. Cleared whichever applicator is left, not only a live one: a
+        # predict-only queue would still re-trace, re-running the workload on
+        # the engine that was just released.
         n_untried = sum(1 for x in queue
                         if x.rejected_reason is None and x.baseline_noop is None)
         rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
@@ -1880,6 +2105,11 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         unenactable = _unenactable(c.spec)
         if unenactable is not None:
             rejected.append(f"{c.spec.name} ({unenactable})")
+            continue
+        noop = (_already_set(getattr(applicator, "engine", None), c.spec)
+                or _not_for_this_model(c.spec, _has_linear_layers))
+        if noop is not None:
+            rejected.append(f"{c.spec.name} ({noop})")
             continue
         cycle_started_ns = time.time_ns()
         # Snapshot the engine config BEFORE the apply: a hot-swap mutates these
@@ -2149,6 +2379,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             why = _record_skip(spec, "autoresearch")
             if why is not None:
                 return f"excluded by --skip-lever {why!r}"
+            noop = (_already_set(getattr(applicator, "engine", None), spec)
+                    or _not_for_this_model(spec, _has_linear_layers))
+            if noop is not None:
+                return noop
             return _unenactable(spec)
 
         def _checkpoint_ar(r: Any) -> None:
@@ -2217,6 +2451,32 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # that only stopped a proposal is still something the run held back, and a
     # file written before that pass would report none of them.
     _write_skips()
+
+    # One end-to-end A/B: where the run started against where it ended. Only
+    # when something was kept, the engine is live and the budget can afford a
+    # candidate's worth of time.
+    final_check: dict[str, Any] | None = None
+    if (isinstance(applicator, LiveEngineApplicator) and engine_lost is None
+            and applicator.engine is not None
+            and os.environ.get("GITM_FINAL_CHECK", "1") != "0"):
+        overrun = _next_cycle_overruns((time.time_ns() - started_ns) / 1e9, budget_s, cycle_s)
+        if overrun is not None:
+            final_check = {"skipped": f"budget {cfg.budget}: {overrun}"}
+        else:
+            try:
+                final_check = _final_check(applicator, original_config)
+            except RestoreFailed as exc:
+                final_check = {"engine_lost": f"could not rebuild a configuration: {exc}"}
+            if final_check.get("engine_lost"):
+                # Every candidate before it was measured against a sound
+                # baseline: approximate, so they stay in history, and the run
+                # still writes its report but no longer reads as a clean finish.
+                engine_lost = f"in the final check: {final_check['engine_lost']}"
+                degradations.record(
+                    ENGINE_LOST, used="a run that lost its engine in the final check",
+                    reason=engine_lost, severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
+        (run_dir / "final_check.json").write_text(json.dumps(final_check, indent=2,
+                                                              default=str))
 
     # A kept restart replaced the engine and released the one cfg.engine still
     # points at: hand the caller the live engine, not a shut-down handle.
@@ -2340,6 +2600,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             else None
         ),
     )
+    report_md += _final_check_md(final_check or {})
     _write_report(run_dir, report_md)
 
     if isinstance(applicator, LiveEngineApplicator):
@@ -2350,6 +2611,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         _noise = applicator.noise
         (run_dir / "noise_floor.json").write_text(json.dumps({
             "validation": _validation,
+            "reps": _reps,
             "min_effect": _min_effect,
             "threshold_without_floor": _THRESHOLD_WITHOUT_FLOOR,
             "calibration_samples": noise_calibration,
@@ -2399,8 +2661,11 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         "n_untried": n_untried,
         # How hard candidates were tested, and the noise they had to beat.
         "validation": _validation,
+        "reps": _reps,
         "noise_floor": (applicator.noise.floor
                         if isinstance(applicator, LiveEngineApplicator) else None),
+        # Where the run started against where it ended, as one A/B.
+        "final_check": final_check,
         "scheduler_stats": asdict(sched_summary) if sched_stats.samples else None,
         "report_path": str(run_dir / "report.md"),
     }

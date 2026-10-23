@@ -576,6 +576,29 @@ def _shutdown_timeout() -> float:
         return 30.0
 
 
+def _call_shutdown(fn: Any, timeout: float) -> None:
+    """Call an engine's ``shutdown``, giving it ``timeout`` when it takes one.
+
+    vLLM's ``MPClient.shutdown(timeout=None)`` hands ``None`` to its process
+    manager, which then waits only its built-in 5 s before force-killing the
+    EngineCore. On 8x MI355X every Kimi teardown was cut off that way, and once
+    the next engine hung in its first all-gather and the run lost its engine;
+    ``VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS`` is not read on that path. The
+    window gitm already gives the workers (``GITM_SHUTDOWN_TIMEOUT_S``) is
+    passed through instead. A ``shutdown`` without a timeout is called as before.
+    """
+    import inspect
+
+    try:
+        takes_timeout = "timeout" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        takes_timeout = False
+    if takes_timeout:
+        fn(timeout=timeout)
+    else:
+        fn()
+
+
 def _timeout_s(var: str, default: float) -> float | None:
     """A watchdog limit from the environment, in seconds; ``None`` disables it."""
     raw = os.environ.get(var)
@@ -623,6 +646,21 @@ def _kill_engine_processes(pids: set[int]) -> list[int]:
 #: After the watchdog kills the engine, how long the blocked call gets to notice
 #: before the watchdog stops waiting for it.
 _WATCHDOG_GRACE_S = 60.0
+
+
+@contextlib.contextmanager
+def _env_set(values: dict[str, str]):
+    """Set ``values`` in the environment for the block, then put back what was there."""
+    saved = {k: os.environ.get(k) for k in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def _with_watchdog(fn: Callable[[], Any], *, what: str, timeout_s: float | None,
@@ -813,12 +851,21 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         GITM_VLLM_SYNTHETIC   "1" -> CPU-only decode stand-in instead of vLLM
                               (exercises the wire/registry path with no GPU or
                               vLLM; produces no GPU kernels)
-        GITM_VLLM_ENFORCE_EAGER "1" -> build with enforce_eager (no CUDA graphs).
-                              Set it when the CUPTI tracer records no kernels
-                              because decode runs via CUDA-graph replay that the
-                              platform's CUPTI doesn't attribute; also skips
-                              torch.compile + graph capture, so engine builds
-                              (and restart-A/B candidates) are much faster.
+        GITM_VLLM_ENFORCE_EAGER "1" -> the A/B baseline is eager too (no CUDA
+                              graphs, no torch.compile). Traced engines (the
+                              opening capture and every re-trace) are always
+                              eager, so this is not needed for a trace: without
+                              it the baseline is stock vLLM and a keep beats the
+                              engine people run. Set it only to make builds
+                              faster (no compile or graph capture).
+        GITM_VLLM_NVTX        "0" -> traced engines skip vLLM's layerwise NVTX
+                              ranges (default on for NVIDIA, off for AMD, where
+                              the opening decode hung with them on; "1" opts in). Without them a kernel is
+                              identified by its name alone, and library GEMMs
+                              and MLA attention map to no op. Traced engines run
+                              vLLM's V1 model runner for it (V2 ignores the flag)
+                              unless VLLM_USE_V2_MODEL_RUNNER is set. A/B engines
+                              never carry the ranges.
 
         GITM_VLLM_MAX_MODEL_LEN / GITM_VLLM_TP / GITM_VLLM_ENABLE_EP /
         GITM_VLLM_TRUST_REMOTE_CODE / GITM_VLLM_EXTRA_JSON
@@ -953,7 +1000,7 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
                     break
             if callable(obj):
                 try:
-                    obj()
+                    _call_shutdown(obj, _shutdown_timeout())
                 except Exception as exc:
                     _warn_release(path, exc)
                 break
@@ -1051,9 +1098,37 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         # their workers share a name, so ownership is the only thing that keeps
         # a candidate's teardown from taking the baseline's workers with it.
         before = engine_worker_pids()
-        with contextlib.nullcontext() if traced else injection.untraced_env():
+        # A traced engine also names the layer and op each kernel ran in. By
+        # kernel name alone, cuBLAS/hipBLASLt GEMMs and MLA attention map to no
+        # op: the first Kimi K2.5 run left 7.4M of 10.4M launches unmodelled and
+        # priced 1.2 s of 747 s as recoverable, so nothing could be targeted.
+        # Traced engines are eager (the opening one by GITM_VLLM_ENFORCE_EAGER),
+        # where vLLM's layerwise ranges fire around every launch. Never on an
+        # A/B engine: the ranges cost host time on every module call.
+        #
+        # vLLM 0.30 registers those ranges only in its V1 model runner. The V2
+        # runner, its default for Qwen2 and Kimi's DeepSeek-V3 alike, accepts
+        # the flag and ignores it: a laptop run with it on recorded CUB's ranges
+        # and none of the model's. So a traced engine runs V1 unless the operator
+        # chose a runner. It only explains where time goes; keep or rollback is
+        # decided on untraced engines, which keep vLLM's default.
+        #
+        # Off by default on AMD. Two Kimi K2.5 runs on MI355X with the labels on
+        # hung at the first traced decode: rocprofiler logged ~1000 stuck-signal
+        # warnings, kernels stopped after 37 s, and vLLM timed out sample_tokens.
+        # The labels themselves arrived (30k markers per rank, correct module
+        # names); what hangs is not isolated yet (marker tracing, per-call HIP
+        # API tracing, the roctx shim or the V1 runner). GITM_VLLM_NVTX=1 opts in.
+        nvtx_default = "0" if injection.active_vendor() == "amd" else "1"
+        nvtx = (traced and tracing
+                and os.environ.get("GITM_VLLM_NVTX", nvtx_default) != "0")
+        build_kwargs = {**kwargs, "enable_layerwise_nvtx_tracing": True} if nvtx else kwargs
+        runner = ({"VLLM_USE_V2_MODEL_RUNNER": "0"}
+                  if nvtx and "VLLM_USE_V2_MODEL_RUNNER" not in os.environ else {})
+        with (injection.nvtx_env() if nvtx else contextlib.nullcontext() if traced
+              else injection.untraced_env()), _env_set(runner):
             engine = _with_watchdog(
-                lambda: LLM(model=model, **kwargs), what="engine build",
+                lambda: LLM(model=model, **build_kwargs), what="engine build",
                 timeout_s=_timeout_s("GITM_BUILD_TIMEOUT_S", 3600.0),
                 pids=lambda: engine_worker_pids() - before)
         engine.gitm_worker_pids = engine_worker_pids() - before
@@ -1066,7 +1141,19 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
             setattr(engine, name, fn)
         return engine
 
-    llm = _build_engine(dict(_base_kwargs), traced=True)
+    # The opening capture is traced, so it runs eager whatever the baseline is,
+    # exactly as a re-trace does (_traced_rebuild): graph replay hides decode
+    # kernels from the tracer, and vLLM's layer ranges fire only in eager mode.
+    # Its recorded configuration stays the baseline's, so the untraced engine
+    # the loop swaps in before the first A/B is stock vLLM (graphs, compile)
+    # unless GITM_VLLM_ENFORCE_EAGER asks otherwise. Every keep then has to beat
+    # the engine people actually run. Forcing eager on the baseline itself made
+    # the loop "find" graph replay against an eager engine it had built.
+    if tracing:
+        llm = _build_engine({**_base_kwargs, "enforce_eager": True}, traced=True)
+        llm.gitm_llm_kwargs = dict(_base_kwargs)
+    else:
+        llm = _build_engine(dict(_base_kwargs), traced=True)
     _activate_engine(llm)
     traffic = os.environ.get("GITM_VLLM_TRAFFIC")
     traffic_summary: dict[str, Any] | None = None

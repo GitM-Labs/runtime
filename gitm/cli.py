@@ -75,6 +75,20 @@ def _add_capture(sub) -> None:
                         help="Verify the target and stop; never opens a window.")
 
 
+def _at_least_one(flag: str, note: str):
+    """argparse type for a count that must be 1 or more, saying why when not."""
+    def parse(text: str) -> int:
+        try:
+            n = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"{flag} expects a whole number, got {text!r}") from None
+        if n < 1:
+            raise argparse.ArgumentTypeError(f"{flag} must be at least 1: {note}")
+        return n
+    return parse
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="gitm",
@@ -93,12 +107,23 @@ def _parser() -> argparse.ArgumentParser:
              "and re-ranks what is left against it; 'off' keeps the opening order.",
     )
     run.add_argument(
-        "--validation", type=int, default=None, metavar="N",
+        "--validation", default=None, metavar="N",
+        type=_at_least_one("--validation", "testing a candidate needs at least one "
+                           "build of it. For no extra rebuilds, use --validation 1 "
+                           "with --reps N to re-measure each engine instead."),
         help="How hard a candidate is tested before it is kept (default 2, or "
              "GITM_VALIDATION). The baseline is first measured against itself N "
              "times to get this run's noise floor, and each candidate must beat "
-             "that noise averaged over N paired A/B rounds. Autoresearch always "
-             "uses at least 2.",
+             "that noise averaged over N paired A/B rounds, rebuilding the "
+             "engines between rounds. Autoresearch always uses at least 2.",
+    )
+    run.add_argument(
+        "--reps", default=None, metavar="N",
+        type=_at_least_one("--reps", "each engine is decoded at least once."),
+        help="Decodes per engine in each measurement, averaged, with no rebuild "
+             "(default 1, or GITM_AB_REPS). --validation rebuilds between rounds "
+             "and catches a lucky build; --reps only steadies run-to-run noise "
+             "on the engine already up, at no build cost. Cheaper, weaker.",
     )
     run.add_argument(
         "--skip-lever", action="append", metavar="PATTERN", default=None,
@@ -838,6 +863,7 @@ def main(argv: list[str] | None = None) -> int:
             rerank=args.rerank,
             skip_levers=args.skip_lever,
             validation=args.validation,
+            reps=args.reps,
         )
         summary = result.get("summary", {})
         if args.report is not None:
@@ -860,7 +886,7 @@ def main(argv: list[str] | None = None) -> int:
             # The report is complete for what was tried, but the run stopped
             # early with the engine in an unknown state. A job that exits 0 here
             # reads as a finished run to whatever scheduled it.
-            print(f"gitm run: stopped early, the engine could not be restored: "
+            print(f"gitm run: stopped early, no engine to measure on: "
                   f"{summary['engine_lost']}", file=sys.stderr)
             return 5
         return 0

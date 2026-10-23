@@ -1074,6 +1074,16 @@ class LiveEngineApplicator:
         self.engine = engine
         self._unmeasured_build = True
 
+    def rebase(self, engine: Any) -> None:
+        """Make ``engine``, a *different* configuration built outside the
+        applicator, the baseline: a fresh build, and not an A/A partner for the
+        configuration that ran before it."""
+        self.install(engine)
+        self._activate(engine)
+        self._prev = None
+        self._generation += 1
+        self._last_baseline = None
+
     def commit(self) -> None:
         """The candidate was kept: release what restore() would have swapped back.
 
