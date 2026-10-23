@@ -68,8 +68,16 @@ def scheduler_causes(
         )
 
     # Under-filled decode batches → launch-bound, GPU starved of parallel work.
+    #
+    # Whether a request was ever left waiting decides what can help. With work
+    # queued, the scheduler is holding it back and its admission limits are the
+    # fix. With nothing queued, the batch is as big as demand: a served engine
+    # at 3 req/s ran ~10 sequences against a cap of 256 with an empty queue, and
+    # raising the cap cannot fill a batch nobody is sending. Only cutting the
+    # per-step overhead (CUDA graphs) helps then. An unknown queue keeps both.
     if summary.mean_batch_occupancy is not None and summary.mean_batch_occupancy < occupancy_floor:
         deficit = (occupancy_floor - summary.mean_batch_occupancy) / occupancy_floor
+        demand_limited = summary.peak_queue_depth == 0
         causes.append(
             SchedulerCause(
                 signal="under_filled_batch",
@@ -77,14 +85,19 @@ def scheduler_causes(
                 severity=min(1.0, deficit),
                 note=(
                     f"mean batch occupancy {summary.mean_batch_occupancy:.0%} < "
+                    f"{occupancy_floor:.0%} with no request ever waiting: the batch is as "
+                    "big as demand, so admission limits cannot fill it. Capture CUDA "
+                    "graphs (enforce_eager=false) to cut per-step launch overhead."
+                    if demand_limited else
+                    f"mean batch occupancy {summary.mean_batch_occupancy:.0%} < "
                     f"{occupancy_floor:.0%}: decode batches are under-filled. Raise "
                     "max_num_seqs / max_num_batched_tokens, or capture CUDA graphs "
                     "(enforce_eager=false) to cut per-step launch overhead."
                 ),
-                motivates_knobs=[
-                    "max_num_seqs", "max_num_batched_tokens", "enforce_eager",
-                    "enable_chunked_prefill",
-                ],
+                motivates_knobs=(
+                    ["enforce_eager"] if demand_limited else
+                    ["max_num_seqs", "max_num_batched_tokens", "enforce_eager",
+                     "enable_chunked_prefill"]),
             )
         )
 
