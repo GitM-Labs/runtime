@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Mock curl. Recognizes /health and /v1/completions. Honors -o <file> and -w '%{http_code}'.
+out=""; url=""
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; -w) shift 2;; -m|-H|-d) shift 2;; -fsS|-s) shift;; http*|https*) url="$1"; shift;; *) shift;; esac; done
+case "$url" in
+  */health)
+    # ready unless scenario says the server never comes up
+    [ "${MOCK_VLLM_READY:-1}" = 1 ] && { echo -n 200; exit 0; }; echo -n 000; exit 7;;
+  */v1/completions)
+    case "${MOCK_INFER:-ok}" in
+      ok)      [ -n "$out" ] && printf '%s' '{"choices":[{"text":"hello world from mock"}]}' >"$out"; echo -n 200;;
+      http500) [ -n "$out" ] && printf '%s' 'internal error' >"$out"; echo -n 500;;
+      invalid) [ -n "$out" ] && printf '%s' '{"error":"boom"}' >"$out"; echo -n 200;;
+      empty)   [ -n "$out" ] && printf '%s' '{"choices":[{"text":""}]}' >"$out"; echo -n 200;;
+      timeout) echo -n 000; exit 28;;
+    esac; exit 0;;
+  *) echo -n 000; exit 1;;
+esac

@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Mock docker for regression tests. State in $MOCK_STATE. Scenario via MOCK_* env.
+# Emulates: --version, image inspect, run -d, logs -f, ps, inspect, stop, rm, kill, run --rm (detect).
+S="${MOCK_STATE:?MOCK_STATE unset}"; mkdir -p "$S"
+sub="${1:-}"; shift || true
+case "$sub" in
+  --version) echo "Docker version 29.1.3 (mock)";;
+  image)     exit 0;;   # image inspect ...
+  inspect)
+    # docker inspect -f '{{.State.ExitCode}}' NAME
+    name="${!#}"; f="$S/$name.exit"; [ -f "$f" ] && cat "$f" || echo 0;;
+  ps)
+    # list running container names (files $S/<name>.running)
+    for f in "$S"/*.running; do [ -e "$f" ] || continue; b="$(basename "$f")"; echo "${b%.running}"; done;;
+  stop)
+    # docker stop -t N NAME  (NAME last). Simulate a wedged container that never stops.
+    name="${!#}"
+    if [ "${MOCK_STOP_HANG:-0}" = 1 ]; then sleep 999; fi
+    rm -f "$S/$name.running"; echo "$name";;
+  kill) name="${!#}"; rm -f "$S/$name.running"; echo "$name";;
+  rm)   name="${!#}"; rm -f "$S/$name.running" "$S/$name.type"; echo "$name";;
+  logs)
+    # docker logs [-f] NAME  -> emit the container's recorded marker, then mark it exited.
+    name="${!#}"; typ="$(cat "$S/$name.type" 2>/dev/null)"
+    case "$typ" in
+      compute)
+        if [ "${MOCK_COMPUTE:-ok}" = fault ]; then : >"$S/FAULTED"; fi
+        [ "${MOCK_COMPUTE:-ok}" = fail ] && echo "COMPUTE_FAIL only 4 of 8 GPUs visible" || echo "COMPUTE_MEM_OK devices=8";;
+      rccl)
+        if [ "${MOCK_RCCL:-ok}" = fault ]; then : >"$S/FAULTED"; fi
+        case "${MOCK_RCCL:-ok}" in
+          ok)    echo "RCCL_OK sum=8 allgather=8 bcast=0 world=8";;
+          wrong) echo "RCCL_OK sum=7 allgather=7 bcast=0 world=8";;
+          *) : ;;
+        esac;;
+      vllm)
+        if echo "${MOCK_LAST_RUN:-}" | grep -q 'VLLM_ROCM_USE_AITER=1'; then
+          echo "Using ['AITER_CUSTOM', 'PYNCCL'] all-reduce backends (in dispatch order) for group 'tp:0'"
+        else
+          echo "Using ['CUSTOM', 'PYNCCL'] all-reduce backends (in dispatch order) for group 'tp:0'"
+        fi
+        echo "Graph capturing finished";;
+    esac
+    # follower: container has now 'exited' (except vllm which stays up until stop)
+    [ "$typ" != vllm ] && rm -f "$S/$name.running";;
+  run)
+    # parse: docker run [-d] [--rm] --name NAME <args...> IMAGE CMD...
+    detach=0; name=""; echo "$*" >"$S/lastrun"; export MOCK_LAST_RUN="$*"
+    args=("$@")
+    for ((i=0;i<${#args[@]};i++)); do case "${args[$i]}" in -d) detach=1;; --name) name="${args[$((i+1))]}";; esac; done
+    whole="$*"
+    # tool-detection probe: `docker run --rm ... bash -lc 'command -v all_reduce_perf'`
+    if echo "$whole" | grep -q 'command -v all_reduce_perf'; then exit 1; fi   # absent -> force torch fallback
+    # classify container type by command
+    typ=other
+    echo "$whole" | grep -q 'vllm serve' && typ=vllm
+    echo "$whole" | grep -Eq 'COMPUTE|python3 -c' && typ=compute
+    echo "$whole" | grep -Eq 'torchrun|all_reduce_perf' && typ=rccl
+    # record every vLLM launch's AITER state so tests can assert what ran
+    [ "$typ" = vllm ] && echo "$whole" | grep -oE 'VLLM_ROCM_USE_AITER=[0-9]' | head -1 >>"$S/vllm_aiter"
+    if [ "$detach" = 1 ] && [ -n "$name" ]; then
+      echo "$typ" >"$S/$name.type"; : >"$S/$name.running"; echo 0 >"$S/$name.exit"; echo "$name"
+    else
+      # foreground run (environment_report version probe etc.)
+      echo "torch 2.12.0 (mock)"; fi;;
+  *) exit 0;;
+esac
+exit 0

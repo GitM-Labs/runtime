@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Minimal amd-smi mock (static/xgmi/topology/process) — enough for environment_report/xgmi_state.
+case "${1:-}" in
+  static) echo "MARKET_NAME: AMD Instinct MI300X"; echo "OAM_ID: 0"; echo "BDF: 0000:2f:00.0"; echo "VERSION: 00159017"; echo "NAME: AMD MI300X_HW_SRIOV_CVS_1VF"; echo "DRIVER"; echo "amdgpu 6.16.13";;
+  xgmi) echo "XGMI mock: links up";;
+  topology) echo "topology mock";;
+  process) echo "No running processes detected";;
+  *) echo "amd-smi mock";;
+esac
+exit 0
