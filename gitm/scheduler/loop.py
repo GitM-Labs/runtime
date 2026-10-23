@@ -8,6 +8,7 @@ partial run is still useful; the durable copy is synced to S3 afterwards.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -62,6 +63,7 @@ from gitm.optimizer.degradation import (
     GRAPH_BATCH,
     GRAPH_HARDWARE,
     GRAPH_MODEL,
+    RESTART_FALLBACK,
     TOKENS,
     TRACE_EMPTY,
     UNRELIABLE,
@@ -995,14 +997,18 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     ``degraded`` / ``degradations``.
     """
     degradations = DegradationLog()
-    out = _run_loop(cfg, degradations)
+    # Releases whatever the A/B still holds asleep, on the way out by any path:
+    # a sleeping engine keeps device memory and its weights in CPU RAM.
+    with contextlib.ExitStack() as cleanup:
+        out = _run_loop(cfg, degradations, cleanup)
     degradations.write(out["run_dir"])
     out["summary"]["degraded"] = bool(degradations.unreliable)
     out["summary"]["degradations"] = degradations.summary()
     return out
 
 
-def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
+def _run_loop(cfg: LoopConfig, degradations: DegradationLog,
+              cleanup: contextlib.ExitStack) -> dict[str, Any]:
     workload = cfg.workload or (getattr(cfg.engine, "workload_id", None) or "vllm-decode")
     if cfg.rerank not in RERANK_MODES:
         # Silently reading as "off" would let a scripted run spend its whole
@@ -1660,6 +1666,25 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     _min_effect = float(os.environ.get("GITM_MIN_EFFECT", "0.01"))
     noise_calibration: list[float] = []
     calibration_lost: str | None = None
+    _restart_record: dict[str, Any] | None = None
+
+    def _write_restart_mode() -> None:
+        """Checkpoint ``restart_mode.json`` with the sleep_swap record so far:
+        each swap's sleep and wake-up seconds and any fallback, which a run
+        that is killed would otherwise lose with the rest of its end-of-run
+        writes. Also run on the way out by any path, after close(), so the
+        last candidate's record is kept even when no A/B record followed it.
+        Nothing to add outside sleep_swap."""
+        swaps = getattr(applicator, "swap_log", None)
+        if _restart_record is None or not swaps:
+            return
+        _restart_record["swaps"] = swaps
+        try:
+            (run_dir / "restart_mode.json").write_text(json.dumps(_restart_record, indent=2))
+        except Exception as exc:  # noqa: BLE001 - a failed checkpoint must not end the run
+            warnings.warn(f"gitm: could not checkpoint restart_mode.json: {exc}",
+                          RuntimeWarning, stacklevel=2)
+
     if cfg.engine is not None:
         # Serial wherever a baseline rebuild is available, rather than parallel
         # by default. Parallel holds the baseline and the candidate at once, and
@@ -1685,11 +1710,15 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             min_effect=_min_effect,
             threshold_without_floor=_THRESHOLD_WITHOUT_FLOOR,
         )
-        (run_dir / "restart_mode.json").write_text(json.dumps({
+        # LIFO: close() releases what is still asleep, then the record is written.
+        cleanup.callback(_write_restart_mode)
+        cleanup.callback(applicator.close)
+        _restart_record = {
             "mode": _restart_mode,
             "why": _restart_why,
             "cannot_fit": applicator.restart_mode_warning,
-        }, indent=2))
+        }
+        (run_dir / "restart_mode.json").write_text(json.dumps(_restart_record, indent=2))
         # The run's own noise floor, before the first candidate is judged: the
         # baseline measured against itself, rebuilt each time. Serial restart
         # only (it needs a baseline rebuild), within the budget, and only with
@@ -1785,6 +1814,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         final write at the end of the run replaces this one with the full set,
         so a run that finishes is unchanged.
         """
+        _write_restart_mode()
         records = verification + ar_live
         if not records:
             return
@@ -2222,6 +2252,18 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # points at: hand the caller the live engine, not a shut-down handle.
     if cfg.engine is not None:
         cfg.engine = getattr(applicator, "engine", cfg.engine)
+    swap_log = getattr(applicator, "swap_log", None)
+    if swap_log:
+        applicator.close()
+        for swap in swap_log:
+            if swap["fallback"]:
+                degradations.record(
+                    RESTART_FALLBACK, used=f"a serial restart for {swap['candidate']}",
+                    reason=swap["fallback"], severity=APPROXIMATE)
+        # Each swap's sleep and wake-up seconds, next to the mode that caused
+        # them: none of it is inside a throughput measurement, so this is the
+        # only place the cost (and the rebuilds saved) shows.
+        _write_restart_mode()
 
     ar_granger_evidence = granger_evidence(hypotheses)
     ar_residual = _ar_target_residual(ar_run, kt_residual)

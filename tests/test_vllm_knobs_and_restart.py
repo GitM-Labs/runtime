@@ -868,3 +868,492 @@ def test_a_nested_knob_is_merged_into_the_baselines_config_not_put_in_its_place(
     assert json.loads(value) == {"method": "ngram", "prompt_lookup_max": 4,
                                  "num_speculative_tokens": 5}
     assert server_arg("max_num_seqs", 64) == ("--max-num-seqs", 64)
+
+
+# --------------------------------------------------------------------------- #
+# GITM_RESTART_MODE=sleep_swap                                                 #
+# --------------------------------------------------------------------------- #
+class _SleepEngine(_FullEngine):
+    """_FullEngine that can sleep and wake, counting every build it causes.
+
+    Throughput is max_num_seqs, as for _FullEngine; measuring an engine that is
+    asleep or shut down fails, as it would on a real one.
+    """
+
+    def __init__(self, max_num_seqs: int = 64, *, log: dict | None = None,
+                 free: float | None = None, fail_builds: int = 0):
+        super().__init__(max_num_seqs)
+        self.log = log if log is not None else {"builds": 0, "fail_builds": fail_builds,
+                                                "events": [], "engines": []}
+        self.log["engines"].append(self)
+        self.asleep = False
+        self.gitm_llm_kwargs = {"enable_sleep_mode": True, "gpu_memory_utilization": 0.9}
+        self.gitm_throughput_fn = self._measure
+        self.gitm_baseline_restart_fn = self._rebuild_baseline
+        self._free = free
+        if free is not None:
+            self.gitm_free_gpu_fraction_fn = lambda e, values=None: e._free
+
+    def _measure(self, e):
+        assert not e.asleep and not e.shut_down, "measured an engine that is not live"
+        return float(e.scheduler_config.max_num_seqs)
+
+    def sleep(self, level=1):
+        assert level == 1
+        self.log["events"].append(("sleep", self.scheduler_config.max_num_seqs))
+        self.asleep = True
+
+    def wake_up(self):
+        self.log["events"].append(("wake", self.scheduler_config.max_num_seqs))
+        self.asleep = False
+
+    def shutdown(self):
+        self.log["events"].append(("shutdown", self.scheduler_config.max_num_seqs))
+        self.shut_down = True
+
+    def _build(self, max_num_seqs):
+        self.log["builds"] += 1
+        if self.log["fail_builds"] > 0:
+            self.log["fail_builds"] -= 1
+            raise RuntimeError("Free memory on device is less than desired")
+        return _SleepEngine(max_num_seqs, log=self.log, free=self._free)
+
+    def _restart(self, old, knob_values):
+        return self._build(int(knob_values.get("max_num_seqs", 64)))
+
+    def _rebuild_baseline(self, old):
+        return self._build(old.scheduler_config.max_num_seqs)
+
+    def live(self):
+        return [e for e in self.log["engines"] if not e.shut_down]
+
+
+def _sleep_app(engine, mode="sleep_swap", **kw):
+    return LiveEngineApplicator(
+        engine, throughput_fn=engine.gitm_throughput_fn, restart_fn=engine.gitm_restart_fn,
+        restart_mode=mode, force_restart=True, **kw)
+
+
+def test_sleep_swap_rollback_wakes_the_baseline_without_a_rebuild():
+    base = _SleepEngine(64)
+    app = _sleep_app(base)
+    res = apply_intervention(_spec("max_num_seqs", 32), app, min_keep_delta=0.0)
+
+    assert res.applied and res.rolled_back
+    assert app.engine is base and not base.asleep and not base.shut_down
+    assert base.log["builds"] == 1                     # the candidate only
+    assert base.live() == [base]
+    assert base.log["events"] == [("sleep", 64), ("shutdown", 32), ("wake", 64)]
+    (swap,) = app.swap_log
+    assert swap["via"] == "sleep_swap" and swap["fallback"] is None
+    assert len(swap["sleep_s"]) == 1 and len(swap["wake_s"]) == 1
+
+
+def test_sleep_swap_keep_shuts_the_old_baseline_and_promotes_the_candidate():
+    base = _SleepEngine(64)
+    app = _sleep_app(base)
+    res = apply_intervention(_spec("max_num_seqs", 128), app, min_keep_delta=0.0)
+
+    assert res.applied and not res.rolled_back
+    assert base.shut_down
+    assert app.engine.scheduler_config.max_num_seqs == 128 and not app.engine.asleep
+    assert base.live() == [app.engine]
+    assert base.log["builds"] == 1
+    # The next candidate sleeps the promoted engine, not the released one.
+    apply_intervention(_spec("max_num_seqs", 32), app, min_keep_delta=0.0)
+    assert app.engine.scheduler_config.max_num_seqs == 128
+    assert base.log["builds"] == 2 and len(base.live()) == 1
+
+
+def test_sleep_swap_falls_back_to_serial_when_the_candidate_cannot_fit():
+    # 5% free with the baseline asleep; the candidate asks for 90%.
+    base = _SleepEngine(64, free=0.05)
+    app = _sleep_app(base)
+    res = apply_intervention(_spec("max_num_seqs", 32), app, min_keep_delta=0.0)
+
+    assert res.applied and res.rolled_back
+    assert base.shut_down                               # released, not kept asleep
+    assert base.log["builds"] == 2                      # candidate + serial rebuild
+    assert app.engine is not base and base.live() == [app.engine]
+    (swap,) = app.swap_log
+    assert swap["via"] == "serial"
+    assert "5% of the device is free" in swap["fallback"]
+    assert "gpu_memory_utilization=0.90" in swap["fallback"]
+    # Measured as a serial restart: the candidate kept its own fraction.
+    assert app.last_result.via == "restart"
+
+
+def test_sleep_swap_falls_back_to_serial_when_the_build_fails_beside_the_sleeper():
+    base = _SleepEngine(64, fail_builds=1)
+    app = _sleep_app(base)
+    res = apply_intervention(_spec("max_num_seqs", 128), app, min_keep_delta=0.0)
+
+    assert res.applied and not res.rolled_back
+    assert base.shut_down
+    assert app.engine.scheduler_config.max_num_seqs == 128
+    assert base.live() == [app.engine]
+    assert "failed to build beside the sleeping baseline" in app.swap_log[0]["fallback"]
+
+
+def test_sleep_swap_falls_back_when_the_baseline_was_built_without_sleep_mode():
+    base = _SleepEngine(64)
+    base.gitm_llm_kwargs["enable_sleep_mode"] = False
+    app = _sleep_app(base)
+    apply_intervention(_spec("max_num_seqs", 32), app, min_keep_delta=0.0)
+
+    assert not any(ev == "sleep" for ev, _ in base.log["events"])
+    assert "enable_sleep_mode" in app.swap_log[0]["fallback"]
+    assert base.live() == [app.engine]
+
+
+def test_sleep_swap_rounds_swap_the_same_two_builds_and_use_factor_one():
+    from gitm.optimizer.apply import NoiseFloor, mean_noise_factor
+
+    base = _SleepEngine(64)
+    noise = NoiseFloor()
+    noise.samples.extend([0.02, -0.02, 0.02])
+    app = _sleep_app(base, validation=3, noise_gate=True, noise=noise)
+    res = apply_intervention(_spec("max_num_seqs", 128), app, min_keep_delta=0.0)
+
+    assert res.applied and not res.rolled_back
+    assert len(app.last_result.rounds) == 3
+    assert base.log["builds"] == 1                      # no rebuild across rounds
+    assert app.last_result.threshold == pytest.approx(
+        noise.threshold(1.0, minimum=app.min_effect,
+                        without_floor=app.threshold_without_floor))
+    # Rebuilt rounds would have earned a smaller bar; swapped rounds must not.
+    assert mean_noise_factor(3, rebuilt=True) < 1.0
+    # A woken baseline is not a fresh build, so it adds no A/A sample.
+    assert noise.samples == [0.02, -0.02, 0.02]
+    # Kept, and the candidate is the one awake.
+    assert not app.engine.asleep and app.engine.scheduler_config.max_num_seqs == 128
+    assert base.live() == [app.engine]
+
+
+def test_sleep_swap_keep_after_a_baseline_round_wakes_the_candidate():
+    base = _SleepEngine(64)
+    app = _sleep_app(base, validation=2)
+    res = apply_intervention(_spec("max_num_seqs", 128), app, min_keep_delta=0.0)
+
+    assert res.applied and not res.rolled_back
+    # Round 2 ended on the baseline; the keep woke the candidate again.
+    assert app.engine.scheduler_config.max_num_seqs == 128 and not app.engine.asleep
+    assert base.shut_down and base.log["builds"] == 1
+
+
+def test_sleep_swap_releases_the_candidate_when_its_measurement_fails():
+    base = _SleepEngine(64)
+    app = _sleep_app(base)
+    real = base._measure
+
+    def flaky(e):
+        if e is not base:
+            raise RuntimeError("decode hung")
+        return real(e)
+
+    app._tps = flaky
+    res = apply_intervention(_spec("max_num_seqs", 128), app, min_keep_delta=0.0)
+
+    assert res.rolled_back and "decode hung" in res.error
+    assert app.engine is base and not base.asleep
+    assert base.live() == [base]
+
+
+def test_sleep_swap_baseline_that_will_not_wake_is_lost_not_leaked():
+    base = _SleepEngine(64)
+
+    def broken_wake():
+        raise RuntimeError("wake_up failed")
+
+    base.wake_up = broken_wake
+    app = _sleep_app(base)
+    res = apply_intervention(_spec("max_num_seqs", 32), app, min_keep_delta=0.0)
+
+    assert res.restore_failed and "could not wake the baseline" in res.error
+    assert app.engine is None
+    assert base.live() == []
+
+
+def test_sleep_swap_interrupted_build_still_wakes_the_baseline():
+    base = _SleepEngine(64)
+
+    def interrupted(_old, _values):
+        raise KeyboardInterrupt
+
+    app = _sleep_app(base)
+    app._restart_fn = interrupted
+    with pytest.raises(KeyboardInterrupt):
+        apply_intervention(_spec("max_num_seqs", 128), app, min_keep_delta=0.0)
+
+    assert app.engine is base and not base.asleep and base.live() == [base]
+
+
+def test_close_releases_an_engine_left_asleep():
+    base = _SleepEngine(64)
+    app = _sleep_app(base)
+    app.snapshot()
+    app.apply(_spec("max_num_seqs", 128))     # baseline asleep, candidate live
+    assert base.asleep
+    app.close()
+
+    assert base.shut_down and base.live() == [app.engine]
+    app.close()                               # idempotent
+    assert base.live() == [app.engine]
+
+
+def test_flag_off_serial_is_unchanged():
+    from gitm.optimizer.apply import resolve_restart_mode
+
+    base = _SleepEngine(64)
+    assert resolve_restart_mode(base, None)[0] == "serial"
+    app = _sleep_app(base, mode="serial")
+    res = apply_intervention(_spec("max_num_seqs", 32), app, min_keep_delta=0.0)
+
+    assert res.rolled_back
+    assert not any(ev in {"sleep", "wake"} for ev, _ in base.log["events"])
+    assert base.log["builds"] == 2                      # candidate + baseline rebuild
+    assert app.swap_log == [] and app.engine is not base
+    assert app.last_result.rounds and app.last_result.via == "restart"
+
+
+def test_run_loop_sleep_swap_records_swaps_and_leaves_one_engine(tmp_path, monkeypatch):
+    import json
+    from contextlib import contextmanager
+    from pathlib import Path
+
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .conftest import make_kernel, make_trace
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [make_kernel(f"paged_attention_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 80)
+                   for i in range(80)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setenv("GITM_RESTART_MODE", "sleep_swap")
+
+    engine = _SleepEngine()
+    cfg = LoopConfig(engine=engine, workload="vllm-decode", budget="24h",
+                     scratch=str(tmp_path), top_n_interventions=50)
+    out = run_loop(cfg)
+
+    record = json.loads((Path(out["run_dir"]) / "restart_mode.json").read_text())
+    assert record["mode"] == "sleep_swap"
+    assert record["swaps"] and all(s["via"] == "sleep_swap" for s in record["swaps"])
+    assert all(s["sleep_s"] and s["wake_s"] for s in record["swaps"])
+    # Nothing is left asleep: the one engine alive is the one handed back.
+    assert engine.live() == [cfg.engine] and not cfg.engine.asleep
+
+
+def test_sleep_swap_env_builds_every_engine_with_sleep_mode(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from gitm.scheduler.loop import LoopConfig
+    from gitm.workloads import get_factory
+
+    class _LLM:
+        def __init__(self, model, **kwargs):
+            self.kwargs = kwargs
+
+    fake = types.ModuleType("vllm")
+    fake.LLM, fake.SamplingParams = _LLM, lambda **kw: types.SimpleNamespace(**kw)
+    monkeypatch.setitem(sys.modules, "vllm", fake)
+    monkeypatch.delenv("GITM_VLLM_SYNTHETIC", raising=False)
+    monkeypatch.setenv("GITM_RESTART_MODE", "sleep_swap")
+
+    engine = get_factory("vllm-decode")(LoopConfig(workload="vllm-decode")).engine
+    assert engine.kwargs["enable_sleep_mode"] is True
+    cand = engine.gitm_restart_fn(engine, {"block_size": 32})
+    assert cand.kwargs["enable_sleep_mode"] is True
+    assert callable(engine.gitm_free_gpu_fraction_fn)
+
+    monkeypatch.setenv("GITM_RESTART_MODE", "serial")
+    plain = get_factory("vllm-decode")(LoopConfig(workload="vllm-decode")).engine
+    assert "enable_sleep_mode" not in plain.kwargs
+
+
+def test_sleep_swap_keep_below_measures_own_bar_still_leaves_the_candidate_live():
+    # A +3% candidate against a 20% floor: round 1 is no clear loss, so round 2
+    # runs and ends on the baseline, and measure() does not judge it a keep.
+    # A caller's negative min_keep_delta keeps it anyway.
+    from gitm.optimizer.apply import NoiseFloor
+
+    base = _SleepEngine(64)
+    noise = NoiseFloor()
+    noise.samples.extend([0.2, -0.2, 0.2])
+    app = _sleep_app(base, validation=2, noise_gate=True, noise=noise)
+    res = apply_intervention(_spec("max_num_seqs", 66), app, min_keep_delta=-1.0)
+
+    assert res.applied and not res.rolled_back
+    assert len(app.last_result.rounds) == 2
+    assert app.engine is not base and not app.engine.shut_down and not app.engine.asleep
+    assert app.engine.scheduler_config.max_num_seqs == 66
+    assert base.shut_down and base.live() == [app.engine]
+
+
+def test_close_releases_the_running_engine_when_a_swap_stopped_halfway():
+    base = _SleepEngine(64)
+    app = _sleep_app(base)
+    app.snapshot()
+    app.apply(_spec("max_num_seqs", 128))
+    cand = app.engine
+    app._sleep(cand)                 # a swap interrupted after its sleep, before its wake
+    app.close()
+
+    assert base.live() == [] and app.engine is None
+    assert cand.shut_down and base.shut_down
+
+
+def test_sleep_swap_fit_check_is_asked_about_the_candidates_settings():
+    asked = []
+    base = _SleepEngine(64, free=0.95)
+    base.gitm_free_gpu_fraction_fn = lambda e, values=None: asked.append(values) or 0.95
+    app = _sleep_app(base)
+    apply_intervention(_spec("max_num_seqs", 32), app, min_keep_delta=0.0)
+
+    assert asked == [{"max_num_seqs": 32}]
+
+
+def test_free_gpu_fraction_reads_only_the_gpus_the_candidate_would_use(monkeypatch):
+    import sys
+    import types
+
+    from gitm.scheduler.loop import LoopConfig
+    from gitm.workloads import get_factory
+
+    class _LLM:
+        def __init__(self, model, **kwargs):
+            self.kwargs = kwargs
+
+    vllm = types.ModuleType("vllm")
+    vllm.LLM, vllm.SamplingParams = _LLM, lambda **kw: types.SimpleNamespace(**kw)
+    # Eight GPUs; the last four are nearly full (someone else's job).
+    nvml = types.ModuleType("pynvml")
+    nvml.nvmlInit = nvml.nvmlShutdown = lambda: None
+    nvml.nvmlDeviceGetCount = lambda: 8
+    nvml.nvmlDeviceGetHandleByIndex = lambda i: i
+    nvml.nvmlDeviceGetMemoryInfo = lambda i: types.SimpleNamespace(
+        free=95 if i < 4 else 5, total=100)
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+    monkeypatch.delenv("GITM_VLLM_SYNTHETIC", raising=False)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("GITM_RESTART_MODE", "sleep_swap")
+    monkeypatch.setenv("GITM_VLLM_TP", "8")
+
+    engine = get_factory("vllm-decode")(LoopConfig(workload="vllm-decode")).engine
+    free = engine.gitm_free_gpu_fraction_fn
+    assert free(engine) == pytest.approx(0.05)
+    assert free(engine, {"tensor_parallel_size": 4}) == pytest.approx(0.95)
+
+
+def test_run_loop_checkpoints_swaps_before_the_run_ends(tmp_path, monkeypatch):
+    import json
+    from contextlib import contextmanager
+
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .conftest import make_kernel, make_trace
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [make_kernel(f"paged_attention_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 80)
+                   for i in range(80)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    calls = []
+    real_apply = loop.apply_intervention
+
+    def dies_on_second(spec, *a, **kw):
+        calls.append(spec.name)
+        if len(calls) == 2:
+            raise RuntimeError("node lost")
+        return real_apply(spec, *a, **kw)
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "apply_intervention", dies_on_second)
+    monkeypatch.setenv("GITM_RESTART_MODE", "sleep_swap")
+
+    engine = _SleepEngine()
+    with pytest.raises(RuntimeError, match="node lost"):
+        run_loop(LoopConfig(engine=engine, workload="vllm-decode", budget="24h",
+                            scratch=str(tmp_path), top_n_interventions=50))
+
+    (record_path,) = tmp_path.rglob("restart_mode.json")
+    swaps = json.loads(record_path.read_text())["swaps"]
+    assert [s["candidate"] for s in swaps] == calls[:1]
+    assert swaps[0]["sleep_s"] and swaps[0]["wake_s"]
+    assert not any(e.asleep and not e.shut_down for e in engine.log["engines"])
+
+
+def test_sleep_swap_candidate_that_will_not_wake_for_the_keep_is_rolled_back(monkeypatch):
+    # The keep-time wake-up of the candidate fails. It happens inside measure(),
+    # so the candidate is rolled back and the baseline woken, never a keep that
+    # hands back an engine still asleep.
+    from gitm.optimizer.apply import NoiseFloor
+
+    real_wake = _SleepEngine.wake_up
+
+    def wake(self):
+        if self.scheduler_config.max_num_seqs == 66:
+            raise RuntimeError("wake_up failed")
+        real_wake(self)
+
+    monkeypatch.setattr(_SleepEngine, "wake_up", wake)
+    base = _SleepEngine(64)
+    noise = NoiseFloor()
+    noise.samples.extend([0.2, -0.2, 0.2])
+    app = _sleep_app(base, validation=2, noise_gate=True, noise=noise)
+    res = apply_intervention(_spec("max_num_seqs", 66), app, min_keep_delta=-1.0)
+
+    assert res.rolled_back and not res.kept and "wake_up failed" in res.error
+    assert app.engine is base and not base.asleep and base.live() == [base]
+
+
+def test_run_loop_writes_the_last_swap_on_the_way_out(tmp_path, monkeypatch):
+    # The second candidate's A/B completes, then the run dies before its
+    # verification record (and so its checkpoint) is written. Cleanup still
+    # writes its swap.
+    import json
+    from contextlib import contextmanager
+
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .conftest import make_kernel, make_trace
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [make_kernel(f"paged_attention_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 80)
+                   for i in range(80)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    calls = []
+    real_apply = loop.apply_intervention
+
+    def dies_after_second(spec, *a, **kw):
+        calls.append(spec.name)
+        result = real_apply(spec, *a, **kw)
+        if len(calls) == 2:
+            raise RuntimeError("node lost")
+        return result
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "apply_intervention", dies_after_second)
+    monkeypatch.setenv("GITM_RESTART_MODE", "sleep_swap")
+
+    with pytest.raises(RuntimeError, match="node lost"):
+        run_loop(LoopConfig(engine=_SleepEngine(), workload="vllm-decode", budget="24h",
+                            scratch=str(tmp_path), top_n_interventions=50))
+
+    (record_path,) = tmp_path.rglob("restart_mode.json")
+    swaps = json.loads(record_path.read_text())["swaps"]
+    assert [s["candidate"] for s in swaps] == calls

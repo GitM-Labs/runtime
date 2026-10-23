@@ -198,6 +198,12 @@ def apply_intervention(
         _audit(audit, "apply", spec, cause="applied live", knobs=_knob_values(spec))
 
         # Step 3: measure. A crash mid-measurement also rolls back.
+        # An applicator that leaves the engine it measured last (not
+        # necessarily the candidate) has to know the bar the keep below will
+        # use, so that putting the candidate back happens here, where a
+        # failure rolls back, and not after the keep has been decided.
+        if hasattr(applicator, "keep_at"):
+            applicator.keep_at = min_keep_delta
         try:
             delta = applicator.measure(spec)
         except RestoreFailed as exc:
@@ -673,6 +679,12 @@ def _largest_fitting_candidate(engine: Any) -> float:
     return limit
 
 
+_RESTART_MODES = ("parallel", "serial", "sleep_swap")
+#: Modes that release the baseline's device memory before building a candidate,
+#: and so need ``baseline_restart_fn`` to get it back.
+_SERIAL_MODES = ("serial", "sleep_swap")
+
+
 def resolve_restart_mode(
     engine: Any, requested: str | None, baseline_restart_fn: Any = None
 ) -> tuple[str, str]:
@@ -696,11 +708,16 @@ def resolve_restart_mode(
     argument got parallel despite having a rebuild available, and one supplying
     only the attribute got serial and then failed every structural apply for
     want of the argument.
+
+    ``"sleep_swap"`` is serial that keeps the baseline asleep instead of
+    destroying it, and is only ever chosen explicitly. It falls back to serial
+    per candidate, so it needs the same baseline rebuild serial does.
     """
     if requested:
-        if requested not in {"parallel", "serial"}:
+        if requested not in _RESTART_MODES:
             raise ValueError(
-                f"restart_mode must be 'parallel' or 'serial', got {requested!r}")
+                "restart_mode must be 'parallel', 'serial' or 'sleep_swap', "
+                f"got {requested!r}")
         return requested, "set explicitly"
     if (baseline_restart_fn or getattr(engine, "gitm_baseline_restart_fn", None)) is None:
         return "parallel", (
@@ -831,9 +848,22 @@ class LiveEngineApplicator:
         self._generation = 0
         self._last_baseline: tuple[int, int, float] | None = None
         # Restore record: ("hotswap", knob, old_value) | ("restart", old_engine) |
-        # ("serial_restart", restore_baseline_fn) | None.
+        # ("serial_restart", restore_baseline_fn) |
+        # ("sleep_swap", baseline, candidate_or_None) | None.
         self._prev: tuple[Any, ...] | None = None
         self.last_result: EngineABResult | None = None
+        #: The ``min_keep_delta`` apply_intervention will keep at. Set by it
+        #: before each measure(), so the engine left live agrees with the keep.
+        self.keep_at = 0.0
+        # sleep_swap: engines put to sleep and not yet woken or shut down, by id.
+        # Each holds weights in CPU RAM and some device memory, so close()
+        # releases whatever is left here.
+        self._sleeping: dict[int, Any] = {}
+        self._swap_rec: dict[str, Any] = {"sleep_s": [], "wake_s": []}
+        #: sleep_swap: one record per restart candidate — how it was built (or
+        #: why it fell back to serial) and each sleep and wake-up it cost, in
+        #: seconds. None of that time is inside a throughput measurement.
+        self.swap_log: list[dict[str, Any]] = []
 
     def _bench(self) -> float:
         return sum(self._tps(self.engine) for _ in range(self._reps)) / self._reps
@@ -902,7 +932,10 @@ class LiveEngineApplicator:
         baseline measurement that fails raises :class:`RestoreFailed`, the same
         as a failed rollback: the run has lost its engine.
         """
-        if pairs < 1 or self._baseline_restart_fn is None or self._restart_mode != "serial":
+        # sleep_swap calibrates exactly as serial does: the floor is
+        # build-to-build noise, so it needs fresh builds, not woken ones.
+        if (pairs < 1 or self._baseline_restart_fn is None
+                or self._restart_mode not in _SERIAL_MODES):
             return []
         before = len(self.noise.samples)
         warm = self._bench_baseline()
@@ -970,15 +1003,27 @@ class LiveEngineApplicator:
                 "restart); no restart_fn supplied, so they cannot be applied live"
             )
         old_engine = self.engine
-        if self._restart_mode == "serial":
+        if self._restart_mode in _SERIAL_MODES:
             if self._baseline_restart_fn is None:
                 raise StructuralKnobRequiresRestart(
-                    "serial restart mode requires baseline_restart_fn to rebuild the baseline"
+                    f"{self._restart_mode} restart mode requires baseline_restart_fn "
+                    "to rebuild the baseline"
                 )
+            if self._restart_mode == "sleep_swap":
+                new_engine = self._build_beside_sleeping(spec, old_engine, values)
+                if new_engine is not None:
+                    self.engine = new_engine
+                    self._unmeasured_build = True
+                    self._activate(new_engine)
+                    return
+                # Fell back: the baseline has been released, and this candidate
+                # is measured as a plain serial restart.
+
             def restore_baseline() -> Any:
                 return self._baseline_restart_fn(old_engine)
 
-            self._shutdown(old_engine)
+            if self._restart_mode == "serial":
+                self._shutdown(old_engine)
             self._prev = ("serial_restart", restore_baseline)
             try:
                 new_engine = self._restart_fn(old_engine, values)
@@ -997,7 +1042,7 @@ class LiveEngineApplicator:
                     f"restart_mode='parallel' cannot provide one: {why}")
             new_engine = self._restart_fn(old_engine, values)
         if new_engine is None:
-            if self._restart_mode == "serial":
+            if self._restart_mode in _SERIAL_MODES:
                 _, restore_baseline = self._prev
                 self._rebuild_baseline(restore_baseline, "restart_fn produced no engine")
             raise StructuralKnobRequiresRestart(
@@ -1006,8 +1051,131 @@ class LiveEngineApplicator:
         self.engine = new_engine
         self._unmeasured_build = True
         self._activate(new_engine)
-        if self._restart_mode != "serial":
+        if self._restart_mode not in _SERIAL_MODES:
             self._prev = ("restart", old_engine)
+
+    def _build_beside_sleeping(self, spec: InterventionSpec, base: Any,
+                               values: dict[str, Any]) -> Any:
+        """sleep_swap: put the baseline to sleep and build the candidate beside it.
+
+        Returns the candidate, with ``_prev`` recording both engines, or ``None``
+        after releasing the baseline when the candidate cannot be built that
+        way; the caller then measures it as a serial restart, and the record
+        says why. The candidate's ``gpu_memory_utilization`` is never lowered to
+        make it fit: the A/B would then compare two KV budgets.
+        """
+        rec: dict[str, Any] = {"candidate": spec.name, "via": "sleep_swap",
+                               "fallback": None, "sleep_s": [], "wake_s": []}
+        self.swap_log.append(rec)
+        self._swap_rec = rec
+        kwargs = getattr(base, "gitm_llm_kwargs", None)
+        why: str | None = None
+        if not callable(getattr(base, "sleep", None)) or not callable(
+                getattr(base, "wake_up", None)):
+            why = "the baseline engine has no sleep()/wake_up()"
+        elif kwargs is not None and not kwargs.get("enable_sleep_mode"):
+            why = "the baseline was not built with enable_sleep_mode=True"
+        if why is None:
+            # Recorded before the build, so a Ctrl-C during it still leaves
+            # restore() able to wake the baseline.
+            self._prev = ("sleep_swap", base, None)
+            try:
+                self._sleep(base)
+            except Exception as exc:
+                why = f"the baseline could not be put to sleep: {exc}"
+        if why is None:
+            why = self._candidate_cannot_fit(base, values)
+        if why is None:
+            try:
+                cand = self._restart_fn(base, values)
+                if cand is None:
+                    raise StructuralKnobRequiresRestart("restart_fn produced no engine")
+            except Exception as exc:
+                why = f"the candidate failed to build beside the sleeping baseline: {exc}"
+            else:
+                self._prev = ("sleep_swap", base, cand)
+                return cand
+        rec["via"] = "serial"
+        rec["fallback"] = why
+        self._prev = None
+        self._release(base)
+        return None
+
+    def _candidate_cannot_fit(self, base: Any, values: dict[str, Any]) -> str | None:
+        """Why vLLM would refuse the candidate with the baseline asleep, or None.
+
+        vLLM starts an engine only if free device memory is at least
+        ``gpu_memory_utilization`` of the total. Asked of the engine's own
+        ``gitm_free_gpu_fraction_fn`` (it reads the device without a CUDA
+        context in this process); an engine without one, or a reading that is
+        unavailable, is left to the build to decide.
+        """
+        free_fn = getattr(base, "gitm_free_gpu_fraction_fn", None)
+        need = gpu_fraction(base)
+        if "gpu_memory_utilization" in values:
+            try:
+                need = float(values["gpu_memory_utilization"])
+            except (TypeError, ValueError):
+                pass
+        if not callable(free_fn) or need is None:
+            return None
+        try:
+            # The candidate's own settings: a lever that changes
+            # tensor_parallel_size runs on a different set of GPUs.
+            free = free_fn(base, values)
+        except Exception:
+            return None
+        if free is None or free >= need:
+            return None
+        return (f"with the baseline asleep {free:.0%} of the device is free and "
+                f"the candidate asks for gpu_memory_utilization={need:.2f}")
+
+    def _sleep(self, engine: Any) -> None:
+        self._sleeping[id(engine)] = engine     # before: a failed sleep is still released
+        t0 = time.perf_counter()
+        engine.sleep(level=1)
+        self._swap_rec["sleep_s"].append(round(time.perf_counter() - t0, 3))
+
+    def _wake(self, engine: Any) -> None:
+        t0 = time.perf_counter()
+        engine.wake_up()
+        self._sleeping.pop(id(engine), None)
+        self._swap_rec["wake_s"].append(round(time.perf_counter() - t0, 3))
+
+    def _release(self, engine: Any) -> None:
+        """Shut an engine down whether it is awake or asleep. Never raises."""
+        self._sleeping.pop(id(engine), None)
+        self._shutdown(engine)
+
+    def _swap_live(self, target: Any) -> None:
+        """sleep_swap: sleep the running engine and wake ``target`` in its place.
+
+        Not a build, so ``target``'s next measurement is not a fresh one. A
+        failure raises with ``_prev`` intact, and restore() sorts out which of
+        the two is still usable.
+        """
+        self._sleep(self.engine)
+        self._wake(target)
+        self.engine = target
+        self._unmeasured_build = False
+        self._activate(target)
+
+    def close(self) -> None:
+        """Shut down every engine still asleep.
+
+        Every path through a sleep_swap candidate already leaves one engine; this
+        is the backstop for one that was interrupted part-way (a restore that
+        began and did not finish, or a swap stopped between its sleep and its
+        wake-up, which leaves the running engine itself asleep). An engine
+        still asleep at this point is never going to be woken, so it is
+        released even when it is ``self.engine``, and the handle is dropped
+        rather than handed back as live. A no-op in every other mode.
+        """
+        for engine in list(self._sleeping.values()):
+            if engine is self.engine:
+                self.engine = None
+            self._release(engine)
+        self._sleeping.clear()
 
     def restore(self, snapshot: dict[str, Any]) -> None:
         if self._prev is None:
@@ -1029,6 +1197,9 @@ class LiveEngineApplicator:
             self._shutdown(self.engine)  # drop the candidate engine we built
             self._rebuild_baseline(restore_baseline, "rolling back the candidate")
             return
+        elif tag == "sleep_swap":
+            self._wake_baseline("rolling back the candidate")
+            return
         elif tag == "baseline_running":
             # Validation ended on a baseline round: the baseline is already the
             # running engine, so there is nothing to put back.
@@ -1036,6 +1207,31 @@ class LiveEngineApplicator:
         # Consume the restore record so a second restore() can't re-undo (or
         # re-shutdown the already-discarded candidate engine) a second time.
         self._prev = None
+
+    def _wake_baseline(self, cause: str) -> None:
+        """sleep_swap rollback: drop the candidate, asleep or not, and make the
+        baseline live again, waking it if it sleeps. No rebuild.
+
+        The record is consumed first, as for a serial rebuild. A baseline that
+        will not wake is shut down rather than handed back: it is a lost
+        engine, :class:`RestoreFailed`, exactly as a rebuild that failed.
+        """
+        _, base, cand = self._prev
+        self._prev = None
+        if cand is not None:
+            self._release(cand)
+        if id(base) in self._sleeping:
+            try:
+                self._wake(base)
+            except Exception as exc:
+                self._release(base)
+                self.engine = None
+                raise RestoreFailed(
+                    f"could not wake the baseline engine ({cause}): {exc}") from exc
+        self.engine = base
+        # Not a build: the baseline that was already measured comes back.
+        self._unmeasured_build = False
+        self._activate(base)
 
     def _rebuild_baseline(self, restore_baseline: Callable[[], Any], cause: str) -> None:
         """Build the baseline engine again after a serial restart, and make it live.
@@ -1084,6 +1280,14 @@ class LiveEngineApplicator:
         """
         if self._prev is not None and self._prev[0] == "restart":
             self._shutdown(self._prev[1])
+        elif self._prev is not None and self._prev[0] == "sleep_swap":
+            # The old baseline sleeps with its weights in CPU RAM; the kept
+            # candidate is the baseline now, so nothing will wake it again.
+            # measure() left the candidate live for this keep; release
+            # whichever engine is not running regardless, so a keep that
+            # disagreed with it can never shut down the one engine left.
+            _, base, cand = self._prev
+            self._release(cand if self.engine is base else base)
         self._prev = None
         # The candidate is the baseline now: a different configuration, so its
         # measurements are not A/A samples against the old one's.
@@ -1155,12 +1359,16 @@ class LiveEngineApplicator:
             )
         candidate, cand_std = self._bench_stats()
         tag = self._prev[0] if self._prev else None
-        via = "restart" if tag in {"restart", "serial_restart"} else "hot-swap"
+        via = "restart" if tag in {"restart", "serial_restart", "sleep_swap"} else "hot-swap"
         rounds = [(baseline, candidate)]
+        # sleep_swap rounds wake the same two builds rather than rebuilding
+        # them, so like a hot-swap they average out no build noise.
         rebuilt = tag == "serial_restart"
         if self.validation > 1 and not self._clear_loss(rounds):
             if rebuilt:
                 rounds = self._validation_rounds(spec, rounds)
+            elif tag == "sleep_swap":
+                rounds = self._rounds_sleep_swap(rounds)
             elif tag in {"hotswap", "restart"}:
                 rounds = self._rounds_in_place(spec, rounds)
         ratios = [b / a for a, b in rounds]
@@ -1179,9 +1387,10 @@ class LiveEngineApplicator:
             if self.noise_gate else 0.0)
         bar = max(threshold, noise_band)
         # One comparison decides everything: apply_intervention keeps at
-        # ``delta - bar >= 0``, and the candidate rebuild below must agree with it.
-        keep = delta - bar >= 0
-        significant = keep if self.noise_gate else delta > noise_band
+        # ``delta - bar >= keep_at``, and the candidate rebuild or wake-up below
+        # must agree with it. Significance stays measured against zero.
+        keep = delta - bar >= self.keep_at
+        significant = delta - bar >= 0 if self.noise_gate else delta > noise_band
         if tag == "hotswap" and keep and self._state_is_baseline:
             self._set_knobs(_knob_values(spec))
         if keep and self._prev and self._prev[0] == "baseline_running":
@@ -1190,6 +1399,10 @@ class LiveEngineApplicator:
             # rollback (a failed correctness gate) rebuilds the baseline.
             self._swap_to_candidate(spec)
             self._prev = ("serial_restart", self._round_restore)
+        if keep and tag == "sleep_swap" and self.engine is not self._prev[2]:
+            # Kept with the baseline awake from the last round: wake the
+            # candidate again so the keep leaves it live.
+            self._swap_live(self._prev[2])
         self.last_result = EngineABResult(
             knob=spec.knob, value=(getattr(spec, "knobs", None) or spec.value),
             baseline_tps=sum(a for a, _ in rounds) / len(rounds),
@@ -1235,6 +1448,39 @@ class LiveEngineApplicator:
                 b = self._bench_stats()[0]
             rounds.append((a, b))
         return rounds
+
+    def _rounds_sleep_swap(self, rounds: list[tuple[float, float]]
+                           ) -> list[tuple[float, float]]:
+        """Validation rounds for sleep_swap, alternating order as serial does,
+        but moving between the two engines by sleep and wake-up instead of a
+        rebuild. Each round re-measures the same two builds.
+
+        A baseline that cannot be measured once woken is a lost engine, as in
+        serial; the candidate asleep beside it is released too.
+        """
+        _, base, cand = self._prev
+        for k in range(2, self.validation + 1):
+            if k % 2 == 0:
+                # B then A: the candidate is running.
+                b = self._bench_stats()[0]
+                self._swap_live(base)
+                a = self._bench_woken_baseline(cand)
+            else:
+                # A then B: the baseline is running.
+                a = self._bench_woken_baseline(cand)
+                self._swap_live(cand)
+                b = self._bench_stats()[0]
+            rounds.append((a, b))
+        return rounds
+
+    def _bench_woken_baseline(self, cand: Any) -> float:
+        try:
+            a = self._bench_baseline()
+        except RestoreFailed:
+            self._release(cand)
+            raise
+        self._note_baseline(a)      # not a fresh build, so never an A/A sample
+        return a
 
     def _clear_loss(self, rounds: list[tuple[float, float]]) -> bool:
         """Round 1 already lost by more than one round's noise: not worth

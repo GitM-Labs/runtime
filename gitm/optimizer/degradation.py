@@ -68,6 +68,10 @@ AR_SKIPPED = "autoresearch.skipped"
 #: trying candidates. What was measured before it stands; what was queued after
 #: it was never tried.
 ENGINE_LOST = "engine.lost"
+#: GITM_RESTART_MODE=sleep_swap could not build a candidate beside the sleeping
+#: baseline, so that candidate was measured as a serial restart. The A/B stands;
+#: only the saving was lost.
+RESTART_FALLBACK = "restart.sleep_swap_fallback"
 #: The run's budget ran out with ranked candidates still queued. What was
 #: measured stands; the rest was never tried, which is not the same as losing.
 BUDGET_SPENT = "budget.spent"
