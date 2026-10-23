@@ -1,0 +1,11 @@
+# /etc/systemd/system/gitm-slack-scheduler.service
+[Unit]
+Description=gitm GPU queue -> Slack (scheduler events)
+After=slurmctld.service network-online.target
+Wants=network-online.target
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/gitm-slack-notify scheduler --interval 30
+Restart=always
+RestartSec=15
+[Install]
+WantedBy=multi-user.target
