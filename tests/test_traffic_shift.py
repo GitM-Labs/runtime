@@ -48,6 +48,18 @@ def test_matched_replays_stay_quiet_at_a_low_false_alarm_rate(envelope, baseline
     assert len(fired) <= 5, f"false alarms on matched replays at seeds {fired}"
 
 
+def test_a_short_baseline_does_not_raise_the_false_alarm_rate(envelope):
+    """The baseline is a finite sample too; ignoring that fired on ~7-10% of matched windows."""
+    fired = total = 0
+    for b_seed in range(10):
+        base_trace, _ = sample_trace(envelope, duration_s=120.0, seed=1000 + b_seed)
+        base = TrafficProfile.from_trace(base_trace)
+        for s in range(1, 11):
+            total += 1
+            fired += detect_shift(base, _window(envelope, s), ShiftConfig(null_draws=300)).shifted
+    assert fired / total <= 0.03, f"{fired}/{total} matched windows fired against a 120 s baseline"
+
+
 @pytest.mark.parametrize("kw, axis", [
     (dict(rate_mult=2.0), "rate"),
     (dict(rate_mult=0.5), "rate"),

@@ -19,9 +19,16 @@ shifted one. So the threshold actually used is the larger of the configured thre
 and the ``null_quantile`` of the distance a same-shaped window of the same size would
 show by chance, simulated from the baseline (multinomial for the histograms, a normal
 approximation to the request count scaled by the baseline's index of dispersion for the
-rate). A window with fewer than ``min_requests`` requests is ``inconclusive``.
+rate). Both the window and the baseline are treated as finite samples, so a short
+baseline raises the bar as well as a short window. A window or baseline with fewer than
+``min_requests`` requests is ``inconclusive``.
 
-What it does not do. It does not look at arrival burstiness, prefix sharing, or the
+What it does not do. It assumes traffic is stationary apart from the shift it is looking
+for: the noise model is two independent samples of one distribution, so slow drift, daily
+cycles and autocorrelation are not modeled and will make real false alarms more likely than
+the synthetic rates below. A profile built from vLLM histograms carries dispersion 1.0
+(Poisson) unless the caller passes the measured value, which understates the noise in the
+request rate of bursty traffic; that case is untested. It does not look at arrival burstiness, prefix sharing, or the
 joint distribution of input and output length. Two traces with the same marginals and
 a different input/output pairing look identical here. The default threshold is a
 starting point, not a calibrated value: it has to be set from real traffic. Validated
@@ -253,20 +260,29 @@ def distance_components(a: TrafficProfile, b: TrafficProfile) -> dict[str, float
 
 
 def _noise_floor(baseline: TrafficProfile, n: int, span_s: float, config: ShiftConfig) -> float:
-    """The ``null_quantile`` distance between the baseline and same-shape windows of size n."""
+    """The ``null_quantile`` distance between two same-shape samples of the baseline's sizes.
+
+    Both finite samples are simulated, one the size of the baseline and one the size of the
+    window, from the baseline's own distribution. Treating the baseline as exact would
+    understate the noise of a short baseline.
+    """
     rng = np.random.default_rng(config.seed)
     p_in, p_out = _norm(baseline.input_hist), _norm(baseline.output_hist)
     has_out = sum(baseline.output_hist) > 0
-    mean_count = baseline.rate_rps * span_s
-    sd_count = math.sqrt(max(baseline.dispersion, 1e-9) * mean_count)
+    nb = baseline.requests
+    rate = baseline.rate_rps
+    disp = max(baseline.dispersion, 1e-9)
+    mean_b, mean_w = rate * baseline.span_s, rate * span_s
     zeros = np.zeros(N_BINS)
     draws = []
     for _ in range(config.null_draws):
-        count = max(rng.normal(mean_count, sd_count), 0.0)
-        sim_in = rng.multinomial(n, p_in)
-        sim_out = rng.multinomial(n, p_out) if has_out else zeros
-        comps = _components(baseline.rate_rps, count / span_s, baseline.input_hist, sim_in,
-                            baseline.output_hist, sim_out)
+        count_b = max(rng.normal(mean_b, math.sqrt(disp * mean_b)), 0.0)
+        count_w = max(rng.normal(mean_w, math.sqrt(disp * mean_w)), 0.0)
+        comps = _components(
+            count_b / baseline.span_s, count_w / span_s,
+            rng.multinomial(nb, p_in), rng.multinomial(n, p_in),
+            rng.multinomial(nb, p_out) if has_out else zeros,
+            rng.multinomial(n, p_out) if has_out else zeros)
         draws.append(max(comps.values()))
     return float(np.quantile(draws, config.null_quantile))
 
