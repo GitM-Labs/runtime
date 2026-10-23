@@ -825,8 +825,11 @@ class RooflinePrediction:
 # ── Execution: what a stored format becomes on a given SKU ────────────────────
 #
 # Every rule below was read from vLLM v0.19.1 (commit b1388b1f), the engine the
-# Kimi K2.6 case pinned. Paths are relative to ``vllm/model_executor/layers/``.
-# CDNA4 rules were read from the AITER tag that vLLM's ROCm image pins
+# Kimi K2.6 case pinned, except ("mxfp4", "cdna4"), the ("nvfp4", "cdna4")
+# refusal and ("mxfp4", "blackwell")'s padding, re-read at vLLM v0.29.0 (and
+# AITER v0.1.19 for CDNA4) and marked so in their text. Paths are relative to
+# ``vllm/model_executor/layers/``.
+# The other CDNA4 rules were read from the AITER tag that vLLM's ROCm image pins
 # (docker/Dockerfile.rocm_base:12, v0.1.10.post2 = c3708fb) and its
 # composable_kernel submodule (7b18f5f); those paths are prefixed ``aiter/`` or
 # ``ck/``.
@@ -838,7 +841,7 @@ Backend = Literal["native", "marlin", "emulation"]
 
 
 class UnsupportedExecution(ValueError):
-    """The pinned engine has no kernel for this format on this architecture."""
+    """The pinned engine has no kernel for this format on this arch, or none a rule prices."""
 
 
 @dataclass(frozen=True)
@@ -943,24 +946,26 @@ _ROCM_WNA16 = (
     "rank on Kimi at TP8, 0.2% of the bank, not modelled."
 )
 _AITER_MXFP4 = (
-    "quantization/quark/quark_moe.py:703-707 (w_mxfp4_a_mxfp4 -> Mxfp4MoeBackend.NONE), "
-    ":737-744 (emulate is False only where supports_mx(), platforms/rocm.py:744-745 = "
-    "gfx95x), :775-779 -> fused_moe/oracle/mxfp4.py:395-397 (ROCm rounds the per-rank "
-    "intermediate and hidden to 256); scales stay uint8 e8m0, 1 B per 32, through "
-    "e8m0_shuffle (aiter/aiter/utility/fp4_utils.py:72-92 pads rows to 256 and cols "
-    "to 8, a no-op at Kimi's shape); rocm_aiter_fused_moe.py:255-257 (BLOCK_1X32); "
-    "aiter/aiter/fused_moe.py:722-726 (per_1x32 never runs the 1-stage path), "
-    ":966-990 (activation MXFP4 quant is its own kernel, fused with the MoE sort "
-    "below 1024 tokens); MACs: the CK 2-stage instance is typed A:mxfp4 B:mxfp4 "
-    "(aiter/csrc/ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages_common.py:200) and "
-    "CK tile's fp4 warp GEMM is the scaled f8f6f4 MFMA "
-    "(ck/include/ck_tile/ops/gemm/warp/warp_gemm_attribute_mfma_impl.hpp:1642, "
-    "__builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4, e8m0 scales as operands). "
-    "Open: when token*topk <= n_experts and the weights are shuffled, "
-    "aiter/fused_moe.py:803-827,:944-954 route to cktile_moe_stage1/2 with bf16 "
-    "activations and no act scale (A16W4); whether the is_shuffled attribute "
-    "survives vLLM's custom-op boundary was not verifiable from source, so the "
-    "small-batch decode path may run bf16 MACs. Bytes are unchanged either way."
+    "Re-read at vLLM v0.29.0 and AITER v0.1.19 (the MI355X loop image). "
+    "quantization/quark/quark_moe.py:1102-1106 (w_mxfp4_a_mxfp4 asks for MXFP4 "
+    "activations) -> fused_moe/oracle/mxfp4.py:382-383, :443-456, :589-602 (only "
+    "AITER_MXFP4_MXFP4 or EMULATION qualify); experts/rocm_aiter_moe.py:451-453 "
+    "(needs VLLM_ROCM_USE_AITER and VLLM_ROCM_USE_AITER_MOE, which the planner cannot "
+    "see), :475-479 (gfx950); quark_moe.py:1140-1157 -> oracle/mxfp4.py:759-761 (ROCm "
+    "rounds the per-rank intermediate and hidden to 256); scales stay uint8 e8m0, "
+    "1 B per 32, through e8m0_shuffle (oracle/mxfp4.py:1076-1087 -> "
+    "aiter/aiter/utility/fp4_utils.py:224-227 -> aiter/aiter/ops/shuffle.py:338-364, "
+    "a permute whose padding to 256 rows and 8 columns is a no-op at Kimi's shape); "
+    "experts/rocm_aiter_moe.py:311-314 (BLOCK_1X32); aiter/aiter/fused_moe.py:1928-1936 "
+    "(an untuned per_1x32 shape never runs the 1-stage path) and the Kimi rows of "
+    "aiter/aiter/configs/model_configs/kimik2_fp4_tuned_fmoe.csv:2-33 set run_1stage 0; "
+    "activations: a fused MXFP4 quant-and-sort before stage 1 (fused_moe.py:2612) and "
+    "a second before stage 2 (:2761-2773) unless the tuned stage-1 kernel writes fp4 "
+    "itself (:2056, :2107, :2713-2721); "
+    "MACs: those rows run FlyDSL afp4_wfp4 kernels, except CK 2-stage FP4X2 for stage 2 "
+    "at csv :2-3, :18-19 and stage 1 at :33; the FlyDSL MFMA was not read, so the fp4 "
+    "compute stays estimated. The A16W4 cktile path needs ksplit > 1 "
+    "(fused_moe.py:2301-2308) and those rows set ksplit 0."
 )
 
 #: (stored format, arch) -> what vLLM v0.19.1 runs by default.
@@ -984,10 +989,10 @@ _EXECUTION_RULES: dict[tuple[str, str], _Rule] = {
     # MXFP4. The default MoE backend on Blackwell is FLASHINFER_TRTLLM_MXFP4_BF16:
     # bf16 activations, so the MACs are bf16 even where fp4 tensor cores exist.
     ("mxfp4", "blackwell"): _Rule(
-        "native", "bf16", pad_hidden=256, pad_inter=256,
-        source="fused_moe/oracle/mxfp4.py:174-182 (TRTLLM_MXFP4_BF16 first), "
-               ":386-388 (hidden and intermediate padded to 256); "
-               "experts/trtllm_mxfp4_moe.py:81",
+        "native", "bf16", pad_hidden=256, pad_inter=128,
+        source="fused_moe/oracle/mxfp4.py:174-182 (TRTLLM_MXFP4_BF16 first); "
+               "v0.29.0 :740-742 (hidden padded to 256, per-rank intermediate to "
+               "128; both 256 at v0.19.1 :386-388); experts/trtllm_mxfp4_moe.py:81",
     ),
     ("mxfp4", "hopper"): _Rule(
         "native", "bf16", estimated=True,
@@ -1009,16 +1014,16 @@ _EXECUTION_RULES: dict[tuple[str, str], _Rule] = {
     ("int4_g32", "cdna4"): _Rule("triton_wna16", "bf16", source=_ROCM_WNA16),
 }
 
-#: Architectures that have no kernel for a format in vLLM v0.19.1.
+#: Architectures with no kernel for a format, or only one no rule prices.
 _UNSUPPORTED: dict[tuple[str, str], str] = {
     ("mxfp8", "hopper"): "quantization/mxfp8.py:77-78 and modelopt.py:1501-1503 "
                          "require sm100",
-    # Every NVFP4 MoE backend is CUDA-gated (oracle/nvfp4.py:140-146 priority list;
-    # Marlin requires is_cuda(), fused_marlin_moe.py:567), so the oracle raises
-    # NotImplementedError at :261 on ROCm.
-    ("nvfp4", "cdna4"): "fused_moe/oracle/nvfp4.py:261: no NvFp4 MoE backend "
-                        "supports ROCm (Marlin is is_cuda-gated, "
-                        "fused_marlin_moe.py:567)",
+    # vLLM v0.29.0 runs NVFP4 MoE on ROCm through the Triton emulation, last in the
+    # auto list (oracle/nvfp4.py:196-205, :293-307): a per-tile dequant inside the
+    # GEMM plus a quant-dequant of each input (experts/nvfp4_emulation_moe.py:51-254,
+    # :489-529). _FORCED's "emulation" entry is v0.19.1's unfused chain, not this.
+    ("nvfp4", "cdna4"): "vLLM v0.29.0 runs it through the Triton emulation "
+                        "(experts/nvfp4_emulation_moe.py), which no rule prices",
 }
 
 #: Forced backends that cannot exist on an arch. Marlin is CUDA-only
@@ -1073,7 +1078,8 @@ def resolve_execution(
 
     Raises :class:`UnsupportedExecution` when the pinned engine has no kernel at
     all (MXFP8 on Hopper), because pricing a checkpoint that will not load would
-    be a prediction for a deployment that cannot exist.
+    be a prediction for a deployment that cannot exist, and when its only kernel
+    is one no rule prices (NVFP4 on CDNA4).
     """
     fmt = quant_format(dtype)
     if fmt is None:
@@ -1095,7 +1101,7 @@ def resolve_execution(
     else:
         why = _UNSUPPORTED.get((fmt.name, hw.arch))
         if why is not None:
-            raise UnsupportedExecution(f"{fmt.name} has no kernel on {hw.arch}: {why}")
+            raise UnsupportedExecution(f"{fmt.name} on {hw.arch}: {why}")
         rule = _EXECUTION_RULES.get((fmt.name, hw.arch))
     if rule is None:
         native = fmt.payload_bits >= 16
