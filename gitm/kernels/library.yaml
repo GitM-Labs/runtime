@@ -47,7 +47,7 @@ interventions:
     review: null
 
   - name: kv_cache_dtype_fp8
-    lever_class: 2  # open, for Sebastian: restart or rebuild? ENG-79 lists "dtype" under rebuild
+    lever_class: 2
     restart_cost: restart
     summary: Store the KV cache in fp8 to roughly double cache capacity.
     knob: kv_cache_dtype
@@ -159,7 +159,7 @@ interventions:
     review: null
 
   - name: cpu_offload_gb_4
-    lever_class: 2  # open, for Sebastian: restart or rebuild? weights move to host memory
+    lever_class: 2
     restart_cost: rebuild
     summary: Offload cold weights to host RAM to free HBM for a larger KV cache.
     knob: cpu_offload_gb
@@ -260,7 +260,7 @@ interventions:
     review: null
 
   - name: speculative_decode_ngram_5
-    lever_class: 1  # open, for Sebastian: class 1 or 2? lossless in theory, but gated on output equivalence
+    lever_class: 1
     restart_cost: restart
     summary: Enable 5-token n-gram speculative decoding to cut decode steps.
     knob: num_speculative_tokens
@@ -301,7 +301,7 @@ interventions:
     review: null
 
   - name: attention_backend_flashinfer
-    lever_class: 1  # open, for Sebastian: ENG-79 says backends are class 1, but kernels round differently
+    lever_class: 1
     restart_cost: restart
     summary: Swap the attention backend to FlashInfer for fused decode attention.
     knob: VLLM_ATTENTION_BACKEND
@@ -459,7 +459,7 @@ interventions:
     review: null
 
   - name: distributed_executor_ray
-    lever_class: 1  # open, for Sebastian: class 1 or 3? multi-node executor
+    lever_class: 1
     restart_cost: restart
     summary: Use the Ray executor backend for multi-node distributed decode.
     knob: distributed_executor_backend
@@ -490,7 +490,7 @@ interventions:
   # MoE model) rather than every op.
 
   - name: moe_backend_deep_gemm
-    lever_class: 2  # open, for Sebastian: class 1 or 2? fp8 accumulation order changes
+    lever_class: 1
     restart_cost: restart
     summary: Select the DeepGEMM fused-MoE backend for the fp8 expert GEMMs.
     knob: moe_backend
@@ -526,7 +526,7 @@ interventions:
     review: null
 
   - name: enable_expert_parallel
-    lever_class: 1  # open, for Sebastian: class 1 or 3? places experts across GPUs
+    lever_class: 1
     restart_cost: rebuild
     summary: Shard whole experts across ranks (EP) instead of slicing each one (TP).
     knob: enable_expert_parallel
@@ -555,8 +555,8 @@ interventions:
     review: null
 
   - name: enable_eplb
-    lever_class: 3  # open, for Sebastian: class 1 or 3? moves experts at run time
-    restart_cost: restart
+    lever_class: 3
+    restart_cost: none
     summary: Rebalance expert placement across ranks to cut routing-induced stragglers.
     knob: enable_eplb
     value: true
@@ -617,7 +617,7 @@ interventions:
   # catalog workloads levels, workload tagged load_library + the gate keep them scoped
   # the measure delta still comes from each benchmarks A/B
   - name: edge_fp16_autocast
-    lever_class: 2  # open, for Sebastian: not vLLM: does restart_cost apply?
+    lever_class: 2
     restart_cost: restart
     summary: Run PointPillars/CenterPoint inference under fp16 autocast, gated on
       detection-equivalence (count + sorted scores within tolerance).
@@ -637,8 +637,8 @@ interventions:
     review: null
 
   - name: edge_frame_batching
-    lever_class: 1  # open, for Sebastian: not vLLM: does restart_cost apply?
-    restart_cost: restart
+    lever_class: 1
+    restart_cost: none
     summary: Run inference on batches of frames in one forward pass instead of one
       frame at a time.
     knob: edge.batch_size
@@ -657,8 +657,8 @@ interventions:
     review: null
 
   - name: hft_top_of_book_fewer_scans
-    lever_class: 1  # open, for Sebastian: not vLLM: does restart_cost apply?
-    restart_cost: restart
+    lever_class: 1
+    restart_cost: none
     summary: Carry per-symbol top-of-book in 2 grouped scans instead of 4, gated on
       byte-identical VWAP/microprice output.
     knob: hft.top_of_book_grouped_scans
