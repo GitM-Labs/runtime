@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Registered 2026-09-24. Not run. No measured verdict. |
+| Status | Registered 2026-09-24. Not run. No measured verdict. Deferred from the Oct 19 three (2026-10-07), kept registered. Three reasons: the primary metric, replayed HBM bytes per MoE layer, has no Tier-2 replay tool yet (one line in `docs/mi355x_experiment_plan.md:60-62`); the loop pod serves one checkpoint by name (`deploy/k8s/mi355x-kimi-loop.yaml:155`, `scripts/kimi_loop/run_loop.sh:36`); the correctness gate allows 1.0 point of GSM8K loss and AMD's model card already shows 0.99 (see Gates). The checkpoint is public at the spec's revision, so the 559 GB download can start without GPUs. |
 | Owner | Tarun (derivation, interpretation). Isaiah (noise floor, evaluation). Abhiram (budget). |
 | Code | `gitm/agents/hypotheses.py` (`H001`, `mxfp4_variant`). Registered but not proposable: it swaps weights. |
 | Tests | `tests/test_hypotheses.py` (size reconciliation, derivation, the CUDA exclusion) |
@@ -37,7 +37,7 @@ The format table and the exclude list together must reproduce the published chec
 | Dense layer 0, 3 x 7168 x 18432 | 3.964e8 | -1.46875 | 0.58 |
 | Predicted gap | | | 36.17 |
 
-This check found a planner bug on the way. `model_weight_bytes` counted the dense FFN at bytes-per-weight squared, and it ignored precision overrides on the dense MLP (fixed in `a6570bc`).
+This check found a planner bug on the way. `model_weight_bytes` counted the dense FFN at bytes-per-weight squared, and it ignored precision overrides on the dense MLP (fixed in #127, `65a8828`).
 
 ## Total overhead versus the recoverable part
 
@@ -79,7 +79,7 @@ Why the band dwarfs the mean. The two arms run different MoE kernels: INT4 W4A16
 
 ## Experiment
 
-Two arms on the MI355X loop deployment (`deploy/k8s/mi355x-kimi-loop.yaml`: TP8, `VLLM_ROCM_USE_AITER=1`, `--max-num-batched-tokens 8192`), with only the checkpoint changed:
+Two arms on the MI355X loop deployment (`deploy/k8s/mi355x-kimi-loop.yaml`: TP8, `VLLM_ROCM_USE_AITER=1`, `--max-num-batched-tokens 8192`), with only the checkpoint changed. The deployment cannot do that yet: it serves `moonshotai/Kimi-K2.5` by name (`:155`), and the load helper sends every request to that name (`scripts/kimi_loop/run_loop.sh:36`, `:56-63`).
 
 | Arm | Model | Quantisation as served (read from vLLM b1388b1f + AITER v0.1.10.post2) |
 |---|---|---|
@@ -92,7 +92,7 @@ Two arms on the MI355X loop deployment (`deploy/k8s/mi355x-kimi-loop.yaml`: TP8,
 
 ## Gates
 
-**Correctness.** GSM8K (lm-eval-harness, 5-shot, 1,319 items) on both arms. Arm B may not score more than 1.0 point below arm A. W4A4 quantises activations dynamically, which is the larger accuracy risk here.
+**Correctness.** GSM8K (lm-eval-harness, 5-shot, 1,319 items) on both arms. Arm B may not score more than 1.0 point below arm A. W4A4 quantises activations dynamically, which is the larger accuracy risk here. The gate sits next to the drop AMD already reports: the model card at rev `42c6da36` gives GSM8K 94.09 for the original and 93.1 for this checkpoint, 0.99 points lower, on `vllm/vllm-openai-rocm:v0.17.0`. One 1,319-item score has a standard error near 0.65 points (estimated: √(0.94 x 0.06 / 1,319)), so the gate is close to a coin flip. AMD measured at TP4 with `--enforce-eager` (the model card's serving command); arm B runs TP8 with graph capture on (`deploy/k8s/mi355x-kimi-loop.yaml` passes no `--enforce-eager`), a different execution mode. ROCm/aiter#3632 (open, filed 2026-06-09 against AITER 0.1.13.post1 and vLLM 0.22.1rc1) reports silent decode corruption for this backend under HIP-graph capture that clears in eager mode; vllm#44988, which forced eager for it, was closed unmerged, and the loop image's vLLM v0.29.0 has no such guard. Whether it still fires at that image's AITER v0.1.19 was not checked. A gate failure on arm B is rerun in eager mode before it counts as an accuracy loss.
 
 **Latency.** Arm B's TTFT p50 may not rise more than 5%.
 
@@ -112,7 +112,9 @@ Two arms on the MI355X loop deployment (`deploy/k8s/mi355x-kimi-loop.yaml`: TP8,
 
 | Item | Estimate | Owner |
 |---|---|---|
-| Download `amd/Kimi-K2.5-MXFP4` (559 GB) to `/mnt/shared/hf-cache` | 1 to 2 h, no GPUs | cluster owner |
+| Download `amd/Kimi-K2.5-MXFP4` (559 GB) to `/mnt/shared/hf-cache` | 1 to 2 h, no GPUs; can start before the rest is ready | cluster owner |
+| Serve a second checkpoint from the loop pod, and point the load helper at it | manifest and `run_loop.sh` change, then a pod rollout | not assigned |
+| Tier-2 byte replay of one MoE kernel with counters | no procedure or tool yet | not assigned |
 | Server start, arm B | up to 1 h cold (the loop runbook reports 3,600 s for 595 GB) | |
 | Load runs and one trace window per arm | about 1 h | |
 | GSM8K on both arms | about 1 h | |
