@@ -38,6 +38,10 @@ def baseline(envelope):
     return TrafficProfile.from_trace(trace)
 
 
+def _window_from_seed(seed):
+    return _window(fit(read_mooncake(FIXTURE)), seed)
+
+
 def _window(envelope, seed, **kw):
     trace, _ = sample_trace(envelope, duration_s=WINDOW_S, seed=seed, **kw)
     return TrafficProfile.from_trace(trace)
@@ -158,3 +162,32 @@ def test_bad_inputs_are_refused():
         ShiftConfig(threshold=1.5)
     with pytest.raises(ValueError, match="bins"):
         TrafficProfile(requests=1, span_s=1, input_hist=(1,), output_hist=(1,))
+
+
+def _sparse_outputs(profile, keep):
+    """The same traffic with only ``keep`` requests carrying an output length."""
+    hist = list(profile.output_hist)
+    total = sum(hist)
+    scaled = [int(round(h * keep / total)) for h in hist]
+    return TrafficProfile(profile.requests, profile.span_s, profile.input_hist, tuple(scaled),
+                          profile.dispersion, profile.source)
+
+
+def test_sparse_outputs_do_not_pass_for_a_full_set_of_observations(baseline):
+    """Greptile P1: outputs were simulated at the request count, so a window with a few
+    recorded outputs looked far more certain than it was and ordinary noise fired."""
+    sparse_base = _sparse_outputs(baseline, 20)
+    fired = 0
+    for s in range(1, 41):
+        window = _sparse_outputs(_window_from_seed(s), 20)
+        res = detect_shift(sparse_base, window, ShiftConfig(null_draws=300))
+        assert not any(c.startswith("output") for c in res.components), res.components
+        assert any(r.startswith("output_not_compared") for r in res.reasons)
+        fired += res.shifted
+    assert fired <= 2
+
+
+def test_enough_outputs_are_still_compared(envelope, baseline):
+    res = detect_shift(baseline, _window(envelope, 1))
+    assert "output_length" in res.components
+    assert not any(r.startswith("output_not_compared") for r in res.reasons)

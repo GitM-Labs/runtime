@@ -21,7 +21,9 @@ show by chance, simulated from the baseline (multinomial for the histograms, a n
 approximation to the request count scaled by the baseline's index of dispersion for the
 rate). Both the window and the baseline are treated as finite samples, so a short
 baseline raises the bar as well as a short window. A window or baseline with fewer than
-``min_requests`` requests is ``inconclusive``.
+``min_requests`` requests is ``inconclusive``. Output lengths are compared only when both
+sides have at least ``min_requests`` recorded outputs (a request can lack one); otherwise the
+output components are left out and the result says so in ``reasons``.
 
 What it does not do. It assumes traffic is stationary apart from the shift it is looking
 for: the noise model is two independent samples of one distribution, so slow drift, daily
@@ -236,7 +238,8 @@ def _quantile(hist: np.ndarray, q: float) -> float:
     return 2.0 ** (len(hist) / BINS_PER_OCTAVE)
 
 
-def _components(rate_a: float, rate_b: float, in_a, in_b, out_a, out_b) -> dict[str, float]:
+def _components(rate_a: float, rate_b: float, in_a, in_b, out_a, out_b,
+                min_out: int = 1) -> dict[str, float]:
     """Every component, from rates and histograms. One function for the real comparison
     and for the noise simulation, so the two cannot drift apart."""
     in_a, in_b = np.asarray(in_a, dtype=float), np.asarray(in_b, dtype=float)
@@ -247,42 +250,47 @@ def _components(rate_a: float, rate_b: float, in_a, in_b, out_a, out_b) -> dict[
         "input_p95": _rate_component(_quantile(in_a, 0.95), _quantile(in_b, 0.95)),
     }
     out_a, out_b = np.asarray(out_a, dtype=float), np.asarray(out_b, dtype=float)
-    if out_a.sum() > 0 and out_b.sum() > 0:
+    if out_a.sum() >= min_out and out_b.sum() >= min_out:
         comps["output_length"] = _tv(_norm(out_a), _norm(out_b))
         comps["output_p50"] = _rate_component(_quantile(out_a, 0.5), _quantile(out_b, 0.5))
         comps["output_p95"] = _rate_component(_quantile(out_a, 0.95), _quantile(out_b, 0.95))
     return comps
 
 
-def distance_components(a: TrafficProfile, b: TrafficProfile) -> dict[str, float]:
+def distance_components(a: TrafficProfile, b: TrafficProfile, min_out: int = 1) -> dict[str, float]:
+    """Each component, in [0, 1]. Output components are left out unless both profiles
+    have at least ``min_out`` recorded output lengths."""
     return _components(a.rate_rps, b.rate_rps, a.input_hist, b.input_hist,
-                       a.output_hist, b.output_hist)
+                       a.output_hist, b.output_hist, min_out)
 
 
-def _noise_floor(baseline: TrafficProfile, n: int, span_s: float, config: ShiftConfig) -> float:
-    """The ``null_quantile`` distance between two same-shape samples of the baseline's sizes.
+def _noise_floor(baseline: TrafficProfile, window: TrafficProfile, config: ShiftConfig) -> float:
+    """The ``null_quantile`` distance between two same-shape samples of the observed sizes.
 
-    Both finite samples are simulated, one the size of the baseline and one the size of the
-    window, from the baseline's own distribution. Treating the baseline as exact would
-    understate the noise of a short baseline.
+    Both finite samples are simulated from the baseline's own distribution, each histogram
+    at the number of observations it actually has: a request with no recorded output adds
+    to the request count but not to the output histogram, and simulating outputs at the
+    request count would understate the noise whenever outputs are sparse. Treating the
+    baseline as exact would likewise understate the noise of a short baseline.
     """
     rng = np.random.default_rng(config.seed)
     p_in, p_out = _norm(baseline.input_hist), _norm(baseline.output_hist)
-    has_out = sum(baseline.output_hist) > 0
-    nb = baseline.requests
-    rate = baseline.rate_rps
-    disp = max(baseline.dispersion, 1e-9)
-    mean_b, mean_w = rate * baseline.span_s, rate * span_s
+    nb_in, nw_in = sum(baseline.input_hist), sum(window.input_hist)
+    nb_out, nw_out = sum(baseline.output_hist), sum(window.output_hist)
+    has_out = min(nb_out, nw_out) >= config.min_requests
+    rate, disp = baseline.rate_rps, max(baseline.dispersion, 1e-9)
+    mean_b, mean_w = rate * baseline.span_s, rate * window.span_s
     zeros = np.zeros(N_BINS)
     draws = []
     for _ in range(config.null_draws):
         count_b = max(rng.normal(mean_b, math.sqrt(disp * mean_b)), 0.0)
         count_w = max(rng.normal(mean_w, math.sqrt(disp * mean_w)), 0.0)
         comps = _components(
-            count_b / baseline.span_s, count_w / span_s,
-            rng.multinomial(nb, p_in), rng.multinomial(n, p_in),
-            rng.multinomial(nb, p_out) if has_out else zeros,
-            rng.multinomial(n, p_out) if has_out else zeros)
+            count_b / baseline.span_s, count_w / window.span_s,
+            rng.multinomial(nb_in, p_in), rng.multinomial(nw_in, p_in),
+            rng.multinomial(nb_out, p_out) if has_out else zeros,
+            rng.multinomial(nw_out, p_out) if has_out else zeros,
+            config.min_requests)
         draws.append(max(comps.values()))
     return float(np.quantile(draws, config.null_quantile))
 
@@ -301,11 +309,16 @@ def detect_shift(
     if reasons:
         return ShiftResult(INCONCLUSIVE, None, reasons=tuple(reasons))
 
-    comps = distance_components(baseline, window)
+    comps = distance_components(baseline, window, config.min_requests)
+    notes = []
+    if "output_length" not in comps:
+        notes.append(
+            f"output_not_compared:{sum(baseline.output_hist)}_baseline_and_"
+            f"{sum(window.output_hist)}_window_outputs_under_{config.min_requests}")
     axis = max(comps, key=comps.__getitem__)  # first wins a tie
     d = comps[axis]
-    floor = _noise_floor(baseline, window.requests, window.span_s, config)
+    floor = _noise_floor(baseline, window, config)
     used = max(config.threshold, floor)
     status = SHIFTED if d > used else STABLE
     return ShiftResult(status, d, comps, axis, floor, used,
-                       reasons=(f"{axis}={d:.3f}_vs_{used:.3f}",))
+                       reasons=(f"{axis}={d:.3f}_vs_{used:.3f}", *notes))
