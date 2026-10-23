@@ -1,0 +1,103 @@
+# moonshotai/Kimi-K2.6 — Moonshot's own int4 release, and the K2.6 checkpoint
+# the H200 deployment serves.
+# Source: https://huggingface.co/moonshotai/Kimi-K2.6/blob/7eb5002f6aadc958aed6a9177b7ed26bb94011bb/config.json
+# Read from config.json and model.safetensors.index.json only — no traces.
+#
+# Byte-for-byte the kimi-k2.5 layout: the same 208,550 tensor names, the same
+# total_size, the same compressed-tensors int4 recipe. config.json differs from
+# K2.5's only in eos_token_id (163585 -> 163586), which the graph does not
+# read. So the spec is inherited unchanged and this entry exists to pin the
+# deployed revision and carry its own provenance. Not to be confused with
+# kimi-k2.6, which is NVIDIA's NVFP4 re-quantisation of the same weights.
+
+name: moonshotai/Kimi-K2.6
+extends: kimi-k2.5
+checkpoint:
+  repository: moonshotai/Kimi-K2.6
+  revision: 7eb5002f6aadc958aed6a9177b7ed26bb94011bb
+  config_sha256: 85825ca6e18cbe539eb83ee09eedfb3f4222265929f06e9f535a6d9364f55899
+  index_sha256: 00a982d005d6e39b25cfcb379a7e6d57f393fc0346e70892ea4271c259c0d1e3
+  tensor_count: 208550
+  shard_count: 64
+  index_total_size: 595148192736
+# How this checkpoint is served here; replaces the kimi-k2.5 block it would
+# otherwise inherit. Cited files are at the repo commit given after the @.
+deployment:
+  status: partial
+  manifest: deploy/h200/gitm-job@0a08d32aa49fe850f4e165a2866d5c50031ea4ca
+  run_record: "upstream commit 90581d6 (PR #183), job 32"
+  served_revision: 7eb5002f6aadc958aed6a9177b7ed26bb94011bb
+  gpu: H200
+  gpus: 8
+  engine: vllm
+  engine_version: null
+  image: vllm/vllm-openai:latest
+  tp: 8
+  ep: 1
+  kv_cache_dtype: auto
+  kv_cache_dtype_resolved: bf16
+  speculative_decoding: none
+  unverified: [engine_version, launch overrides]
+description: >
+  Same text model as kimi-k2.5: 61 layers, hidden 7168, dense MLA
+  (kv_lora_rank 512, no sparse-attention indexer), layer 0 dense FFN, layers
+  1-60 MoE (384 experts, top-8, one shared). Routed experts int4
+  (compressed-tensors W4A16, group 32); everything else bf16. No MTP head.
+
+spec: {}
+
+provenance:
+  verified:
+    - claim: this is the checkpoint the H200 deployment serves
+      detail: >
+        Confirmed by Adit 2026-10-20: H200 runs moonshotai/Kimi-K2.6 (the int4
+        release), fetched with `hf download moonshotai/Kimi-K2.6` from main.
+        main resolved to 7eb5002f on 2026-10-20 (Hub revision API, last
+        modified 2026-05-19) and has not moved since, so a download from main
+        after that date holds 7eb5002f. The node's own snapshot
+        (refs/main in the HF cache) has not been read.
+    - claim: text shape and quantisation identical to kimi-k2.5
+      detail: >
+        config.json at 7eb5002f (sha256 85825ca6) differs from kimi-k2.5's at
+        4d01dfe0 (sha256 acd5bb01) only in eos_token_id, top level and
+        text_config. Every spec shape field and text_config.quantization_config
+        (int4 pack-quantized, symmetric, group 32, weights only,
+        kv_cache_scheme null, same ignore list) are equal.
+    - claim: weight map identical to kimi-k2.5
+      detail: >
+        model.safetensors.index.json at 7eb5002f (sha256 00a982d0) has the same
+        208,550 tensor names as kimi-k2.5's and total_size 595,148,192,736 B
+        over 64 shards, equal to K2.5's. Zero indexer and nextn/mtp/eh_proj
+        tensors. model_weight_bytes predicts 594.20 GB, -0.16%, the residual
+        being the unmodelled vision tower, as for kimi-k2.5.
+    - claim: H200 runs vLLM on all 8 GPUs, no EP, bf16 KV, no speculative decoding
+      detail: >
+        deploy/h200/gitm-job @0a08d32a gives every job a whole node
+        (GPUS_PER_JOB = 8, line 38). Its default command (lines 296-297) is
+        `vllm serve "$MODEL" --tensor-parallel-size 8 --trust-remote-code`,
+        with no expert-parallel, KV-dtype or speculative flag. The one recorded
+        K2.6 run on H200, job 32 (upstream commit 90581d6, PR #183), was the
+        `gitm run` loop on a "stock baseline". That path (gitm/workloads.py:
+        874-911 @a857b6e9) leaves KV at vLLM's auto and EP off unless
+        GITM_VLLM_KV_DTYPE / GITM_VLLM_ENABLE_EP are set, and has no
+        speculative-decoding knob. Auto resolves to bf16 because
+        kv_cache_scheme is null at 7eb5002f, matching spec kv_dtype. The
+        checkpoint has no MTP head, so nothing could draft against it anyway.
+
+  estimated:
+    - field: everything under kimi-k2.5's estimated
+      value: carried over unchanged (MLA absorption, moe_router precision)
+      detail: Same weights and recipe, so the same open readings apply.
+
+  unmodelled:
+    - The vLLM version on H200. The image is vllm/vllm-openai:latest, copied
+      to each node once at setup (deploy/h200/setup-node.sh:23,182 @0a08d32a,
+      around 2026-10-14) and never recorded in the repo. The job 32 log
+      (/var/lib/gitm/results/32.log on the node that ran it) holds it.
+      Engine-dependent rules in roofline are read from vLLM v0.19.1, so a
+      newer engine's kernel choices may differ from what the graph prices.
+    - Launch overrides for job 32. "Stock baseline" is how PR 183 describes it,
+      not a record of which GITM_VLLM_* variables were set. TP 8 is inferred.
+      The loop only sets tensor_parallel_size when GITM_VLLM_TP is given, and
+      the checkpoint does not fit on one H200.
+    - The vision tower and mm projector, as for kimi-k2.5.

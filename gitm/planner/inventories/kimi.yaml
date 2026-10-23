@@ -174,8 +174,8 @@ checkpoints:
   last_verified: '2026-10-11'
   verification_status: verified
   catalogue:
-    status: not-in-catalogue
-    entry: null
+    status: covered
+    entry: kimi-k2.6-int4
   quantization:
     status: declared
     sources:
@@ -710,8 +710,8 @@ checkpoints:
   last_verified: '2026-10-11'
   verification_status: verified
   catalogue:
-    status: not-in-catalogue
-    entry: null
+    status: covered
+    entry: kimi-k2.7-code
   quantization:
     status: declared
     sources:
@@ -851,8 +851,8 @@ checkpoints:
   last_verified: '2026-10-11'
   verification_status: verified
   catalogue:
-    status: not-in-catalogue
-    entry: null
+    status: covered
+    entry: kimi-k3
   quantization:
     status: declared
     sources:

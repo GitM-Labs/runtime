@@ -242,7 +242,11 @@ def _load(model: str) -> tuple[Any, str, str]:
         prov = entry.get("provenance", {})
         est = [e.get("field") for e in prov.get("estimated", [])]
         note = f"catalogue; fitted fields: {est or 'none'}"
-        if entry.get("checkpoint"):
+        deployment = entry.get("deployment")
+        if deployment:
+            gaps = ", ".join(deployment.get("unverified") or []) or "none"
+            note += f"; deployment {deployment['status']} (gaps: {gaps}); UNVERIFIED: traffic, trace"
+        elif entry.get("checkpoint"):
             note += "; STATIC_CHECKPOINT_ONLY; UNVERIFIED: engine, deployment, traffic, trace"
         return load_spec(model), entry["family"], note
 

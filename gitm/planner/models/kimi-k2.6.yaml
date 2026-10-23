@@ -1,7 +1,11 @@
 # nvidia/Kimi-K2.6-NVFP4 — the same text model as Kimi K2.5
 # (KimiK25ForConditionalGeneration wrapping DeepseekV3ForCausalLM); only the
 # precision differs.
-# Source: https://huggingface.co/nvidia/Kimi-K2.6-NVFP4/blob/main/config.json
+# Source: https://huggingface.co/nvidia/Kimi-K2.6-NVFP4/blob/2fd3a800dedd098b8327eb49e93ebc75f85da19f/config.json
+#
+# Not moonshotai/Kimi-K2.6: that is a separate int4 checkpoint (7eb5002f) with
+# kimi-k2.5's exact layout and bytes, catalogued as kimi-k2.6-int4. That one is
+# what the H200 deployment serves; this NVFP4 entry is not deployed here.
 #
 # Everything shape-related is inherited from kimi-k2.5, including the exact DSA
 # switch-off (index_topk = max_position_embeddings, every layer 'shared'), so
@@ -11,6 +15,15 @@
 
 name: nvidia/Kimi-K2.6-NVFP4
 extends: kimi-k2.5
+checkpoint:
+  repository: nvidia/Kimi-K2.6-NVFP4
+  revision: 2fd3a800dedd098b8327eb49e93ebc75f85da19f
+  config_sha256: af4c0fea7ec43d5438532eeef8daa9fcabbdf97ddedc9da2319aa675f68f51ff
+  index_sha256: 5bb72bd3bf09b300e6854b01366349ff7d51f5e94b0d6049c2f87c1f3aaf8984
+  hf_quant_config_sha256: 6ee4be1d46bf2b5204284b6641ed7bb5d9fc2fc7e8157a4eb06d5fe500dddc3a
+  tensor_count: 277670
+  shard_count: 60
+  index_total_size: 595148146656
 description: >
   61 layers, hidden 7168, dense MLA (kv_lora_rank 512, no sparse-attention
   indexer), layer 0 dense FFN, layers 1-60 MoE (384 experts, top-8, one
@@ -37,7 +50,8 @@ provenance:
   verified:
     - claim: text shape is identical to kimi-k2.5
       detail: >
-        config.json text_config (read 2026-09-10, re-read 2026-09-15):
+        config.json text_config (read 2026-09-10, re-read 2026-09-15; confirmed
+        unchanged 2026-10-19 at 2fd3a800, sha256 af4c0fea):
         hidden_size 7168, num_hidden_layers 61, num_attention_heads 64,
         q_lora_rank 1536, kv_lora_rank 512, qk_nope/rope/v 128/64/128,
         n_routed_experts 384, num_experts_per_tok 8, n_shared_experts 1,
@@ -52,13 +66,23 @@ provenance:
         vision tower. An earlier -0.03% came from the dense FFN being counted
         at bytes-per-weight squared. NVFP4 (0.5 + 1/16) and int4 (0.5 + 2/32)
         are both 0.5625 B/weight, so K2.6 predicts the same footprint as K2.5.
+        At 2fd3a800 the index total_size is 595,148,146,656 B (277,670 tensors,
+        60 shards); the 37 MB above it in the shard sum is safetensors headers.
+        Against total_size the residual is still -0.16%.
     - claim: precision layout
       detail: >
-        hf_quant_config.json: quant_algo NVFP4, group_size 16,
-        kv_cache_quant_algo FP8. exclude_modules lists lm_head, layers.0*, and
-        every layer's self_attn* and mlp.shared_experts*, so attention, the
-        dense layer, the shared expert and lm_head stay bf16 (weight_dtype
-        bf16 plus the moe_shared override); only routed experts are NVFP4.
+        hf_quant_config.json at 2fd3a800 (sha256 6ee4be1d): quant_algo NVFP4,
+        group_size 16, kv_cache_quant_algo FP8. exclude_modules lists lm_head,
+        layers.0*, vision_tower*, mm_projector*, and self_attn* plus
+        mlp.shared_experts* for all of layers 1-60 (checked per layer), so
+        attention, the dense layer, the shared expert and lm_head stay bf16
+        (weight_dtype bf16 plus the moe_shared override); only routed experts
+        are NVFP4. config.json quantization_config (modelopt) agrees: W4A4
+        float group 16 and a static 8-bit float kv_cache_scheme.
+    - claim: no indexer, no MTP head, layer 0 dense, read from the weight map
+      detail: >
+        At 2fd3a800 (index sha256 5bb72bd3): zero indexer and zero
+        nextn/mtp/eh_proj tensors; language layers 0-60, experts on 1-60 only.
     - claim: kv_rope_dtype fp8 (576 B per entry, not DeepSeek's fp8_ds_mla)
       detail: >
         vLLM (mla_attention.py, _canonicalize_sparse_mla_kv_cache_dtype) maps a
@@ -96,6 +120,10 @@ provenance:
         node's prefill time.
 
   unmodelled:
+    - A local deployment. Adit confirmed 2026-10-20 that H200 serves
+      moonshotai/Kimi-K2.6 (kimi-k2.6-int4), not this repository. The engine
+      claims here (vLLM v0.19.1, the EAGLE3 draft, fp8 KV as served) describe
+      NVIDIA's published recipe, not anything run on this cluster.
     - The EAGLE3 draft model (lightseekorg/kimi-k2.6-eagle3-mla). With
       --spec-tokens the graph prices the target's 1+D verify rows per sequence,
       but none of the draft's own forward passes.

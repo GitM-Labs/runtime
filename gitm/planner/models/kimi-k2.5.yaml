@@ -1,7 +1,8 @@
 # moonshotai/Kimi-K2.5 — KimiK25ForConditionalGeneration; text_config is
 # DeepseekV3ForCausalLM (model_type kimi_k2): classic dense MLA + sparse MoE.
-# Source: https://huggingface.co/moonshotai/Kimi-K2.5/blob/main/config.json
+# Source: https://huggingface.co/moonshotai/Kimi-K2.5/blob/4d01dfe0332d63057c186e0b262165819efb6611/config.json
 # Read from config.json and model.safetensors.index.json only — no traces.
+# Engine and deployment facts live in `deployment:`, apart from the checkpoint.
 #
 # Family note: `glm_moe_dsa` is the graph that models MLA + MoE; the DSA
 # indexer is the one piece Kimi does not have, and it is switched off exactly,
@@ -14,6 +15,33 @@
 
 name: moonshotai/Kimi-K2.5
 family: glm_moe_dsa
+checkpoint:
+  repository: moonshotai/Kimi-K2.5
+  revision: 4d01dfe0332d63057c186e0b262165819efb6611
+  config_sha256: acd5bb01a16f64b309599cd6ed196be056f613c99d6bc9300692b82cd10882f6
+  index_sha256: bdba19b127c4d1dc57dc3b6f3366c10739c7e7f13baf3f5424b556469a4dbc1b
+  tensor_count: 208550
+  shard_count: 64
+  index_total_size: 595148192736
+# How this checkpoint is served here. Engine facts, kept apart from the
+# checkpoint facts above; `spec` must agree with them (tests check it).
+# Cited files are at the repo commit given after the @.
+deployment:
+  status: verified
+  manifest: deploy/k8s/mi355x-kimi-loop.yaml@d9d8e6c02000dd08dd5f5d690baadd786031153f
+  run_record: docs/autoresearch_noise_floor_mi355x.md@41c8fab783c20bb5c2a49cc69beaaa9667124d78
+  served_revision: 4d01dfe0332d63057c186e0b262165819efb6611
+  gpu: MI355X
+  gpus: 8
+  engine: vllm
+  engine_version: 0.29.0
+  image: vllm/vllm-openai-rocm@sha256:e5e47f6aaab675c252c381f0dac237b31b10d87bb74d092b07fb4065efd7f5a1
+  tp: 8
+  ep: 1
+  kv_cache_dtype: auto
+  kv_cache_dtype_resolved: bf16
+  speculative_decoding: none
+  unverified: []
 description: >
   61 layers, hidden 7168, ~1T total / ~32B active per token. Dense MLA
   attention (kv_lora_rank 512, one latent shared across 64 query heads, no
@@ -142,8 +170,25 @@ spec:
 
 provenance:
   verified:
+    - claim: text shape matches config.json text_config
+      detail: >
+        Re-read 2026-10-19 at 4d01dfe0 (config.json sha256 acd5bb01, matching the
+        inventory). Every spec shape field agrees: hidden 7168, 61 layers, 64
+        heads, q/kv lora 1536/512, qk_nope/rope/v 128/64/128, 384 routed experts,
+        top-8, 1 shared, moe_intermediate 2048, intermediate 18432,
+        first_k_dense_replace 1, routed_scaling_factor 2.827, vocab 163840,
+        num_nextn_predict_layers 0. The config has no index_topk; 262144 is
+        max_position_embeddings, as above.
+    - claim: precision recipe matches text_config.quantization_config
+      detail: >
+        At 4d01dfe0: compressed-tensors pack-quantized int4, symmetric, group 32,
+        weights only (input_activations null), kv_cache_scheme null. ignore is
+        self_attn, shared_experts, mlp.(gate|up|gate_up|down)_proj (layer 0's
+        dense FFN), lm_head, vision_tower, mm_projector, so only routed experts
+        are int4. That is expert_dtype int4, kv_dtype bf16, moe_shared bf16.
     - claim: no sparse-attention indexer and no MTP head, read from the weight map
       detail: >
+        Re-read 2026-10-19 at 4d01dfe0 (index sha256 bdba19b1).
         model.safetensors.index.json (208,550 tensors) contains zero indexer
         tensors and zero nextn/mtp/eh_proj tensors. Layers run 0..60 with
         exactly the seven DeepSeek-V3 MLA attention tensors each
@@ -155,11 +200,39 @@ provenance:
         shared_experts.*. Matches first_k_dense_replace 1.
     - claim: predicted weight bytes match the published checkpoint
       detail: >
-        model.safetensors.index.json total_size is 595,148,192,736 B
-        (595.15 GB). model_weight_bytes with int4 experts (0.5 + 2/32 B/weight)
-        predicts 594.20 GB, -0.16%; the residual is the unmodelled vision tower
-        (~0.9 GB). The same shape all-bf16 would be 2.053 TB, so the int4 entry
-        is doing real work here, not rounding.
+        At 4d01dfe0, model.safetensors.index.json total_size is 595,148,192,736 B
+        (595.15 GB) over 64 shards. model_weight_bytes with int4 experts
+        (0.5 + 2/32 B/weight) predicts 594.20 GB, -0.16%; the residual is the
+        unmodelled vision tower (~0.9 GB). The same shape all-bf16 would be
+        2.053 TB, so the int4 entry is doing real work here, not rounding.
+    - claim: the MI355X deployment serves this revision on vLLM 0.29.0, TP8, no EP
+      detail: >
+        docs/autoresearch_noise_floor_mi355x.md:60-63 @41c8fab7, a measured run
+        on 2026-10-12, records HF snapshot 4d01dfe0 (this entry's pin), vLLM
+        0.29.0 on ROCm 7.2.3, image digest e5e47f6a, launched from
+        deploy/k8s/mi355x-kimi-loop.yaml. That manifest @d9d8e6c0 (lines
+        155-165) runs `vllm serve moonshotai/Kimi-K2.5 --tensor-parallel-size 8
+        --gpu-memory-utilization 0.92 --max-num-batched-tokens 8192
+        --max-num-seqs 256` with no --enable-expert-parallel, no
+        --kv-cache-dtype and no speculative config. The baseline record
+        docs/search_space_kimi_mi355x.md:14,23 @0a2bd67d agrees: TP=8, expert
+        parallel off, bf16 KV (auto).
+    - claim: KV cache is bf16 as served, matching spec kv_dtype
+      detail: >
+        No --kv-cache-dtype means vLLM's auto, which follows the checkpoint.
+        text_config.quantization_config.kv_cache_scheme is null at 4d01dfe0, so
+        auto resolves to the model dtype, bf16. The fp8 KV in
+        deploy/k8s/parallel/kimi-intervene.yaml:116 is an intervention arm
+        against this baseline (docs/kimi_mi355x_loop_runbook.md:19), not the
+        deployment.
+    - claim: deploy/k8s/mi355x-kimi.yaml (SGLang + NEXTN) is not the deployment
+      detail: >
+        mi355x-kimi-loop.yaml:14-17 @d9d8e6c0 records that it replaced the SGLang
+        unit because this checkpoint has no MTP head, so the NEXTN flags
+        (mi355x-kimi.yaml:116-123 @383f3c3f) drafted with nothing. The SGLang
+        file still carries SGLANG_IMAGE and REGISTRY placeholders, so it cannot
+        be applied as written; it was the tracer-validation unit. Speculative
+        decoding is off in the real deployment.
 
   estimated:
     - field: MLA absorption (attn_kv_b vs attn_out_proj width)
@@ -183,6 +256,10 @@ provenance:
         settle it.
 
   unmodelled:
+    - The served revision is recorded by a run, not pinned by the manifest.
+      mi355x-kimi-loop.yaml passes no --revision, so a node whose HF cache
+      pulled a newer main would serve something else. main has not moved from
+      4d01dfe0 (inventory, verified 2026-10-11).
     - The vision tower (27 ViT layers, hidden 1152, ~0.9 GB) and mm projector.
       This entry prices the text decode step; vision tensors sit resident but
       idle. Their weight bytes are the dominant term in the total_size residual.
