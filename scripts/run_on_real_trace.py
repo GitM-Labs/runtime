@@ -19,8 +19,6 @@ import sys
 import warnings
 from pathlib import Path
 
-warnings.filterwarnings("ignore")  # this is a diagnostic script; keep output clean
-
 
 def main() -> int:
     try:
@@ -33,19 +31,30 @@ def main() -> int:
         print("SKIP: no CUDA device")
         return 2
 
-    from gitm.optimizer.attribution import attribute
+    from gitm.optimizer.attribution import (
+        AnalysisStatus,
+        RankedHypotheses,
+        attribute,
+        granger_evidence,
+    )
     from gitm.optimizer.dr import attribute_dr
     from gitm.optimizer.monitor import (
         KernelResidual,
         Residuals,
         _serialized_fraction,
         check_invariants,
+        serialized_text,
     )
     from gitm.planner.graph import predict_graph
     from gitm.tracer import capture
 
     out = Path("/tmp/w2_real_trace.jsonl")
-    with capture(out, workload_id="real-trace") as tr:
+    # The tracer warns when it loses records (unreadable shards, collector
+    # drops); they are listed below, not hidden. Granger and DR record their
+    # own warnings in their run records.
+    with warnings.catch_warnings(record=True) as capture_warnings, \
+            capture(out, workload_id="real-trace") as tr:
+        warnings.simplefilter("always")
         a = torch.randn(2048, 2048, device="cuda")
         b = torch.randn(2048, 2048, device="cuda")
         c = a
@@ -56,6 +65,8 @@ def main() -> int:
         _ = c.sum().item()
         torch.cuda.synchronize()
 
+    for w in capture_warnings:
+        print(f"capture warning: {w.category.__name__}: {w.message}")
     kernels = [e for e in tr.events if e.kind == "kernel"]
     if not kernels:
         print("FAIL: no kernels captured (is the CUPTI shim built? run gpu_setup.sh)")
@@ -64,7 +75,7 @@ def main() -> int:
 
     # Real stream-concurrency computed from the trace stream IDs.
     sc = _serialized_fraction(kernels)
-    print(f"serialized_concurrency_fraction (REAL): {sc:.3f}")
+    print(f"serialized_concurrency_fraction (REAL): {serialized_text(sc, len(kernels))}")
 
     # Residual per kernel = deviation from that kernel name's median duration.
     by_name: dict[str, list[int]] = {}
@@ -87,13 +98,36 @@ def main() -> int:
 
     graph = predict_graph()
     g = attribute(res, graph)
-    d = attribute_dr(res, graph)
-    print("top Granger hypotheses:",
+    try:  # as in the loop: a DR failure is recorded, not raised
+        d = attribute_dr(res, graph)
+    except Exception as exc:
+        d = RankedHypotheses(hypotheses=[], status=(
+            AnalysisStatus.UNAVAILABLE if isinstance(exc, ImportError) else AnalysisStatus.FAILED))
+        d.record_failure(type(exc).__name__, exc)
+
+    print(granger_evidence(g, pairs_in="the line below"))
+    print("top Granger pairs (exploratory):",
           [(h.cause_op[:18], h.effect_op[:18], round(h.p_value, 3)) for h in g.top(3)] or "none")
+    print(f"doubly-robust: {d.status.value}, {d.pairs_completed}/{d.pairs_attempted} op pairs"
+          + (f", failures {d.failures}" if d.failures else "")
+          + (f", warnings {d.warnings}" if d.warnings else "")
+          + (f", not tried as cause {d.skipped_causes}" if d.skipped_causes else "")
+          + (f" ({d.reason})" if d.reason else ""))
     print("top doubly-robust:",
           [(h.cause_op[:18], h.effect_op[:18], h.notes) for h in d.top(2)] or "none")
 
-    print("PASS: the runtime ran end-to-end on real A100 kernel data")
+    # Insufficient data is a correct answer (e.g. DR on a trace with no
+    # anomalies), not a failure to run; it passes with a note.
+    broken = (AnalysisStatus.NOT_RUN, AnalysisStatus.UNAVAILABLE, AnalysisStatus.FAILED)
+    if g.status in broken or d.status in broken:
+        print(f"FAIL: attribution did not run (Granger {g.status.value}, DR {d.status.value})")
+        return 1
+    notes = [f"{name} {h.status.value}" for name, h in (("Granger", g), ("DR", d))
+             if h.status is not AnalysisStatus.OK]
+    if capture_warnings:
+        notes.append(f"{len(capture_warnings)} capture warning(s)")
+    print("PASS: the runtime ran end-to-end on real A100 kernel data"
+          + (f" (note: {'; '.join(notes)})" if notes else ""))
     return 0
 
 

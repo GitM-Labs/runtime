@@ -1,0 +1,47 @@
+# zai-org/GLM-5.1-FP8 — the vendor's FP8 release of GLM-5.1.
+# Source: https://huggingface.co/zai-org/GLM-5.1-FP8/blob/main/config.json
+#
+# `extends: glm-5-fp8` with nothing overridden in spec. config.json differs
+# from GLM-5-FP8's only in transformers_version (identical quantization_config,
+# including the modules_to_not_convert list), and model.safetensors.index.json
+# is byte-identical to GLM-5-FP8's: same 756,162,687,872 B, same 119,028
+# tensors in 142 shards. All 142 shard LFS oids differ — new weights.
+# This is the checkpoint the vLLM GLM5 recipe actually serves.
+
+name: zai-org/GLM-5.1-FP8
+family: glm_moe_dsa
+extends: glm-5-fp8
+description: >
+  GLM-5.1 quantised to FP8 e4m3 (128x128 blocks); the same precision split as
+  GLM-5-FP8 — indexer wq_b/wk fp8, weights_proj, router, embeddings, lm_head
+  and eh_proj bf16. No IndexShare.
+
+spec: {}
+
+provenance:
+  verified:
+    - claim: identical to GLM-5-FP8 in config and weight map
+      detail: >
+        config.json diff: transformers_version only. model.safetensors.index.json
+        byte-identical (cmp). The fp8 indexer projections proven on GLM-5-FP8 by
+        byte difference therefore hold here.
+    - claim: predicted weight bytes vs the published checkpoint
+      detail: >
+        total_size 756,162,687,872 B. model_weight_bytes predicts
+        756,009,171,936 B: -0.020%.
+
+  estimated:
+    - field: kv_dtype
+      value: bf16 (inherited)
+      detail: >
+        The vLLM GLM5 recipe command for GLM-5.1-FP8 passes no
+        --kv-cache-dtype; fp8 KV is an operator choice.
+    - field: index_share_for_mtp_iteration
+      value: false (inherited)
+      detail: No config key; the MTP layer ships its own indexer.
+
+  unmodelled:
+    - Indexer gate priced at the indexer op dtype (fp8) in the graph; stored
+      bf16 in the footprint. Under 2% of indexer bytes.
+    - rope_theta / max_position_embeddings — not spec fields.
+    - MTP eh_proj weight bytes; absorbed-MLA decode; MTP acceptance rate.

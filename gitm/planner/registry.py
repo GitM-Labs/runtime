@@ -2,11 +2,47 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+from dataclasses import asdict
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
 from gitm.planner.graph import Graph
 from gitm.planner.roofline import BatchConfig, HardwareSpec, ShardingConfig
+
+
+def text_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The text sub-config, or the config itself.
+
+    Some checkpoints ship a multimodal wrapper whose top level carries only
+    ``architectures``, the vision tower and the token ids; every shape the
+    decode graph needs sits under ``text_config``.
+
+    Hoisted here from ``hybrid_graph``, which learned this first and alone. The
+    other predicates read the top level, so a wrapped sparse-MoE checkpoint
+    failed every family test and resolved to ``dense`` — and the dense reader
+    then failed on the same missing ``hidden_size`` and fell back to the
+    Llama-2-7B default. An 8x MI355X run against Kimi K2.5 produced
+    ``"family": "dense"`` with 161 nodes on exactly that path: not a coarser
+    graph, a graph of a different model, with every residual measured against
+    it.
+
+    Applied at dispatch rather than inside each reader, so a fourth family
+    cannot forget it. Idempotent — a config with no wrapper comes back
+    unchanged, which is why the readers that already descend keep working.
+    """
+    inner = cfg.get("text_config")
+    if not isinstance(inner, dict):
+        return inner.to_dict() if hasattr(inner, "to_dict") else cfg
+    # The inner config wins on every shape, but a wrapper may be the only place
+    # the family is named — and `is_glm_moe_dsa_config` keys on exactly these
+    # two fields, with the registry's own comment saying that check "has to
+    # win". Replacing the config wholesale could delete the identity and leave a
+    # wrapped GLM matching the structural sparse-MoE test instead, priced with
+    # the DeepSeek-V4 graph. Carried over only where the inner config is silent.
+    return {**{k: cfg[k] for k in ("model_type", "architectures")
+               if k in cfg and not inner.get(k)}, **inner}
 
 
 def detect_family(cfg: dict[str, Any]) -> str:
@@ -15,6 +51,12 @@ def detect_family(cfg: dict[str, Any]) -> str:
     from gitm.planner.hybrid_graph import is_hybrid_moe_config
     from gitm.planner.moe_graph import is_sparse_moe_config
 
+    # Shapes come from the inner config; the *name* of the family may be on
+    # either. A multimodal wrapper can be the only place a checkpoint says what
+    # it is, so the identity check below is asked of both rather than given a
+    # precedence rule that would be a guess in one direction or the other.
+    outer, cfg = cfg, text_config(cfg)
+
     # The hybrid guard reads ``num_experts``; GLM and V4 both spell it
     # ``n_routed_experts``, so they fall through it. GLM must be tested *before*
     # sparse_moe: both carry ``index_topk`` + ``n_routed_experts``, so the
@@ -22,7 +64,7 @@ def detect_family(cfg: dict[str, Any]) -> str:
     # the clean separator and has to win.
     if is_hybrid_moe_config(cfg):
         return "hybrid"
-    if is_glm_moe_dsa_config(cfg):
+    if is_glm_moe_dsa_config(cfg) or is_glm_moe_dsa_config(outer):
         return "glm_moe_dsa"
     if is_sparse_moe_config(cfg):
         return "sparse_moe"
@@ -31,6 +73,7 @@ def detect_family(cfg: dict[str, Any]) -> str:
 
 def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None):
     """Build whichever model spec the detected family uses."""
+    cfg = text_config(cfg)
     family = detect_family(cfg)
     if family == "hybrid":
         from gitm.planner.hybrid_graph import spec_from_hf_config as _hybrid
@@ -44,9 +87,12 @@ def spec_from_hf_config(cfg: dict[str, Any], *, name: str | None = None):
         from gitm.planner.moe_graph import spec_from_hf_config as _sparse
 
         return _sparse(cfg, name=name)
-    raise NotImplementedError(
-        "no config reader for the dense family yet — build a ModelSpec directly"
-    )
+    # The dense reader refuses (DenseConfigUnsupported, a ValueError and a
+    # NotImplementedError) anything it cannot price exactly: detect_family's
+    # "dense" is a fallback, not a positive identification.
+    from gitm.planner.graph import spec_from_hf_config as _dense
+
+    return _dense(cfg, name=name)
 
 
 def predict_for_config(
@@ -62,11 +108,14 @@ def predict_for_config(
     Raises
     ------
     NotImplementedError
-        For the dense family, which has no config reader. Deliberately an
+        For a config that falls through to the dense family but is not a plain
+        dense transformer (or omits a shape the dense graph needs). The raised
+        ``DenseConfigUnsupported`` is also a ``ValueError``. Deliberately an
         exception rather than a silently generic graph: a dense prediction for a
         checkpoint whose shape was never read would produce residuals against a
         model of something else.
     """
+    cfg = text_config(cfg)
     family = detect_family(cfg)
     if family == "hybrid":
         from gitm.planner.hybrid_graph import predict_hybrid_graph
@@ -83,12 +132,10 @@ def predict_for_config(
         from gitm.planner.moe_graph import spec_from_hf_config as _sparse
 
         return predict_moe_graph(_sparse(cfg, name=name), hw, batch, sharding), family
-    raise NotImplementedError(
-        f"{name or 'this checkpoint'} is neither a hybrid linear-attention MoE, a "
-        "GLM-5.2-class glm_moe_dsa, nor a DeepSeek-V4-class sparse-MoE checkpoint. The "
-        "dense graph models it, but has no config reader — construct a ModelSpec and "
-        "call predict_graph directly."
-    )
+    from gitm.planner.graph import predict_dense_graph
+    from gitm.planner.graph import spec_from_hf_config as _dense
+
+    return predict_dense_graph(_dense(cfg, name=name), hw, batch, sharding), family
 
 
 # ── ``gitm plan``: the CLI front for everything above ───────────────────────
@@ -130,6 +177,18 @@ def add_plan_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="Seconds per dependent kernel launch. Default 2e-6 "
                          "(CUDA-graph replay); eager is nearer 5e-6, and the "
                          "2.5x moves where launch-bound work crosses over.")
+    ap.add_argument("--gpu-mem-util", type=float, default=0.9,
+                    help="vLLM --gpu-memory-utilization, for the fit ledger (default 0.9).")
+    ap.add_argument("--workspace-gb", type=float, default=0.0,
+                    help="Per-rank activation workspace + graph pools + comm buffers, "
+                         "GB. Charged in the same ledger as KV; 0 prints as unstated.")
+    ap.add_argument("--kv-cache-dtype", default="auto",
+                    choices=("auto", "bf16", "fp16", "fp8"),
+                    help="vLLM --kv-cache-dtype. 'auto' (the default) prices the "
+                         "catalogue's kv_dtype, which records what vLLM resolves auto "
+                         "to for that checkpoint: fp8 when its quantization_config "
+                         "declares a static fp8 kv_cache_scheme, the model dtype "
+                         "otherwise. 'fp8' is the generic one-byte layout.")
     ap.add_argument("--tp", type=int, default=1, help="Tensor-parallel size.")
     ap.add_argument("--ep", type=int, default=1, help="Expert-parallel size.")
     ap.add_argument("--dp", type=int, default=1, help="Data-parallel size.")
@@ -157,25 +216,48 @@ def _hardware(sku: str | None) -> HardwareSpec:
 
 def _load(model: str) -> tuple[Any, str, str]:
     """``(spec, family, provenance_note)`` from a catalogue name or a config path."""
-    from gitm.planner.model_catalogue import available, load_entry, load_spec
+    from gitm.planner.model_catalogue import _resolve, available, load_entry, load_spec
 
     p = Path(model)
-    if p.suffix == ".json" and p.is_file():
-        cfg = json.loads(p.read_text())
-        # Family first: the dense reader raises, and the caller wants to decline
-        # with a message rather than surface a NotImplementedError.
-        family = detect_family(cfg)
-        if family == "dense":
-            return None, family, "config.json (no provenance)"
-        return (spec_from_hf_config(cfg, name=str(p)), family,
-                "config.json (no provenance)")
 
-    if model in available() or Path(model).suffix in (".yaml", ".yml"):
+    # The catalogue first, for every form including a path. An entry carries a
+    # corrected family and fields fitted by hand that a raw config does not, so
+    # where both exist the entry is the better answer — and a `config.json`
+    # inside an HF snapshot is exactly that case: the directory above it still
+    # names the model. `_resolve` takes a stem, a model id, or a cache path.
+    #
+    # Existence is tested separately from loading: `load_entry` also raises
+    # FileNotFoundError when an entry's `extends` base is missing, and catching
+    # that here would report a broken entry as an absent one and quietly fall
+    # back to the raw config.
+    try:
+        _resolve(model)
+    except FileNotFoundError:
+        entry = None
+    else:
         entry = load_entry(model)
+    if entry is not None:
+        if entry.get("execution_status") == "static_only":
+            raise ValueError(f"{model}: checkpoint evidence only; planner integration pending")
         prov = entry.get("provenance", {})
         est = [e.get("field") for e in prov.get("estimated", [])]
         note = f"catalogue; fitted fields: {est or 'none'}"
+        if entry.get("checkpoint"):
+            note += "; STATIC_CHECKPOINT_ONLY; UNVERIFIED: engine, deployment, traffic, trace"
         return load_spec(model), entry["family"], note
+
+    # No entry: read the checkpoint itself, from a config.json path or from the
+    # directory holding one.
+    cfg_path = p / "config.json" if p.is_dir() else p
+    if cfg_path.suffix == ".json" and cfg_path.is_file():
+        cfg = json.loads(cfg_path.read_text())
+        family = detect_family(cfg)
+        # Named by what the caller asked for, not by the file that answered. A
+        # directory is how a local checkpoint is identified; reporting every one
+        # of them as `.../config.json` makes two of them indistinguishable in the
+        # table, the sweep and the JSON output.
+        return (spec_from_hf_config(cfg, name=model), family,
+                "config.json (no provenance)")
 
     raise FileNotFoundError(
         f"no catalogue entry or config.json at {model!r}. "
@@ -192,9 +274,33 @@ def _predict(spec, family: str, hw, batch, sharding):
         from gitm.planner.glm_graph import predict_glm_graph
 
         return predict_glm_graph(spec, hw, batch, sharding)
+    if family == "dense":
+        from gitm.planner.graph import predict_dense_graph
+
+        return predict_dense_graph(spec, hw, batch, sharding)
     from gitm.planner.moe_graph import predict_moe_graph
 
     return predict_moe_graph(spec, hw, batch, sharding)
+
+
+def _prediction_semantics() -> dict[str, Any]:
+    """Interpret the legacy aggregate without asserting an empirical latency.
+
+    A sum of modeled node costs is a whole-step lower bound only after its
+    traffic, rate and schedule assumptions have been established. Keep the
+    numeric legacy result unchanged; expose the interpretation to JSON clients.
+    """
+    return {
+        "kind": "serial_resource_proxy",
+        "aggregation": "sum_of_node_t_pred_s",
+        "latency_estimate_s": None,
+        "whole_step_bound_status": "not_validated",
+        "assumptions": [
+            "configured rates bound the resources used by this backend",
+            "modeled bytes match physical traffic at those resources",
+            "serial node aggregation matches the execution schedule",
+        ],
+    }
 
 
 def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
@@ -266,7 +372,7 @@ def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
     n_launch = sum(1 for n in g.nodes if n.prediction.bound == "launch")
     out += [
         "",
-        f"  floor {total * 1e3:.3f} ms/step   " + (
+        f"  serial proxy {total * 1e3:.3f} ms/step   " + (
             f"{g.batch.prefill_tokens / total:,.0f} tok/s "
             f"prefilling {g.batch.prefill_tokens:,} tokens"
             if g.batch.is_prefill
@@ -300,9 +406,10 @@ def _render_table(g, hw: HardwareSpec, spec, family: str, note: str) -> str:
         out.append("  ! priced against fallback peaks — the ceiling is low in a "
                    "known direction")
     out.append("")
-    out.append("  This is a floor at vendor peak, not a target. A measured kernel is")
-    out.append("  slower by whatever the implementation leaves on the table; a residual")
-    out.append("  here is a lead, not a defect.")
+    out.append("  This is a serial sum of modeled node costs at configured rates.")
+    out.append("  It is not an empirical latency target. A whole-step lower bound")
+    out.append("  needs validated traffic, rate and serial-schedule assumptions.")
+    out.append("  A residual is a lead, not by itself a defect.")
     return "\n".join(out)
 
 
@@ -312,6 +419,10 @@ def main(argv: list[str] | None = None) -> int:
         description="Predicted roofline floor for a checkpoint, without running it.",
     ))
     args = ap.parse_args(argv)
+    if not isfinite(args.gpu_mem_util) or not 0 < args.gpu_mem_util <= 1:
+        ap.error("--gpu-mem-util must be finite and in (0, 1]")
+    if not isfinite(args.workspace_gb) or args.workspace_gb < 0:
+        ap.error("--workspace-gb must be finite and nonnegative")
 
     from gitm.planner.model_catalogue import available
 
@@ -336,19 +447,32 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, ValueError) as e:
         print(f"cannot plan: {e}")
         return 2
-    if family == "dense":
-        print(f"cannot plan: {args.model} resolves to the dense family, which has no "
-              "config reader. Build a ModelSpec and call predict_graph directly.")
-        return 2
+    if args.kv_cache_dtype != "auto":
+        from dataclasses import fields as _fields
+        from dataclasses import replace as _replace_spec
+
+        # vLLM resolves 'auto' from the checkpoint (engine/arg_utils.py:1567-1570
+        # -> utils/torch_utils.py:324-342), which is what the catalogue records.
+        # An explicit dtype overrides the cache on every family, and both halves
+        # of an MLA entry where the spec splits them.
+        names = {f.name for f in _fields(spec)}
+        kv = {n: args.kv_cache_dtype for n in ("kv_dtype", "kv_rope_dtype") if n in names}
+        if not kv:
+            print(f"cannot plan: --kv-cache-dtype does not apply to the {family} family")
+            return 2
+        spec = _replace_spec(spec, **kv)
+
+    from gitm.planner.context import peak_for_sku
 
     hw = _hardware(args.gpu)
     if args.launch_overhead is not None:
         from dataclasses import replace as _replace
 
         hw = _replace(hw, kernel_launch_overhead_s=args.launch_overhead)
-    if args.gpu and args.gpu.lower() not in hw.name.lower():
+    # Not a name check: "A10" is inside the fallback's "A100-SXM4-80GB".
+    if args.gpu and peak_for_sku(args.gpu) is None:
         print(f"warning: --gpu {args.gpu!r} is not in the catalogue; priced against "
-              f"{hw.name}, whose bandwidth may differ by more than 2x.")
+              f"{hw.name}, whose bandwidth may differ by more than 2x.", file=sys.stderr)
 
     sharding = ShardingConfig(tp=args.tp, ep=args.ep, dp=args.dp)
 
@@ -362,11 +486,15 @@ def main(argv: list[str] | None = None) -> int:
               f"kv_len={args.kv_len}, TP={args.tp} EP={args.ep}")
         print(f"  {'batch':>7s} {'ms/step':>10s} {'tok/s':>12s} {'compute-bound':>14s}")
         for b in sizes:
-            g = _predict(spec, family, hw,
-                         BatchConfig(batch=b, kv_cache_len=args.kv_len,
-                                     speculative_tokens=args.spec_tokens,
-                                     acceptance_rate=args.acceptance_rate),
-                         sharding)
+            try:
+                g = _predict(spec, family, hw,
+                             BatchConfig(batch=b, kv_cache_len=args.kv_len,
+                                         speculative_tokens=args.spec_tokens,
+                                         acceptance_rate=args.acceptance_rate),
+                             sharding)
+            except ValueError as e:
+                print(f"cannot plan: {e}")
+                return 2
             cb = sum(1 for n in g.nodes if n.prediction.bound == "compute")
             print(f"  {b:7d} {g.total_pred_s * 1e3:9.3f} "
                   f"{b / g.total_pred_s:12,.0f} {cb:9d}/{len(g.nodes)}")
@@ -386,9 +514,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.as_json:
+        fit_data, fit_why = None, f"fit ledger unsupported for {family}"
+        if family == "glm_moe_dsa":
+            fit, fit_why = _fit_ledger(spec, hw, batch, sharding, args)
+            if fit is not None:
+                fit_data = {**asdict(fit), "kv_available": fit.kv_available,
+                            "kv_tokens": fit.kv_tokens, "fits": fit.fits}
         print(json.dumps({
             "model": getattr(spec, "name", None),
             "family": family,
+            "provenance": note,
             "hardware": hw.name,
             "sharding": {"tp": args.tp, "ep": args.ep, "dp": args.dp},
             "batch": {"batch": args.batch, "kv_cache_len": args.kv_len,
@@ -397,7 +532,14 @@ def main(argv: list[str] | None = None) -> int:
                       "prefill_tokens": args.prefill_tokens,
                       "prefill_context": args.prefill_context,
                       "prefill_requests": args.prefill_requests},
+            "kv_cache_dtype": getattr(spec, "kv_dtype", None),
+            "requested_kv_cache_dtype": args.kv_cache_dtype,
+            "gpu_memory_utilization": args.gpu_mem_util,
+            "workspace_bytes": args.workspace_gb * 1e9,
+            "memory_fit": fit_data,
+            "memory_fit_unavailable_reason": None if fit_data is not None else fit_why,
             "total_pred_s": g.total_pred_s,
+            "prediction_semantics": _prediction_semantics(),
             "has_unpriced_collectives": g.has_unpriced_collectives,
             "has_fallback_peaks": g.has_fallback_peaks,
             "nodes": [
@@ -417,4 +559,67 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print(_render_table(g, hw, spec, family, note))
+    if family == "glm_moe_dsa":
+        print(_render_precision_and_fit(spec, hw, batch, sharding, args))
     return 0
+
+
+_NO_CAPACITY = "no HBM capacity in the catalogue for this SKU"
+
+
+def _fit_ledger(spec, hw: HardwareSpec, batch, sharding, args):
+    """The per-rank ledger, or the one reason it cannot be built.
+
+    Text and JSON output both come through here, so an unknown SKU (the fallback
+    spec carries ``memory_bytes`` 0) reads as unknown capacity in both rather
+    than as a zero-capacity deployment that does not fit.
+    """
+    if hw.memory_bytes <= 0:
+        return None, _NO_CAPACITY
+    from gitm.planner.glm_graph import memory_fit
+
+    return memory_fit(spec, hw, batch, sharding,
+                      gpu_memory_utilization=args.gpu_mem_util,
+                      workspace_bytes=args.workspace_gb * 1e9), None
+
+
+def _render_precision_and_fit(spec, hw: HardwareSpec, batch, sharding, args) -> str:
+    """What the expert weights execute as, and the per-rank memory ledger.
+
+    The expert bank is most of a decode step on every MoE entry, so its stored
+    format, the backend it lands on and the rows at which it turns compute-bound
+    are printed rather than left implicit in a bytes column.
+    """
+    from gitm.planner.roofline import critical_rows, distinct_experts, resolve_execution
+
+    dtype = spec.dtype_for("moe_routed", spec.expert_dtype)
+    ex = resolve_execution(dtype, hw)
+    fmt = ex.stored
+    distinct = distinct_experts(batch.positions_per_step, spec.n_routed_experts,
+                                spec.num_experts_per_tok)
+    rows_per_expert = (batch.positions_per_step * spec.num_experts_per_tok / distinct
+                       if distinct else 0.0)
+    knee = critical_rows(dtype, hw, spec.hidden, spec.moe_intermediate_size)
+    out = [
+        f"  experts   {fmt.name}: {fmt.bytes_per_elem:.4f} B/weight stored "
+        f"({fmt.scale_overhead:.1%} scales) -> {ex.backend}, {ex.compute_dtype} MACs, "
+        f"{ex.bytes_per_use:.4f} B/weight per use"
+        + (" [estimated rule]" if ex.estimated else ""),
+        f"            {rows_per_expert:.2f} rows/expert at this batch; compute-bound "
+        f"above {knee:.0f}",
+    ]
+    fit, why = _fit_ledger(spec, hw, batch, sharding, args)
+    if fit is None:
+        return "\n".join(out + [f"  fit       {why}"])
+    ws = (f"{fit.workspace / 1e9:.1f} GB workspace" if fit.workspace
+          else "workspace unstated (0)")
+    out += [
+        f"  fit       {fit.budget / 1e9:.1f} GB budget ({args.gpu_mem_util:g} x "
+        f"{fit.capacity / 1e9:.0f}) - {fit.weights / 1e9:.1f} GB weights - {ws} = "
+        f"{fit.kv_available / 1e9:.1f} GB for KV",
+        f"            need {fit.kv_needed / 1e9:.1f} GB KV "
+        f"({fit.kv_bytes_per_token:,.0f} B/token, replicated per rank): "
+        + ("fits" if fit.fits else "DOES NOT FIT")
+        + f"; holds {fit.kv_tokens:,.0f} tokens",
+    ]
+    return "\n".join(out)

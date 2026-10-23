@@ -7,17 +7,17 @@
 
 ## Summary
 
-1 verified claims, aggregate measured delta +4.8%.
+1 claim(s) kept on a measured A/B; the largest is +4.8% (kv_cache_block_size_16). Each was measured in its own A/B, so the deltas do not add up to a run total.
 
 ## Claims
 
 Every claim below carries the full provenance chain. Incomplete chain = no
 claim. Rejected and rolled-back candidates are listed in the appendix.
 
-| # | Claim | Residual | Causal evidence | Intervention | Predicted Δ | Measured Δ |
+| # | Claim | Residual | Evidence | Intervention | Predicted Δ | Measured Δ |
 |---|---|---|---|---|---|---|
-| 1 | Set PagedAttention block size to 16 | `kernel_time`: +35.0% | mlp_gate_up→attn_score_value (p=0.02) | `kv_cache_block_size_16` | +5.0% | +4.8% |
-| 2 | Raise GPU memory utilization to 0.92 | `memory_traffic`: +28.0% | paged_attention→attn_out_proj (p=0.04) | `gpu_memory_utilization_092` | +3.0% | — |
+| 1 | Set PagedAttention block size to 16 | `kernel_time`: +35.0% | live A/B: kept (+4.8% decode throughput, via restart) | `kv_cache_block_size_16` | +5.0% | +4.8% |
+| 2 | Raise GPU memory utilization to 0.92 | `memory_traffic`: +28.0% | Granger ran (20/20 op pairs) but is not used as evidence: series are ordered by launch, not step; pairs in residuals.json | `gpu_memory_utilization_092` | +3.0% | — |
 
 
 ## Appendix

@@ -1,0 +1,173 @@
+# Qwen/Qwen3.8-Flash-Next — Qwen4ExpForConditionalGeneration (model_type
+# qwen4_exp, text model_type qwen4_exp_text). A qwen3_5_moe-style gated-DeltaNet
+# 3:1 hybrid backbone plus four mechanisms the `hybrid` family has never seen.
+# Source: https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/de4b8e4d43b917e7706784d8bb445c9af86a3540/config.json
+# Read from config.json, model.safetensors.index.json, the safetensors headers
+# of all 131 shards (HTTP Range), and the three small I64 n-gram index tensors
+# read directly from shard bytes, at that revision. No modeling code was
+# published alongside the config to read; no traces.
+#
+# Family note: `hybrid` carries the backbone field for field (attention,
+# DeltaNet, 512-expert MoE, MTP). It cannot express what is new:
+#   - an n-gram embedding table (102.40 GB, 28.4% of the checkpoint) feeding a
+#     per-layer-embedding (PLE) block on one layer,
+#   - 4-stream hyper-connections with a rank-320 mixer on both sub-blocks of
+#     every layer (1.28 GB, streamed every decode step),
+#   - a sparse indexer on the 12 full-attention layers (top-2048 of a 4x
+#     compressed key set),
+# so this is the closest honest fit and its predictions are wrong in known
+# directions, listed under unmodelled. The big one: fit checks under-count
+# resident bytes by ~109 GB (30%), because model_weight_bytes has no term for
+# the n-gram table or the MTP layer.
+#
+# "176B": the parameter count that reproduces it is total minus vision minus
+# MTP — 179.999981459B params in the headers, less 0.449B vision and 2.607B
+# MTP = 176.94B. Of those, 51.20B (29%) are the n-gram table, which is a
+# lookup (16 rows of 160 per token) rather than compute; 120.80B are routed
+# experts; the transformer proper excluding the table is 125.74B.
+
+name: Qwen/Qwen3.8-Flash-Next
+family: hybrid
+description: >
+  48 layers, 36 gated-DeltaNet and 12 full-attention (full attention on layers
+  3, 7 ... 47), hidden 2560, top-10 of 512 experts (width 640) plus one shared
+  expert on every layer. Gated attention output, partial RoPE (64 of 256).
+  New vs Qwen3.5/3.6: sparse indexer on full-attention layers (4 heads x 128,
+  compress 4, budget 2048), 4-way hyper-connections (rank 320), a 3-gram hashed
+  embedding table (16 heads x ~20M rows x 160, 102.4 GB) into a per-layer
+  embedding block on one layer. One MTP layer. bf16. 360.00 GB on disk
+  (~180B params; the advertised 176B excludes vision and MTP).
+
+spec:
+  hidden: 2560
+  n_layers: 48
+  vocab: 248320
+
+  # Full attention. 24 heads x 256 = 6144, wider than hidden. The config has no
+  # attn_output_gate key; it has output_gate_type: sigmoid, and the header
+  # settles it: q_proj is [12288, 2560] = query 6144 + gate 6144, o_proj
+  # [2560, 6144]. k_proj / v_proj [512, 2560] = 2 KV heads x 256.
+  n_heads: 24
+  num_kv_heads: 2
+  head_dim: 256
+  partial_rotary_factor: 0.25
+  attn_output_gate: true
+
+  # Gated DeltaNet, 16 key heads, 48 value heads (3:1). Header: in_proj_qkv
+  # [10240, 2560] = q 2048 + k 2048 + v 6144; in_proj_z [6144, 2560]; out_proj
+  # [2560, 6144]; in_proj_a/b [48, 2560]; conv1d [10240, 1, 4].
+  linear_num_key_heads: 16
+  linear_num_value_heads: 48
+  linear_key_head_dim: 128
+  linear_value_head_dim: 128
+  linear_conv_kernel_dim: 4
+  ssm_state_dtype: fp32           # mamba_ssm_dtype float32
+  # Explicit conv state, as in qwen3.5-397b-a17b: channels read from the
+  # conv1d header, bf16 state dtype estimated. conv_dim is the legacy fitted
+  # field (value width) and is superseded.
+  conv_dim: 6144
+  linear_conv_channels: 10240
+  linear_conv_state_dtype: bf16
+
+  # MoE on all 48 layers (no mlp_only_layers key; experts on every layer in the
+  # header). gate_up_proj fused [512, 1280, 2560], down_proj [512, 2560, 640].
+  num_experts: 512
+  num_experts_per_tok: 10
+  moe_intermediate_size: 640
+  shared_expert_intermediate_size: 640
+
+  layer_types:
+    pattern: [linear_attention, linear_attention, linear_attention, full_attention]
+    repeat: 12
+  full_attention_interval: 4
+
+  # mtp.layer_types [full_attention], mtp.num_hidden_layers 1. The MTP layer has
+  # its own 512-expert bank, its own indexer and its own hyper-connections.
+  mtp_num_hidden_layers: 1
+  mtp_layer_kind: full_attention
+
+  weight_dtype: bf16
+  kv_dtype: bf16
+  act_dtype: bf16
+
+provenance:
+  verified:
+    - claim: backbone shapes and schedule read from the weight map
+      detail: >
+        self_attn.* (incl. indexer) on exactly layers 3,7,...,47; linear_attn.*
+        on the other 36; mlp.experts on all 48; shapes as commented in the spec.
+        All BF16 except three I64 n-gram index tensors (Hub metadata: BF16
+        179,999,981,424 / I64 35 params).
+    - claim: predicted weight bytes against the published checkpoint
+      detail: >
+        total_size 359,999,963,128 B (360.00 GB), equal to the sum of the 131
+        shard headers. model_weight_bytes predicts 250.84 GB, -30.32%. The
+        backbone it does model matches the headers (routed experts 241.59 GB to
+        the byte); the residual is, from the headers: -102.40 GB n-gram table,
+        -5.21 GB MTP layer, -1.28 GB hyper-connections, -0.90 GB vision,
+        -0.07 GB PLE projections, -0.04 GB indexer, -0.03 GB small DeltaNet
+        tensors and norms, against +0.75 GB from the DeltaNet query over-count
+        (see estimated); the terms sum to the residual within 0.02 GB. Against
+        total_size less the n-gram table the delta is -2.6%.
+    - claim: n-gram table geometry read from shard bytes
+      detail: >
+        layers.1.ple.ple_embedding.ngram_heads_vocab_sizes holds 16 primes
+        20,000,003 ... 20,000,171 (sum 320,001,446; ngram_vocab_size_base 20M),
+        = (ngram_size 3 - 1) orders x heads_per_ngram 8. The table is split
+        into split_ngram_parts 128 tensors of [2,500,012, 160] bf16 (rows padded
+        to a multiple of 128: 320,001,536), 102,400,491,520 B. 160 x 16 heads =
+        2560 = ple_embed_dim. layer_multipliers is three I64 hash multipliers.
+
+  estimated:
+    - field: DeltaNet input-projection width
+      value: graph prices q at linear_num_value_heads x key_dim (6144); header has 2048
+      detail: >
+        Same family rule as qwen3.5-397b-a17b: linear_query_dim follows the
+        value-head count, the checkpoint's q follows the key-head count. +4096
+        x 2560 weights per DeltaNet layer (21 MB), +0.75 GB over 36 layers,
+        linattn_in_proj over-priced by 4096/(10240+6144) = 25%. Needs the
+        shared-code fix, not a catalogue value.
+    - field: linear_conv_state_dtype
+      value: bf16
+      detail: >
+        As in qwen3.5-397b-a17b — conv state in the model dtype, recurrent state
+        in mamba_ssm_dtype; inferred, not read from engine source.
+    - field: full-attention cost at long context
+      value: dense over kv_len (indexer ignored)
+      detail: >
+        With indexer_budget 2048 the attention core reads at most 2048 selected
+        positions per query once kv_len exceeds it, so the dense pricing
+        over-states attn_score_value by kv_len/2048 (16x at 32k) on 12 of 48
+        layers, while omitting the indexer's own scoring pass (4 heads x 128
+        over kv_len/4 compressed keys) and its 0.04 GB of weights. Below 2048
+        tokens the two coincide except for the indexer pass.
+
+  unmodelled:
+    - The n-gram embedding table, 102.40 GB bf16 resident (28.4% of the
+      checkpoint). Per decode token it is 16 hashed row gathers of 160 bf16
+      (5 KB) — negligible traffic, enormous footprint. model_weight_bytes has
+      no field for it, so any fit / TP-shape claim from this entry
+      under-states memory by this amount. Shared-code change needed (an
+      extra-resident-bytes or ngram_* term on HybridMoEModelSpec).
+    - The PLE block, on layer index 1 in the weight map (config says
+      ple_layer_ids [2] — either 1-based or "before layer 2"; unresolved
+      without modeling code) — key_proj [10240, 2560], value_proj [2560, 2560],
+      a width-4 conv1d over 10240 channels (ple_conv_kernel_size 4), three
+      norms. 0.07 GB; one GEMM-sized node per decode step not emitted.
+    - Hyper-connections, hc_count 4 / hc_lowrank 320. The residual stream is 4
+      x 2560 = 10240 wide; each of the 96 sub-blocks (attn + mlp per layer)
+      carries input_mix_weight_down [320, 10240], input_mix_weight_up
+      [10240, 320], block_inject_weight [4, 10240] and a 10240 norm, plus a
+      final mixer. 1.28 GB bf16, all of it read every decode step — about a
+      tenth on top of the ~12 GB of weights a batch-1 step otherwise streams — and 4x
+      the residual-stream activation bytes. No nodes emitted.
+    - The sparse indexer on full-attention layers (indexer_n_heads 4,
+      indexer_head_dim 128, indexer_kv_heads 1, compress ratio 4, budget 2048;
+      index_qk_proj [640, 2560] = 4x128 q + 1x128 k). Its compressed index-key
+      cache (~128 elements per 4 tokens per layer, ~3% on top of K+V) is not in
+      kv_bytes_per_token.
+    - The MTP layer, 5.21 GB (own 512-expert bank 5.03 GB, indexer, HC,
+      fc_embedding / fc_hidden [2560, 2560]). Not in model_weight_bytes; its
+      indexer and HC are not in the draft graph either.
+    - The vision tower (27 blocks, hidden 1152) and merger, 0.90 GB.
+    - Prefill, and interleaved mRoPE (mrope_section [11, 11, 10]).

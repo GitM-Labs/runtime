@@ -1,0 +1,71 @@
+{
+  "base": "05abd11b866bdabe2619b5f289db52d647eb55ad",
+  "head": "16d6d44c984d5446b6fc124550c995649cf96106",
+  "status": "ahead",
+  "total_commits": 3,
+  "changed_files": [
+    "docs/kernel_identity.md",
+    "docs/rocm.md",
+    "docs/rocm_correlation.md",
+    "gitm/distributed/correlate.py",
+    "gitm/health/__init__.py",
+    "gitm/health/collective.py",
+    "gitm/health/probe_worker.py",
+    "gitm/optimizer/apply.py",
+    "gitm/optimizer/attribution.py",
+    "gitm/optimizer/deviation.py",
+    "gitm/optimizer/dr.py",
+    "gitm/optimizer/mechanism_fixtures.py",
+    "gitm/optimizer/monitor.py",
+    "gitm/scheduler/loop.py",
+    "gitm/serve/vllm.py",
+    "gitm/tracer/_cupti/build.py",
+    "gitm/tracer/_cupti/cupti_core.c",
+    "gitm/tracer/_cupti/cupti_core.h",
+    "gitm/tracer/_cupti/cupti_inject.c",
+    "gitm/tracer/_cupti/cupti_shim.c",
+    "gitm/tracer/_cupti_decode.py",
+    "gitm/tracer/_rocm/rocm_inject.c",
+    "gitm/tracer/emulate.py",
+    "gitm/tracer/injection.py",
+    "gitm/tracer/kernel_attributes.py",
+    "gitm/tracer/kernel_taxonomy.py",
+    "gitm/tracer/schema.py",
+    "gitm/tracer/vendor.py",
+    "gitm/tracer/vllm_stats.py",
+    "gitm/workloads.py",
+    "scripts/check_collectors.py",
+    "scripts/check_restart_release.py",
+    "tests/native/nvtx_stack_harness.c",
+    "tests/test_amd_kernel_vocabulary.py",
+    "tests/test_causal_attribution_parity.py",
+    "tests/test_collective_health.py",
+    "tests/test_correlate_single_process.py",
+    "tests/test_graph_identity_emitters.py",
+    "tests/test_identity_accuracy.py",
+    "tests/test_nvtx_graph_mode.py",
+    "tests/test_restore_failure.py",
+    "tests/test_rocm_collector_contract.py",
+    "tests/test_rocm_correlation.py",
+    "tests/test_run_loop_workload.py",
+    "tests/test_vendor_classification.py",
+    "tests/test_vllm_knobs_and_restart.py"
+  ],
+  "commits": [
+    {
+      "sha": "397f337ac68bdc7a37667f28ce4c62e951c74df7",
+      "message": "Feat/gpu health checker (#162)"
+    },
+    {
+      "sha": "97c062df6f1fb5ff962000ec87340ccc8ed03f35",
+      "message": "restart A/B: release the engine a kept candidate replaces (#155)"
+    },
+    {
+      "sha": "16d6d44c984d5446b6fc124550c995649cf96106",
+      "message": "tracer: ROCm port of kernel-identity correlation, validated against ground truth (#164)"
+    }
+  ],
+  "checked_at": "2026-10-11",
+  "planner_files_changed": [],
+  "source": "https://api.github.com/repos/GitM-Labs/runtime/compare/05abd11b866bdabe2619b5f289db52d647eb55ad...16d6d44c984d5446b6fc124550c995649cf96106"
+}

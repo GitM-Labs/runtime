@@ -1,0 +1,74 @@
+# MiniMaxAI/MiniMax-M2.7 — same architecture and byte layout as MiniMax-M2.5.
+# Source: https://huggingface.co/MiniMaxAI/MiniMax-M2.7/blob/d494266a4affc0d2995ba1fa35c8481cbd84294b/config.json
+# Read from config.json, model.safetensors.index.json and ALL 125 safetensors
+# shard headers (HTTP Range) at that revision. No engine source, no trace.
+#
+# Extends minimax-m2.5 with NO spec overrides, because nothing the spec
+# carries differs: config.json differs from M2.5's only in
+# max_position_embeddings (204800 vs 196608 — the planner has no field for it;
+# kv_cache_len is a BatchConfig input) and an added `"dtype": "bfloat16"` key
+# (the unquantised modules' dtype, already bf16 in M2.5's headers). The weight
+# map has the same 96,103 tensor names, and the headers give the same dtype and
+# shape for every tensor pattern, summing to the same 230,121,630,720 B.
+
+name: MiniMaxAI/MiniMax-M2.7
+family: hybrid
+extends: minimax-m2.5
+checkpoint:
+  repository: MiniMaxAI/MiniMax-M2.7
+  revision: d494266a4affc0d2995ba1fa35c8481cbd84294b
+  config_sha256: 697c30492781d55ac516011f937b5cdec045710b5b0c9ca39a6ea277785df9aa
+  index_sha256: 15a84f7839a8589549075c900f6a601360986dbbbf6120bc9765add6d5b90630
+  tensor_count: 96103
+  shard_count: 125
+  # Like M2.5's, total_size is not the checkpoint size (and is 14.75 GB larger
+  # than M2.5's for an identical payload). See provenance.open.
+  index_total_size: 480836588544
+  payload_bytes: 230121630720
+description: >
+  MiniMax-M2.5's architecture unchanged: 62 full-attention GQA layers (48q/8kv,
+  head_dim 128, partial RoPE 64/128), 256 experts top-8 width 1536, no shared
+  expert, fp8 e4m3 128x128 blocks with fp32 router and bf16 embedding/lm_head.
+  Only max_position_embeddings changes (204800). 230.12 GB on disk; no MTP
+  tensors shipped despite num_mtp_modules 3.
+
+spec: {}
+
+provenance:
+  verified:
+    - claim: the architecture is identical to MiniMax-M2.5
+      detail: >
+        config.json diff against M2.5 at f710177: max_position_embeddings
+        196608 -> 204800, plus a new "dtype": "bfloat16" key. Every other key
+        (hidden_size, layers, heads, head_dim, rotary_dim, experts, top-k,
+        intermediate_size, shared_intermediate_size, quantization_config,
+        num_mtp_modules, attn_type_list) is equal.
+    - claim: the weight map and headers agree tensor for tensor
+      detail: >
+        Same 96,103 tensor names. Across all 125 shard headers every tensor
+        pattern has the same dtype and shape as M2.5 (F8_E4M3 linears with F32
+        128x128 weight_scale_inv, F32 gate [256, 3072], BF16 embed_tokens and
+        lm_head [200064, 3072]); payload sums to 230,121,630,720 B, identical to
+        M2.5, and shard files to 230,134,260,592 B (the rest is JSON headers).
+    - claim: predicted weight bytes against the shipped payload
+      detail: >
+        228,744,752,832 B against 230,121,630,720 B (-0.60%), the same figure
+        and the same byte-exact residual ledger as M2.5 (bf16 embed/lm_head and
+        fp32 router priced at fp8, plus 1,720,320 B of norms and bias).
+        Against index total_size 480,836,588,544 B it is -52.4%.
+
+  open:
+    - question: why index total_size is 2.09x the shipped bytes
+      detail: >
+        480,836,588,544 B in metadata vs 230,121,630,720 B of tensors — and M2.5
+        reports 466,083,044,352 B for byte-identical tensors. Unexplained; the
+        header payload is treated as the published size.
+    - question: MTP — 3 modules declared, none shipped
+      detail: Same as M2.5; mtp_num_hidden_layers stays 0.
+    - question: KV cache dtype, TP vs EP
+      detail: Serving decisions, as on M2.5.
+
+  unmodelled:
+    - Everything M2.5's entry lists (per-op byte precision for lm_head and the
+      fp32 router; possible TP reduction inside the full-width QK-norm).
+    - max_position_embeddings 204800 — no spec field; context is a batch input.

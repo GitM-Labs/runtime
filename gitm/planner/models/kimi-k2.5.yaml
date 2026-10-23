@@ -157,10 +157,9 @@ provenance:
       detail: >
         model.safetensors.index.json total_size is 595,148,192,736 B
         (595.15 GB). model_weight_bytes with int4 experts (0.5 + 2/32 B/weight)
-        predicts 595.00 GB — -0.03%. The unmodelled vision tower (~0.9 GB) and
-        the omitted norms/weight_shape tensors nearly cancel against the coarse
-        per-group scale accounting; the same shape all-bf16 would be 2.054 TB,
-        so the int4 entry is doing real work here, not rounding.
+        predicts 594.20 GB, -0.16%; the residual is the unmodelled vision tower
+        (~0.9 GB). The same shape all-bf16 would be 2.053 TB, so the int4 entry
+        is doing real work here, not rounding.
 
   estimated:
     - field: MLA absorption (attn_kv_b vs attn_out_proj width)

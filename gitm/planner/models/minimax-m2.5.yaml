@@ -1,0 +1,166 @@
+# MiniMaxAI/MiniMax-M2.5 — MiniMaxM2ForCausalLM (model_type minimax_m2):
+# all-full-attention GQA + 256-expert MoE, fp8 e4m3 with 128x128 block scales.
+# Source: https://huggingface.co/MiniMaxAI/MiniMax-M2.5/blob/f710177d938eff80b684d42c5aa84b382612f21f/config.json
+# Read from config.json, model.safetensors.index.json and ALL 125 safetensors
+# shard headers (HTTP Range) at that revision. No engine source, no trace.
+#
+# Family note: `hybrid` is the only catalogue family with GQA attention, and an
+# all-`full_attention` schedule with zero shared experts is a degenerate but
+# exact case of it — no linear-attention layer, no window, no shared expert.
+# What the family cannot express is listed under provenance.unmodelled; the
+# largest item is that per-op dtype overrides change an op's compute ceiling but
+# NOT its bytes (see the weight-bytes claim).
+
+name: MiniMaxAI/MiniMax-M2.5
+family: hybrid
+checkpoint:
+  repository: MiniMaxAI/MiniMax-M2.5
+  revision: f710177d938eff80b684d42c5aa84b382612f21f
+  config_sha256: 3372a31ecbdba614b309cfa5b3dfec33ceea3c580cb9612ff35345d92ced8618
+  index_sha256: 13268f1c512163d7b1b482e1307fcf7c6565d4a9109861af9612e1b4f0c96c49
+  tensor_count: 96103
+  shard_count: 125
+  # The index's metadata.total_size. It is NOT the size of the checkpoint — see
+  # provenance.open Q1. payload_bytes is the sum of every tensor's data_offsets
+  # span across all 125 shard headers, and sum(shard file sizes) minus that sum
+  # is exactly the 125 JSON headers (12,633,840 B), so it is complete.
+  index_total_size: 466083044352
+  payload_bytes: 230121630720
+description: >
+  62 layers, hidden 3072, every layer full softmax attention with GQA 48 query /
+  8 KV heads at head_dim 128 (q_dim 6144, wider than hidden), partial RoPE on 64
+  of 128 dims, per-layer QK RMSNorm. 256 routed experts top-8 (sigmoid + score
+  correction bias), expert width 1536, no shared expert, no dense layer. fp8 e4m3
+  128x128 block-quantised linears; router fp32, embedding and lm_head bf16
+  (untied). config.json declares 3 MTP modules but the release ships no MTP
+  tensors. 230.12 GB on disk.
+
+spec:
+  hidden: 3072
+  n_layers: 62
+  vocab: 200064
+
+  # Attention. q_proj is [6144, 3072] in the header = 48 x 128, so the query
+  # projection WIDENS (q_dim 6144 vs hidden 3072); deriving head_dim as
+  # hidden / n_heads would give 64 and halve every attention term.
+  # k_proj / v_proj [1024, 3072] = 8 x 128. o_proj [3072, 6144].
+  n_heads: 48
+  num_kv_heads: 8
+  head_dim: 128
+  # rotary_dim 64 of head_dim 128.
+  partial_rotary_factor: 0.5
+  attn_output_gate: false
+
+  # Every layer is full attention: attn_type_list is 62 x 1 and there is no
+  # sliding_window key. Written as a pattern because there is no phase to get
+  # wrong.
+  layer_types: {pattern: [full_attention], repeat: 62}
+  full_attention_interval: 1
+
+  # Mixture of experts. num_local_experts 256, num_experts_per_tok 8,
+  # intermediate_size 1536 (that IS the expert width: w1 [1536, 3072]).
+  # shared_intermediate_size 0 and no shared_experts tensors in the index.
+  num_experts: 256
+  num_experts_per_tok: 8
+  moe_intermediate_size: 1536
+  shared_expert_intermediate_size: 0
+
+  # Multi-token prediction: config.json says use_mtp true, num_mtp_modules 3,
+  # mtp_transformer_layers 1 — but the weight map has no mtp.* / layers.62+
+  # tensor at all (96,103 tensors, every one under layers.0-61, embed, norm or
+  # lm_head). A draft head with no weights cannot run, so the count here is the
+  # checkpoint's, 0. See provenance.open Q2.
+  mtp_num_hidden_layers: 0
+
+  # A TP convention (post-attention, post-MoE), as on MiMo — estimated.
+  all_reduces_per_layer: 2
+
+  # Precision. quantization_config: fp8, float8_e4m3fn, weight_block_size
+  # [128, 128] -> "fp8" aliases fp8_block128 (1 B + one fp32 scale per 16,384
+  # weights), which is exactly what the headers carry: w1 F8_E4M3 [1536, 3072]
+  # beside weight_scale_inv F32 [12, 24].
+  weight_dtype: fp8
+  act_dtype: bf16
+  kv_dtype: bf16                    # OPEN — serving decision, see open Q3
+  op_dtype_overrides:
+    # modules_to_not_convert: gate, e_score_correction_bias, lm_head. The
+    # header has gate.weight F32 [256, 3072] — fp32, not bf16.
+    - [moe_router, fp32]
+    - [lm_head, bf16]               # lm_head.weight BF16 [200064, 3072]
+    # The score-value core has no weights; it reads a bf16 cache.
+    - [attn_score_value, bf16]
+
+provenance:
+  verified:
+    - claim: every spec value is read from config.json and confirmed by shard headers
+      detail: >
+        hidden_size 3072, num_hidden_layers 62, num_attention_heads 48,
+        num_key_value_heads 8, head_dim 128, rotary_dim 64, vocab_size 200064,
+        num_local_experts 256, num_experts_per_tok 8, intermediate_size 1536,
+        shared_intermediate_size 0, attn_type_list 62 x 1,
+        tie_word_embeddings false. Headers (all 125 shards): q_proj F8_E4M3
+        [6144, 3072], k/v_proj F8_E4M3 [1024, 3072], o_proj F8_E4M3
+        [3072, 6144], experts w1/w3 F8_E4M3 [1536, 3072], w2 [3072, 1536], each
+        with an F32 weight_scale_inv on a 128x128 grid; gate F32 [256, 3072];
+        embed_tokens and lm_head BF16 [200064, 3072]; q_norm BF16 [6144],
+        k_norm BF16 [1024].
+    - claim: predicted weight bytes against the shipped payload
+      detail: >
+        model_weight_bytes = 228,744,752,832 B against a header payload of
+        230,121,630,720 B (-0.60%). The residual is the family pricing every
+        weight at weight_dtype: embed_tokens + lm_head are bf16 in the
+        checkpoint (2,458,386,432 B) but priced at fp8 (1,229,493,312 B), and
+        the router is fp32 (195,035,136 B) but priced at fp8 (48,770,688 B).
+        Applying those two corrections leaves 1,720,320 B, which is exactly the
+        norms (input/post-attention/q/k/final, 1,656,832 B) plus
+        e_score_correction_bias (63,488 B) — the ledger closes to the byte.
+        Against the index total_size (466.08 GB) the figure is -50.9%, which is
+        the index being wrong, not the spec — see open Q1.
+    - claim: there is no shared expert and no dense layer
+      detail: >
+        No shared_experts.* and no mlp.* tensors anywhere; all 62 layers carry
+        256 x 3 expert matrices and a gate. shared_expert_intermediate_size 0
+        and an empty dense_layers are read, not defaulted.
+
+  estimated:
+    - field: all_reduces_per_layer
+      value: 2
+      detail: >
+        TP convention, not observed. Falsifiable by counting NCCL kernels per
+        step. Under TP, vLLM's MiniMax-M2 per-layer QK-norm normalises over the
+        FULL q/k width (q_norm weight is [6144], not [128]), which needs a
+        cross-rank variance reduction — if implemented as an all-reduce that is
+        extra small collectives per layer this field does not count
+        (UNVERIFIED against engine source).
+
+  open:
+    - question: why index total_size is 2.03x the shipped bytes
+      detail: >
+        metadata.total_size 466,083,044,352 B; the 125 headers sum to
+        230,121,630,720 B and the shard files to 230,134,264,560 B. It does not
+        equal 2 B x element count (457,407,289,856) either. Unexplained; the
+        header payload is used as the published size here. MiniMax-M2.7's index
+        reports a different total (480.84 GB) for a byte-identical payload.
+    - question: MTP — 3 modules declared, none shipped
+      detail: >
+        num_mtp_modules 3, use_mtp true in config.json; zero MTP tensors in the
+        index. Whether MiniMax serves MTP from a separate artifact is not in the
+        repository. If one appears, set mtp_num_hidden_layers 3 (each module
+        mtp_transformer_layers 1); its layer kind and MoE-vs-dense FFN are
+        unknown.
+    - question: KV cache dtype
+      detail: >
+        Not a checkpoint fact. bf16 is what the config supports; an fp8 cache
+        halves the 62 x 8 x 256 = 126,976 elements per token of context.
+    - question: TP-only or expert parallel
+      detail: Changes every collective row; resolve from the launch args.
+
+  unmodelled:
+    - >
+      Per-op byte precision. op_dtype_overrides sets an op's compute dtype only;
+      bytes on every node use weight_dtype. lm_head (bf16, 1.23 GB) is priced at
+      0.61 GB per decode step — 2x low on the largest single non-expert weight
+      read — and the fp32 router ~4x low (fp8 block bytes vs 4 B). A code change is needed (per-op stored dtype;
+      see tests/test_catalogue_gqa_moe_new.py).
+    - Per-layer (full-width) QK RMSNorm's TP reduction, if any — see estimated.
+    - Sigmoid routing with e_score_correction_bias (one elementwise add; free).

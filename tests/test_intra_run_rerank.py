@@ -54,6 +54,9 @@ def captures(monkeypatch):
 
     monkeypatch.setattr(loop, "capture", fake_capture)
     monkeypatch.setattr(loop, "sync_device", lambda: None)
+    # These tests are about the re-trace itself, so it runs after every
+    # candidate; when one may be skipped is tested on its own below.
+    monkeypatch.setattr(loop, "_RETRACE_ANYWAY_EVERY", 1)
     return taken
 
 
@@ -339,3 +342,69 @@ def test_the_cli_offers_exactly_the_modes_the_loop_knows(tmp_path):
                   .choices["run"]._actions if a.dest == "rerank")
 
     assert tuple(action.choices) == RERANK_MODES
+
+
+def test_a_rerank_reads_the_causes_the_retrace_shows(tmp_path, captures, monkeypatch):
+    """A kept lever can relieve the pressure that motivated the next one. The
+    re-trace samples the scheduler again, and the re-rank uses what it shows
+    now, not the opening capture's causes."""
+    from gitm.optimizer.scheduler_attribution import SchedulerCause
+
+    calls: list[int] = []
+
+    def causes(_summary):
+        calls.append(1)
+        if len(calls) > 1:
+            return []      # pressure gone by the re-trace
+        return [SchedulerCause(signal="kv_cache_preemption", effect="e", severity=0.9,
+                               note="n", motivates_knobs=["max_num_seqs"])]
+
+    monkeypatch.setattr(loop, "scheduler_causes", causes)
+    _run(tmp_path, rerank="recapture")
+    doc = _rerank_doc(tmp_path)
+
+    assert len(calls) > 1, "the re-trace did not re-read the scheduler"
+    recaptured = [s for s in doc["steps"] if s["recaptured"]]
+    assert recaptured and all(s["causes"] == [] for s in recaptured)
+
+
+
+# --------------------------------------------------------------------------- #
+# a re-trace that could not change the order is skipped                       #
+# --------------------------------------------------------------------------- #
+def _cand(name, *, whole_step=True, kernels=(), rejected=None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(spec=SimpleNamespace(name=name, whole_step=whole_step,
+                                                applies_to_kernels=list(kernels)),
+                           rejected_reason=rejected)
+
+
+def test_a_retrace_is_skipped_only_when_nothing_could_move_the_order():
+    whole = [_cand("graphs"), _cand("chunked_prefill")]
+    why = loop._retrace_skip_reason(whole, floors_priced=False, causes_seen=False)
+    assert why is not None and "whole-step" in why
+    # Any of the three things a re-trace reorders on brings it back:
+    assert loop._retrace_skip_reason(whole, floors_priced=True, causes_seen=False) is None
+    assert loop._retrace_skip_reason(whole, floors_priced=False, causes_seen=True) is None
+    scoped = [*whole, _cand("fix_attn", whole_step=False, kernels=["attn"])]
+    assert loop._retrace_skip_reason(scoped, floors_priced=False, causes_seen=False) is None
+    # ... but not a rejected op-scoped lever, which nothing will try.
+    gone = [*whole, _cand("x", whole_step=False, kernels=["attn"], rejected="gate")]
+    assert loop._retrace_skip_reason(gone, floors_priced=False, causes_seen=False) is not None
+
+
+def test_skipped_retraces_are_recorded_and_one_still_runs_every_third(
+        tmp_path, captures, monkeypatch):
+    """With nothing to re-order on, re-traces are skipped and say why, but a
+    kept lever can create pressure, so every third one still runs."""
+    monkeypatch.setattr(loop, "_RETRACE_ANYWAY_EVERY", 3)
+    monkeypatch.setattr(loop, "_retrace_skip_reason",
+                        lambda *_a, **_k: "nothing could move the order")
+    _run(tmp_path, rerank="recapture")
+    steps = _rerank_doc(tmp_path)["steps"]
+    assert len(steps) >= 3
+    skipped = [not s["recaptured"] and s.get("skipped") == "nothing could move the order"
+               for s in steps]
+    assert skipped[:3] == [True, True, False]           # the third re-traces anyway
+    assert all(s["order_before"] == s["order_after"] for s, k in zip(steps, skipped, strict=True) if k)

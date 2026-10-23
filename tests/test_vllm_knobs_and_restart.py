@@ -7,6 +7,9 @@ still in progress — #4 (hot-swap vs restart-apply) and #2 (stats → attributi
 
 from __future__ import annotations
 
+import re
+
+import numpy as np
 import pytest
 
 from gitm.kernels.spec import InterventionSpec
@@ -82,6 +85,17 @@ def test_unmet_prerequisite():
 
     # Engine exposes neither the taxonomy path nor a flat attr -> conservative reject.
     assert "unknown on this engine" in unmet_prerequisite(object(), "dbo_prefill_token_threshold")
+
+
+def test_prerequisite_flag_is_not_its_own_prerequisite():
+    # ("dbo", "enable_dbo") substring-matches enable_dbo itself; turning the flag
+    # on must not demand that it already be on.
+    off = _EngineWithFlags(enable_dbo=False)
+    assert unmet_prerequisite(off, "enable_dbo") is None
+    assert unmet_prerequisite(None, "enable_dbo") is None
+    assert unmet_prerequisite(object(), "enable_dbo") is None
+    # The knobs the flag gates are still gated by it.
+    assert unmet_prerequisite(off, "dbo_decode_token_threshold") is not None
 
 
 def test_resolve_relative_value():
@@ -261,6 +275,62 @@ def test_restart_apply_rolls_back_to_original_engine_on_regression():
     assert app.engine is e0  # original engine restored
 
 
+class _ShutEngine(_TpsEngine):
+    def __init__(self, tps: float):
+        super().__init__(tps)
+        self.shutdown_calls = 0
+
+    def shutdown(self):
+        self.shutdown_calls += 1
+
+
+def test_parallel_restart_kept_candidate_releases_old_engine():
+    """A kept parallel-mode candidate must release the engine it replaced.
+
+    Regression: restore() was the only release path, so on a keep the previous
+    engine sat in _prev until the next snapshot() dropped it unreleased — every
+    later candidate was built beside two resident engines, not one.
+    """
+    e0 = _ShutEngine(100.0)
+    e1 = _ShutEngine(200.0)  # wins against e0
+    e2 = _ShutEngine(150.0)  # loses against e1
+    builds = iter([e1, e2])
+    built_from: list = []
+
+    def restart_fn(old, _knob_values):
+        built_from.append(old)
+        return next(builds)
+
+    app = LiveEngineApplicator(e0, throughput_fn=_tps_of, restart_fn=restart_fn)
+
+    res = apply_intervention(_spec("block_size", 16), app, min_keep_delta=0.0)
+    assert res.applied and not res.rolled_back
+    # Released at the keep itself — not deferred to a next candidate that a
+    # last-candidate win would never get.
+    assert e0.shutdown_calls == 1
+    assert app.engine is e1 and e1.shutdown_calls == 0
+
+    res = apply_intervention(_spec("block_size", 32), app, min_keep_delta=0.0)
+    assert res.rolled_back
+    assert built_from == [e0, e1]  # the winner is the next baseline
+    assert e2.shutdown_calls == 1  # rollback drops the losing candidate...
+    assert app.engine is e1 and e1.shutdown_calls == 0  # ...and keeps the winner
+    assert e0.shutdown_calls == 1  # never released twice
+
+
+def test_engine_release_failure_is_warned_not_swallowed():
+    class Broken(_TpsEngine):
+        def shutdown(self):
+            raise RuntimeError("rank 3 did not exit")
+
+    e0 = Broken(100.0)
+    app = LiveEngineApplicator(e0, throughput_fn=_tps_of,
+                               restart_fn=lambda *_: _TpsEngine(200.0))
+    with pytest.warns(RuntimeWarning, match="rank 3 did not exit"):
+        res = apply_intervention(_spec("block_size", 16), app, min_keep_delta=0.0)
+    # A failed release still never aborts the A/B: the winner is kept.
+    assert res.applied and not res.rolled_back
+
 
 def test_serial_restart_releases_baseline_before_building_candidate():
     class Engine(_TpsEngine):
@@ -417,6 +487,10 @@ class _FullEngine:
         self.scheduler_config.max_num_seqs = max_num_seqs
         self.gitm_throughput_fn = lambda e: float(e.scheduler_config.max_num_seqs)
         self.gitm_restart_fn = self._restart
+        self.shut_down = False
+
+    def shutdown(self):
+        self.shut_down = True
 
     def get_num_unfinished_requests(self):
         return 2
@@ -448,8 +522,9 @@ def test_run_loop_scheduler_stats_feed_attribution_and_claims(tmp_path, monkeypa
     # Non-expiring budget: max_num_seqs_dynamic ranks low and this asserts it's
     # reached + kept; a short wall-clock would make that racy under load (loop
     # is budget-bounded).
-    out = run_loop(LoopConfig(engine=engine, workload="vllm-decode", budget="24h",
-                              scratch=str(tmp_path), top_n_interventions=50))
+    cfg = LoopConfig(engine=engine, workload="vllm-decode", budget="24h",
+                     scratch=str(tmp_path), top_n_interventions=50)
+    out = run_loop(cfg)
 
     run_dir = Path(out["run_dir"])
     residuals = json.loads((run_dir / "residuals.json").read_text())
@@ -463,6 +538,118 @@ def test_run_loop_scheduler_stats_feed_attribution_and_claims(tmp_path, monkeypa
     assert "max_num_seqs" in out["report_md"]
     # Scheduler summary surfaced in the run summary (synchronous first sample).
     assert out["summary"]["scheduler_stats"] is not None
+    # The kept restart released the original engine, and the caller is handed
+    # the live winner instead of that released handle.
+    assert engine.shut_down
+    assert cfg.engine is not engine and not cfg.engine.shut_down
+
+
+def test_run_loop_vetoes_library_lever_with_unmet_prerequisite(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .conftest import make_kernel, make_trace
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [make_kernel(f"paged_attention_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 80)
+                   for i in range(80)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    # _FullEngine has no enable_expert_parallel and no enable_dbo.
+    out = run_loop(LoopConfig(engine=_FullEngine(), workload="vllm-decode", budget="24h",
+                              scratch=str(tmp_path), top_n_interventions=50))
+
+    report = out["report_md"]
+    # The library lever is vetoed before apply, same as an autoresearch candidate.
+    assert "enable_eplb (prerequisite 'enable_expert_parallel' unknown on this engine)" in report
+    # enable_dbo is its own prerequisite flag, so it is not vetoed for lacking itself.
+    assert "enable_dbo (prerequisite" not in report
+
+
+class _ParallelCfg:
+    def __init__(self, *, enable_expert_parallel: bool, enable_eplb: bool):
+        self.enable_expert_parallel = enable_expert_parallel
+        self.enable_eplb = enable_eplb
+
+
+class _ExpertParallelEngine(_FullEngine):
+    """_FullEngine whose MoE flags only a restart can change. Each flag on adds
+    throughput, so the A/B keeps whichever lever turns one on."""
+
+    def __init__(self, *, enable_expert_parallel: bool = False, enable_eplb: bool = False):
+        super().__init__()
+        self.parallel_config = _ParallelCfg(
+            enable_expert_parallel=enable_expert_parallel, enable_eplb=enable_eplb)
+        self.gitm_throughput_fn = lambda e: (
+            64.0 + 8.0 * e.parallel_config.enable_expert_parallel
+            + 4.0 * e.parallel_config.enable_eplb)
+
+    def _restart(self, old_engine, knob_values):
+        pc = old_engine.parallel_config
+        return _ExpertParallelEngine(
+            enable_expert_parallel=bool(
+                knob_values.get("enable_expert_parallel", pc.enable_expert_parallel)),
+            enable_eplb=bool(knob_values.get("enable_eplb", pc.enable_eplb)))
+
+
+def test_run_loop_prerequisite_reads_the_engine_a_kept_restart_left(tmp_path, monkeypatch):
+    """cfg.engine has expert parallel off. The first lever turns it on through a
+    restart that is kept, so enable_eplb's prerequisite holds only on the engine
+    the applicator now holds. A check that read cfg.engine would veto it."""
+    from contextlib import contextmanager
+
+    import gitm.scheduler.loop as loop
+    from gitm.kernels.spec import Applicability, SafetyGate
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .conftest import make_kernel, make_trace
+
+    def lever(name, knob, mean):
+        return InterventionSpec(
+            name=name, summary=f"set {knob}", knob=knob, value=True,
+            expected_delta_mean=mean, expected_delta_lo=0.0, expected_delta_hi=0.2,
+            source="test", applies_to_kernels=["paged_attention"],
+            applicability=Applicability(workloads=["vllm-decode"]),
+            safety=SafetyGate(tier="moderate"))
+
+    ep = lever("ep_on", "enable_expert_parallel", 0.08)
+    eplb = lever("eplb_on", "enable_eplb", 0.04)
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [make_kernel(f"paged_attention_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 80)
+                   for i in range(80)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    applied: list[str] = []
+    real_apply = loop.apply_intervention
+
+    def recording_apply(spec, *a, **kw):
+        applied.append(spec.name)
+        return real_apply(spec, *a, **kw)
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "load_library", lambda workload=None: [ep, eplb])
+    monkeypatch.setattr(loop, "apply_intervention", recording_apply)
+
+    engine = _ExpertParallelEngine()
+    out = run_loop(LoopConfig(engine=engine, workload="vllm-decode", budget="24h",
+                              scratch=str(tmp_path)))
+
+    report = out["report_md"]
+    assert applied == ["ep_on", "eplb_on"]
+    assert "eplb_on (prerequisite" not in report
+    # The restart behind ep_on was kept, and cfg.engine itself never changed.
+    assert report.count("via restart") >= 1
+    assert engine.parallel_config.enable_expert_parallel is False
+
 
 def test_report_kernel_time_residual_uses_weighted_total_and_clamps():
     from gitm.optimizer.monitor import KernelResidual, Residuals
@@ -490,9 +677,11 @@ def test_ar_target_residual_uses_the_search_target_not_a_hardcoded_zero():
     from gitm.agents.autoresearch import AutoresearchRun, ResidualTarget
     from gitm.scheduler.loop import _ar_target_residual
 
-    # No target found (nothing exceeded its predicted ceiling) -> honest 0.0.
+    # No target found (nothing exceeded its predicted ceiling): the run-level
+    # residual when there is one, else None. A 0.0 here read as "on target".
     empty = AutoresearchRun(bottleneck_class="idle_stall", results=[], target=None)
-    assert _ar_target_residual(empty) == 0.0
+    assert _ar_target_residual(empty) is None
+    assert _ar_target_residual(empty, 0.12) == 0.12
 
     # A real target -> its residual surfaces, clamped like every other residual.
     modest = AutoresearchRun(
@@ -506,3 +695,176 @@ def test_ar_target_residual_uses_the_search_target_not_a_hardcoded_zero():
         target=ResidualTarget(op="attn_score_value", residual=17.8, n_kernels=8),
     )
     assert _ar_target_residual(huge) == 1.0
+
+
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [(ImportError("No module named 'statsmodels.api'"), "unavailable"),
+     (np.linalg.LinAlgError("Singular matrix"), "failed")],
+)
+def test_run_loop_survives_dr_failure_and_records_granger_status(tmp_path, monkeypatch, error, status):
+    """A DR failure (dr.py imports statsmodels.api on its own, and its numpy math
+    can raise) must not lose the Granger record or the report."""
+    import json
+    from contextlib import contextmanager
+    from pathlib import Path
+
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .conftest import make_kernel, make_trace
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [make_kernel(f"paged_attention_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 80)
+                   for i in range(80)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    def dr_without_statsmodels(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "attribute_dr", dr_without_statsmodels)
+
+    out = run_loop(LoopConfig(engine=_FullEngine(), workload="vllm-decode", budget="24h",
+                              scratch=str(tmp_path), top_n_interventions=3))
+
+    residuals = json.loads((Path(out["run_dir"]) / "residuals.json").read_text())
+    assert residuals["dr"]["status"] == status
+    assert residuals["dr"]["first_errors"] == {type(error).__name__: str(error)}
+    assert residuals["dr"]["pairs_attempted"] == 0  # same record shape as a DR that ran
+    assert residuals["granger"]["status"] in {"ok", "partial", "failed", "insufficient_data"}
+    assert "top_hypotheses_granger" in residuals  # legacy key kept for readers
+    assert "no strong causal signal" not in out["report_md"]
+
+
+_OP_PAIR = re.compile(r"\S+\s*(→|->)\s*\S+\s*\(p=")
+
+
+def _two_op_capture(n_per_op: int = 40):
+    """A capture whose kernels classify to two graph ops, enough for Granger."""
+    from contextlib import contextmanager
+
+    import numpy as np
+
+    from .conftest import make_kernel, make_trace
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        rng = np.random.default_rng(0)
+        kernels, t = [], 0
+        for _ in range(n_per_op):
+            for name, base in (("_ZN5flash24flash_fwd_splitkv_kernel", 30_000),
+                               ("silu_and_mul_kernel", 8_000)):
+                dur = int(base * (1 + rng.normal(0, 0.2)))
+                kernels.append(make_kernel(name, start_ns=t, end_ns=t + dur))
+                t += dur + 100
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    return fake_capture
+
+
+def _run_two_op_loop(tmp_path, monkeypatch):
+    """Predict-only loop run (no engine), so no claim has a live A/B and every
+    catalog claim's evidence is the Granger text."""
+    import json
+    from pathlib import Path
+
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    monkeypatch.setattr(loop, "capture", _two_op_capture())
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    out = run_loop(LoopConfig(engine=None, workload="vllm-decode", budget="24h",
+                              scratch=str(tmp_path), top_n_interventions=5))
+    residuals = json.loads((Path(out["run_dir"]) / "residuals.json").read_text())
+    return out, residuals
+
+
+def test_run_loop_granger_completes_on_installed_statsmodels(tmp_path, monkeypatch):
+    """Through the real loop and the installed statsmodels, Granger runs to
+    completion, and no claim shows an op pair."""
+    pytest.importorskip("statsmodels.tsa.stattools")
+    out, residuals = _run_two_op_loop(tmp_path, monkeypatch)
+
+    granger = residuals["granger"]
+    assert granger["status"] == "ok", granger
+    assert granger["pairs_completed"] == granger["pairs_attempted"] == 2
+    assert {p["exploratory"] for p in granger["top_pairs"]} == {True}
+    assert len(residuals["top_hypotheses_granger"]) == 2
+    # DR's record is its real outcome, not a blanket "ok" for "did not raise".
+    dr = residuals["dr"]
+    assert dr["status"] in {"ok", "partial", "failed", "insufficient_data"}
+    assert {"pairs_attempted", "pairs_completed", "warnings", "reason"} <= dr.keys()
+    if dr["status"] == "insufficient_data":
+        assert dr["reason"]
+    claim_rows = [line for line in out["report_md"].splitlines() if re.match(r"\| \d+ \|", line)]
+    assert claim_rows
+    assert all("Granger ran (2/2 op pairs) but is not used as evidence" in row for row in claim_rows)
+    assert not _OP_PAIR.search(out["report_md"])
+    assert "no strong causal signal" not in out["report_md"]
+
+
+def test_run_loop_keeps_legacy_granger_key_on_partial(tmp_path, monkeypatch):
+    """Readers of top_hypotheses_granger still get the pairs that completed."""
+    stattools = pytest.importorskip("statsmodels.tsa.stattools")
+    real = stattools.grangercausalitytests
+    calls = {"n": 0}
+
+    def fail_first_pair(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("boom")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(stattools, "grangercausalitytests", fail_first_pair)
+    out, residuals = _run_two_op_loop(tmp_path, monkeypatch)
+
+    assert residuals["granger"]["status"] == "partial"
+    assert residuals["granger"]["failures"] == {"ValueError": 1}
+    assert len(residuals["top_hypotheses_granger"]) == 1
+    assert "1 of 2 op pairs failed (ValueError: 1)" in out["report_md"]
+def test_nested_knobs_reach_llm_as_the_argument_vllm_takes():
+    """P2-1, which was marked fixed but was not: LLM() rejects
+    num_speculative_tokens at the top level; it lives in speculative_config."""
+    from gitm.optimizer.vllm_knobs import engine_kwargs, knob_from_server_arg, server_arg
+
+    assert engine_kwargs({"num_speculative_tokens": 5, "max_num_seqs": 64}) == {
+        "speculative_config": {"method": "ngram", "num_speculative_tokens": 5},
+        "max_num_seqs": 64,
+    }
+    flag, value = server_arg("num_speculative_tokens", 5)
+    assert flag == "--speculative-config"
+    assert knob_from_server_arg("speculative_config", value) == ("num_speculative_tokens", 5)
+    # Read back as the lever only when the token count is all that changed from
+    # the baseline. Against no baseline, that is the n-gram config gitm emits.
+    other = '{"method": "eagle", "model": "x", "num_speculative_tokens": 5}'
+    assert knob_from_server_arg("speculative_config", other)[0] == "speculative_config"
+    eagle_base = '{"method": "eagle", "model": "x", "num_speculative_tokens": 2}'
+    assert knob_from_server_arg("speculative_config", other, eagle_base) == \
+        ("num_speculative_tokens", 5)
+    # A changed method is not the token-count lever, even at the lever's count.
+    ngram_base = '{"method": "ngram", "num_speculative_tokens": 5}'
+    assert knob_from_server_arg("speculative_config", other, ngram_base)[0] == \
+        "speculative_config"
+    assert knob_from_server_arg("speculative_config", "not json")[0] == "speculative_config"
+
+
+def test_a_nested_knob_is_merged_into_the_baselines_config_not_put_in_its_place():
+    """Replacing it would drop the baseline's method, draft model and lookup
+    window, and the A/B would measure all of that, not the lever."""
+    import json
+
+    from gitm.optimizer.vllm_knobs import engine_kwargs, server_arg
+
+    base = {"speculative_config": {"method": "eagle", "model": "x",
+                                   "num_speculative_tokens": 2}}
+    assert engine_kwargs({"num_speculative_tokens": 5}, base) == {
+        "speculative_config": {"method": "eagle", "model": "x", "num_speculative_tokens": 5}}
+    assert base["speculative_config"]["num_speculative_tokens"] == 2     # not mutated
+    _, value = server_arg("num_speculative_tokens", 5,
+                          '{"method":"ngram","prompt_lookup_max":4}')
+    assert json.loads(value) == {"method": "ngram", "prompt_lookup_max": 4,
+                                 "num_speculative_tokens": 5}
+    assert server_arg("max_num_seqs", 64) == ("--max-num-seqs", 64)

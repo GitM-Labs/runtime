@@ -1,0 +1,1020 @@
+# Checkpoint inventory. One record per checkpoint; see gitm/planner/inventory.py.
+# Maintained by `gitm inventory add|sync` — edit by hand only to change a status
+# you have verified yourself, and say so in the commit.
+#
+#   revision  full commit sha, or UNVERIFIED. Never a branch.
+#   artifacts sha256 of every file in `include`; git_oid is kept for plain git
+#             files so `check` can compare without downloading them.
+#   consumers every deploy/ manifest that loads this repository, and the
+#             revision that manifest pins (UNVERIFIED when it pins none).
+schema_version: 1
+family: kimi
+checkpoints:
+- id: kimi-k2.5
+  repository: moonshotai/Kimi-K2.5
+  tracked_ref: main
+  revision: 4d01dfe0332d63057c186e0b262165819efb6611
+  last_verified: '2026-10-11'
+  verification_status: verified
+  catalogue:
+    status: covered
+    entry: kimi-k2.5
+  quantization:
+    status: declared
+    sources:
+    - file: config.json
+      key: text_config.quantization_config
+      recipe:
+        config_groups:
+          group_0:
+            input_activations: null
+            output_activations: null
+            targets:
+            - Linear
+            weights:
+              actorder: null
+              block_structure: null
+              dynamic: false
+              group_size: 32
+              num_bits: 4
+              observer: minmax
+              observer_kwargs: {}
+              strategy: group
+              symmetric: true
+              type: int
+        format: pack-quantized
+        ignore:
+        - re:.*self_attn.*
+        - re:.*shared_experts.*
+        - re:.*mlp\.(gate|up|gate_up|down)_proj.*
+        - re:.*lm_head.*
+        - re:vision_tower.*
+        - re:mm_projector.*
+        kv_cache_scheme: null
+        quant_method: compressed-tensors
+        quantization_status: compressed
+  artifacts:
+    include:
+    - '*.safetensors'
+    - '*.safetensors.index.json'
+    - config.json
+    - generation_config.json
+    - hf_quant_config.json
+    - preprocessor_config.json
+    - '*.py'
+    - '*.jinja'
+    - tokenizer*
+    - '*.model'
+    - special_tokens_map.json
+    - added_tokens.json
+    - docs/deploy_guidance.md
+    files:
+      chat_template.jinja: {size: 3759, sha256: 7c91e4b3578b518bfb388d2e3dc645daf0fbf843656e887db75d12891e0030ff, git_oid: f88cb41422626beb4cf1e7826b079448a4663cd0}
+      config.json: {size: 5416, sha256: acd5bb01a16f64b309599cd6ed196be056f613c99d6bc9300692b82cd10882f6, git_oid: 951255997883c0e4fd53a8a3e10add6e79354217}
+      configuration_deepseek.py: {size: 10615, sha256: c1327c307e2dd11d1bf0adc8bcef69ae51f9617a3a869a9497bb08aec912f931, git_oid: b3152dd7c3e53d223d561848dc967f487daf32ef}
+      configuration_kimi_k25.py: {size: 5435, sha256: 2bc5487efced291e0e6aa3b24aad1082bade4172aff94ea1b6f0ae20a1d6bb4f, git_oid: 5858b3290a32509480affd58abc01482d5976550}
+      docs/deploy_guidance.md: {size: 3233, sha256: 3f95844718be30742eef1924f81b96840bac39cb9f993bdb3ee78435587b69b7, git_oid: 1aac57bead663d507b156284690add81f1146953}
+      generation_config.json: {size: 52, sha256: 5431db52f431099f309ece737670e977de148f8cfd5340e920ff1f44d7cff596, git_oid: 4bb3f8ec4a1d604598b7ffb4621b955e995bda92}
+      kimi_k25_processor.py: {size: 6906, sha256: 537d7a708e1654766fc628c99667bdb9364136d3541633d6522ac43cef9bfea0, git_oid: d526032f91036de5f3d226b866acf449553b986d}
+      kimi_k25_vision_processing.py: {size: 10019, sha256: 498e20753c9aa6b6224ddbcd05b04deb7e987b76595bf5c28ee8583f33ebc375, git_oid: fdf3ab2f100f7c28a1f1e7295297e54b515d0b53}
+      media_utils.py: {size: 13179, sha256: 77a6b1fed3580b0562443092928a0240c2989e3950377e93893952123ae48e3d, git_oid: 8795e06f381700d6420798f82174e3f9647e9f89}
+      model-00001-of-000064.safetensors: {size: 995001888, sha256: 18daf53a15070b9c70d8bb63420dbd39764af9118af67982eeb60749f5453233}
+      model-00002-of-000064.safetensors: {size: 9809047464, sha256: e017c948926333558df1a9637ff052c663378a70afbc1bb5b20528b8b5a501aa}
+      model-00003-of-000064.safetensors: {size: 9809047464, sha256: c74880b04dc208397d7182c4692ca67644ea732be216ac4b23241db389f86886}
+      model-00004-of-000064.safetensors: {size: 9809047464, sha256: 17faa37dbf12b17eb3cb94bc7d9b85db9f7d68411bdecec84224425b25b22fca}
+      model-00005-of-000064.safetensors: {size: 9809047464, sha256: a97ff66ec88a9e02a129cb3dc75b2c3cb4fc4ccf698777042253504be372b52f}
+      model-00006-of-000064.safetensors: {size: 9809047464, sha256: da5cfbfe78d1c740c3cbe8ba49d84712d4328be72d3389dad54361d480cd3148}
+      model-00007-of-000064.safetensors: {size: 9809047464, sha256: 65b0cd81a5c8320fdfbba91f3530bf35da9befe7a776da1f4d5485083b527d8a}
+      model-00008-of-000064.safetensors: {size: 9809047464, sha256: da91fa6a5e61a3dc36a2a9e46e0be066ce67ae78a1f2dcdce04511c38e30fb5d}
+      model-00009-of-000064.safetensors: {size: 9809047464, sha256: e4f08c59cee6cc26a92cfb5f36952511b171d5db527d1d78f84f7a081ab78599}
+      model-00010-of-000064.safetensors: {size: 9809047464, sha256: 7bdae095b9c721830784435564dada40a63c2c4b434cba4d81dbc0b1173e3d75}
+      model-00011-of-000064.safetensors: {size: 9809050936, sha256: 899dbf01f498fa71c4e97833caac73c7fbb3e197a237f2f7d9fea9c5262afdc3}
+      model-00012-of-000064.safetensors: {size: 9809050936, sha256: 72be28902ba87b0a1ac24ebb3b36ee89850cc7f13fbbb51e8b1dba743c7eb171}
+      model-00013-of-000064.safetensors: {size: 9809050936, sha256: f375d01e1b1230cb0bbfc3c6ce6a81c26a578b633dc43e24956610c84205d688}
+      model-00014-of-000064.safetensors: {size: 9809050936, sha256: b341417f09964cf477c60fd431ecd6e454442e973d41a17038004340ce8ad83e}
+      model-00015-of-000064.safetensors: {size: 9809050936, sha256: 9534ee2411e8c05451e19b7234ceddcd33271795b782d910baa9ebb96738d2f9}
+      model-00016-of-000064.safetensors: {size: 9809050936, sha256: 46cd89549baf6099c1629a1a023b0a6886d5d115f9afc97ffb68390339967eb7}
+      model-00017-of-000064.safetensors: {size: 9809050936, sha256: 2b653d852e4d30f8eceb0800ae1a5b15c02fd203fae04c097aebb8fc99a0ef03}
+      model-00018-of-000064.safetensors: {size: 9809050936, sha256: cd82fedc4da324d1be93db896d0b30ccc02ffd4d267bd1b64875c5cc0d7cee22}
+      model-00019-of-000064.safetensors: {size: 9809050936, sha256: 835c2cce752c8f7030d04fdd11a27311efc489b1558dee9d646d135d3cd82044}
+      model-00020-of-000064.safetensors: {size: 9809050936, sha256: 26a3ec988f47120f07938afbf7ce3a27dbeeaf955e816ccf202ebf3751833438}
+      model-00021-of-000064.safetensors: {size: 9809050936, sha256: 02376f1b7e16343f0e7ea4d847c85e33da30295499c25145fbd4998cb44fdcff}
+      model-00022-of-000064.safetensors: {size: 9809050936, sha256: a177b349938d277b2ff17d4593981343c7a66a6445b964fd596551dc325dd889}
+      model-00023-of-000064.safetensors: {size: 9809050936, sha256: ecbbd2355a4b74d425a1ab847de07d603a0f23c1eb5615563e72f224335022d7}
+      model-00024-of-000064.safetensors: {size: 9809050936, sha256: 505f7178c7e3d089aa51d3eb83b2133e379ae75e25b00ebc80793c4affbd90e3}
+      model-00025-of-000064.safetensors: {size: 9809050936, sha256: 9240b5987ffbe8b47f0668db0b7608916e1648bc9a3a0b55f6079c222e430a83}
+      model-00026-of-000064.safetensors: {size: 9809050936, sha256: 4886aa2bf3e83fbb83adee7fde183b9476820dafcbaade99a87b95c8946e5b78}
+      model-00027-of-000064.safetensors: {size: 9809050936, sha256: 06e78ba422ca3d7188d701d6cbfef9ca79a94e56c572894ac63666cc90336a0c}
+      model-00028-of-000064.safetensors: {size: 9809050936, sha256: 4235b1e3d587a2ebbdcf111eb231c1d66a891ef0c8e6bc91214e4ebccbfa499f}
+      model-00029-of-000064.safetensors: {size: 9809050936, sha256: 2e37a630cd0f516cf82442de3db77f1f4ec7f0fa7b37a429c51dd17c26fd6b02}
+      model-00030-of-000064.safetensors: {size: 9809050936, sha256: 04da30f98f4c57c6a821090be82d0d8e3af92ccb3edefb7cabed893d96ee0a04}
+      model-00031-of-000064.safetensors: {size: 9809050936, sha256: fdf3def720479758dfb38f53b6cf97d4d326fd39f215b2d1c65699423d3af2ad}
+      model-00032-of-000064.safetensors: {size: 9809050936, sha256: 52534a0a523aaf64c061297aa1efe3b6cb5e42a0af422f14933c159c92ba9e49}
+      model-00033-of-000064.safetensors: {size: 9809050936, sha256: 3b8438e1e9a6573f403c03defa00aa0649f716b5da098beb422827834e889ea8}
+      model-00034-of-000064.safetensors: {size: 9809050936, sha256: bf6a7b9cf582a34c663e945ead490b13f3f6a07a00ff247c29afc4bf908960e3}
+      model-00035-of-000064.safetensors: {size: 9809050936, sha256: fe6cd19a160352d14d6f28bb66dd7d9c06f1e9350025645def52fa979b77e004}
+      model-00036-of-000064.safetensors: {size: 9809050936, sha256: c5487f8977f5ae403c45f36c34add86a8616da4bb8fa4f7dbccc9a0c156dcc1d}
+      model-00037-of-000064.safetensors: {size: 9809050936, sha256: 4236900d679c2a9c134e71e080b905fa877a53648ee7da7d36d3bf0b1f5586bb}
+      model-00038-of-000064.safetensors: {size: 9809050936, sha256: b1c15627438fcdd2c905aa78a682f51a26fbdc50403bfa74601be6ee1550da3b}
+      model-00039-of-000064.safetensors: {size: 9809050936, sha256: 67cbaa9ecb8dc2dfd53c396927439bfd6a8a7503a49997615004fe5df0138e20}
+      model-00040-of-000064.safetensors: {size: 9809050936, sha256: 76b1c63b64a234b2631566f983f5775393ff3d8cbb6d8828fe9d168a039873ea}
+      model-00041-of-000064.safetensors: {size: 9809050936, sha256: b7e27bd85a6de53b3098a5ebc83e47dae99ce0d207dca130681e2ca1f95ac649}
+      model-00042-of-000064.safetensors: {size: 9809050936, sha256: 67a8e121c665e0ad9fe9e72406d4560cc513b6a3df85ab05b8063e26cedc3f0b}
+      model-00043-of-000064.safetensors: {size: 9809050936, sha256: 743f85f3f9d57e10432ab2961728385f5cb8ea8035e14b4fde83086b062b1afb}
+      model-00044-of-000064.safetensors: {size: 9809050936, sha256: 2ce242860d1d06de3c8d9077817e83e48841daf9d85cacb2ec19fbff04c69161}
+      model-00045-of-000064.safetensors: {size: 9809050936, sha256: 59b8afda0898ca3dd0ea382e941d05d1624061716f83b296f456a6e27db43f49}
+      model-00046-of-000064.safetensors: {size: 9809050936, sha256: 5e6118090a8738a46430bae56464855ea0adf2ab2f4752b63c96a53c88f3b74c}
+      model-00047-of-000064.safetensors: {size: 9809050936, sha256: 953fb907ef1c49724b402c0f420ce3007eac3f20d4b2ecf286012b4cde671cb8}
+      model-00048-of-000064.safetensors: {size: 9809050936, sha256: 587db1e460105d0911601db58c115cb8b6d136b2b327426127dc8a45ff39c5e8}
+      model-00049-of-000064.safetensors: {size: 9809050936, sha256: a93c151606f2853f398eecd708da5a2c8975600bf319f6b7f1bade66f83a8ca9}
+      model-00050-of-000064.safetensors: {size: 9809050936, sha256: 6a5be161b2f3af9e1f299588d4ef898a174504324aa163398c0a510d8cf735eb}
+      model-00051-of-000064.safetensors: {size: 9809050936, sha256: d042fbe87dc47857f897b7491b2a965207be73d7477e5a1d8c46d5f25441615e}
+      model-00052-of-000064.safetensors: {size: 9809050936, sha256: eaddbb07f16c5567ca9b94ef8585124188197877ce7c11b3c9818431da884adc}
+      model-00053-of-000064.safetensors: {size: 9809050936, sha256: 87a86769c0b7f8bc5f260ddedf35f85c4fc73db5524d025e9241adcb633bba15}
+      model-00054-of-000064.safetensors: {size: 9809050936, sha256: 803a24c512c5e2b0cd336323720be011df58036e176d6d63f7f1976ec8e533ab}
+      model-00055-of-000064.safetensors: {size: 9809050936, sha256: fcb683f1c9170fc6a661c569dc18163934e2629c0d25f278e4bc73f2ad09bfbe}
+      model-00056-of-000064.safetensors: {size: 9809050936, sha256: 3ef1f8d5bac88618ad5104a0ac30c268eac98a2add384c0bd31ec82cf8c3d5bd}
+      model-00057-of-000064.safetensors: {size: 9809050936, sha256: db51daa87c01b891ab72cf41acc01be732a5f8108afa32c7a50e8e1bba57e263}
+      model-00058-of-000064.safetensors: {size: 9809050936, sha256: 07998dcd30b032da866526de21463c7d4b54c16818ccac2d0faf9609b8d3ec8d}
+      model-00059-of-000064.safetensors: {size: 9809050936, sha256: f7c1b87ab8a9c0df0e85acb6af5c5b7096ac434aaf2df17ca05b0b12ccd5a8ea}
+      model-00060-of-000064.safetensors: {size: 9809050936, sha256: d328618ace908cc752a8197591157a6ab060205f95b222e11bb9c57d8d906802}
+      model-00061-of-000064.safetensors: {size: 9809050936, sha256: b10e67a118315d38fa740093f4c6f82f468eb7f2881e08639c74230927dfdc51}
+      model-00062-of-000064.safetensors: {size: 4697635160, sha256: 60f6e14a3f89fb81a1565de92417606379ed6f4aeaafff2ccba679a53df8c77f}
+      model-00063-of-000064.safetensors: {size: 108556344, sha256: 0eb212be70e29ade1a3de5fdc24bff35aaee507dfba745ffb74febf2b05395e6}
+      model-00064-of-000064.safetensors: {size: 833769904, sha256: 7a8bc2d71c92fce81cbda9da8a33db470eb1f5eb899e87c03c0973cba34ddf8f}
+      model.safetensors.index.json: {size: 23597438, sha256: bdba19b127c4d1dc57dc3b6f3366c10739c7e7f13baf3f5424b556469a4dbc1b}
+      modeling_deepseek.py: {size: 78528, sha256: 1fd8d198ff6ad69a5aec6fd85bf489d91ae2c432560b1e8ba7e34f710463c80a, git_oid: 707925a7f440d22c1fde9ea13676b7ee924d6e21}
+      modeling_kimi_k25.py: {size: 50961, sha256: ef28f469e7cb5ab91008a52c1b34718ad37de8428e2ed6aadc408d031a38a372, git_oid: a40ec230e0fdc7283fa4b7c504303296913785ec}
+      preprocessor_config.json: {size: 742, sha256: 0c43520fbcc076dacbffcf0273f0dfa0ee318ff9aa55537cf7f2788d906de7b2, git_oid: b0accb4b335998b847e0093bf4a63e1f32447cc9}
+      tiktoken.model: {size: 2795286, sha256: b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103}
+      tokenization_kimi.py: {size: 13353, sha256: 56aae6f32aa6d8604a119ed6097fd07968c3bc2fbbe225f151acbed9141add6f, git_oid: 7868ea7598734c24cbbbbf904799c76b29af9803}
+      tokenizer_config.json: {size: 4862, sha256: 12fcab43d2b6068f46769f5ff373960bf7c17a94d7abbc50e2491306b2f6cf58, git_oid: c4d32fcaffbe72d4050388e6464bb719408e361e}
+      tool_declaration_ts.py: {size: 16517, sha256: 97e09ed262f1cd38f87584eaa46c5d4d5b3c9725dd299b21642f389040794ebc, git_oid: 3cc7727ddbeabef16b90ce0219446bc2d4ea9032}
+  consumers:
+  - {manifest: deploy/k8s/mi355x-kimi-loop.yaml, reference: vllm serve, revision: UNVERIFIED}
+  - {manifest: deploy/k8s/mi355x-kimi.yaml, reference: --model-path (env MODEL_ID), revision: UNVERIFIED}
+  - {manifest: deploy/k8s/parallel/kimi-int-eager.yaml, reference: vllm serve, revision: UNVERIFIED}
+  - {manifest: deploy/k8s/parallel/kimi-int-ep.yaml, reference: vllm serve, revision: UNVERIFIED}
+  - {manifest: deploy/k8s/parallel/kimi-int-kvhead.yaml, reference: vllm serve, revision: UNVERIFIED}
+  - {manifest: deploy/k8s/parallel/kimi-int-maxseqs.yaml, reference: vllm serve, revision: UNVERIFIED}
+  - {manifest: deploy/k8s/parallel/kimi-int-mla-triton.yaml, reference: vllm serve, revision: UNVERIFIED}
+  - {manifest: deploy/k8s/parallel/kimi-int-moe-triton.yaml, reference: vllm serve, revision: UNVERIFIED}
+  - {manifest: deploy/k8s/parallel/kimi-int-prefill.yaml, reference: vllm serve, revision: UNVERIFIED}
+  - {manifest: deploy/k8s/parallel/kimi-int-rccl-ring.yaml, reference: vllm serve, revision: UNVERIFIED}
+  - {manifest: deploy/k8s/parallel/kimi-int-tp4.yaml, reference: vllm serve, revision: UNVERIFIED}
+  - {manifest: deploy/k8s/parallel/kimi-intervene.yaml, reference: vllm serve, revision: UNVERIFIED}
+  - {manifest: deploy/k8s/parallel/kimi-sweep-chat.yaml, reference: vllm serve, revision: UNVERIFIED}
+  - {manifest: deploy/k8s/parallel/kimi-sweep-long.yaml, reference: vllm serve, revision: UNVERIFIED}
+  - {manifest: deploy/k8s/parallel/kimi-sweep-rag.yaml, reference: vllm serve, revision: UNVERIFIED}
+  - {manifest: deploy/k8s/parallel/kimi-traced.yaml, reference: vllm serve, revision: UNVERIFIED}
+- id: kimi-k2.6
+  repository: moonshotai/Kimi-K2.6
+  tracked_ref: main
+  revision: 7eb5002f6aadc958aed6a9177b7ed26bb94011bb
+  last_verified: '2026-10-11'
+  verification_status: verified
+  catalogue:
+    status: not-in-catalogue
+    entry: null
+  quantization:
+    status: declared
+    sources:
+    - file: config.json
+      key: text_config.quantization_config
+      recipe:
+        config_groups:
+          group_0:
+            input_activations: null
+            output_activations: null
+            targets:
+            - Linear
+            weights:
+              actorder: null
+              block_structure: null
+              dynamic: false
+              group_size: 32
+              num_bits: 4
+              observer: minmax
+              observer_kwargs: {}
+              strategy: group
+              symmetric: true
+              type: int
+        format: pack-quantized
+        ignore:
+        - re:.*self_attn.*
+        - re:.*shared_experts.*
+        - re:.*mlp\.(gate|up|gate_up|down)_proj.*
+        - re:.*lm_head.*
+        - re:vision_tower.*
+        - re:mm_projector.*
+        kv_cache_scheme: null
+        quant_method: compressed-tensors
+        quantization_status: compressed
+  artifacts:
+    include:
+    - '*.safetensors'
+    - '*.safetensors.index.json'
+    - config.json
+    - generation_config.json
+    - hf_quant_config.json
+    - preprocessor_config.json
+    - '*.py'
+    - '*.jinja'
+    - tokenizer*
+    - '*.model'
+    - special_tokens_map.json
+    - added_tokens.json
+    - docs/deploy_guidance.md
+    files:
+      chat_template.jinja: {size: 4022, sha256: 8bf859698fd4781c0e1e1c63ce74422aab27e53ccc5f47116317c64cda06132f, git_oid: 039939fb0cbca410595f7cefc0d62018d142b931}
+      config.json: {size: 5416, sha256: 85825ca6e18cbe539eb83ee09eedfb3f4222265929f06e9f535a6d9364f55899, git_oid: eb7e9302b33c55765ac93e09eeb87cf7d7d4c438}
+      configuration_deepseek.py: {size: 10615, sha256: c1327c307e2dd11d1bf0adc8bcef69ae51f9617a3a869a9497bb08aec912f931, git_oid: b3152dd7c3e53d223d561848dc967f487daf32ef}
+      configuration_kimi_k25.py: {size: 5435, sha256: 2bc5487efced291e0e6aa3b24aad1082bade4172aff94ea1b6f0ae20a1d6bb4f, git_oid: 5858b3290a32509480affd58abc01482d5976550}
+      docs/deploy_guidance.md: {size: 3648, sha256: 103a660460f6ce9b43a68b5c7a98a76271b5b3121dc57afd521fe11953abc530, git_oid: a09004990dfca2ea4b043171ae2e60259f3d3bf9}
+      generation_config.json: {size: 52, sha256: 5431db52f431099f309ece737670e977de148f8cfd5340e920ff1f44d7cff596, git_oid: 4bb3f8ec4a1d604598b7ffb4621b955e995bda92}
+      kimi_k25_processor.py: {size: 6906, sha256: 537d7a708e1654766fc628c99667bdb9364136d3541633d6522ac43cef9bfea0, git_oid: d526032f91036de5f3d226b866acf449553b986d}
+      kimi_k25_vision_processing.py: {size: 10019, sha256: 498e20753c9aa6b6224ddbcd05b04deb7e987b76595bf5c28ee8583f33ebc375, git_oid: fdf3ab2f100f7c28a1f1e7295297e54b515d0b53}
+      media_utils.py: {size: 13179, sha256: 77a6b1fed3580b0562443092928a0240c2989e3950377e93893952123ae48e3d, git_oid: 8795e06f381700d6420798f82174e3f9647e9f89}
+      model-00001-of-000064.safetensors: {size: 995001888, sha256: cb6e037206c1936876c33f348bc644fd6f9f4d7ac973f8906359977c1eaebd43}
+      model-00002-of-000064.safetensors: {size: 9809047464, sha256: a609fccff2406505ae575850a51470474e8bb3eb825ddd208f84aae31cfb4960}
+      model-00003-of-000064.safetensors: {size: 9809047464, sha256: f79ae8d220ecbba674c1224bbb36e2ad826ccc365765a89fab57555af47a8540}
+      model-00004-of-000064.safetensors: {size: 9809047464, sha256: efa041ff6fd295b3a5b8bc4fe7db502d32e6f887d650353425c3074388ecaa33}
+      model-00005-of-000064.safetensors: {size: 9809047464, sha256: 6f772c9bf434aea41b6f6dc05eb32da4e8259548a3145d79e26607b4a9d1753b}
+      model-00006-of-000064.safetensors: {size: 9809047464, sha256: 5cf4c4593e5a7e5b4ababc8991245ab53121be414558099dc12dd01ab00eb920}
+      model-00007-of-000064.safetensors: {size: 9809047464, sha256: 66775118dec5d4f549aa19d0c8cd07dcc42c48d4d9dd6f289f772ec5d692a3af}
+      model-00008-of-000064.safetensors: {size: 9809047464, sha256: cdca9b399dce8e82e0cf5bf9c59f600ea9f6001c56b84c78d9364cb8f55f48a5}
+      model-00009-of-000064.safetensors: {size: 9809047464, sha256: 4f8c2dcde7c51a3eca91bb892eacd8bcbcd7724842254a0000bb1c45faf92eb2}
+      model-00010-of-000064.safetensors: {size: 9809047464, sha256: 311ffdf698fb27c03697598cd2c652a1ec210d9a7351d5c2de1b14d605635195}
+      model-00011-of-000064.safetensors: {size: 9809050936, sha256: b2a93273e323843ad067e00dc859f63d90f62bd2e81ef0a77ffe49a9f39a3607}
+      model-00012-of-000064.safetensors: {size: 9809050936, sha256: fa3200710275f7e8d60cdb91d1d623477fda55d04bda5e32be29b5809383f4ca}
+      model-00013-of-000064.safetensors: {size: 9809050936, sha256: 8925783dd26187bbff4f9030aeff392c3fe3d931409daa341d673bc93393965d}
+      model-00014-of-000064.safetensors: {size: 9809050936, sha256: ee309d11f1c4194db36e961293d6e7b9d3c3c8227da5064ffc32b806ac03cc91}
+      model-00015-of-000064.safetensors: {size: 9809050936, sha256: 4859b4dfe8eb7998bbda5e453f9336b139881d403b0a8c128b98842c9c27800d}
+      model-00016-of-000064.safetensors: {size: 9809050936, sha256: 4345e4706a01e63aef6a43025bc101ebbfb8e8c235ea44604fb9c5ad7038b4cc}
+      model-00017-of-000064.safetensors: {size: 9809050936, sha256: e0b6e9d578c7f0eaa3e91aa917fb3cbdcaf5637caa3ad97e9dc002bcb35feb22}
+      model-00018-of-000064.safetensors: {size: 9809050936, sha256: 1bef116d936999f347b83403ee13fe479f51214a87592409121614793d7e65e7}
+      model-00019-of-000064.safetensors: {size: 9809050936, sha256: 71b624faee1df5cc99bad259b018befb0bdbbdd160af3d130487bf1165d48b9a}
+      model-00020-of-000064.safetensors: {size: 9809050936, sha256: 9c6ee52ccb57bd2fdba6077a18faaf3ea6da1b3536597af4fef6c5cf713bec34}
+      model-00021-of-000064.safetensors: {size: 9809050936, sha256: fb99455eb90ddd9ab343538496c3e90b40868c0029a344d79b0b94f73820dd1f}
+      model-00022-of-000064.safetensors: {size: 9809050936, sha256: f98118e5b5e700ad57b510f3c80183fc2e5e3dcd1badf43a959ce63140ae4e61}
+      model-00023-of-000064.safetensors: {size: 9809050936, sha256: 0a4f4fb4557c2954dc07ffd8d81af93587ab784e6810eca093fef6b0fab03d3c}
+      model-00024-of-000064.safetensors: {size: 9809050936, sha256: 9fa6f9aba1f02a552a66d0bcf2808fdc9192425b5554684b637d7e9d9312fb3d}
+      model-00025-of-000064.safetensors: {size: 9809050936, sha256: 98a0dc92227ed3beb2a1491558d2fa631dca256a5c28e1895b1bf28ae4c9731b}
+      model-00026-of-000064.safetensors: {size: 9809050936, sha256: 6b6e19204d6f74af7ff2c78c67a33991f5ee4105e0262d99eda6ba6bc0362630}
+      model-00027-of-000064.safetensors: {size: 9809050936, sha256: 8476d21ab258330c16020124d634d2cd1f22a5a7859d3dd778132dea0271e810}
+      model-00028-of-000064.safetensors: {size: 9809050936, sha256: ee16b8cf5c8a9efb0c5fd89c282622e5cfbf4f49fb28d5b3638240434dadef7a}
+      model-00029-of-000064.safetensors: {size: 9809050936, sha256: 87e0e7b5caf5b39314caf4158b666d0b0c9fe00a96dd09ea545563f4a6f408ed}
+      model-00030-of-000064.safetensors: {size: 9809050936, sha256: 3f8d186de5354913a9aab43b26395c97bdf27b695586260bbd6492ba8ab795dc}
+      model-00031-of-000064.safetensors: {size: 9809050936, sha256: 696da932f44c248e96ca8b616424ee87e0609fb32ef640bd086f296665ad4ad8}
+      model-00032-of-000064.safetensors: {size: 9809050936, sha256: eee21740e4d75ba175965f322dd8d2747411fedc1b59b9a0559630d7c94d06c6}
+      model-00033-of-000064.safetensors: {size: 9809050936, sha256: cc9a7b5737151ca68fed23cb16308aff1527d8932be59d507318795025a9034e}
+      model-00034-of-000064.safetensors: {size: 9809050936, sha256: 783faa4cbeac1c7336070596c5a3f603bd49193c1ab6da74eb29d6fed935d905}
+      model-00035-of-000064.safetensors: {size: 9809050936, sha256: 0256b0e5c83716c66871f0b63b0b87fe92aab595355aae583d5a674a691411e2}
+      model-00036-of-000064.safetensors: {size: 9809050936, sha256: 6a86f1000cad632e3bfc96507d8217ccda56e7e1581671e592071a1e1c23c210}
+      model-00037-of-000064.safetensors: {size: 9809050936, sha256: 0c7c1080287ab3b2968335b87c0652000b0bfdffa1925be375fca3bda44c307f}
+      model-00038-of-000064.safetensors: {size: 9809050936, sha256: 3def12f0c85c494faafdfa3ce30d53aae7eff0baf9d195a347893a09b411e69f}
+      model-00039-of-000064.safetensors: {size: 9809050936, sha256: 2e09b40d7cc63d12c721b80a628246d984e39613b8c04c3f17c178d8c2b2b08e}
+      model-00040-of-000064.safetensors: {size: 9809050936, sha256: e2274434831845c62d4c82e15e37583720062b97093b897333d59ec2ff037097}
+      model-00041-of-000064.safetensors: {size: 9809050936, sha256: a7105088b5deeabf085121a0b1107fac42662eb3fea5baa09f027f0a7c5e9bdf}
+      model-00042-of-000064.safetensors: {size: 9809050936, sha256: 1215992a0a15aac21b7100c1f236c8029e361d03e69749d5d3e2d93c94dc8315}
+      model-00043-of-000064.safetensors: {size: 9809050936, sha256: 170fa46329c380b972269f75ccf01c3a4addeb29dd4ee865a700e1be3a0241c0}
+      model-00044-of-000064.safetensors: {size: 9809050936, sha256: 46101090a2c0b8c1a656a52ff9f10b71b42235470df68acf496eaaf1907cd4ef}
+      model-00045-of-000064.safetensors: {size: 9809050936, sha256: e0deb85da8e48a71353ce08b6b834de618791ee493a4e168ba9668f5f508be3b}
+      model-00046-of-000064.safetensors: {size: 9809050936, sha256: 5ba68e4ac7c67a64d61804ebc3107fb183fa613591ea6da58d331a58f43d89a3}
+      model-00047-of-000064.safetensors: {size: 9809050936, sha256: 29c023ba04d62faae4d2ffb73b59b5595d849727cb937626366cb512586fd5bb}
+      model-00048-of-000064.safetensors: {size: 9809050936, sha256: ebbde9208528e898fd82a76825c3149e3054a540824b5ca98e1cd56ca7ecfc11}
+      model-00049-of-000064.safetensors: {size: 9809050936, sha256: 4cb4685422970c3933807e3bd2bd81e2b931a0fb4aa43a900d17bc692a2efc7a}
+      model-00050-of-000064.safetensors: {size: 9809050936, sha256: f9a2ca8f3adb0e15215be60d9d0b2f11a8aa47cffaee8185c738cb7703fc8a23}
+      model-00051-of-000064.safetensors: {size: 9809050936, sha256: bc9588957be18f8e10b21e279b1764fa140b316c16a2d09583fcaa23188c8ce0}
+      model-00052-of-000064.safetensors: {size: 9809050936, sha256: 8861c6344eb946121bdc67bb3c0c64f6c600c13d83861399862b2c4176d5d25f}
+      model-00053-of-000064.safetensors: {size: 9809050936, sha256: 7e9ed6ed7757d845262390e645c663be925c5634c1afea5e918a0dec5bd4e034}
+      model-00054-of-000064.safetensors: {size: 9809050936, sha256: a1d4d2090a4e1d2500a5eb7b64a85b9a2386b50e9081220387b910c2153ec4a4}
+      model-00055-of-000064.safetensors: {size: 9809050936, sha256: 7e67cb8e165d64674fc743a80b66588feab2f4319d4772b578ca9778538ceb5a}
+      model-00056-of-000064.safetensors: {size: 9809050936, sha256: b92fb0d442a6c4c3bf68fcc9d2e88ecb0d35f775d09bbad72096a2f245c92010}
+      model-00057-of-000064.safetensors: {size: 9809050936, sha256: fbce540ebf43d5161cb69ca732a4d32850c73b051d29cd065d3fd717346b5b47}
+      model-00058-of-000064.safetensors: {size: 9809050936, sha256: e15bd7e760663b37a5c5eecaed66ac936b3540f5125ba71cc13607a07a26eeca}
+      model-00059-of-000064.safetensors: {size: 9809050936, sha256: 46dcfd4ef0e87d6ac5fb72275cca67dcc1422adf05aa16a03eab747fdf387aa0}
+      model-00060-of-000064.safetensors: {size: 9809050936, sha256: 3f942b79b835d3eaf96117302adbb7baa8ebea283cc9c3f32c27c04f3772e3a9}
+      model-00061-of-000064.safetensors: {size: 9809050936, sha256: ad295842a722b5cc700fbbf485ec9a9875f0aab756326b6b62ff4fc4bed0bd1b}
+      model-00062-of-000064.safetensors: {size: 4697635160, sha256: 794cc68f5dcb9d7fbb1c10ef7346ae37c094ecf05a147137f1a7d2163ab6e031}
+      model-00063-of-000064.safetensors: {size: 108556344, sha256: ace801249ecca82c93b82c0abfc18ab21beca2fea8e94c410353e26c14cd11f2}
+      model-00064-of-000064.safetensors: {size: 833769904, sha256: af1c927919bd073c2ab893bf2c6d9826100a06828c3b40f0128fabb4660a610d}
+      model.safetensors.index.json: {size: 23597438, sha256: 00a982d005d6e39b25cfcb379a7e6d57f393fc0346e70892ea4271c259c0d1e3}
+      modeling_deepseek.py: {size: 78528, sha256: 1fd8d198ff6ad69a5aec6fd85bf489d91ae2c432560b1e8ba7e34f710463c80a, git_oid: 707925a7f440d22c1fde9ea13676b7ee924d6e21}
+      modeling_kimi_k25.py: {size: 50961, sha256: ef28f469e7cb5ab91008a52c1b34718ad37de8428e2ed6aadc408d031a38a372, git_oid: a40ec230e0fdc7283fa4b7c504303296913785ec}
+      preprocessor_config.json: {size: 742, sha256: 0c43520fbcc076dacbffcf0273f0dfa0ee318ff9aa55537cf7f2788d906de7b2, git_oid: b0accb4b335998b847e0093bf4a63e1f32447cc9}
+      tiktoken.model: {size: 2795286, sha256: b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103}
+      tokenization_kimi.py: {size: 13462, sha256: 2ab1ffb6f5c4380758bd8d9752ff1041c09024182676a4311528fbdf92fb9599, git_oid: 436afeff0908a207c893f8e86ad91892268cec30}
+      tokenizer_config.json: {size: 4862, sha256: 12fcab43d2b6068f46769f5ff373960bf7c17a94d7abbc50e2491306b2f6cf58, git_oid: c4d32fcaffbe72d4050388e6464bb719408e361e}
+      tool_declaration_ts.py: {size: 16517, sha256: 97e09ed262f1cd38f87584eaa46c5d4d5b3c9725dd299b21642f389040794ebc, git_oid: 3cc7727ddbeabef16b90ce0219446bc2d4ea9032}
+  consumers: []
+- id: kimi-k2.6-nvfp4
+  repository: nvidia/Kimi-K2.6-NVFP4
+  tracked_ref: main
+  revision: 2fd3a800dedd098b8327eb49e93ebc75f85da19f
+  last_verified: '2026-10-13'
+  verification_status: verified
+  catalogue:
+    status: covered
+    entry: kimi-k2.6
+  quantization:
+    status: declared
+    sources:
+    - file: config.json
+      key: quantization_config
+      recipe:
+        config_groups:
+          group_0:
+            input_activations:
+              dynamic: false
+              num_bits: 4
+              type: float
+              group_size: 16
+            weights:
+              dynamic: false
+              num_bits: 4
+              type: float
+              group_size: 16
+            targets:
+            - Linear
+        ignore:
+        - language_model.lm_head
+        - language_model.model.layers.0*
+        - language_model.model.layers.1.mlp.shared_experts*
+        - language_model.model.layers.1.self_attn*
+        - language_model.model.layers.10.mlp.shared_experts*
+        - language_model.model.layers.10.self_attn*
+        - language_model.model.layers.11.mlp.shared_experts*
+        - language_model.model.layers.11.self_attn*
+        - language_model.model.layers.12.mlp.shared_experts*
+        - language_model.model.layers.12.self_attn*
+        - language_model.model.layers.13.mlp.shared_experts*
+        - language_model.model.layers.13.self_attn*
+        - language_model.model.layers.14.mlp.shared_experts*
+        - language_model.model.layers.14.self_attn*
+        - language_model.model.layers.15.mlp.shared_experts*
+        - language_model.model.layers.15.self_attn*
+        - language_model.model.layers.16.mlp.shared_experts*
+        - language_model.model.layers.16.self_attn*
+        - language_model.model.layers.17.mlp.shared_experts*
+        - language_model.model.layers.17.self_attn*
+        - language_model.model.layers.18.mlp.shared_experts*
+        - language_model.model.layers.18.self_attn*
+        - language_model.model.layers.19.mlp.shared_experts*
+        - language_model.model.layers.19.self_attn*
+        - language_model.model.layers.2.mlp.shared_experts*
+        - language_model.model.layers.2.self_attn*
+        - language_model.model.layers.20.mlp.shared_experts*
+        - language_model.model.layers.20.self_attn*
+        - language_model.model.layers.21.mlp.shared_experts*
+        - language_model.model.layers.21.self_attn*
+        - language_model.model.layers.22.mlp.shared_experts*
+        - language_model.model.layers.22.self_attn*
+        - language_model.model.layers.23.mlp.shared_experts*
+        - language_model.model.layers.23.self_attn*
+        - language_model.model.layers.24.mlp.shared_experts*
+        - language_model.model.layers.24.self_attn*
+        - language_model.model.layers.25.mlp.shared_experts*
+        - language_model.model.layers.25.self_attn*
+        - language_model.model.layers.26.mlp.shared_experts*
+        - language_model.model.layers.26.self_attn*
+        - language_model.model.layers.27.mlp.shared_experts*
+        - language_model.model.layers.27.self_attn*
+        - language_model.model.layers.28.mlp.shared_experts*
+        - language_model.model.layers.28.self_attn*
+        - language_model.model.layers.29.mlp.shared_experts*
+        - language_model.model.layers.29.self_attn*
+        - language_model.model.layers.3.mlp.shared_experts*
+        - language_model.model.layers.3.self_attn*
+        - language_model.model.layers.30.mlp.shared_experts*
+        - language_model.model.layers.30.self_attn*
+        - language_model.model.layers.31.mlp.shared_experts*
+        - language_model.model.layers.31.self_attn*
+        - language_model.model.layers.32.mlp.shared_experts*
+        - language_model.model.layers.32.self_attn*
+        - language_model.model.layers.33.mlp.shared_experts*
+        - language_model.model.layers.33.self_attn*
+        - language_model.model.layers.34.mlp.shared_experts*
+        - language_model.model.layers.34.self_attn*
+        - language_model.model.layers.35.mlp.shared_experts*
+        - language_model.model.layers.35.self_attn*
+        - language_model.model.layers.36.mlp.shared_experts*
+        - language_model.model.layers.36.self_attn*
+        - language_model.model.layers.37.mlp.shared_experts*
+        - language_model.model.layers.37.self_attn*
+        - language_model.model.layers.38.mlp.shared_experts*
+        - language_model.model.layers.38.self_attn*
+        - language_model.model.layers.39.mlp.shared_experts*
+        - language_model.model.layers.39.self_attn*
+        - language_model.model.layers.4.mlp.shared_experts*
+        - language_model.model.layers.4.self_attn*
+        - language_model.model.layers.40.mlp.shared_experts*
+        - language_model.model.layers.40.self_attn*
+        - language_model.model.layers.41.mlp.shared_experts*
+        - language_model.model.layers.41.self_attn*
+        - language_model.model.layers.42.mlp.shared_experts*
+        - language_model.model.layers.42.self_attn*
+        - language_model.model.layers.43.mlp.shared_experts*
+        - language_model.model.layers.43.self_attn*
+        - language_model.model.layers.44.mlp.shared_experts*
+        - language_model.model.layers.44.self_attn*
+        - language_model.model.layers.45.mlp.shared_experts*
+        - language_model.model.layers.45.self_attn*
+        - language_model.model.layers.46.mlp.shared_experts*
+        - language_model.model.layers.46.self_attn*
+        - language_model.model.layers.47.mlp.shared_experts*
+        - language_model.model.layers.47.self_attn*
+        - language_model.model.layers.48.mlp.shared_experts*
+        - language_model.model.layers.48.self_attn*
+        - language_model.model.layers.49.mlp.shared_experts*
+        - language_model.model.layers.49.self_attn*
+        - language_model.model.layers.5.mlp.shared_experts*
+        - language_model.model.layers.5.self_attn*
+        - language_model.model.layers.50.mlp.shared_experts*
+        - language_model.model.layers.50.self_attn*
+        - language_model.model.layers.51.mlp.shared_experts*
+        - language_model.model.layers.51.self_attn*
+        - language_model.model.layers.52.mlp.shared_experts*
+        - language_model.model.layers.52.self_attn*
+        - language_model.model.layers.53.mlp.shared_experts*
+        - language_model.model.layers.53.self_attn*
+        - language_model.model.layers.54.mlp.shared_experts*
+        - language_model.model.layers.54.self_attn*
+        - language_model.model.layers.55.mlp.shared_experts*
+        - language_model.model.layers.55.self_attn*
+        - language_model.model.layers.56.mlp.shared_experts*
+        - language_model.model.layers.56.self_attn*
+        - language_model.model.layers.57.mlp.shared_experts*
+        - language_model.model.layers.57.self_attn*
+        - language_model.model.layers.58.mlp.shared_experts*
+        - language_model.model.layers.58.self_attn*
+        - language_model.model.layers.59.mlp.shared_experts*
+        - language_model.model.layers.59.self_attn*
+        - language_model.model.layers.6.mlp.shared_experts*
+        - language_model.model.layers.6.self_attn*
+        - language_model.model.layers.60.mlp.shared_experts*
+        - language_model.model.layers.60.self_attn*
+        - language_model.model.layers.7.mlp.shared_experts*
+        - language_model.model.layers.7.self_attn*
+        - language_model.model.layers.8.mlp.shared_experts*
+        - language_model.model.layers.8.self_attn*
+        - language_model.model.layers.9.mlp.shared_experts*
+        - language_model.model.layers.9.self_attn*
+        - mm_projector*
+        - vision_tower*
+        quant_algo: NVFP4
+        kv_cache_scheme:
+          dynamic: false
+          num_bits: 8
+          type: float
+        producer:
+          name: modelopt
+          version: 0.0.1.dev752+gbd4fc3a65.d20260504
+        quant_method: modelopt
+    - file: hf_quant_config.json
+      key: ''
+      recipe:
+        producer:
+          name: modelopt
+          version: 0.0.1.dev752+gbd4fc3a65.d20260504
+        quantization:
+          quant_algo: NVFP4
+          kv_cache_quant_algo: FP8
+          group_size: 16
+          exclude_modules:
+          - language_model.lm_head
+          - language_model.model.layers.0*
+          - language_model.model.layers.1.mlp.shared_experts*
+          - language_model.model.layers.1.self_attn*
+          - language_model.model.layers.10.mlp.shared_experts*
+          - language_model.model.layers.10.self_attn*
+          - language_model.model.layers.11.mlp.shared_experts*
+          - language_model.model.layers.11.self_attn*
+          - language_model.model.layers.12.mlp.shared_experts*
+          - language_model.model.layers.12.self_attn*
+          - language_model.model.layers.13.mlp.shared_experts*
+          - language_model.model.layers.13.self_attn*
+          - language_model.model.layers.14.mlp.shared_experts*
+          - language_model.model.layers.14.self_attn*
+          - language_model.model.layers.15.mlp.shared_experts*
+          - language_model.model.layers.15.self_attn*
+          - language_model.model.layers.16.mlp.shared_experts*
+          - language_model.model.layers.16.self_attn*
+          - language_model.model.layers.17.mlp.shared_experts*
+          - language_model.model.layers.17.self_attn*
+          - language_model.model.layers.18.mlp.shared_experts*
+          - language_model.model.layers.18.self_attn*
+          - language_model.model.layers.19.mlp.shared_experts*
+          - language_model.model.layers.19.self_attn*
+          - language_model.model.layers.2.mlp.shared_experts*
+          - language_model.model.layers.2.self_attn*
+          - language_model.model.layers.20.mlp.shared_experts*
+          - language_model.model.layers.20.self_attn*
+          - language_model.model.layers.21.mlp.shared_experts*
+          - language_model.model.layers.21.self_attn*
+          - language_model.model.layers.22.mlp.shared_experts*
+          - language_model.model.layers.22.self_attn*
+          - language_model.model.layers.23.mlp.shared_experts*
+          - language_model.model.layers.23.self_attn*
+          - language_model.model.layers.24.mlp.shared_experts*
+          - language_model.model.layers.24.self_attn*
+          - language_model.model.layers.25.mlp.shared_experts*
+          - language_model.model.layers.25.self_attn*
+          - language_model.model.layers.26.mlp.shared_experts*
+          - language_model.model.layers.26.self_attn*
+          - language_model.model.layers.27.mlp.shared_experts*
+          - language_model.model.layers.27.self_attn*
+          - language_model.model.layers.28.mlp.shared_experts*
+          - language_model.model.layers.28.self_attn*
+          - language_model.model.layers.29.mlp.shared_experts*
+          - language_model.model.layers.29.self_attn*
+          - language_model.model.layers.3.mlp.shared_experts*
+          - language_model.model.layers.3.self_attn*
+          - language_model.model.layers.30.mlp.shared_experts*
+          - language_model.model.layers.30.self_attn*
+          - language_model.model.layers.31.mlp.shared_experts*
+          - language_model.model.layers.31.self_attn*
+          - language_model.model.layers.32.mlp.shared_experts*
+          - language_model.model.layers.32.self_attn*
+          - language_model.model.layers.33.mlp.shared_experts*
+          - language_model.model.layers.33.self_attn*
+          - language_model.model.layers.34.mlp.shared_experts*
+          - language_model.model.layers.34.self_attn*
+          - language_model.model.layers.35.mlp.shared_experts*
+          - language_model.model.layers.35.self_attn*
+          - language_model.model.layers.36.mlp.shared_experts*
+          - language_model.model.layers.36.self_attn*
+          - language_model.model.layers.37.mlp.shared_experts*
+          - language_model.model.layers.37.self_attn*
+          - language_model.model.layers.38.mlp.shared_experts*
+          - language_model.model.layers.38.self_attn*
+          - language_model.model.layers.39.mlp.shared_experts*
+          - language_model.model.layers.39.self_attn*
+          - language_model.model.layers.4.mlp.shared_experts*
+          - language_model.model.layers.4.self_attn*
+          - language_model.model.layers.40.mlp.shared_experts*
+          - language_model.model.layers.40.self_attn*
+          - language_model.model.layers.41.mlp.shared_experts*
+          - language_model.model.layers.41.self_attn*
+          - language_model.model.layers.42.mlp.shared_experts*
+          - language_model.model.layers.42.self_attn*
+          - language_model.model.layers.43.mlp.shared_experts*
+          - language_model.model.layers.43.self_attn*
+          - language_model.model.layers.44.mlp.shared_experts*
+          - language_model.model.layers.44.self_attn*
+          - language_model.model.layers.45.mlp.shared_experts*
+          - language_model.model.layers.45.self_attn*
+          - language_model.model.layers.46.mlp.shared_experts*
+          - language_model.model.layers.46.self_attn*
+          - language_model.model.layers.47.mlp.shared_experts*
+          - language_model.model.layers.47.self_attn*
+          - language_model.model.layers.48.mlp.shared_experts*
+          - language_model.model.layers.48.self_attn*
+          - language_model.model.layers.49.mlp.shared_experts*
+          - language_model.model.layers.49.self_attn*
+          - language_model.model.layers.5.mlp.shared_experts*
+          - language_model.model.layers.5.self_attn*
+          - language_model.model.layers.50.mlp.shared_experts*
+          - language_model.model.layers.50.self_attn*
+          - language_model.model.layers.51.mlp.shared_experts*
+          - language_model.model.layers.51.self_attn*
+          - language_model.model.layers.52.mlp.shared_experts*
+          - language_model.model.layers.52.self_attn*
+          - language_model.model.layers.53.mlp.shared_experts*
+          - language_model.model.layers.53.self_attn*
+          - language_model.model.layers.54.mlp.shared_experts*
+          - language_model.model.layers.54.self_attn*
+          - language_model.model.layers.55.mlp.shared_experts*
+          - language_model.model.layers.55.self_attn*
+          - language_model.model.layers.56.mlp.shared_experts*
+          - language_model.model.layers.56.self_attn*
+          - language_model.model.layers.57.mlp.shared_experts*
+          - language_model.model.layers.57.self_attn*
+          - language_model.model.layers.58.mlp.shared_experts*
+          - language_model.model.layers.58.self_attn*
+          - language_model.model.layers.59.mlp.shared_experts*
+          - language_model.model.layers.59.self_attn*
+          - language_model.model.layers.6.mlp.shared_experts*
+          - language_model.model.layers.6.self_attn*
+          - language_model.model.layers.60.mlp.shared_experts*
+          - language_model.model.layers.60.self_attn*
+          - language_model.model.layers.7.mlp.shared_experts*
+          - language_model.model.layers.7.self_attn*
+          - language_model.model.layers.8.mlp.shared_experts*
+          - language_model.model.layers.8.self_attn*
+          - language_model.model.layers.9.mlp.shared_experts*
+          - language_model.model.layers.9.self_attn*
+          - mm_projector*
+          - vision_tower*
+  artifacts:
+    include:
+    - '*.safetensors'
+    - '*.safetensors.index.json'
+    - config.json
+    - generation_config.json
+    - hf_quant_config.json
+    - preprocessor_config.json
+    - processor_config.json
+    - '*.py'
+    - '*.jinja'
+    - tokenizer*
+    - '*.model'
+    - special_tokens_map.json
+    - added_tokens.json
+    - docs/deploy_guidance.md
+    files:
+      chat_template.jinja: {size: 4022, sha256: 8bf859698fd4781c0e1e1c63ce74422aab27e53ccc5f47116317c64cda06132f, git_oid: 039939fb0cbca410595f7cefc0d62018d142b931}
+      config.json: {size: 13498, sha256: af4c0fea7ec43d5438532eeef8daa9fcabbdf97ddedc9da2319aa675f68f51ff, git_oid: 555e443a8b9ef32fe3fc28683ad5f5881d796409}
+      configuration_deepseek.py: {size: 10615, sha256: c1327c307e2dd11d1bf0adc8bcef69ae51f9617a3a869a9497bb08aec912f931, git_oid: b3152dd7c3e53d223d561848dc967f487daf32ef}
+      configuration_kimi_k25.py: {size: 5435, sha256: 2bc5487efced291e0e6aa3b24aad1082bade4172aff94ea1b6f0ae20a1d6bb4f, git_oid: 5858b3290a32509480affd58abc01482d5976550}
+      generation_config.json: {size: 52, sha256: 5431db52f431099f309ece737670e977de148f8cfd5340e920ff1f44d7cff596, git_oid: 4bb3f8ec4a1d604598b7ffb4621b955e995bda92}
+      hf_quant_config.json: {size: 7776, sha256: 6ee4be1d46bf2b5204284b6641ed7bb5d9fc2fc7e8157a4eb06d5fe500dddc3a, git_oid: dcdde1d1ca9afec820cd6cd4e011f3d1a67b68e2}
+      kimi_k25_processor.py: {size: 6906, sha256: 537d7a708e1654766fc628c99667bdb9364136d3541633d6522ac43cef9bfea0, git_oid: d526032f91036de5f3d226b866acf449553b986d}
+      kimi_k25_vision_processing.py: {size: 10019, sha256: 498e20753c9aa6b6224ddbcd05b04deb7e987b76595bf5c28ee8583f33ebc375, git_oid: fdf3ab2f100f7c28a1f1e7295297e54b515d0b53}
+      media_utils.py: {size: 13179, sha256: 77a6b1fed3580b0562443092928a0240c2989e3950377e93893952123ae48e3d, git_oid: 8795e06f381700d6420798f82174e3f9647e9f89}
+      model-00001-of-00060.safetensors: {size: 9996526192, sha256: 4469c3c444becfd566ef92a1b4967fd2682510635c9349242db7fac533256f07}
+      model-00002-of-00060.safetensors: {size: 9999105896, sha256: 332f30d35bc1ff6565235a4198e38a4e8d8578a91af31b565655728e9d7fba98}
+      model-00003-of-00060.safetensors: {size: 9999105896, sha256: b5b7141b90c9e286c86640fbb11a99a7c214b15d5bf57214cc116e1566d2d921}
+      model-00004-of-00060.safetensors: {size: 9999105904, sha256: f6490dd64a503936d9d3557c5a80ccf3a5db24cbf0dbd5f606e3ed7fa1fdb5c9}
+      model-00005-of-00060.safetensors: {size: 9999105896, sha256: 22c9f6c9974e1fa34ccdd9536125f492e7a4e95584df0d6d78f83da99e5b35a6}
+      model-00006-of-00060.safetensors: {size: 9999105896, sha256: 52fe719662f7d22ee8b41f98ba11d281aebc08314b1afb4fcfb845630e167047}
+      model-00007-of-00060.safetensors: {size: 9999105904, sha256: d8f97fdbe8a418bc1cb12c6fcb129bd7206f776ab944a3801abc0002f49f5fd5}
+      model-00008-of-00060.safetensors: {size: 9999105896, sha256: 19680a7fd511b8fa72d52dd0adbf3870c7db5aec29c1866eaca173b1d540a4a3}
+      model-00009-of-00060.safetensors: {size: 9999105896, sha256: 2b84902bb242df97e7d3c3854ddde2b3e01e6060e80e451f3dab56b3aaa6b291}
+      model-00010-of-00060.safetensors: {size: 9999109424, sha256: e78e3d120f3c5f6a50c5704087f820c3f31abe82bb82b6d3587af6bed0dce766}
+      model-00011-of-00060.safetensors: {size: 9999110608, sha256: 2923503b72de9d4cf7c847e03755364194c9006fe758f5b60d945b5153461465}
+      model-00012-of-00060.safetensors: {size: 9999110608, sha256: 3af6628a6d15e318383622ab907544f9d967879b33c6ef49e87ef4f9286dcb51}
+      model-00013-of-00060.safetensors: {size: 9999110616, sha256: e56b160136d90b36a167a68901233f7dff134da366a6d03b43e08002508191b2}
+      model-00014-of-00060.safetensors: {size: 9999110608, sha256: e2134f1cdaa52859361dc5016ec0723910a2a2a47ed2916fe1688d9d9f53e9d5}
+      model-00015-of-00060.safetensors: {size: 9999110608, sha256: 4f56893457a22da94e392aa44444642925f151a289030cdb7b1b3e556fdbf8f8}
+      model-00016-of-00060.safetensors: {size: 9999110616, sha256: c8d7faf9f213d6f9a3ac553d6b20f3ddc955575e00164e02ff3a7845d9b45aa4}
+      model-00017-of-00060.safetensors: {size: 9999110608, sha256: 0ffba90de1aaf73e41ee18844c517d92c293bcc43191d8cddce240d13162fb0a}
+      model-00018-of-00060.safetensors: {size: 9999110608, sha256: 34c59c112066c6dfd82147b2c90667833fe7667e8392631e74c94250ba2fec68}
+      model-00019-of-00060.safetensors: {size: 9999110616, sha256: fabac58713da0dfa522f768310c90d0276e00ffb8d3074b0293792b795c35ca7}
+      model-00020-of-00060.safetensors: {size: 9999110608, sha256: 9d3352320923e5164761e6885fb792e8906f26ef60dcbea568d520ade04dc9ae}
+      model-00021-of-00060.safetensors: {size: 9999110608, sha256: ed353a240c2a9d3d3d1c80b1b096b1695a74790bdba72c572371709e31b8a878}
+      model-00022-of-00060.safetensors: {size: 9999110616, sha256: f9679fc0c9d86a2c81e9aeea7e176e255aa8716d76cbff774d61c1a4621a492e}
+      model-00023-of-00060.safetensors: {size: 9987338120, sha256: 75713d1a1c3c934e56ac809efc1d7c7225d4e58a7f895e02f3756e6e2aee2cab}
+      model-00024-of-00060.safetensors: {size: 10000281592, sha256: bbe126b8e3c8a8607e1cd6eb85d2525b08fb5a0d56c784dda437f6e81c7363ab}
+      model-00025-of-00060.safetensors: {size: 10000028336, sha256: 67886f110747777db3be59addde41f60295b57a4a6a21ae5aeb2eba6afdf5bd6}
+      model-00026-of-00060.safetensors: {size: 9999110520, sha256: f198e1c4998dd12775f7effa74d908f611f60b13d875e7d44388558b14a82989}
+      model-00027-of-00060.safetensors: {size: 9999110528, sha256: 6f340eab6c5a162364c829dbad821ec169a3ac57353fcdab65ff4836cbd75917}
+      model-00028-of-00060.safetensors: {size: 9999110520, sha256: 415a66ec3deb908f917fc86ce8e1ce34281888cb23a4d121760ef993e8200dce}
+      model-00029-of-00060.safetensors: {size: 9999110520, sha256: ccb4294d8025da4241439fe83ec9bc925614e1d13f6b6c07b4b131100a745e5f}
+      model-00030-of-00060.safetensors: {size: 9999110528, sha256: bcbda7f03840efb2ddc1c928686797bca2ac6327abedbbcf5a3d5ce0699c25bc}
+      model-00031-of-00060.safetensors: {size: 9999110520, sha256: 7d3a79ee1ecd5048eedaeb4afd0c8a2a9b5ae9abdee225e8d9e0a2193a1784a0}
+      model-00032-of-00060.safetensors: {size: 9999110520, sha256: 5744f86e2a6fb8423bae0711ec2033032b01bf36f850070fa90c785fdf3db2f4}
+      model-00033-of-00060.safetensors: {size: 9999110528, sha256: d733bd5f084ec51654059a6716fce50ae56894203a51775e606c24cbc95cde97}
+      model-00034-of-00060.safetensors: {size: 9999110520, sha256: 13fdc04f5d939b437bd95f74097506baa65a9f135108281f406c55e336957911}
+      model-00035-of-00060.safetensors: {size: 9999110520, sha256: b7862577247b63f8a8214cd36c55a7e93140485fc4ef3add8ae3723878e73b8d}
+      model-00036-of-00060.safetensors: {size: 9999110528, sha256: 0130d83efac7b223cf1c0504b2576c8da392db78cc456fa787cfa95ab5b4eab0}
+      model-00037-of-00060.safetensors: {size: 9999110544, sha256: 29e978ac9ff03cfe445e1bec0ad7ef71c95e87e978832c7cf510e4329c06b1bc}
+      model-00038-of-00060.safetensors: {size: 9999110608, sha256: 3412437e376c69f32081009d89b0a12257ddae4f3861c8f31b8024439996b613}
+      model-00039-of-00060.safetensors: {size: 9999110616, sha256: bb7ab2c61bbb6e78fb53a2e8eb4a501fa347f0c066e02e75adeab76ea996f175}
+      model-00040-of-00060.safetensors: {size: 9999110608, sha256: bbef193ffe2e2fd7065b9db8ffd2b709bad340e05debd7ab36599637331aabfe}
+      model-00041-of-00060.safetensors: {size: 9999110608, sha256: 74ae562ec8fe73d664f3c3e17304d71ebad388ebb9f4735a70f7bad3f15b34ab}
+      model-00042-of-00060.safetensors: {size: 9999110616, sha256: b5c1d863355ae6ba41f3aa3496e417d990b7b6a831d6ce441b71e4bdcdb0fb52}
+      model-00043-of-00060.safetensors: {size: 9999110608, sha256: 1021d33909c5574f8169af9e46687bb72795c5669c1430162ae8399d0db3ccf2}
+      model-00044-of-00060.safetensors: {size: 9999110608, sha256: a460d826c065a844be7ac145c0020d60bc597d7c22c7b1651c4865dcaa6a7971}
+      model-00045-of-00060.safetensors: {size: 9999110616, sha256: c5eca724d2792840dc485be42557843bce3a0ac9a93826a62c123363efe7da92}
+      model-00046-of-00060.safetensors: {size: 9999110608, sha256: 11ca03630e56888e50c2bbf131679dd89ca84e790718899e1596b073a599af20}
+      model-00047-of-00060.safetensors: {size: 9999110608, sha256: d31d710d7a93ec1f122c75fee4bba57340d8f02e505840fdb74aece9401f8982}
+      model-00048-of-00060.safetensors: {size: 9999110616, sha256: d4bfe8b59a923430e4614ae197084eb568ad7c4d331e567f129e70129c80c976}
+      model-00049-of-00060.safetensors: {size: 9999110608, sha256: 0fabadda1ffe485df68b330c148f4c45eb28006641f634b157d44292666edd9f}
+      model-00050-of-00060.safetensors: {size: 9999110608, sha256: ed0307403d754a1373931e794ddeff3472d9f99de679502402473f3e9c72640d}
+      model-00051-of-00060.safetensors: {size: 9999110616, sha256: 215140a5b54ec6a5bcc46cccb3d3bb5cac3971beb1a8ae2d3bd86d589ada4525}
+      model-00052-of-00060.safetensors: {size: 9999110608, sha256: 47417d1ee80dfb802ca713326a4773de9acd41231417365efaf01ed52188bfe3}
+      model-00053-of-00060.safetensors: {size: 9999110608, sha256: 8250cf02aaf1c4e4f28c0fd574d55eda43cd71250fb8005110179b2e97f92581}
+      model-00054-of-00060.safetensors: {size: 9999110616, sha256: e9d172c255e721bbed5db268895b9b20f5f99c0ffc08d33657e3a09a2251bd20}
+      model-00055-of-00060.safetensors: {size: 9999110608, sha256: ab571b19948afd6d3a86b1cc3ebe57000d26f065aac726bced0e2750ccabfd22}
+      model-00056-of-00060.safetensors: {size: 9999110608, sha256: 5a1d3cb159cd5f765100c7032f9d10e18fc87e138d511f1a82a5f785b7e42521}
+      model-00057-of-00060.safetensors: {size: 9999110616, sha256: bf4d282d8c7a78be32f4c3865855314d66089debb0699a104090ffe01ccc9555}
+      model-00058-of-00060.safetensors: {size: 9999110608, sha256: 3532b212ba6486d5fe4fb49c76d40b3dbf4f75c63b75b50da143d6bf33246d95}
+      model-00059-of-00060.safetensors: {size: 9999110608, sha256: 77ff7fd133160f8e0fcb8091b1600075b3282cc8bb1e6311771db475818ad111}
+      model-00060-of-00060.safetensors: {size: 5250188760, sha256: c5d0450837742d0369f16177377d0abc2141145e8aec3fbdee3a708d0a7a48ae}
+      model.safetensors.index.json: {size: 30708519, sha256: 5bb72bd3bf09b300e6854b01366349ff7d51f5e94b0d6049c2f87c1f3aaf8984}
+      modeling_deepseek.py: {size: 78528, sha256: 1fd8d198ff6ad69a5aec6fd85bf489d91ae2c432560b1e8ba7e34f710463c80a, git_oid: 707925a7f440d22c1fde9ea13676b7ee924d6e21}
+      modeling_kimi_k25.py: {size: 50961, sha256: ef28f469e7cb5ab91008a52c1b34718ad37de8428e2ed6aadc408d031a38a372, git_oid: a40ec230e0fdc7283fa4b7c504303296913785ec}
+      preprocessor_config.json: {size: 742, sha256: 0c43520fbcc076dacbffcf0273f0dfa0ee318ff9aa55537cf7f2788d906de7b2, git_oid: b0accb4b335998b847e0093bf4a63e1f32447cc9}
+      processor_config.json: {size: 124, sha256: 171b734e3e3cf5bbd14b075a46a4fd84e38bcc8bf6f6ca89fbe05fb83ba9ad30, git_oid: 31838a3332c7aad5652f4fa910b2f5c3cae3636c}
+      special_tokens_map.json: {size: 736, sha256: 166020916c8df927b0e2c0b04c405e4cead4328fcfab33fa5c67e0fa9747b764, git_oid: a7815a0bd492c62d5f88efca347cb04bcf99b408}
+      tiktoken.model: {size: 2795286, sha256: b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103}
+      tokenization_kimi.py: {size: 13462, sha256: 2ab1ffb6f5c4380758bd8d9752ff1041c09024182676a4311528fbdf92fb9599, git_oid: 436afeff0908a207c893f8e86ad91892268cec30}
+      tokenizer_config.json: {size: 4862, sha256: 12fcab43d2b6068f46769f5ff373960bf7c17a94d7abbc50e2491306b2f6cf58, git_oid: c4d32fcaffbe72d4050388e6464bb719408e361e}
+      tool_declaration_ts.py: {size: 16517, sha256: 97e09ed262f1cd38f87584eaa46c5d4d5b3c9725dd299b21642f389040794ebc, git_oid: 3cc7727ddbeabef16b90ce0219446bc2d4ea9032}
+  consumers: []
+- id: kimi-k2.7-code
+  repository: moonshotai/Kimi-K2.7-Code
+  tracked_ref: main
+  revision: 74797c9c62378b951a1f6fcf5c4631024e9b8bef
+  last_verified: '2026-10-11'
+  verification_status: verified
+  catalogue:
+    status: not-in-catalogue
+    entry: null
+  quantization:
+    status: declared
+    sources:
+    - file: config.json
+      key: text_config.quantization_config
+      recipe:
+        config_groups:
+          group_0:
+            input_activations: null
+            output_activations: null
+            targets:
+            - Linear
+            weights:
+              actorder: null
+              block_structure: null
+              dynamic: false
+              group_size: 32
+              num_bits: 4
+              observer: minmax
+              observer_kwargs: {}
+              strategy: group
+              symmetric: true
+              type: int
+        format: pack-quantized
+        ignore:
+        - re:.*self_attn.*
+        - re:.*shared_experts.*
+        - re:.*mlp\.(gate|up|gate_up|down)_proj.*
+        - re:.*lm_head.*
+        - re:.*vision_tower.*
+        - re:.*mm_projector.*
+        kv_cache_scheme: null
+        quant_method: compressed-tensors
+        quantization_status: compressed
+  artifacts:
+    include:
+    - '*.safetensors'
+    - '*.safetensors.index.json'
+    - config.json
+    - generation_config.json
+    - hf_quant_config.json
+    - preprocessor_config.json
+    - '*.py'
+    - '*.jinja'
+    - tokenizer*
+    - '*.model'
+    - special_tokens_map.json
+    - added_tokens.json
+    - docs/deploy_guidance.md
+    files:
+      chat_template.jinja: {size: 2385, sha256: 8d21200dff7e85beaf51c8b110952e039ffd0779f615d64d63293d74773360f9, git_oid: 317ce481296988cd4281e42764252b9198076e2f}
+      config.json: {size: 5420, sha256: ffbb57bff844e024f6c112640b63da80af228ceb8fb3e2e21908a21febbcdffb, git_oid: 82efafe47e37462a55e6eb50f46fc1f04e34f75e}
+      configuration_deepseek.py: {size: 10615, sha256: c1327c307e2dd11d1bf0adc8bcef69ae51f9617a3a869a9497bb08aec912f931, git_oid: b3152dd7c3e53d223d561848dc967f487daf32ef}
+      configuration_kimi_k25.py: {size: 5435, sha256: 2bc5487efced291e0e6aa3b24aad1082bade4172aff94ea1b6f0ae20a1d6bb4f, git_oid: 5858b3290a32509480affd58abc01482d5976550}
+      docs/deploy_guidance.md: {size: 3689, sha256: b1bc4c5fb7c8b1da727663d4da83999afc902f6166ff862fbaef514b86de2c65, git_oid: f2d63b7abb0f83ad553d79adee8b4cea98a5a88f}
+      generation_config.json: {size: 91, sha256: b784cc6a9ecb551196b81cb6b1d2dcb18467b92adaab6992ae4cc455ad44d2ce, git_oid: cc46200200f5f296e83858c7cdf8a512f0b8c178}
+      kimi_k25_processor.py: {size: 6906, sha256: 537d7a708e1654766fc628c99667bdb9364136d3541633d6522ac43cef9bfea0, git_oid: d526032f91036de5f3d226b866acf449553b986d}
+      kimi_k25_vision_processing.py: {size: 10019, sha256: 498e20753c9aa6b6224ddbcd05b04deb7e987b76595bf5c28ee8583f33ebc375, git_oid: fdf3ab2f100f7c28a1f1e7295297e54b515d0b53}
+      media_utils.py: {size: 13179, sha256: 77a6b1fed3580b0562443092928a0240c2989e3950377e93893952123ae48e3d, git_oid: 8795e06f381700d6420798f82174e3f9647e9f89}
+      model-00001-of-000064.safetensors: {size: 995001888, sha256: f039216c7c449fc944ec23f96ca0a19dcdfd10f7134dbc05b94dc82bfc48c4b4}
+      model-00002-of-000064.safetensors: {size: 9809047464, sha256: 9f29f76850192a8a0422fc3d75be10ffdb6e1e6c57536db09b9e57330402938a}
+      model-00003-of-000064.safetensors: {size: 9809047464, sha256: 1e3c59ab16fde9059831edf1245e34aaea32ecf28c332af52e7ef53f35169281}
+      model-00004-of-000064.safetensors: {size: 9809047464, sha256: 0863caf2c5b5bd6f3374757b7acbfec477b31bcec3bceaf064327478e09f6027}
+      model-00005-of-000064.safetensors: {size: 9809047464, sha256: 63709e48656914ee96cc239311049f4a616b54dc687b27d702b24d266acec2d6}
+      model-00006-of-000064.safetensors: {size: 9809047464, sha256: a303b0bd76aaed95328b680b11ff7e96f68aa2947a93e1e112ebdcb98affa7d1}
+      model-00007-of-000064.safetensors: {size: 9809047464, sha256: 94244e6eee19b2b9e60f1ed9bd1cca37b126ffefa10fd03bbf06739e473b0405}
+      model-00008-of-000064.safetensors: {size: 9809047464, sha256: 40099c8bb5935abe5a22147a17eabb07e19b4d3678ae8b4f8ee0238bfdfd5581}
+      model-00009-of-000064.safetensors: {size: 9809047464, sha256: 1e32aee880f63e74f9c9a0e968f198829aabd6afc1e41fa40d7ca16f77a833d6}
+      model-00010-of-000064.safetensors: {size: 9809047464, sha256: b601a5e469be6f384d6bcd194bdb728a346b2dc9953b198a2c96caf090359cd2}
+      model-00011-of-000064.safetensors: {size: 9809050936, sha256: 235b8db1f814df9ec4dbee727327703134e8e29e74ac198b437170ffaa85da32}
+      model-00012-of-000064.safetensors: {size: 9809050936, sha256: 3ad887ad0b63c8e4f59ec9090bf7b8f01ca091df828ef4601b53b9d8fe943da8}
+      model-00013-of-000064.safetensors: {size: 9809050936, sha256: 9a10a26f5e633d7d0a300f37490ca0b2c57cf05e66c29b3089ca037280ed1bfa}
+      model-00014-of-000064.safetensors: {size: 9809050936, sha256: f7536219b9599de4cca8a57d08dce416f2f38b9472600e945e018dc9daa64840}
+      model-00015-of-000064.safetensors: {size: 9809050936, sha256: f279fa4cc3d3d72d31c9a391b1c1ff3977c6f26f1297a913c221d33f8dde9092}
+      model-00016-of-000064.safetensors: {size: 9809050936, sha256: c1a5426a084d23e9fcdbb485b79b87972128c7b6bb7a331d82af94939d49068f}
+      model-00017-of-000064.safetensors: {size: 9809050936, sha256: 41acfc6a032b0dd4baa1f60c2722e9d4c89d8592cf4c36487dcc7f6f71ff92d0}
+      model-00018-of-000064.safetensors: {size: 9809050936, sha256: 9bf9d5a8b5c148a0f8330dacc4725f37346cf103ac025b4970db1f535398028d}
+      model-00019-of-000064.safetensors: {size: 9809050936, sha256: e57a91d0b0badfe4d0d4dc81e2b301361b2bb7cdfdfd8e0f4335c7a8f059d63b}
+      model-00020-of-000064.safetensors: {size: 9809050936, sha256: b3e10972380a82cc494452d42e8b529e14883904d9d6592cb7822e6216cc0f72}
+      model-00021-of-000064.safetensors: {size: 9809050936, sha256: c299d47a3e086de334b966444759fcf3990b7243b566d3c9671109ac817f688f}
+      model-00022-of-000064.safetensors: {size: 9809050936, sha256: 8e63d7c0a78f9ecefb9d6929e517f4abc0057ff9fb41a9412cd2a4bd31b2a957}
+      model-00023-of-000064.safetensors: {size: 9809050936, sha256: ffe92aab5e845a289c7a71ff1c5f9e38c374072f06c63ef3d509b677ba28eeaf}
+      model-00024-of-000064.safetensors: {size: 9809050936, sha256: 9be724631c19fb10b9021d0b3ae5d3de7c673590273ea70d2322fba42a5c2037}
+      model-00025-of-000064.safetensors: {size: 9809050936, sha256: 467da6b42df6ec2363a0a51396d27575f294f1e09341609a4c93cbbe35837861}
+      model-00026-of-000064.safetensors: {size: 9809050936, sha256: 09a9ba1ea4b4a2c9cf06814f64681295366246b45a7a347a73ef85be490f7ff0}
+      model-00027-of-000064.safetensors: {size: 9809050936, sha256: 57387f5523c7a0083ca38435717209179711d6a0eddbfb77c7f6b39f527346b1}
+      model-00028-of-000064.safetensors: {size: 9809050936, sha256: b40522c6529ff6156823ca0c640e7a47ba4034fd8fdd13e4ff8f507dbd01d86a}
+      model-00029-of-000064.safetensors: {size: 9809050936, sha256: 9836d709a2baa92af5c11bdb8329e414df843d26b18eba00814040721f7beea8}
+      model-00030-of-000064.safetensors: {size: 9809050936, sha256: 92afe1fb4c0fb6533c3ab870f39c35481769115480928b455151ba14e25e5ad5}
+      model-00031-of-000064.safetensors: {size: 9809050936, sha256: 9208435eb7ea4652dce1024cf818df1951ae94a75e01c0ca12beb53e4c4172be}
+      model-00032-of-000064.safetensors: {size: 9809050936, sha256: 9e1a18abff1537b11dda04b1d669960fc4bed0794b56bc0fab29620e962848ff}
+      model-00033-of-000064.safetensors: {size: 9809050936, sha256: a6d01497bd1013531ca185a120f2bea40281baad8822a9a60953ceac4e2a2c51}
+      model-00034-of-000064.safetensors: {size: 9809050936, sha256: 9d1f5005abb5810f8602c2175e9173fba5771116e95aadda295ffe7a23be4b83}
+      model-00035-of-000064.safetensors: {size: 9809050936, sha256: e188d2d498e5761f71f5206d3c89fdca88c28eaa62b48f519b04e46527204857}
+      model-00036-of-000064.safetensors: {size: 9809050936, sha256: 75d9b3a4438a44fdbc6d760268ccdb485c8a0899717b59813b5845e5ddb8f27f}
+      model-00037-of-000064.safetensors: {size: 9809050936, sha256: 20b51e48e3a1d82a95c36f7fc85e210d1843e956d0fc6933cf9a0b2f32824198}
+      model-00038-of-000064.safetensors: {size: 9809050936, sha256: 79a6e09b4267f2bd26d0190870628cf15cb813284cc6d7696c2f636f2ee9dae9}
+      model-00039-of-000064.safetensors: {size: 9809050936, sha256: cee10b128e5b9338ddedb25087d94d1c2f72000544fc75b1ec14b4e554e0c56a}
+      model-00040-of-000064.safetensors: {size: 9809050936, sha256: fe22693f53c8e1740db4f041f315282d51e4d3942a83149e1ad797f8bd2f9738}
+      model-00041-of-000064.safetensors: {size: 9809050936, sha256: 7b345c1000526dc315d53d814278c6bd3d33a249ac300283c4ae4ec1db824de7}
+      model-00042-of-000064.safetensors: {size: 9809050936, sha256: 652cff25ce13996b0ed8f5837fcc3bb643f6d11cf9f10fba7cf80d2e74d27f7a}
+      model-00043-of-000064.safetensors: {size: 9809050936, sha256: a42e80c85ac2eb249b1544c5d968c83dca3f8f497d6f0c30955154ed6b6736ac}
+      model-00044-of-000064.safetensors: {size: 9809050936, sha256: a8442a1943ef5e75c8ec399a7cebd6a0c1055db3392eed71dec5ac116fcb1d0a}
+      model-00045-of-000064.safetensors: {size: 9809050936, sha256: d9531df35b99c8ab8b256ed53767b337edd222746252f7cd581f3f16d24f1a7c}
+      model-00046-of-000064.safetensors: {size: 9809050936, sha256: d964bd060f98d75539b277c8837ed7a5d4547b9106c9a68d57dddfb6d75a61da}
+      model-00047-of-000064.safetensors: {size: 9809050936, sha256: 722716bf5ce948a2fb6e5698a1f9f8e40c83b0f2423b8d38c790b727a1b2b50a}
+      model-00048-of-000064.safetensors: {size: 9809050936, sha256: ea4bfcff45f7443f51e4396a1d43ae9aa97f54ae18e3886cbd26d38bdc03f36b}
+      model-00049-of-000064.safetensors: {size: 9809050936, sha256: 573d91a2b0a4f29d4362a1ad97218db03a795ddd92df951b6cd366ce17c77380}
+      model-00050-of-000064.safetensors: {size: 9809050936, sha256: 7f50a49a3bffb280a92d57c41a225cdf71fbc557eb0beefdd9844b26b32179a6}
+      model-00051-of-000064.safetensors: {size: 9809050936, sha256: f4fa61418ea5b7a3db52af61ed05d6163d6a26dfdaf3c2ac3f1411872888117a}
+      model-00052-of-000064.safetensors: {size: 9809050936, sha256: 50368bb4d1bb3ba5ee96fb2cdb417912d1e7ebe005eb8068f471b89e3d404501}
+      model-00053-of-000064.safetensors: {size: 9809050936, sha256: 4ab2de271a7572acfca12a82d0f5a3a6fab654e753be9fcadd856dccf9e593e2}
+      model-00054-of-000064.safetensors: {size: 9809050936, sha256: 258a169f35df3eb0de2dea77818528124e9f7e674ca5d7294a8d6ad7022d32a1}
+      model-00055-of-000064.safetensors: {size: 9809050936, sha256: 5d466f7a7500b264eae3ac9b40321edddf4c81ac9d2234426a31f8ca1438d2f0}
+      model-00056-of-000064.safetensors: {size: 9809050936, sha256: c654a9f9f075b8cf447f6d9a9409678fe8d8d7941d99e299b9e0172bf5ea67d1}
+      model-00057-of-000064.safetensors: {size: 9809050936, sha256: 277099862a1d4ea4b59dbe930d36764a633e94a16e0354fd0f0cf5dbbb50e832}
+      model-00058-of-000064.safetensors: {size: 9809050936, sha256: 37fda8ec7f54805474156382828313315c632d925474e7812ad758f6cb9464c5}
+      model-00059-of-000064.safetensors: {size: 9809050936, sha256: 7b075f0e1f4f5b0642f659c57fb2e537d9275343e85cdf48dd88ba7122ed25b1}
+      model-00060-of-000064.safetensors: {size: 9809050936, sha256: 1f4dd9524c2d8913debfa5390b797938870166ed30962ae96fc9a98785db6c69}
+      model-00061-of-000064.safetensors: {size: 9809050936, sha256: 99a2460c4e71e9f28716db03095cf4e7a8c8d43d5c7c591eb63dd52fff48db7e}
+      model-00062-of-000064.safetensors: {size: 4697635160, sha256: 92de68e442a6a3762a2b28e98a643652342f823ed88872a32f68989e7b262ead}
+      model-00063-of-000064.safetensors: {size: 108556344, sha256: 147ef95378fd5da43a939c93ccfba82500b75c150791e0976a647359df8c1b2b}
+      model-00064-of-000064.safetensors: {size: 833769904, sha256: 087a5095d18196449052e0226d04b78b63daee8513bbd194feca034ff88bf87c}
+      model.safetensors.index.json: {size: 23597438, sha256: f6dd3318271f0121445d2af1c0c3f75707127a84a625f86bc0eaae9deb848f40}
+      modeling_deepseek.py: {size: 78639, sha256: 17e079e0a5e41114aabd2ae5ba924128ba6652bc6f9a00ea06efcd1230340406, git_oid: d33cf2edf7a5b959c0818ce59b549965d1b5e27e}
+      modeling_kimi_k25.py: {size: 53045, sha256: a1594f129ae8dc5fa3c9dbbc24e8e603b30d7caef1226669b4d95dc8f2a3e2dd, git_oid: c871db69d5af2e766ef40f40405d6d2467628cfd}
+      preprocessor_config.json: {size: 744, sha256: bd9a1f5d7b1580b38093c35ca49162580a118485164fac48e1cdb224ee41fcff, git_oid: 41291c9c4657724feacf30fe4ff3a82bf3eb16a0}
+      tiktoken.model: {size: 2795286, sha256: b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103}
+      tokenization_kimi.py: {size: 14132, sha256: 88394687bd081f55928849b2d140e190c70297660d3fb8b7c54c0e5633b177e3, git_oid: 5f0b292c6e7e105eeba82da6881dfa6acdcf7ad3}
+      tokenizer_config.json: {size: 4832, sha256: 6dfafeacca3d44748fc4a2fcc6725be5ea616ecc5b95f5a8b4277077c06e7d9f, git_oid: 0ffd8f25af6e8cd62bf0918e7f690ba1d1be279d}
+      tool_declaration_ts.py: {size: 16517, sha256: 97e09ed262f1cd38f87584eaa46c5d4d5b3c9725dd299b21642f389040794ebc, git_oid: 3cc7727ddbeabef16b90ce0219446bc2d4ea9032}
+  consumers: []
+- id: kimi-k3
+  repository: moonshotai/Kimi-K3
+  tracked_ref: main
+  revision: f831ab66814297da540d832a5235f8e904f29d06
+  last_verified: '2026-10-11'
+  verification_status: verified
+  catalogue:
+    status: not-in-catalogue
+    entry: null
+  quantization:
+    status: declared
+    sources:
+    - file: config.json
+      key: text_config.quantization_config
+      recipe:
+        config_groups:
+          group_0:
+            format: mxfp4-pack-quantized
+            input_activations: null
+            output_activations: null
+            targets:
+            - Linear
+            weights:
+              actorder: null
+              block_structure: null
+              dynamic: false
+              group_size: 32
+              num_bits: 4
+              observer: minmax
+              observer_kwargs: {}
+              scale_dtype: torch.uint8
+              strategy: group
+              symmetric: true
+              type: float
+              zp_dtype: null
+        format: mxfp4-pack-quantized
+        global_compression_ratio: null
+        ignore:
+        - re:.*self_attn.*
+        - re:.*shared_experts.*
+        - re:.*mlp\.(gate|up|gate_up|down)_proj.*
+        - re:.*lm_head.*
+        - re:.*vision_tower.*
+        - re:.*mm_projector.*
+        kv_cache_scheme: null
+        quant_method: compressed-tensors
+        quantization_status: compressed
+  artifacts:
+    include:
+    - '*.safetensors'
+    - '*.safetensors.index.json'
+    - config.json
+    - generation_config.json
+    - hf_quant_config.json
+    - preprocessor_config.json
+    - '*.py'
+    - '*.jinja'
+    - tokenizer*
+    - '*.model'
+    - special_tokens_map.json
+    - added_tokens.json
+    - docs/deploy_guidance.md
+    files:
+      config.json: {size: 7006, sha256: 9710e121a58d03ac92c8d6da287a19541994319afbbe6d6202af001ffd379213, git_oid: d7f26ead420b1d967f2759679dbebc65edfcff93}
+      configuration_kimi_k3.py: {size: 11343, sha256: 735eb9ebe593e17d231e08e1df7f7be9b5ee0e079f511aa201f9572077b416ae, git_oid: b38c4f8fcab1ce295aea236772ea1cba57f978c9}
+      encoding_k3.py: {size: 26304, sha256: 49ff03305fdc4be26867972788d36150b67f8a9e852e62bb7959d87482223676, git_oid: 82a5f1f0777cd6135d3394002be82639345d0fe3}
+      generation_config.json: {size: 53, sha256: c6648c25e9705af7fba8847e243840d21b5cc63ddeb6297f750a7ddbb6a02836, git_oid: 3908a4a5477122aa4b09386acab760fb7887c0fc}
+      kimi_k3_processor.py: {size: 7660, sha256: ec9f7e86d2ab0eee07a8e7e7c037046e77ac3c25a710ad1298ec13be3b585b54, git_oid: 033a5773885c144509788e89a445217b76d6c046}
+      kimi_k3_vision_processing.py: {size: 6686, sha256: d122b30bfd3a51a6f05d4bfcfda1e657827322b1353f7caefeebc2835d7736b5, git_oid: 58154424ff951289570c8fb5578e7372bfbfaa8b}
+      media_utils.py: {size: 13844, sha256: 78403540328f9847d6b7ebc5c44eb2e6a752863de0afb7d0710728bb161dc60d, git_oid: e8b2ae127e254e364e6b568b1093a7e12ac576e0}
+      model-00001-of-000096.safetensors: {size: 2341216112, sha256: 975584c00f85a95fce8ae0f840af8cef69c2ef4db00d34cab3e2cbdfc60f6e51}
+      model-00002-of-000096.safetensors: {size: 16990911504, sha256: 26a3284e1d2cb567934ebef002e6a1813551d646739e8bcb1e9e3fe7f878e0f5}
+      model-00003-of-000096.safetensors: {size: 16990911504, sha256: e54af9de4c554956082364010f732443bcd5097390f0121a33fb35e37280b5a9}
+      model-00004-of-000096.safetensors: {size: 16567501776, sha256: 5955fd8feda89b1af8400c25e885e7177d47edff155f54b318beb8dd1cec5c05}
+      model-00005-of-000096.safetensors: {size: 16990911504, sha256: d60d68ad0381ffd2d8716d5991a65993cc81837455bf05d1c76ea3a75662e268}
+      model-00006-of-000096.safetensors: {size: 16990911504, sha256: b1d4805767471a9721cd087d2047843ab9262d4f9bbe0d4a306e72c07179f939}
+      model-00007-of-000096.safetensors: {size: 16990911504, sha256: fb1120fef34c0416e73a3259ae6114b9a82b6081871b368a199e0b265cac7df7}
+      model-00008-of-000096.safetensors: {size: 16567501776, sha256: 2318dda54fc1985b63d6068de54fbe312ac87317c902666c9075aa5e10e8a1c9}
+      model-00009-of-000096.safetensors: {size: 16990911504, sha256: 8b66cdde34f5130cf4f99ec35b16f1f6d33bf0ec946cf2a5612004f5d399f998}
+      model-00010-of-000096.safetensors: {size: 16990911504, sha256: d34f55f7b734a1eaecc986fc7f92bcaa1b7d18fad90a33befd3fae4f1b2771a9}
+      model-00011-of-000096.safetensors: {size: 16990916912, sha256: 1738856a4cca2e356510892de4accf3c3f94b9f598b0394a87e7951740ba4a21}
+      model-00012-of-000096.safetensors: {size: 16567507176, sha256: c6b9bef38415f509898fa7b5c04d20c6fee84b0e02c05d74259d201fe6f3868b}
+      model-00013-of-000096.safetensors: {size: 16990916912, sha256: 3cbf43d56d9c80be0f848a4866e290741c697e09d885dc2351b0a11de514d9c8}
+      model-00014-of-000096.safetensors: {size: 16990916912, sha256: ce5f343f07d408c64fb247bbe8691edb84d54e3976d3ff586ebcf5929fd143ad}
+      model-00015-of-000096.safetensors: {size: 16990916912, sha256: b55caa8013348498525eef2b1416a657f0c28264ada9b245df19d2eea168b4c1}
+      model-00016-of-000096.safetensors: {size: 16567507176, sha256: 5a63e63ced659c1996b02ccabdea977546a39ecce025af1e54552de3bfc0489e}
+      model-00017-of-000096.safetensors: {size: 16990916912, sha256: 622bfa605205f4ef65e44dac07246bea79e18123ae8b84ab33eec89b6364c3a9}
+      model-00018-of-000096.safetensors: {size: 16990916912, sha256: 838b265ebb86a1320e589685779125d224663160823873b9e5930cf63fafe796}
+      model-00019-of-000096.safetensors: {size: 16990916912, sha256: 599a8ecf88f21d4c91295b4160e7564e501807535e522195ee45050a04f17ded}
+      model-00020-of-000096.safetensors: {size: 16567507176, sha256: 8e01b61ab76655ca0c5bd6645303a00c05fb58da94e00f978a9ef1e8114a6f0f}
+      model-00021-of-000096.safetensors: {size: 16990916912, sha256: 1944265bd024ea6caa23796326e420260a801e5c52e6253155f22ce97e9578d0}
+      model-00022-of-000096.safetensors: {size: 16990916912, sha256: 2d32d3e3c8da0764f73830289c6a22224f755c0cf058df0262fb0f83b3777029}
+      model-00023-of-000096.safetensors: {size: 16990916912, sha256: c291f2ec15788cb24cdf791c6d68dbf8803b26d01415cff3fab367cba581a169}
+      model-00024-of-000096.safetensors: {size: 16567507176, sha256: 278855ab81d42337e2a1857f136d740911fe3f5b1813dc21ce2cb03dc5c3cde3}
+      model-00025-of-000096.safetensors: {size: 16990916912, sha256: 6e3ae6ad868f5b38fa7ddface520796ea251568b07447deee3d164a0a32d862b}
+      model-00026-of-000096.safetensors: {size: 16990916912, sha256: cdd79fb52c7a3350926c4b947ae82cccd0af17fa3fb537c5694a4cedf2b59811}
+      model-00027-of-000096.safetensors: {size: 16990916912, sha256: 1d974b40c4aeb5cc0adeba6f9fbad25fc99f8cd39f9dd3513aeb2fb30a9c4188}
+      model-00028-of-000096.safetensors: {size: 16567507176, sha256: 1bec58e89ab7835d3ca40e581cc6f047cb93de47fda804eaea4e2407e01c3ed3}
+      model-00029-of-000096.safetensors: {size: 16990916912, sha256: c3bf0e738aa5fbd6ca3ecad982aba8d09efffd58b40cd8fb62d02fe0492f5ceb}
+      model-00030-of-000096.safetensors: {size: 16990916912, sha256: 7b996410482ad3c21700ed35d3f2b36282540db92b5631a31aeda1c5e90d6343}
+      model-00031-of-000096.safetensors: {size: 16990916912, sha256: c26689540a2471fe690c441a6cf9bec8f00471930e3131962206fd992e0d377c}
+      model-00032-of-000096.safetensors: {size: 16567507176, sha256: f7dc9e726d46d5c7c2c35af2eea4860cc89dd38a52b60591358a5ca7899c5159}
+      model-00033-of-000096.safetensors: {size: 16990916912, sha256: 615afa33b69cbaa42122bb3bcce92e40d6de86713a301c43c5d1bc2ac4342c1b}
+      model-00034-of-000096.safetensors: {size: 16990916912, sha256: a53b27fe92df11e77aec7c5de93ac148b9e2a7bac95020535f68854a7977bde7}
+      model-00035-of-000096.safetensors: {size: 16990916912, sha256: 9f4b44c89e4965a973f4fa71eaa0f8ada110f588065541e83bf52692feaa886d}
+      model-00036-of-000096.safetensors: {size: 16567507176, sha256: 55aef33fab36df93731289ba38d0ce516d9880c100be5f69f933d0af80bf3c6e}
+      model-00037-of-000096.safetensors: {size: 16990916912, sha256: e95dd3599d6918f5a22bc7b1256aaee9147f40aa05f43135d083d511eb5cbd80}
+      model-00038-of-000096.safetensors: {size: 16990916912, sha256: 1ce472771309248fd1155313dc3f72daa6fcc4793fba86d6c5d6a758ff6254ae}
+      model-00039-of-000096.safetensors: {size: 16990916912, sha256: 9c75b18c0d3a5088e13973dde519e74ead5c7b1df216dcd623b7ee561f378057}
+      model-00040-of-000096.safetensors: {size: 16567507176, sha256: 6f664598c00aee095174db1f860182652ff9b808f53c7764f70e071c6f8a4893}
+      model-00041-of-000096.safetensors: {size: 16990916912, sha256: 375f05f94a59d1509bef0976269fceb8f28d40e161d4903e64f735b1ede405c2}
+      model-00042-of-000096.safetensors: {size: 16990916912, sha256: b65947611d6c150394955f4637d4b05007f20a9b1c0f0f02bcf45d0ae2a428ba}
+      model-00043-of-000096.safetensors: {size: 16990916912, sha256: b5a425f100bbfaf804ac2dcca197ccf8fb3a910b6aa79d93e3a103b0146a8309}
+      model-00044-of-000096.safetensors: {size: 16567507176, sha256: 113ee012044206e9156dd683cb97ee5f27b07d0a4f936cbda457cd0bcf8ca336}
+      model-00045-of-000096.safetensors: {size: 16990916912, sha256: eb0698659da59c469020a03b3aa8d9ef847fc6359b2513b6720746a44da6f4de}
+      model-00046-of-000096.safetensors: {size: 16990916912, sha256: 0270727a399c553a602360b04bc1b5feaf09b22e12e3bb7eea5261801d4a1024}
+      model-00047-of-000096.safetensors: {size: 16990916912, sha256: b38f63eb08036cdf766a078c93ee037630d6481ded26065150915b8deaf03bb8}
+      model-00048-of-000096.safetensors: {size: 16567507176, sha256: 131e243c02cf2dc713de108edb8bfdb01c7ee28ce59d0a6615a630fb7cf0e4ae}
+      model-00049-of-000096.safetensors: {size: 16990916912, sha256: 72c91dcf2909ead55b6b5234e725227effbcd59fa5ce9f552e91c48d423cef0f}
+      model-00050-of-000096.safetensors: {size: 16990916912, sha256: 0a627a082cd39ee7d55f7440a5012c1fe084313f970e7d4351bb08d8ac7f5f2a}
+      model-00051-of-000096.safetensors: {size: 16990916912, sha256: 38a37bcec20abe1ddfaf68a636cd61cd291b71d554419a57736fd97d08a8cbff}
+      model-00052-of-000096.safetensors: {size: 16567507176, sha256: 9703b632174112ea051aaa2ca8b67558ffbf41a4699d042580ff11f26ec28e0a}
+      model-00053-of-000096.safetensors: {size: 16990916912, sha256: 413ec9ea0b693161c5e8a393a7a6be40a9f3c27114a919e1302fe94daeeee621}
+      model-00054-of-000096.safetensors: {size: 16990916912, sha256: 0e3da201b765929787e40c2fb8cd0cfb3476bfb9b95d7eb59b7d1066960606a2}
+      model-00055-of-000096.safetensors: {size: 16990916912, sha256: e7c9f4e44f8ac95f73048078c406781fb0418831089fd2f7c55459887606204b}
+      model-00056-of-000096.safetensors: {size: 16567507176, sha256: efd6176016b9fab27cca7710dce7ed599f06bbba1a8b126cfc76781b42c0e880}
+      model-00057-of-000096.safetensors: {size: 16990916912, sha256: e6982c96ac9101b75ab32c56568f5740ddae771acad29d92750b95aeeb3a7a30}
+      model-00058-of-000096.safetensors: {size: 16990916912, sha256: c93a23cbd6530391dcd9ce5617d24fb759e380f5ca676f83d00c8d6a9cda896f}
+      model-00059-of-000096.safetensors: {size: 16990916912, sha256: a62eb822071036421fa4aab662dafe3a3873b1b926378ebf489cddfd48a4d5de}
+      model-00060-of-000096.safetensors: {size: 16567507176, sha256: 9bccbaa71b98f8526ca4c6cb091a489063ec4734c84bb5f6d11eeb0512360b5f}
+      model-00061-of-000096.safetensors: {size: 16990916912, sha256: 1ae3969540fc676480804c37adc54df77e5ebb923952abb46d398b3a2d612e9d}
+      model-00062-of-000096.safetensors: {size: 16990916912, sha256: 96babdc24f2203eed68bd88f8534546696ab35bb1d0db7a5f15aaee295deee68}
+      model-00063-of-000096.safetensors: {size: 16990916912, sha256: 8a81caa697a7baf491393d83e3b85e14a0d025f5ee2ca91561528e8aec5c63ea}
+      model-00064-of-000096.safetensors: {size: 16567507176, sha256: 325c72d6ca5aaefd020da647ac317621903c8576a97d1de664b93638b7172f39}
+      model-00065-of-000096.safetensors: {size: 16990916912, sha256: 276d1cce1d8d494526938d878d4afb713ca379f98064dcd3c505325c954639db}
+      model-00066-of-000096.safetensors: {size: 16990916912, sha256: 2ebd83fea628d8cf7496a936f66a8a7f1b430bc8438644ae6ac9761ac056194e}
+      model-00067-of-000096.safetensors: {size: 16990916912, sha256: f0228892f8199c29c5053e7e5388a60dacf1458b53eb6f471e1f548f02478dd1}
+      model-00068-of-000096.safetensors: {size: 16567507176, sha256: fa75764056d16855c42baffd474bcc01045deda7ed5f773d88ff8887ea8458b6}
+      model-00069-of-000096.safetensors: {size: 16990916912, sha256: 9375584663bd3073cd95df18c3dc99fd4346c0c71dfdeec686a4891b7768a738}
+      model-00070-of-000096.safetensors: {size: 16990916912, sha256: ab53464148721a209d4941dc3ab6f698574f913179e729726d00ed6232144893}
+      model-00071-of-000096.safetensors: {size: 16990916912, sha256: 28ac0d3286ffc5c8567cc3b265500777ba2b75a0a5c6a273c87a5c9cfd8a8a5b}
+      model-00072-of-000096.safetensors: {size: 16567507176, sha256: 0a269faaf8ea2daccef499e7c1501089ea05386ca7c6a5a9d4150fd38e37673b}
+      model-00073-of-000096.safetensors: {size: 16990916912, sha256: a1b2e79e1bb7c9e0ade3f0825b748024a5207317589fc57f91dc2540443d716a}
+      model-00074-of-000096.safetensors: {size: 16990916912, sha256: df945022b493373bdcacc3903cc406978342dff2c1b3ace5278b1909fb1d2479}
+      model-00075-of-000096.safetensors: {size: 16990916912, sha256: 8c6d7cb12f7c51aa88207c5b9410fccfa44e4a9022efc75d73c06054c1296c05}
+      model-00076-of-000096.safetensors: {size: 16567507176, sha256: d5174eb5de19274b0fe62d466bfb21bac3b03d6d9676b801c6fea1ed57657998}
+      model-00077-of-000096.safetensors: {size: 16990916912, sha256: 8707eacfd69e8be65c7052551834e7ac26945b9ddf915939e08f5eb813c6a262}
+      model-00078-of-000096.safetensors: {size: 16990916912, sha256: 2773d41de168c7373bf2f7f9994cbbb2712c379503578d8462aa783db7cba128}
+      model-00079-of-000096.safetensors: {size: 16990916912, sha256: da02c8a46b81f42a64330e0e31478dcd7b020633a65251b535817431bba1d96b}
+      model-00080-of-000096.safetensors: {size: 16567507176, sha256: 96b5accdf3bc2b4651979361fa7f6191197b8573c36ab6a58effce487402b177}
+      model-00081-of-000096.safetensors: {size: 16990916912, sha256: 01562aa616ea3dc398a7c40b4d9c3c4700885541efeaed6dbd1ba8076cae9c4b}
+      model-00082-of-000096.safetensors: {size: 16990916912, sha256: 8cba090734d9a3900276cca442bd6fa60f5206ce0c70884f7b2df3df877485bd}
+      model-00083-of-000096.safetensors: {size: 16990916912, sha256: 6ceebf8ce621712dd3185943224ca83a45f5bc310c272df7dee4b69e3dfc87fe}
+      model-00084-of-000096.safetensors: {size: 16567507176, sha256: c3f1318e7e1cc6893230a14c229a0c9ec0037cb1d0912a395f9222a3e8a8bc2d}
+      model-00085-of-000096.safetensors: {size: 16990916912, sha256: 633b2e3b86ec35f87fa4216b14bba49fc4058a1296433bc22b0576925118b6ad}
+      model-00086-of-000096.safetensors: {size: 16990916912, sha256: add4056ab3ecaa7befdac2e00280d294ce470d541917ac90df8fc50497df7fb0}
+      model-00087-of-000096.safetensors: {size: 16990916912, sha256: f6d608f2c40b584b775db184013e37740d4710abad414c584408e0ad09fb486b}
+      model-00088-of-000096.safetensors: {size: 16567507176, sha256: 87afe43b8a71d2cc56787a976f52f8c35bcfbe85df7d0c445194bc1f4d7e0c4a}
+      model-00089-of-000096.safetensors: {size: 16990916912, sha256: 24016b28cfdf9420ae2f411145ef919cf2e1ec667830aded439bfb761c61755f}
+      model-00090-of-000096.safetensors: {size: 16990916912, sha256: 1ecd85dbd77ce081f6238b894f8a7da2ff40346da7042c427a52d83562dbb5ea}
+      model-00091-of-000096.safetensors: {size: 16990916912, sha256: a4e666132aed052b4bf174f56853b70cbb2ada898fe568f60e0cdf3ad46a0a4a}
+      model-00092-of-000096.safetensors: {size: 16567507176, sha256: 359848294be55e1c8949f0a4c92098bc73276895289fd1123f10769ba685e248}
+      model-00093-of-000096.safetensors: {size: 16567507176, sha256: d31d58d1bd3fcb8c350ef497d2acd23e0fe768ab5c0621e60f20b03d611f64e6}
+      model-00094-of-000096.safetensors: {size: 4697664072, sha256: ad66e1cb96b86963e63d6a0a466b6a407b13c9815cb480fe612480cc6bb3b6e1}
+      model-00095-of-000096.safetensors: {size: 92289328, sha256: 01d41139abb8cf3b5288a97318cc4ab92676671b4eb141031cd80d7c3ced6122}
+      model-00096-of-000096.safetensors: {size: 802448352, sha256: 9d10c74fc10161bef9463a8541a634a97f521f43c99368ea7243ce0c79cdbf7c}
+      model.safetensors.index.json: {size: 59764096, sha256: a1c5210650ce71d2d3ae9ec5a101ac4afd3cf4b10091be589853437eb967febd}
+      modeling_kimi_k3.py: {size: 53444, sha256: b9171c96726eda55234c92ac8dfae7e24c512fda68968ae8f2c3782b42665ea2, git_oid: be85612710534c2e41065b67933a9639e7817d7f}
+      modeling_kimi_linear.py: {size: 51506, sha256: 9e3564c70ac21854ce5a090cc946c5dc76b70d1050ef50840449181a20fff44a, git_oid: b8c41e8bfce768d74d8da3a37e693f5ee43876a0}
+      preprocessor_config.json: {size: 1011, sha256: 4be333605990c53a816e586dee9d5dd545afb7a59947c17f8f7ef26b4782668e, git_oid: 8be28c13c93fb8982f81928d3f4fe80568102286}
+      tiktoken.model: {size: 2795286, sha256: b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103}
+      tokenization_kimi.py: {size: 16145, sha256: f28ea66e2d862a2a5814970b2ce40c2f7d8296ff09aed90a7e7def689b906944, git_oid: 5df9d462b43295245084fbab46fd956020d4b84e}
+      tokenizer_config.json: {size: 3478, sha256: 5d0803c94db9cd78763499e0956c95fd5a225c14a727e5a6cf5db3f96f010a6e, git_oid: 418aaacbd996a6674efa89d26be06dae11433e1c}
+  consumers: []

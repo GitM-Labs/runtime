@@ -65,7 +65,7 @@ guide() {  # guide <outfile> <streams> <prompt> <output> <seconds>
 scrape_metrics() {  # scrape_metrics <outfile> — 1 Hz until killed
   while :; do
     printf '### ts_ns=%s\n' "$(date +%s%N)"
-    curl -sf "$EP/metrics" | grep -E 'vllm:(num_requests_running|num_requests_waiting|gpu_cache_usage_perc|num_preemptions)' || true
+    curl -sf "$EP/metrics" | grep -E 'vllm:(num_requests_running|num_requests_waiting|kv_cache_usage_perc|gpu_cache_usage_perc|num_preemptions)' || true
     sleep 1
   done >> "$1"
 }
@@ -222,6 +222,7 @@ e8() {
   local LEVER="${INTERVENTION:?set INTERVENTION='--kv-cache-dtype fp8' (or another lever) for e8}"
   log "E8: intervention arm: $LEVER (headline point, before/after)"
   local D="$RUN/e8"; mkdir -p "$D"
+  rm -f "$D/guidellm_after.json" "$D/LEVER"  # never pair this baseline with an earlier lever's after-run
   IFS=: read -r name prompt output <<< "$HEADLINE"
   bash "$SCRIPTS/arm.sh" B
   manifest e8 B "baseline for intervention"
@@ -230,6 +231,10 @@ e8() {
   wait "$CAPPID" || true
   bash "$SCRIPTS/arm.sh" I $LEVER
   manifest e8 I "$LEVER"
+  # Validity gate, as P1 runs it: an incoherent arm is restored to B before any
+  # timed run. It does not judge accuracy; that is the spec's correctness gate.
+  timeout 900 python -m gitm.optimizer.separation sanity --base-url "$EP" --model "$MODEL" --out "$D/sanity.json" \
+    || { log "!!! e8 validity gate failed under $LEVER, restoring arm B"; bash "$SCRIPTS/arm.sh" B; exit 1; }
   capture_window "$D/cap_after" 190 & CAPPID=$!; sleep 3
   guide "$D/guidellm_after.json" "$HEADLINE_C" "$prompt" "$output" 180
   wait "$CAPPID" || true

@@ -1,0 +1,295 @@
+{
+  "scope": "source-derived family mechanisms with documented or selected scenario demands; no measured deployment ceiling",
+  "Trainium2": {
+    "region_id": "load_tile",
+    "resources": {
+      "chip_hbm": {
+        "known_bytes": 131072,
+        "total_bytes": 131072,
+        "startup_floor_s": 0.0,
+        "startup_characterized": true,
+        "known_demand_service_floor_s": 4.369066666666667e-08,
+        "known_demand_ideal_payload_service_upper_s": null,
+        "conditional_payload_service_s": null,
+        "bound_kind": "upper",
+        "rate_kind": "peak",
+        "complete_term_floor": true,
+        "bandwidth_evidence": {
+          "kind": "source-derived",
+          "artifact": "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.31.1/nki/guides/architecture/trainium2_arch.html",
+          "qualification": "documented 128x512 two-byte tile; whole-chip 3.0TB/s is an optimistic envelope, not core allocation"
+        },
+        "demand_evidence": [
+          {
+            "kind": "source-derived",
+            "artifact": "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.31.1/nki/guides/architecture/trainium2_arch.html",
+            "qualification": "documented 128x512 two-byte tile; whole-chip 3.0TB/s is an optimistic envelope, not core allocation"
+          },
+          {
+            "kind": "source-derived",
+            "artifact": "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.31.1/nki/guides/architecture/trainium2_arch.html",
+            "qualification": "documented 128x512 two-byte tile; whole-chip 3.0TB/s is an optimistic envelope, not core allocation"
+          }
+        ]
+      },
+      "core_sbuf": {
+        "known_bytes": 131072,
+        "total_bytes": 131072,
+        "startup_floor_s": 0.0,
+        "startup_characterized": true,
+        "known_demand_service_floor_s": null,
+        "known_demand_ideal_payload_service_upper_s": null,
+        "conditional_payload_service_s": null,
+        "bound_kind": "unknown",
+        "rate_kind": "peak",
+        "complete_term_floor": false,
+        "bandwidth_evidence": {
+          "kind": "source-derived",
+          "artifact": "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.31.1/nki/guides/architecture/trainium2_arch.html",
+          "qualification": "documented 128x512 two-byte tile; whole-chip 3.0TB/s is an optimistic envelope, not core allocation"
+        },
+        "demand_evidence": [
+          {
+            "kind": "source-derived",
+            "artifact": "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.31.1/nki/guides/architecture/trainium2_arch.html",
+            "qualification": "documented 128x512 two-byte tile; whole-chip 3.0TB/s is an optimistic envelope, not core allocation"
+          },
+          {
+            "kind": "source-derived",
+            "artifact": "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.31.1/nki/guides/architecture/trainium2_arch.html",
+            "qualification": "documented 128x512 two-byte tile; whole-chip 3.0TB/s is an optimistic envelope, not core allocation"
+          }
+        ]
+      },
+      "core_dma": {
+        "known_bytes": 131072,
+        "total_bytes": 131072,
+        "startup_floor_s": 0.0,
+        "startup_characterized": false,
+        "known_demand_service_floor_s": null,
+        "known_demand_ideal_payload_service_upper_s": null,
+        "conditional_payload_service_s": null,
+        "bound_kind": "unknown",
+        "rate_kind": "peak",
+        "complete_term_floor": false,
+        "bandwidth_evidence": {
+          "kind": "source-derived",
+          "artifact": "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.31.1/nki/guides/architecture/trainium2_arch.html",
+          "qualification": "documented 128x512 two-byte tile; whole-chip 3.0TB/s is an optimistic envelope, not core allocation"
+        },
+        "demand_evidence": [
+          {
+            "kind": "source-derived",
+            "artifact": "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.31.1/nki/guides/architecture/trainium2_arch.html",
+            "qualification": "documented 128x512 two-byte tile; whole-chip 3.0TB/s is an optimistic envelope, not core allocation"
+          },
+          {
+            "kind": "source-derived",
+            "artifact": "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.31.1/nki/guides/architecture/trainium2_arch.html",
+            "qualification": "documented 128x512 two-byte tile; whole-chip 3.0TB/s is an optimistic envelope, not core allocation"
+          }
+        ]
+      }
+    },
+    "coverage_complete": true,
+    "known_memory_service_floor_s": 4.369066666666667e-08,
+    "complete_memory_resource_floor_s": null,
+    "whole_step_latency_s": null,
+    "attainable_region_time_s": null
+  },
+  "Trainium2_capacity": {
+    "HBM": {
+      "known_peak_bytes": 0,
+      "capacity_bytes": null,
+      "aggregate_fits": null,
+      "placement_legal": null,
+      "capacity_evidence": {
+        "kind": "source-derived",
+        "artifact": "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.31.1/nki/guides/architecture/trainium2_arch.html",
+        "qualification": "documented 128x512 two-byte tile; whole-chip 3.0TB/s is an optimistic envelope, not core allocation"
+      },
+      "allocation_evidence": []
+    },
+    "SBUF": {
+      "known_peak_bytes": 131072,
+      "capacity_bytes": 29360128,
+      "aggregate_fits": true,
+      "placement_legal": null,
+      "capacity_evidence": {
+        "kind": "source-derived",
+        "artifact": "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.31.1/nki/guides/architecture/trainium2_arch.html",
+        "qualification": "documented 128x512 two-byte tile; whole-chip 3.0TB/s is an optimistic envelope, not core allocation"
+      },
+      "allocation_evidence": [
+        {
+          "kind": "source-derived",
+          "artifact": "https://awsdocs-neuron.readthedocs-hosted.com/en/v2.31.1/nki/guides/architecture/trainium2_arch.html",
+          "qualification": "documented 128x512 two-byte tile; whole-chip 3.0TB/s is an optimistic envelope, not core allocation"
+        }
+      ]
+    }
+  },
+  "SN40L_activation": {
+    "region_id": "activate",
+    "resources": {
+      "ddr": {
+        "known_bytes": 64000000,
+        "total_bytes": 64000000,
+        "startup_floor_s": 0.0,
+        "startup_characterized": true,
+        "known_demand_service_floor_s": null,
+        "known_demand_ideal_payload_service_upper_s": null,
+        "conditional_payload_service_s": 0.00064,
+        "bound_kind": "point",
+        "rate_kind": "peak",
+        "complete_term_floor": false,
+        "bandwidth_evidence": {
+          "kind": "scenario",
+          "artifact": "64MB activation with ten later HBM reads",
+          "qualification": "Arshia preferred DDR 100GB/s and HBM 1.6TB/s scenario rates; not measured rates"
+        },
+        "demand_evidence": [
+          {
+            "kind": "scenario",
+            "artifact": "64MB activation with ten later HBM reads",
+            "qualification": "Arshia preferred DDR 100GB/s and HBM 1.6TB/s scenario rates; not measured rates"
+          },
+          {
+            "kind": "source-derived",
+            "artifact": "https://arxiv.org/html/2405.07518v2",
+            "qualification": "DDR-to-HBM activation mechanism and paper-v2 64GiB HBM; no deployed V3.2 mapping"
+          }
+        ]
+      },
+      "hbm": {
+        "known_bytes": 64000000,
+        "total_bytes": 64000000,
+        "startup_floor_s": 0.0,
+        "startup_characterized": true,
+        "known_demand_service_floor_s": null,
+        "known_demand_ideal_payload_service_upper_s": null,
+        "conditional_payload_service_s": 4e-05,
+        "bound_kind": "point",
+        "rate_kind": "peak",
+        "complete_term_floor": false,
+        "bandwidth_evidence": {
+          "kind": "scenario",
+          "artifact": "64MB activation with ten later HBM reads",
+          "qualification": "Arshia preferred DDR 100GB/s and HBM 1.6TB/s scenario rates; not measured rates"
+        },
+        "demand_evidence": [
+          {
+            "kind": "scenario",
+            "artifact": "64MB activation with ten later HBM reads",
+            "qualification": "Arshia preferred DDR 100GB/s and HBM 1.6TB/s scenario rates; not measured rates"
+          },
+          {
+            "kind": "source-derived",
+            "artifact": "https://arxiv.org/html/2405.07518v2",
+            "qualification": "DDR-to-HBM activation mechanism and paper-v2 64GiB HBM; no deployed V3.2 mapping"
+          }
+        ]
+      },
+      "activation_engine": {
+        "known_bytes": 64000000,
+        "total_bytes": 64000000,
+        "startup_floor_s": 0.0,
+        "startup_characterized": false,
+        "known_demand_service_floor_s": null,
+        "known_demand_ideal_payload_service_upper_s": null,
+        "conditional_payload_service_s": null,
+        "bound_kind": "unknown",
+        "rate_kind": "peak",
+        "complete_term_floor": false,
+        "bandwidth_evidence": {
+          "kind": "source-derived",
+          "artifact": "https://arxiv.org/html/2405.07518v2",
+          "qualification": "DDR-to-HBM activation mechanism and paper-v2 64GiB HBM; no deployed V3.2 mapping"
+        },
+        "demand_evidence": [
+          {
+            "kind": "scenario",
+            "artifact": "64MB activation with ten later HBM reads",
+            "qualification": "Arshia preferred DDR 100GB/s and HBM 1.6TB/s scenario rates; not measured rates"
+          },
+          {
+            "kind": "source-derived",
+            "artifact": "https://arxiv.org/html/2405.07518v2",
+            "qualification": "DDR-to-HBM activation mechanism and paper-v2 64GiB HBM; no deployed V3.2 mapping"
+          }
+        ]
+      }
+    },
+    "coverage_complete": true,
+    "known_memory_service_floor_s": 0.0,
+    "complete_memory_resource_floor_s": null,
+    "whole_step_latency_s": null,
+    "attainable_region_time_s": null
+  },
+  "SN40L_reuse": {
+    "region_id": "reuse",
+    "resources": {
+      "hbm": {
+        "known_bytes": 640000000,
+        "total_bytes": 640000000,
+        "startup_floor_s": 0.0,
+        "startup_characterized": true,
+        "known_demand_service_floor_s": null,
+        "known_demand_ideal_payload_service_upper_s": null,
+        "conditional_payload_service_s": 0.0004,
+        "bound_kind": "point",
+        "rate_kind": "peak",
+        "complete_term_floor": false,
+        "bandwidth_evidence": {
+          "kind": "scenario",
+          "artifact": "64MB activation with ten later HBM reads",
+          "qualification": "Arshia preferred DDR 100GB/s and HBM 1.6TB/s scenario rates; not measured rates"
+        },
+        "demand_evidence": [
+          {
+            "kind": "scenario",
+            "artifact": "64MB activation with ten later HBM reads",
+            "qualification": "Arshia preferred DDR 100GB/s and HBM 1.6TB/s scenario rates; not measured rates"
+          }
+        ]
+      }
+    },
+    "coverage_complete": true,
+    "known_memory_service_floor_s": 0.0,
+    "complete_memory_resource_floor_s": null,
+    "whole_step_latency_s": null,
+    "attainable_region_time_s": null
+  },
+  "SN40L_capacity": {
+    "DDR": {
+      "known_peak_bytes": 0,
+      "capacity_bytes": null,
+      "aggregate_fits": null,
+      "placement_legal": null,
+      "capacity_evidence": {
+        "kind": "source-derived",
+        "artifact": "https://arxiv.org/html/2405.07518v2",
+        "qualification": "DDR-to-HBM activation mechanism and paper-v2 64GiB HBM; no deployed V3.2 mapping"
+      },
+      "allocation_evidence": []
+    },
+    "HBM": {
+      "known_peak_bytes": 64000000,
+      "capacity_bytes": 68719476736,
+      "aggregate_fits": true,
+      "placement_legal": null,
+      "capacity_evidence": {
+        "kind": "source-derived",
+        "artifact": "https://arxiv.org/html/2405.07518v2",
+        "qualification": "DDR-to-HBM activation mechanism and paper-v2 64GiB HBM; no deployed V3.2 mapping"
+      },
+      "allocation_evidence": [
+        {
+          "kind": "scenario",
+          "artifact": "64MB activation with ten later HBM reads",
+          "qualification": "Arshia preferred DDR 100GB/s and HBM 1.6TB/s scenario rates; not measured rates"
+        }
+      ]
+    }
+  }
+}

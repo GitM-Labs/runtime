@@ -1,0 +1,55 @@
+# zai-org/GLM-5.1 — a post-trained refresh of GLM-5 on the same architecture.
+# Source: https://huggingface.co/zai-org/GLM-5.1/blob/main/config.json
+#
+# `extends: glm-5` with NOTHING overridden in spec, and that is the claim:
+#   - config.json differs from GLM-5's in exactly one key, transformers_version
+#     (5.0.2.dev0 -> 5.4.0). No index_topk_freq, no indexer_types, no
+#     moe_router_dtype, no quantization_config, rope_theta 1e6, max position
+#     202,752 — all as GLM-5.
+#   - model.safetensors.index.json is byte-identical to GLM-5's: same
+#     total_size, same 59,870 tensors in the same 282 shards, indexer tensors on
+#     all 78 layers + MTP layer 78.
+#   - All 282 shard LFS sha256s differ from GLM-5's: new weights, same shapes.
+# The vLLM recipe (recipes GLM/GLM5.md) describes GLM-5.1 as "a refreshed
+# version of GLM-5" and serves both with one command.
+
+name: zai-org/GLM-5.1
+family: glm_moe_dsa
+extends: glm-5
+description: >
+  GLM-5.1: new weights on GLM-5's exact architecture. 78 layers, hidden 6144,
+  MLA + a DSA indexer on every layer (no IndexShare), 256-expert top-8 MoE
+  after 3 dense layers, one MTP head. bf16; zai-org/GLM-5.1-FP8 is the
+  deployment shape (`glm-5.1-fp8`).
+
+spec: {}
+
+provenance:
+  verified:
+    - claim: architecture and weight map are identical to GLM-5
+      detail: >
+        config.json diff against zai-org/GLM-5: transformers_version only.
+        model.safetensors.index.json: byte-for-byte identical (cmp), so the
+        indexer schedule (79 indexer-bearing layers), the dense/sparse split and
+        every tensor's shard placement carry over unchanged.
+    - claim: predicted weight bytes vs the published checkpoint
+      detail: >
+        total_size 1,507,728,316,928 B — the same as GLM-5. model_weight_bytes
+        predicts 1,507,574,808,576 B: -0.010%.
+    - claim: these are different weights, not a re-upload
+      detail: >
+        None of the 282 shard LFS oids match GLM-5's.
+
+  estimated:
+    - field: index_share_for_mtp_iteration
+      value: false (inherited)
+      detail: >
+        As glm-5: no config key, and the MTP layer ships its own indexer.
+    - field: MLA absorption (attn_kv_b vs attn_out_proj width)
+      value: unabsorbed (inherited reading)
+      detail: Same resident weights either way; moves attn_out_proj 2x.
+
+  unmodelled:
+    - rope_theta 1e6 / max_position_embeddings 202,752 — not spec fields.
+    - MTP eh_proj weight bytes (151 MB bf16), absent from model_weight_bytes.
+    - Absorbed-MLA decode; MTP acceptance rate.

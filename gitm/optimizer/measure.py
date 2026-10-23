@@ -20,12 +20,20 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from gitm.optimizer.attribution import attribute
+from gitm.optimizer.attribution import (
+    AnalysisStatus,
+    RankedHypotheses,
+    attribute,
+    granger_evidence,
+)
 from gitm.optimizer.monitor import (
+    LIMITATIONS,
     KernelResidual,
     Residuals,
     _serialized_fraction,
     check_invariants,
+    measured_serialized_fraction,
+    serialized_text,
 )
 from gitm.optimizer.report import Claim
 from gitm.planner.graph import predict_graph
@@ -51,14 +59,60 @@ def kernel_family(name: str) -> str:
     return f"{lib}.{fn}"
 
 
+#: What a measurement run's numbers cannot say. Its "kernel_time" residual is
+#: each kernel against its own median, so it measures jitter, not distance from
+#: the roofline.
+MEASURE_LIMITATIONS = (
+    *LIMITATIONS,
+    "kernel_time here is relative to each kernel's median, not the roofline",
+)
+
+
 @dataclass
 class MeasureResult:
     n_kernels: int
     n_memcpy: int
     serialized_fraction: float
     violations: list = field(default_factory=list)
-    top_hypotheses: list = field(default_factory=list)
+    top_hypotheses: list = field(default_factory=list)  # granger.top(5), kept for readers of the list
     families: list[str] = field(default_factory=list)
+    granger: RankedHypotheses = field(default_factory=lambda: RankedHypotheses(hypotheses=[]))
+
+    @property
+    def serialized_measured(self) -> float | None:
+        """``serialized_fraction`` for artifacts: None when under 2 kernels."""
+        return measured_serialized_fraction(self.serialized_fraction, self.n_kernels)
+
+    @property
+    def serialized_text(self) -> str:
+        return serialized_text(self.serialized_fraction, self.n_kernels)
+
+
+def attribute_families(
+    res_attr: Residuals, fam_counts: Counter, min_attr: int
+) -> RankedHypotheses:
+    """Granger over kernel families, with the families too small to test on record.
+
+    Families under ``min_attr`` samples are filtered out before ``attribute``
+    sees them, so its own ``excluded_ops`` would not list them; they are added
+    here, and ``min_obs`` reports the threshold that actually applied.
+    """
+    small = {fam: n for fam, n in fam_counts.items() if n < min_attr}
+    if res_attr.per_kernel:
+        granger = attribute(res_attr, predict_graph())
+    else:
+        granger = RankedHypotheses(
+            hypotheses=[],
+            status=AnalysisStatus.INSUFFICIENT_DATA,
+            reason=f"no kernel family had {min_attr} samples",
+        )
+    granger.series_lengths.update(small)
+    granger.excluded_ops.update(small)
+    granger.min_obs = max(granger.min_obs or 0, min_attr)
+    if granger.status is AnalysisStatus.INSUFFICIENT_DATA and res_attr.per_kernel:
+        # attribute() wrote its own, lower threshold; state the one that applied.
+        granger.reason = f"fewer than 2 kernel families with at least {granger.min_obs} samples"
+    return granger
 
 
 def measure_trace(trace: Trace, *, min_attr: int = 16) -> MeasureResult:
@@ -101,30 +155,28 @@ def measure_trace(trace: Trace, *, min_attr: int = 16) -> MeasureResult:
             KernelResidual(op=fam, layer=None, r_kt=((k.end_ns - k.start_ns) - m) / m, r_mt=None)
         )
     families = sorted({kr.op for kr in res_attr.per_kernel})
-    top_hyps = list(attribute(res_attr, predict_graph()).top(5)) if res_attr.per_kernel else []
+    granger = attribute_families(res_attr, fam_counts, min_attr)
 
     return MeasureResult(
         n_kernels=len(kernels),
         n_memcpy=len(memcpys),
         serialized_fraction=sc,
         violations=violations,
-        top_hypotheses=top_hyps,
+        top_hypotheses=granger.top(5),
         families=families,
+        granger=granger,
     )
 
 
-def measurement_claims(result: MeasureResult, *, limit: int = 5) -> list[Claim]:
+def measurement_claims(
+    result: MeasureResult, *, limit: int = 5, pairs_in: str = "measurement.json"
+) -> list[Claim]:
     """Build measurement observations (not optimization claims) from deviations.
 
-    Each carries the real invariant deviation and its top causal hypothesis; the
+    Each carries the real invariant deviation and the Granger run's status; the
     intervention column is explicitly ``(none — measurement run)``.
     """
-    top = result.top_hypotheses
-    evidence = (
-        f"top hypothesis: {top[0].cause_op[:30]} → {top[0].effect_op[:30]} (p={top[0].p_value:.3g})"
-        if top
-        else "no ranked hypothesis"
-    )
+    evidence = granger_evidence(result.granger, pairs_in=pairs_in)
     claims: list[Claim] = []
     for v in result.violations[:limit]:
         claims.append(
@@ -146,7 +198,7 @@ def measurement_summary(workload: str, result: MeasureResult) -> str:
     return (
         f"Measurement run for {workload!r}: {result.n_kernels:,} kernels "
         f"({result.n_memcpy:,} memcpy) captured, {len(result.violations)} invariant "
-        f"deviation(s), serialized-concurrency={result.serialized_fraction:.3f}. "
+        f"deviation(s), serialized-concurrency={result.serialized_text}. "
         f"Kernel families: {fams}. No interventions applied — this workload has no "
         f"tuned intervention library, so the runtime reports what it measured."
     )

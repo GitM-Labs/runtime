@@ -189,3 +189,48 @@ def test_edge_report_claim_labels_serialized_concurrency_not_kernel_time(tmp_pat
     md = result["report_md"]
     assert "`stream_concurrency`" in md
     assert "`kernel_time`" not in md
+
+
+def _edge_result(tmp_path, events):
+    from gitm.optimizer.qualification import QualificationResult
+    from gitm.scheduler.loop import _edge_intervention_result
+    from gitm.tracer.schema import Trace
+
+    trace = Trace(workload_id="kitti", fingerprint="f", run_id="r", device_count=1,
+                  vendor="nvidia", captured_at_ns=0, duration_ns=10**6, events=events)
+    return _edge_intervention_result(
+        run_dir=tmp_path, run_id="r", workload="kitti", trace=trace,
+        qual=QualificationResult(commit=False, floor=0.0, fingerprint="f"),
+        applicator=EdgeBatchingApplicator(_fake_run_mode(equivalent=True), reps=1),
+        started_ns=0, trace_path=tmp_path / "trace.jsonl",
+    )
+
+
+def test_edge_claim_with_no_kernels_says_concurrency_was_not_measured(tmp_path):
+    """An empty capture used to report serialized-concurrency 0.0, which reads
+    as "fully overlapped". It is now null, with the reason in the report."""
+    import json
+
+    md = _edge_result(tmp_path, [])["report_md"]
+    assert "`stream_concurrency`: fewer than 2 kernels captured |" in md
+    assert "+0.0%" not in md.split("| Measured Δ |")[1].split("\n")[2]
+
+    record = json.loads((tmp_path / "apply_result.json").read_text())
+    assert record["serialized_concurrency_fraction"] is None
+    assert record["granger"]["status"] == "not_run"
+    assert "kernel_time here is relative to each kernel's median" in record["limitations"][-1]
+
+
+def test_edge_claim_evidence_is_the_granger_status(tmp_path):
+    import re
+
+    from gitm.tracer.schema import KernelEvent
+
+    events = [KernelEvent(name="voxel_kernel", start_ns=i * 1000, end_ns=i * 1000 + 400 + i % 7,
+                          stream_id=0, device_id=0) for i in range(20)]
+    md = _edge_result(tmp_path, events)["report_md"]
+    row = next(line for line in md.splitlines() if line.startswith("| 1 |"))
+    # One kernel family of 20: one op qualifies, Granger needs two.
+    assert "Granger not run: 1 ops had ≥ 16 samples, need 2" in row
+    assert "serialized-concurrency=" in row and "n/a" not in row
+    assert not re.search(r"\S+\s*(→|->)\s*\S+\s*\(p=", row)

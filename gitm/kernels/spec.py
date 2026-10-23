@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic.json_schema import SkipJsonSchema
 
 SafetyTier = Literal["low_risk", "moderate", "high_risk"]
 
@@ -32,6 +34,10 @@ class SafetyGate(BaseModel):
     requires_rollback_window_s: int = 60
     forbid_if_oom_history: bool = True
     requires_qualification_commit: bool = False
+    # Persisted twin of InterventionSpec.correctness_gate, which a save drops:
+    # a reloaded spec that needs a gate is refused, not applied ungated.
+    requires_correctness_gate: bool = False
+    correctness_gate_timeout_s: float = Field(default=1800.0, gt=0, allow_inf_nan=False)
     notes: str = ""
 
 
@@ -67,6 +73,29 @@ class InterventionSpec(BaseModel):
     #: model's ops made these levers invisible on a sparse-MoE one, where the same
     #: knob applies just as much and none of those op names occur.
     whole_step: bool = False
+    #: The lever's gain comes from making the ops it names *faster*, so a region
+    #: already at its roofline floor has nothing for it to recover.
+    #:
+    #: Separate from ``applies_to_kernels``, which says which kernels the lever
+    #: touches — what coverage needs — and *not* where its gain comes from. Most
+    #: op-scoped levers in the catalogue fail this: five of the six scoped to
+    #: ``attn_score_value`` work through cache capacity, host swap or avoided
+    #: recomputation (``kv_cache_dtype_fp8`` doubles capacity,
+    #: ``preemption_mode_swap`` swaps instead of recomputing), and none of those
+    #: need the attention kernels to be above their floor to pay off. Reading the
+    #: two fields as one would reject them on a sound measurement and wrong
+    #: reasoning.
+    #:
+    #: "Makes the op faster" is also narrower than "shortens the step by way of
+    #: that op". ``enable_eplb`` cuts expert stragglers, but a straggler rank
+    #: runs *more* expert GEMMs rather than slower ones, so each kernel sits at
+    #: its floor while the step waits — a distribution problem the per-op gap
+    #: cannot see. Only a lever whose gain is the slack between one op and its
+    #: own floor belongs here.
+    #:
+    #: Only consulted by the selection gate, and defaults false so a lever is
+    #: never filtered on a mechanism nobody has stated.
+    recovers_kernel_time: bool = False
     expected_delta_mean: float  # signed, e.g. +0.08 = 8% improvement
     expected_delta_lo: float
     expected_delta_hi: float
@@ -74,6 +103,14 @@ class InterventionSpec(BaseModel):
     applicability: Applicability = Field(default_factory=Applicability)
     safety: SafetyGate = Field(default_factory=SafetyGate)
     review: str | None = None  # reviewer sign-off note (None until reviewed)
+    # An accuracy sentinel the apply path runs after measuring and before
+    # keeping: None to pass, else the reason. The live keep gate sees throughput
+    # alone, so a lever that can change model output carries its own check here
+    # and apply_intervention rolls back on failure whatever applicator is used.
+    # Runtime-only: a callable, never read from or written to library YAML.
+    correctness_gate: SkipJsonSchema[Callable[[Any], str | None] | None] = Field(
+        default=None, exclude=True, repr=False
+    )
 
     @property
     def knob_values(self) -> dict[str, Any]:

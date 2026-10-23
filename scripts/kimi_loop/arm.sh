@@ -1,13 +1,15 @@
 #!/bin/bash
 # Switch the serving arm — run INSIDE the gitm sidecar of kimi-k25-loop.
 #
-#   arm.sh A|B|C|I [extra vllm args for I]
+#   arm.sh A|B|C|I|L [extra vllm args for I and L]
 #
 #   A  clean:      no tool loaded — the headline-numbers arm
 #   B  traced:     GITM tracer injected, dormant until a window is armed
 #   C  correlate:  B + rocTX correlation + vLLM layerwise ranges
 #   I  intervene:  B + caller-supplied vllm args (e.g. --kv-cache-dtype fp8) —
 #                  the E8 intervention arm; pass the lever as $2...
+#   L  lever, clean: A + caller-supplied vllm args, no tool loaded — the
+#                  untraced twin of I (the P1 experiment's off arm)
 #
 # Writes /scratch/arm.env (ALL five variables, every time — the supervisor
 # re-sources with `set -a`, so an omitted variable would leak from the previous
@@ -16,7 +18,7 @@
 # restart is exactly sufficient — and nothing less is.
 set -euo pipefail
 
-ARM="${1:?usage: arm.sh A|B|C|I [extra vllm args]}"
+ARM="${1:?usage: arm.sh A|B|C|I|L [extra vllm args]}"
 shift || true
 TOOL=/scratch/lib/libgitm_rocm_inject.so
 OUT=/scratch/trace/kimi.jsonl
@@ -34,6 +36,7 @@ case "$ARM" in
   # eager-vs-graphs delta is itself a measurement (the H200 residual story).
   C) ROCP="$TOOL"; NVTX=1; EXTRA="--enable-layerwise-nvtx-tracing --enforce-eager"; PRELOAD="$SHIM" ;;
   I) ROCP="$TOOL"; NVTX=0; EXTRA="$*";                              PRELOAD="" ;;
+  L) ROCP="";      NVTX=0; EXTRA="$*";                              PRELOAD="" ;;
   *) echo "unknown arm: $ARM" >&2; exit 2 ;;
 esac
 

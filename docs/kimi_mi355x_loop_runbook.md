@@ -12,6 +12,8 @@ and where each deliverable lands.
 |---|---|---|
 | predicted graph | `scripts/kimi_loop/predict_sweep.py` (planner: `kimi-k2.5` @ MI355X, TP=8) | laptop |
 | execution | `deploy/k8s/mi355x-kimi-loop.yaml` + `scripts/kimi_loop/run_loop.sh` (GuideLLM sweeps, BurstGPT replay, GITM tracer arms) | cluster |
+| collector bring-up | checked procedure: [`docs/kimi_mi355x_collector_bringup.md`](kimi_mi355x_collector_bringup.md) | cluster |
+| run qualification | [`docs/run_qualification_path.md`](run_qualification_path.md); `python -m gitm.optimizer.qualify_run` | laptop / sidecar |
 | deviations | `gitm deviate` per captured window + `analyze_join.py` | laptop |
 | monitoring | amd-smi 1 Hz (in-pod, always on) + 1 Hz `/metrics` scrapes + deviation invariants (`gitm.optimizer.monitor`) | pod + laptop |
 | interventions | `run_loop.sh e8` with `INTERVENTION='--kv-cache-dtype fp8'` (or another lever), before/after measured | cluster |
@@ -47,10 +49,10 @@ python3 scripts/kimi_loop/predict_sweep.py
 
 → `evidence/kimi-mi355x/predicted/`: 18 (config × concurrency) points with
 ITL floor, TTFT floor, throughput floor, plus per-op decode tables. Headline
-prediction: decode floor 11.0 ms/step at rag c=64 (`moe_routed` 86%,
+prediction: decode floor 11.0 ms/step at rag c=64 (`moe_routed` 60%,
 memory-bound) — the number the measured sweep gets compared against.
-Footprint validation is in the catalogue entry itself: predicted 595.00 GB vs
-the published checkpoint's 595.15 GB (−0.03%).
+Footprint validation is in the catalogue entry itself: predicted 594.20 GB vs
+the published checkpoint's 595.15 GB (−0.16%).
 
 ## 2. Execution (inside the gitm sidecar)
 

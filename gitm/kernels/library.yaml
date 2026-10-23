@@ -279,6 +279,9 @@ interventions:
     knob: VLLM_ATTENTION_BACKEND
     value: FLASHINFER
     applies_to_kernels: [attn_score_value]  # attention kernel swap only
+    # A different attention kernel for the same work: if the attention already
+    # runs at its roofline floor there is no slack for a faster kernel to take.
+    recovers_kernel_time: true
     expected_delta_mean: 0.07
     expected_delta_lo: -0.03
     expected_delta_hi: 0.15
@@ -452,6 +455,9 @@ interventions:
     # classify to moe_routed, never to the dense mlp_* ops, so a dense-op scope
     # covered nothing on a real MoE trace.
     applies_to_kernels: [moe_routed]
+    # A different kernel for the same expert GEMMs, so its gain is the slack
+    # between the observed GEMM time and its floor.
+    recovers_kernel_time: true
     expected_delta_mean: 0.05
     expected_delta_lo: -0.05
     expected_delta_hi: 0.20
@@ -507,6 +513,12 @@ interventions:
     knob: enable_eplb
     value: true
     applies_to_kernels: [moe_routed]  # expert load is the routed-expert GEMMs
+    # Deliberately NOT recovers_kernel_time, though "cut stragglers" reads like
+    # it. A straggler rank runs *more* expert GEMMs, not slower ones, so each of
+    # its kernels can sit exactly at its floor while the step waits on that rank.
+    # The per-op roofline gap cannot see a distribution problem; rank skew is
+    # measured separately (importers/node_rollup.py, busy_fraction max - min),
+    # and that is the signal this lever should one day be gated on.
     expected_delta_mean: 0.03
     expected_delta_lo: -0.02
     expected_delta_hi: 0.15

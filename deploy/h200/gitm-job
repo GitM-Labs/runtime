@@ -1,0 +1,896 @@
+#!/usr/bin/env python3
+"""gitm-job: queue whole-node (8x H200) gitm tracing jobs on Slurm, in containers.
+
+    gitm-job submit --name kimi-k26 --model moonshotai/Kimi-K2.6
+    gitm-job submit --name custom --model Qwen/Qwen3-235B -- python my_script.py
+    gitm-job ls                  # running, waiting (with position), recent
+    gitm-job logs <jobid> [-f]
+    gitm-job cancel <jobid>
+
+Every job gets all 8 GPUs of one node (sbatch --exclusive) and runs inside a
+fresh container (Pyxis + Enroot). gitm, the CUPTI shim and anything you pip
+install live only in that container, which is deleted when the job ends: the
+node is left exactly as it was, apart from your results folder.
+
+The same file runs the status pusher behind the team web page
+(`gitm-job _push-status`, started by gitm-status.service as root on the
+Slurm controller). Stdlib only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import hashlib
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+CONF_DIR = "/etc/gitm-gpu"
+STATE_DIR = "/var/lib/gitm-gpu"
+GPUS_PER_JOB = 8
+DEFAULT_IMAGE = "vllm/vllm-openai:latest"
+GITM_REPO_URL = "https://github.com/GitM-Labs/runtime"
+LOG_TAIL_LINES = 25
+SCHEMA_VERSION = 1
+SEP = "\x1f"   # field separator for squeue/sacct output; can't appear in names
+
+
+# --------------------------------------------------------------------------
+# config + shell helpers
+# --------------------------------------------------------------------------
+
+def load_config() -> dict[str, str]:
+    cfg = {
+        "PARTITION": "gpu",
+        "RESULTS_DIR": "/var/lib/gitm/results",
+        "HF_CACHE": "/var/lib/gitm/hf-cache",
+        "DEFAULT_IMAGE": DEFAULT_IMAGE,
+        "GRES": f"gpu:{GPUS_PER_JOB}",
+        "STATUS_REPO": "",
+        "JOBCOMP_LOG": "",
+        "REPORT_KEY": os.path.join(CONF_DIR, "report_key"),
+    }
+    try:
+        with open(os.path.join(CONF_DIR, "config")) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip()
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+def run(cmd: list[str], *, input: str | None = None, check: bool = True,
+        timeout: float = 60) -> subprocess.CompletedProcess:
+    try:
+        p = subprocess.run(cmd, input=input, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise RuntimeError(f"{cmd[0]} not found (run this on a Slurm node)") from None
+    if check and p.returncode != 0:
+        raise RuntimeError(f"{cmd[0]}: {(p.stderr or p.stdout).strip()}")
+    return p
+
+
+def whoami() -> str:
+    return os.environ.get("SUDO_USER") or getpass.getuser()
+
+
+# --------------------------------------------------------------------------
+# time parsing (Slurm prints local time without a zone)
+# --------------------------------------------------------------------------
+
+def slurm_ts(s: str | None) -> str | None:
+    """'2026-10-14T17:02:11' (local) -> ISO UTC 'Z'. None for N/A/Unknown/None."""
+    if not s or s in ("N/A", "Unknown", "None", "(null)") or not s[0].isdigit():
+        return None
+    try:
+        t = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.astimezone()   # interpret as this host's local time
+    return t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_ts(s: str | None) -> float | None:
+    if not s:
+        return None
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+
+
+def iso(ts: float | None) -> str | None:
+    return None if ts is None else datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def slurm_duration(s: str | None) -> int | None:
+    """'1-00:00:00' / '12:00:00' / '30:00' / minutes '720' -> seconds; None if unlimited."""
+    if not s or s.upper() in ("UNLIMITED", "INVALID", "N/A", "NONE", "PARTITION_LIMIT"):
+        return None
+    days = 0
+    if "-" in s:
+        d, s = s.split("-", 1)
+        days = int(d)
+    parts = [int(p) for p in s.split(":")]
+    if len(parts) == 1:          # bare minutes (jobcomp TimeLimit)
+        return days * 86400 + parts[0] * 60
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    h, m, sec = parts
+    return days * 86400 + h * 3600 + m * 60 + sec
+
+
+# --------------------------------------------------------------------------
+# reading Slurm
+# --------------------------------------------------------------------------
+
+SQ_FIELDS = ["id", "name", "user", "state", "submit", "start", "limit", "nodes", "reason", "comment", "priority"]
+SQ_FORMAT = SEP.join(["%i", "%j", "%u", "%T", "%V", "%S", "%l", "%N", "%r", "%k", "%Q"])
+
+_REASONS = {
+    "Resources": "waiting for a free node",
+    "Priority": "behind other jobs",
+    "None": "",
+    "BeginTime": "scheduled for later",
+    "Dependency": "waiting on another job",
+    "JobHeldUser": "held (scontrol release <id>)",
+    "JobHeldAdmin": "held by an admin",
+    "PartitionTimeLimit": "time limit is above the partition maximum; cancel and resubmit",
+    "ReqNodeNotAvail": "requested node is unavailable",
+    "PartitionNodeLimit": "asks for more nodes than the partition allows",
+}
+
+_ENDED = {
+    "COMPLETED": ("succeeded", ""),
+    "FAILED": ("failed", "exited with an error"),
+    "TIMEOUT": ("failed", "hit max runtime"),
+    "CANCELLED": ("cancelled", ""),
+    "NODE_FAIL": ("failed", "node failure"),
+    "OUT_OF_MEMORY": ("failed", "ran out of host memory"),
+    "PREEMPTED": ("failed", "preempted"),
+    "BOOT_FAIL": ("failed", "node failed to boot"),
+    "DEADLINE": ("failed", "missed its deadline"),
+}
+
+
+def parse_comment(c: str) -> dict[str, str]:
+    """gitm-job stores 'gitm model=<id> image=<ref>' in the job comment."""
+    out = {}
+    if c and c.startswith("gitm "):
+        for tok in c[5:].split():
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                out[k] = v
+    return out
+
+
+def squeue(partition: str) -> list[dict]:
+    p = run(["squeue", "-h", "-a", "-p", partition, "-t", "all", "-o", SQ_FORMAT])
+    jobs = []
+    for line in p.stdout.splitlines():
+        f = line.split(SEP)
+        if len(f) != len(SQ_FIELDS):
+            continue
+        jobs.append(dict(zip(SQ_FIELDS, f, strict=True)))
+    return jobs
+
+
+def describe(raw: list[dict]) -> list[dict]:
+    """squeue rows -> the records used by `ls` and the status page."""
+    recs = []
+    for j in raw:
+        meta = parse_comment(j["comment"])
+        state = j["state"].split()[0].rstrip("+")
+        rec = {
+            "name": j["id"],
+            "display_name": j["name"],
+            "owner": j["user"],
+            "model": meta.get("model", ""),
+            "image": meta.get("image", ""),
+            "node": j["nodes"] if j["nodes"] and j["nodes"] != "(null)" else None,
+            "submitted": slurm_ts(j["submit"]),
+            "started": None,
+            "finished": None,
+            "max_runtime_s": slurm_duration(j["limit"]),
+            "detail": "",
+            "priority": int(j["priority"]) if j["priority"].isdigit() else 0,
+        }
+        if state == "PENDING":
+            rec["state"] = "queued"
+            rec["node"] = None
+            rec["detail"] = _REASONS.get(j["reason"], j["reason"])
+        elif state in ("CONFIGURING", "RESV_DEL_HOLD", "REQUEUED", "RESIZING"):
+            rec["state"], rec["started"] = "starting", slurm_ts(j["start"])
+            rec["detail"] = "allocating the node"
+        elif state in ("RUNNING", "COMPLETING", "SIGNALING", "STAGE_OUT", "SUSPENDED", "STOPPED"):
+            rec["state"], rec["started"] = "running", slurm_ts(j["start"])
+            if state == "COMPLETING":
+                rec["detail"] = "finishing"
+            elif state in ("SUSPENDED", "STOPPED"):
+                rec["detail"] = state.lower()
+        else:
+            st, why = _ENDED.get(state, ("failed", state.lower()))
+            rec["state"], rec["detail"] = st, why
+            rec["started"] = slurm_ts(j["start"])
+        recs.append(rec)
+
+    queued = sorted((r for r in recs if r["state"] == "queued"),
+                    key=lambda r: (-r["priority"], r["submitted"] or "", int(r["name"])))
+    for i, r in enumerate(queued, 1):
+        r["position"] = i
+    return recs
+
+
+def sinfo_nodes(partition: str) -> list[dict]:
+    p = run(["sinfo", "-h", "-N", "-p", partition, "-o", SEP.join(["%N", "%T", "%G", "%o"])])
+    nodes, seen = [], set()
+    for line in p.stdout.splitlines():
+        f = line.split(SEP)
+        if len(f) != 4 or f[0] in seen:
+            continue
+        seen.add(f[0])
+        state = f[1].lower().rstrip("*~#!%$@^-")
+        m = re.search(r"gpu(?::[\w.-]+)?:(\d+)", f[2])
+        nodes.append({
+            "name": f[0],
+            "ready": not any(s in state for s in ("down", "fail", "not_responding", "unknown", "power")),
+            "schedulable": not any(s in state for s in ("drain", "maint", "reserved")),
+            "gpus_allocatable": int(m.group(1)) if m else 0,
+            "addr": f[3] if f[3] and f[3] != "(null)" else f[0],
+            "slurm_state": state,
+        })
+    return nodes
+
+
+# --------------------------------------------------------------------------
+# submit
+# --------------------------------------------------------------------------
+
+def safe_name(s: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-.")
+    return s[:60] or "job"
+
+
+def job_comment(args, cfg: dict[str, str]) -> str:
+    # Read back by the status page. Passed on the sbatch command line (not as an
+    # #SBATCH line) so spaces survive without relying on directive quoting.
+    model = re.sub(r"\s", "", args.model)
+    image = re.sub(r"\s", "", args.image or cfg["DEFAULT_IMAGE"])
+    return f"gitm model={model} image={image}"
+
+
+def build_script(args, cfg: dict[str, str]) -> str:
+    image = args.image or cfg["DEFAULT_IMAGE"]
+    results = cfg["RESULTS_DIR"].rstrip("/")
+    gres = f"#SBATCH --gres={cfg['GRES']}\n" if cfg.get("GRES") else ""
+    hours = args.max_hours
+    limit = f"{int(hours * 60)}"   # minutes
+
+    extra_env = []
+    for kv in args.env or []:
+        if "=" not in kv:
+            sys.exit(f"gitm-job: --env expects KEY=VALUE, got {kv!r}")
+        k, v = kv.split("=", 1)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+            sys.exit(f"gitm-job: bad env var name {k!r}")
+        if k in ("NVIDIA_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+            sys.exit(f"gitm-job: {k} is managed for you (every job gets all 8 GPUs)")
+        extra_env.append(f"export {k}={shlex.quote(v)}")
+
+    install = f'pip install -q "gitm-labs[nvidia] @ {GITM_REPO_URL}/archive/{args.gitm_ref}.tar.gz"'
+    if args.command:
+        body = f"{install}\ncd /out\n{shlex.join(args.command)}\n"
+    else:
+        body = (
+            f"{install}\n"
+            'echo "gitm $(python3 -c "import gitm; print(gitm.__version__)") | model $MODEL | out $OUT"\n'
+            f"gitm capture serve --out /out {args.capture_args or ''} -- \\\n"
+            f'  vllm serve "$MODEL" --tensor-parallel-size {GPUS_PER_JOB} --trust-remote-code {args.vllm_args or ""}\n'
+        )
+    inner = ("set -euo pipefail\nexport CUDA_HOME=/usr/local/cuda HOME=/out/.home\n"
+             "mkdir -p \"$HOME\"\n" + body)
+
+    node = f"#SBATCH --nodelist={args.node}\n" if args.node else ""
+    return f"""#!/bin/bash
+#SBATCH --job-name={safe_name(args.name)}
+#SBATCH --partition={cfg['PARTITION']}
+#SBATCH --nodes=1
+#SBATCH --exclusive
+{gres}#SBATCH --time={limit}
+#SBATCH --output={results}/%j.log
+#SBATCH --chdir=/tmp
+{node}#
+# Generated by gitm-job. Runs inside a throwaway container: nothing installed
+# here touches the node. Results: {results}/<jobid>/ on the node it ran on.
+set -euo pipefail
+OUT_HOST={shlex.quote(results)}/$SLURM_JOB_ID
+# Model cache: this node's own setting (HF_CACHE in /etc/gitm-gpu/config), read
+# when the job starts, so each node can keep its models wherever it likes.
+HF_DIR=$(grep -E '^HF_CACHE=' /etc/gitm-gpu/config 2>/dev/null | tail -1 | cut -d= -f2-)
+HF_DIR=${{HF_DIR:-{shlex.quote(cfg['HF_CACHE'])}}}
+mkdir -p "$OUT_HOST"
+# The submitter's own Hugging Face paths (e.g. ~/hf_hub) don't exist in the
+# container: always use the node's cache, mounted at /hf.
+unset HF_HUB_CACHE HF_XET_CACHE HF_ASSETS_CACHE HF_MODULES_CACHE TRANSFORMERS_CACHE HF_DATASETS_CACHE HUGGINGFACE_HUB_CACHE
+export MODEL={shlex.quote(args.model)} OUT=/out HF_HOME=/hf HF_HUB_CACHE=/hf/hub GITM_SCRATCH=/out GITM_JOB=$SLURM_JOB_ID
+if [ -r {CONF_DIR}/hf_token ]; then export HF_TOKEN="$(cat {CONF_DIR}/hf_token)"; fi
+{chr(10).join(extra_env)}
+echo "job $SLURM_JOB_ID on $(hostname) | image {image} | models $HF_DIR"
+srun --container-image={shlex.quote(image)} \\
+     --container-mounts="$HF_DIR":/hf,"$OUT_HOST":/out \\
+     --container-workdir=/out \\
+     --container-writable \\
+     --no-container-mount-home \\
+     bash -c {shlex.quote(inner)}
+"""
+
+
+def cmd_submit(args) -> int:
+    cfg = load_config()
+    if not 0 < args.max_hours <= 168:
+        sys.exit("gitm-job: --max-hours must be between 0 and 168 (the partition may allow less)")
+    script = build_script(args, cfg)
+    comment = job_comment(args, cfg)
+    if args.dry_run:
+        print(f"# sbatch --parsable --comment={shlex.quote(comment)} <<'EOF'")
+        print(script + "EOF")
+        return 0
+    p = run(["sbatch", "--parsable", f"--comment={comment}"], input=script)
+    jobid = p.stdout.strip().split(";")[0]
+    recs = describe(squeue(cfg["PARTITION"]))
+    me = next((r for r in recs if r["name"] == jobid), None)
+    busy = sum(1 for r in recs if r["state"] in ("running", "starting"))
+    print(f"submitted job {jobid}")
+    if me and me["state"] == "queued":
+        ahead = (me.get("position") or 1) - 1
+        print(f"  waiting: {ahead} job(s) ahead of you, {busy} running")
+    else:
+        print("  a node is free; it should start within seconds (first run of an image takes a few minutes to unpack)")
+    print(f"  follow it:  gitm-job logs {jobid} -f")
+    print(f"  results:    {cfg['RESULTS_DIR']}/{jobid}/ on the node it runs on")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# ls / logs / cancel
+# --------------------------------------------------------------------------
+
+def _age(ts: str | None, now: float) -> str:
+    t = parse_ts(ts)
+    if t is None:
+        return "-"
+    s = int(now - t)
+    if s < 120:
+        return f"{s}s"
+    if s < 7200:
+        return f"{s // 60}m"
+    if s < 172800:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    return f"{s // 86400}d"
+
+
+def cmd_ls(args) -> int:
+    cfg = load_config()
+    recs = describe(squeue(cfg["PARTITION"]))
+    if not args.all:
+        recs = [r for r in recs if r["state"] in ("running", "starting", "queued")] + \
+               [r for r in recs if r["state"] not in ("running", "starting", "queued")][:5]
+    if args.mine:
+        recs = [r for r in recs if r["owner"] == whoami()]
+    order = {"running": 0, "starting": 1, "queued": 2}
+    recs.sort(key=lambda r: (order.get(r["state"], 3), r.get("position") or 0))
+    if args.json:
+        print(json.dumps(recs, indent=2))
+        return 0
+    if not recs:
+        print("no jobs. Submit one: gitm-job submit --name NAME --model ORG/MODEL")
+        return 0
+    now = time.time()
+    rows = [("JOBID", "NAME", "OWNER", "STATE", "NODE", "TIME", "MODEL", "NOTE")]
+    for r in recs:
+        state = r["state"] + (f" #{r['position']}" if r.get("position") else "")
+        if r["state"] in ("running", "starting"):
+            t = _age(r["started"], now)
+        elif r["state"] == "queued":
+            t = "waiting " + _age(r["submitted"], now)
+        else:
+            t = "ended"
+        rows.append((r["name"], r["display_name"], r["owner"], state, r["node"] or "-", t,
+                     r["model"] or "-", r["detail"][:50]))
+    widths = [max(len(str(row[i])) for row in rows) for i in range(len(rows[0]))]
+    for row in rows:
+        print("  ".join(str(c).ljust(w) for c, w in zip(row, widths, strict=True)).rstrip())
+    return 0
+
+
+def cmd_logs(args) -> int:
+    cfg = load_config()
+    jobid = args.job
+    if not jobid.isdigit():
+        sys.exit("gitm-job: give the numeric job id (see gitm-job ls)")
+    log = os.path.join(cfg["RESULTS_DIR"], f"{jobid}.log")
+    recs = {r["name"]: r for r in describe(squeue(cfg["PARTITION"]))}
+    r = recs.get(jobid)
+    if r and r["state"] == "queued":
+        print(f"job {jobid} is still waiting ({r['detail'] or 'queued'}); no output yet.")
+        return 0
+    here = socket.gethostname().split(".")[0]
+    if os.path.exists(log) and (not r or not r["node"] or r["node"] == here):
+        cmd = ["tail", f"-n{args.tail}"] + (["-F"] if args.follow else []) + [log]
+        return subprocess.call(cmd)
+    if r and r["state"] in ("running", "starting"):
+        # The log lives on the job's node: read it from inside the allocation.
+        cmd = ["srun", f"--jobid={jobid}", "--overlap", "--ntasks=1", "--quiet",
+               "tail", f"-n{args.tail}"] + (["-F"] if args.follow else []) + [log]
+        return subprocess.call(cmd)
+    where = f" on {r['node']}" if r and r["node"] else ""
+    print(f"job {jobid}'s output is in {log}{where}.")
+    return 1
+
+
+def cmd_cancel(args) -> int:
+    if not args.job.isdigit():
+        sys.exit("gitm-job: give the numeric job id (see gitm-job ls)")
+    run(["scancel", args.job])
+    print(f"cancelled job {args.job}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# status pusher (root, on the Slurm controller, via gitm-status.service)
+# --------------------------------------------------------------------------
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_SECRETS = [
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.S), "[redacted private key]"),
+    (re.compile(r"\bhf_[A-Za-z0-9]{20,}"), "hf_[redacted]"),
+    (re.compile(r"\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"), "gh_[redacted]"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "github_pat_[redacted]"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"), "sk-[redacted]"),
+    (re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b"), "[redacted aws key]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "[redacted google key]"),
+    (re.compile(r"\bya29\.[0-9A-Za-z_-]+"), "[redacted google token]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "[redacted jwt]"),
+    (re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [redacted]"),
+    (re.compile(r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|ACCESS_KEY)[A-Z0-9_]*)"
+                r"(\s*[=:]\s*|\"\s*:\s*\")([^\s\"',]{4,})"), r"\1\2[redacted]"),
+    (re.compile(r"(?i)(://[^/\s:@]+:)[^@\s/]+@"), r"\1[redacted]@"),
+]
+
+
+def redact(line: str) -> str:
+    line = _ANSI.sub("", line).replace("\r", "")
+    for pat, repl in _SECRETS:
+        line = pat.sub(repl, line)
+    return line[:400] + " …" if len(line) > 400 else line
+
+
+class History:
+    """Finished jobs for the 'recent' list.
+
+    squeue forgets a job a few minutes after it ends, so finished jobs come from
+    sacct when accounting is on, else from the jobcomp/filetxt log, and are
+    enriched with what the pusher remembered while the job was live (model,
+    image, log tail)."""
+
+    def __init__(self, cfg: dict[str, str]):
+        self.cfg = cfg
+        self.path = os.path.join(STATE_DIR, "seen.json")
+        try:
+            with open(self.path) as f:
+                self.seen: dict[str, dict] = json.load(f)
+        except (OSError, ValueError):
+            self.seen = {}
+        self.use_sacct = True
+
+    def remember(self, recs: list[dict]) -> None:
+        for r in recs:
+            keep = self.seen.setdefault(r["name"], {})
+            for k in ("display_name", "owner", "model", "image", "node", "submitted", "started",
+                      "max_runtime_s"):
+                if r.get(k):
+                    keep[k] = r[k]
+            if r.get("log_tail"):
+                keep["log_tail"] = r["log_tail"]
+            if r.get("result"):
+                keep["result"] = r["result"]
+            keep["last_seen"] = time.time()
+        cutoff = time.time() - 8 * 86400
+        self.seen = {k: v for k, v in self.seen.items() if v.get("last_seen", 0) > cutoff}
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=STATE_DIR, delete=False) as f:
+            json.dump(self.seen, f)
+        os.replace(f.name, self.path)
+
+    def finished(self) -> list[dict]:
+        rows = self._sacct() if self.use_sacct else None
+        if rows is None:
+            self.use_sacct = False
+            rows = self._jobcomp()
+        out = []
+        for r in rows:
+            mem = self.seen.get(r["name"], {})
+            for k in ("model", "image", "log_tail", "display_name", "max_runtime_s", "result"):
+                if not r.get(k) and mem.get(k):
+                    r[k] = mem[k]
+            r.setdefault("log_tail", [])
+            out.append(r)
+        out.sort(key=lambda r: r.get("finished") or "", reverse=True)
+        return out[:15]
+
+    def _row(self, jid, name, user, state, submit, start, end, nodes, limit, comment="", exit_code=""):
+        st = state.split()[0].rstrip("+")
+        mapped, why = _ENDED.get(st, (None, ""))
+        if not mapped:
+            return None
+        if mapped == "failed" and exit_code and exit_code not in ("0:0",):
+            why += f" (exit {exit_code.split(':')[0]})" if exit_code.split(":")[0] != "0" else ""
+        meta = parse_comment(comment)
+        return {"name": jid, "display_name": name, "owner": user, "state": mapped, "detail": why,
+                "model": meta.get("model", ""), "image": meta.get("image", ""),
+                "node": nodes if nodes and nodes not in ("None assigned", "(null)") else None,
+                "submitted": slurm_ts(submit), "started": slurm_ts(start), "finished": slurm_ts(end),
+                "max_runtime_s": slurm_duration(limit)}
+
+    def _sacct(self) -> list[dict] | None:
+        fields = "JobID,JobName,User,State,Submit,Start,End,NodeList,Timelimit,ExitCode,Comment"
+        p = run(["sacct", "-a", "-X", "-n", "-P", f"--delimiter={SEP}", "-r", self.cfg["PARTITION"],
+                 "-S", "now-7days", "-E", "now", "-o", fields], check=False, timeout=30)
+        if p.returncode != 0 or "disabled" in (p.stderr or "").lower():
+            return None
+        rows = []
+        for line in p.stdout.splitlines():
+            f = line.split(SEP)
+            if len(f) != 11:
+                continue
+            jid, name, user, state, submit, start, end, nodes, limit, exitc, comment = f
+            r = self._row(jid, name, user, state, submit, start, end, nodes, limit, comment, exitc)
+            if r:
+                rows.append(r)
+        return rows
+
+    def _jobcomp(self) -> list[dict]:
+        path = self.cfg.get("JOBCOMP_LOG")
+        rows = []
+        if not path:
+            return rows
+        try:
+            with open(path, errors="replace") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 2_000_000))
+                lines = f.read().splitlines()[-500:]
+        except OSError:
+            return rows
+        cutoff = time.time() - 7 * 86400
+        for line in lines:
+            kv = dict(re.findall(r"(\w+)=(\S*)", line))
+            if kv.get("Partition") != self.cfg["PARTITION"]:
+                continue
+            user = re.sub(r"\(\d+\)$", "", kv.get("UserId", "?"))
+            r = self._row(kv.get("JobId", ""), kv.get("Name", ""), user, kv.get("JobState", ""),
+                          kv.get("SubmitTime"), kv.get("StartTime"), kv.get("EndTime"),
+                          kv.get("NodeList"), kv.get("TimeLimit"), "", kv.get("ExitCode", ""))
+            if r and (parse_ts(r["finished"]) or 0) >= cutoff:
+                rows.append(r)
+        return rows
+
+
+def node_report(node: dict, jobids: list[str], cfg: dict[str, str]) -> dict:
+    """GPU readings + log tails from one node: local exec here, restricted SSH (user gitm-report) elsewhere."""
+    here = {socket.gethostname().split(".")[0], socket.gethostname()}
+    if node["name"] in here or node["addr"] in ("localhost", "127.0.0.1"):
+        cmd = ["/usr/local/bin/gitm-node-report", *jobids]
+    else:
+        cmd = ["ssh", "-i", cfg["REPORT_KEY"], "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+               "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new",
+               "-o", f"UserKnownHostsFile={STATE_DIR}/known_hosts",
+               f"gitm-report@{node['addr']}", "gitm-node-report", *jobids]
+    p = run(cmd, check=False, timeout=30)
+    if p.returncode != 0:
+        return {"gpus": [], "logs": {}}
+    try:
+        return json.loads(p.stdout)
+    except ValueError:
+        return {"gpus": [], "logs": {}}
+
+
+def collect_status(cfg: dict[str, str], history: History) -> dict:
+    part = cfg["PARTITION"]
+    recs = describe(squeue(part))
+    live = [r for r in recs if r["state"] in ("running", "starting")]
+    queued = sorted((r for r in recs if r["state"] == "queued"), key=lambda r: r["position"])
+    # Jobs squeue still shows as ended are also in sacct/jobcomp; tail them once more.
+    just_ended = [r for r in recs if r["state"] not in ("running", "starting", "queued")]
+
+    nodes = sinfo_nodes(part)
+    for n in nodes:
+        mine = [r for r in live + just_ended if r["node"] == n["name"]]
+        rep = node_report(n, [r["name"] for r in mine], cfg)
+        n["gpus"] = rep.get("gpus", [])
+        for r in mine:
+            tail = rep.get("logs", {}).get(r["name"])
+            if tail:
+                r["log_tail"] = [redact(x) for x in tail]
+            res = rep.get("results", {}).get(r["name"])
+            if res:
+                r["result"] = res
+        n["job"] = next((r["name"] for r in live if r["node"] == n["name"]), None)
+    for r in recs:
+        r.setdefault("log_tail", [])
+
+    history.remember(recs)
+    recent = history.finished()
+    for r in live + queued + recent:
+        r.pop("priority", None)
+    for n in nodes:
+        n.pop("addr", None)
+    return {
+        "schema": SCHEMA_VERSION,
+        "scheduler": "slurm",
+        "updated": iso(time.time()),
+        "nodes": nodes,
+        "running": live,
+        "queued": queued,
+        "recent": recent,
+    }
+
+
+class GitPublisher:
+    """Force-pushes a one-commit orphan branch holding status.json.
+
+    One commit, always replaced: the status repo never grows, and readers fetch
+    the file by commit sha (immutable, so no CDN staleness)."""
+
+    def __init__(self, repo: str, branch: str = "status", key: str | None = None,
+                 token_file: str | None = None):
+        self.branch = branch
+        self.gitdir = os.path.join(STATE_DIR, "status.git")
+        self.env = dict(os.environ, GIT_DIR=self.gitdir, GIT_TERMINAL_PROMPT="0",
+                        GIT_AUTHOR_NAME="gitm-status", GIT_AUTHOR_EMAIL="gitm-status@localhost",
+                        GIT_COMMITTER_NAME="gitm-status", GIT_COMMITTER_EMAIL="gitm-status@localhost")
+        if token_file:
+            # HTTPS with a fine-grained token (for orgs that disable deploy keys).
+            # The token goes in through git's environment config, never argv, so
+            # it doesn't show up in `ps` for other users on the machine.
+            import base64
+            try:
+                with open(token_file) as f:
+                    tok = f.read().strip()
+            except OSError as e:
+                raise RuntimeError(f"cannot read {token_file}: {e}") from None
+            if not tok:
+                raise RuntimeError(f"{token_file} is empty")
+            basic = base64.b64encode(f"x-access-token:{tok}".encode()).decode()
+            self.remote = f"https://github.com/{repo}.git"
+            self.env.update(GIT_CONFIG_COUNT="1",
+                            GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
+                            GIT_CONFIG_VALUE_0=f"Authorization: Basic {basic}")
+        else:
+            key = key or os.path.join(CONF_DIR, "deploy_key")
+            self.remote = f"git@github.com:{repo}.git"
+            self.env["GIT_SSH_COMMAND"] = (f"ssh -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
+                                           f"-o UserKnownHostsFile={STATE_DIR}/known_hosts")
+        if not os.path.isdir(self.gitdir):
+            os.makedirs(STATE_DIR, exist_ok=True)
+            subprocess.run(["git", "init", "-q", "--bare", self.gitdir], check=True)
+
+    def _git(self, *args: str, input: str | None = None) -> str:
+        p = subprocess.run(["git", *args], input=input, capture_output=True, text=True,
+                           env=self.env, timeout=60)
+        if p.returncode != 0:
+            raise RuntimeError(f"git {args[0]}: {p.stderr.strip()}")
+        return p.stdout.strip()
+
+    def publish(self, content: str) -> None:
+        blob = self._git("hash-object", "-w", "--stdin", input=content)
+        tree = self._git("mktree", input=f"100644 blob {blob}\tstatus.json\n")
+        commit = self._git("commit-tree", tree, "-m", "status")
+        self._git("push", "-q", "--force", self.remote, f"{commit}:refs/heads/{self.branch}")
+
+
+PAGE_PASSWORD_FILE = os.path.join(CONF_DIR, "page_password")
+KDF_ITERATIONS = 600_000
+
+
+class PageSealer:
+    """Encrypts status.json with the team page password (AES-256-GCM, key from
+    PBKDF2-SHA256). The status page decrypts it in the browser with WebCrypto;
+    the public repo only ever holds ciphertext.
+
+    The password file is re-read every cycle, so a new password takes effect on
+    the next push without restarting the service."""
+
+    def __init__(self, path: str = PAGE_PASSWORD_FILE):
+        self.path = path
+        self._fingerprint = None
+        self._key = self._salt = None
+
+    def password_changed(self) -> bool:
+        pw = self._read()
+        fp = hashlib.sha256(pw.encode()).hexdigest()
+        if fp == self._fingerprint:
+            return False
+        try:
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        except ImportError:
+            raise RuntimeError("python3-cryptography is missing: sudo apt-get install -y python3-cryptography") from None
+        self._salt = os.urandom(16)
+        self._key = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=self._salt,
+                               iterations=KDF_ITERATIONS).derive(pw.encode())
+        changed = self._fingerprint is not None
+        self._fingerprint = fp
+        return changed
+
+    def _read(self) -> str:
+        try:
+            with open(self.path) as f:
+                pw = f.read().strip()
+        except OSError:
+            pw = ""
+        if not pw:
+            raise RuntimeError("no page password set, refusing to publish status in the clear. "
+                               "Set one with: sudo gitm-job set-page-password")
+        return pw
+
+    def seal(self, text: str) -> str:
+        import base64
+
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        self.password_changed()
+        iv = os.urandom(12)
+        ct = AESGCM(self._key).encrypt(iv, text.encode(), None)
+        b64 = lambda b: base64.b64encode(b).decode()  # noqa: E731
+        return json.dumps({"sealed": 1, "alg": "AES-256-GCM", "kdf": "PBKDF2-SHA256",
+                           "iter": KDF_ITERATIONS, "salt": b64(self._salt), "iv": b64(iv),
+                           "data": b64(ct)})
+
+
+def cmd_set_page_password(args) -> int:
+    if os.geteuid() != 0:
+        sys.exit("gitm-job: run with sudo")
+    pw = getpass.getpass("New page password: ")
+    if len(pw) < 10:
+        sys.exit("gitm-job: use at least 10 characters")
+    if getpass.getpass("Again: ") != pw:
+        sys.exit("gitm-job: passwords don't match")
+    os.makedirs(CONF_DIR, exist_ok=True)
+    fd = os.open(PAGE_PASSWORD_FILE + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(pw + "\n")
+    os.replace(PAGE_PASSWORD_FILE + ".tmp", PAGE_PASSWORD_FILE)
+    print("Saved. The page switches to the new password within a minute; "
+          "anyone with the old one is asked again.")
+    return 0
+
+
+def cmd_push_status(args) -> int:
+    cfg = load_config()
+    history = History(cfg)
+    pub = None
+    if not args.out:
+        if not cfg.get("STATUS_REPO"):
+            sys.exit("gitm-job: STATUS_REPO missing from /etc/gitm-gpu/config")
+        pub = GitPublisher(cfg["STATUS_REPO"], key=cfg.get("DEPLOY_KEY") or None,
+                           token_file=cfg.get("STATUS_TOKEN_FILE") or None)
+
+    sealer = None if args.plaintext else PageSealer()
+    last_state_key = last_full_key = None
+    last_push = 0.0
+    failures = 0
+    while True:
+        try:
+            if sealer and sealer.password_changed():
+                last_state_key = None   # new password: re-publish now
+            status = collect_status(cfg, history)
+            body = {k: v for k, v in status.items() if k != "updated"}
+            full_key = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+            state_key = hashlib.sha256(json.dumps(
+                [(r["name"], r["state"], r.get("position"), r["node"])
+                 for r in status["running"] + status["queued"] + status["recent"]]
+                + [(n["name"], n["ready"], n["job"]) for n in status["nodes"]],
+                sort_keys=True).encode()).hexdigest()
+            since = time.time() - last_push
+            # Sized for the page's GitHub API budget (60/h per viewer):
+            # state change -> now; logs/GPU readings -> at most every 60s;
+            # nothing new -> heartbeat every 5 min so the page can tell idle from down.
+            if (state_key != last_state_key
+                    or (full_key != last_full_key and since >= args.min_interval)
+                    or since >= args.heartbeat):
+                text = json.dumps(status, indent=1)
+                if sealer:
+                    text = sealer.seal(text)
+                if args.out:
+                    with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(os.path.abspath(args.out)),
+                                                     delete=False) as f:
+                        f.write(text)
+                    os.replace(f.name, args.out)
+                else:
+                    pub.publish(text)
+                last_push, last_state_key, last_full_key = time.time(), state_key, full_key
+                print(f"{status['updated']} pushed: {len(status['running'])} running, "
+                      f"{len(status['queued'])} waiting", flush=True)
+            failures = 0
+        except Exception as e:  # keep the service alive; the page shows staleness
+            failures += 1
+            print(f"error ({failures}): {e}", file=sys.stderr, flush=True)
+        if args.once:
+            return 1 if failures else 0
+        time.sleep(min(args.poll * (2 ** min(failures, 4)), 300))
+
+
+# --------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="gitm-job", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("submit", help="queue a containerized job that gets a whole 8-GPU node",
+                       description="Queue a job. By default it installs gitm in the container and runs "
+                                   "`gitm capture serve -- vllm serve MODEL --tensor-parallel-size 8`. "
+                                   "Anything after `--` replaces that command (gitm is still installed; "
+                                   "$MODEL is set and /out is your results folder).")
+    s.add_argument("--name", required=True, help="short label, e.g. kimi-k26-baseline")
+    s.add_argument("--model", required=True, help="Hugging Face model id, e.g. moonshotai/Kimi-K2.6")
+    s.add_argument("--image", help="container image: org/img:tag, registry#org/img:tag, or a .sqsh file "
+                                   "(default from /etc/gitm-gpu/config)")
+    s.add_argument("--gitm-ref", default="main", help="branch/tag/sha of GitM-Labs/runtime to install")
+    s.add_argument("--max-hours", type=float, default=12, help="hard runtime limit (default 12)")
+    s.add_argument("--node", help="pin to one node, e.g. gitmachine-2; default: first free")
+    s.add_argument("--env", action="append", metavar="KEY=VALUE", help="extra env var (repeatable)")
+    s.add_argument("--capture-args", help='extra args for gitm capture serve, e.g. "--requests 1024"')
+    s.add_argument("--vllm-args", help='extra args for vllm serve, e.g. "--max-model-len 65536"')
+    s.add_argument("--dry-run", action="store_true", help="print the batch script instead of submitting")
+    s.add_argument("command", nargs=argparse.REMAINDER, help="-- custom command")
+    s.set_defaults(fn=cmd_submit)
+
+    s = sub.add_parser("ls", help="running, waiting and recent jobs")
+    s.add_argument("--all", action="store_true", help="every job squeue still knows about")
+    s.add_argument("--mine", action="store_true", help="only your jobs")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_ls)
+
+    s = sub.add_parser("logs", help="print a job's output")
+    s.add_argument("job", help="job id")
+    s.add_argument("-f", "--follow", action="store_true")
+    s.add_argument("--tail", type=int, default=200)
+    s.set_defaults(fn=cmd_logs)
+
+    s = sub.add_parser("cancel", help="cancel a waiting or running job")
+    s.add_argument("job", help="job id")
+    s.set_defaults(fn=cmd_cancel)
+
+    s = sub.add_parser("_push-status", help=argparse.SUPPRESS)
+    s.add_argument("--poll", type=float, default=15)
+    s.add_argument("--min-interval", type=float, default=60)
+    s.add_argument("--heartbeat", type=float, default=300)
+    s.add_argument("--once", action="store_true")
+    s.add_argument("--out", help="write status.json here instead of pushing (testing)")
+    s.add_argument("--plaintext", action="store_true", help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_push_status)
+
+    s = sub.add_parser("set-page-password", help="set the password for the team status page (admin)")
+    s.set_defaults(fn=cmd_set_page_password)
+
+    args = ap.parse_args(argv)
+    if getattr(args, "command", None) and args.command[:1] == ["--"]:
+        args.command = args.command[1:]
+    try:
+        return args.fn(args)
+    except RuntimeError as e:
+        print(f"gitm-job: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

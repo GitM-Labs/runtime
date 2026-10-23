@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from gitm.optimizer.metrics import HardwarePeak
@@ -28,16 +29,20 @@ from gitm.planner.roofline import HardwareSpec
 # a substring of "l40" and the first substring match wins.
 _PEAKS: dict[str, tuple[float, float]] = {
     # "GB200" must precede "B200": the latter is a substring of the former, and
-    # the first substring match wins. Both are the same silicon per GPU, so the
-    # ordering is cosmetic here — it stops mattering the moment they diverge.
+    # the first substring match wins. Here they differ only in HBM bandwidth:
+    # 7.7 TB/s per GPU for HGX B200 (NVIDIA doc 3384703 Dec 2024 p.7) against
+    # 8 TB/s for the GB200 GPU (doc 4204213 Oct 2025 p.8); GB200's ~11% higher
+    # compute peaks are not carried. DGX B200 (64 TB/s per board, so 8) shows
+    # up in NVML as "NVIDIA B200" too; the B200 row takes the lower figure.
     # Blackwell Ultra raises dense fp4 by ~1.67x and doubles HBM, but leaves
     # bf16/fp8 and — decisively for decode — memory bandwidth unchanged at
-    # 8 TB/s. A memory-bound decode step therefore sees essentially none of the
-    # uplift, which is only visible if these are separate entries.
+    # 8 TB/s (3.9% over HGX B200's 7.7). A memory-bound decode step therefore
+    # sees essentially none of the uplift, which is only visible if these are
+    # separate entries.
     "GB300": (2250e12, 8000e9),
     "B300": (2250e12, 8000e9),
     "GB200": (2250e12, 8000e9),
-    "B200": (2250e12, 8000e9),
+    "B200": (2250e12, 7700e9),
     "H100": (989e12, 3350e9),
     "H200": (989e12, 4800e9),
     # CDNA4. Dense matrix bf16 peak — AMD quotes 5 PFLOPS *with* 2:4 sparsity,
@@ -63,13 +68,22 @@ _PEAKS: dict[str, tuple[float, float]] = {
 #
 _QUANT_PEAKS: dict[str, dict[str, float]] = {
     # Blackwell Ultra: 15 PFLOPS dense fp4, with fp8/bf16 carried over from B200.
-    "GB300": {"fp8": 4500e12, "fp4": 15000e12},
-    "B300": {"fp8": 4500e12, "fp4": 15000e12},
-    "GB200": {"fp8": 4500e12, "fp4": 9000e12},
-    "B200": {"fp8": 4500e12, "fp4": 9000e12},
-    # Hopper has fp8 tensor cores; it has no fp4 path (MXFP4 runs dequantised
-    # through Marlin, which is why an fp4 checkpoint traced on H100/H200 prices
-    # against fp8 and still shows a compute-bound expert GEMM).
+    # fp32 is the CUDA-core rate: HGX B200 and HGX B300 both list 600 TFLOPS
+    # FP32 across eight GPUs (NVIDIA HGX datasheets; Lenovo Press LP2226), and
+    # GB200/GB300 are the same silicon per GPU. Without it an fp32 router on
+    # B200 priced at A100's 19.5 TF/s and the K2.6 case's planner run carried
+    # 0.54 ms of router compute that the hardware does not impose. Unlike a
+    # missing fp8/fp4 peak this fallback is NOT flagged, so every Blackwell
+    # entry carries the figure rather than one.
+    "GB300": {"fp8": 4500e12, "fp4": 15000e12, "fp32": 75e12},
+    "B300": {"fp8": 4500e12, "fp4": 15000e12, "fp32": 75e12},
+    "GB200": {"fp8": 4500e12, "fp4": 9000e12, "fp32": 75e12},
+    "B200": {"fp8": 4500e12, "fp4": 9000e12, "fp32": 75e12},
+    # Hopper has fp8 tensor cores and no fp4 path. An fp4 checkpoint does not
+    # therefore price against fp8: vLLM runs it through Marlin, which dequantises
+    # in registers and multiplies in bf16, so ``resolve_execution`` sends it to
+    # the fp16/bf16 peak. The fp8 figure is only the ladder fallback for a SKU
+    # whose arch is unknown.
     #
     # ``fp32`` is the *vector* (non-tensor-core) rate, and it is here because
     # mixed-precision checkpoints run a genuinely fp32 op: the MoE router casts
@@ -101,6 +115,55 @@ _INTERCONNECT: dict[str, float] = {
     "A100": 600e9,  # NVLink 3
     "MI355X": 1075e9,  # xGMI / Infinity Fabric, 7 links, aggregate bidirectional
 }
+
+
+# Tensor-core generation per SKU substring, same first-match ordering as
+# ``_PEAKS``. It decides what a quantised checkpoint *executes* as, which the
+# peak tables alone cannot: Hopper has fp8 tensor cores and no fp4 or
+# microscaling path, so an NVFP4 or MXFP4 expert runs through Marlin at bf16
+# (see ``roofline.resolve_execution``); CDNA4 has MX fp4/fp8 but no NVFP4.
+_ARCH: dict[str, str] = {
+    "GB300": "blackwell",
+    "B300": "blackwell",
+    "GB200": "blackwell",
+    "B200": "blackwell",
+    "H100": "hopper",
+    "H200": "hopper",
+    "MI355X": "cdna4",
+    "A100": "ampere",
+    "L40": "ada",
+    "L4": "ada",
+    "T4": "turing",
+    "V100": "volta",
+}
+
+# HBM per GPU (bytes), for deployment fit. Vendor figures: H200 SXM 141 GB, H100
+# SXM 80 GB, HGX B200 1,440 GB / 8, HGX B300 2.3 TB / 8, GB200 NVL72 13.4 TB / 72,
+# GB300 NVL72 20.7 TB / 72, MI355X 288 GB.
+_MEMORY: dict[str, float] = {
+    "GB300": 288e9,
+    "B300": 288e9,
+    "GB200": 186e9,
+    "B200": 180e9,
+    "H100": 80e9,
+    "H200": 141e9,
+    "MI355X": 288e9,
+    "A100-SXM": 80e9,
+    "A100": 40e9,
+    "L40": 48e9,
+    "L4": 24e9,
+    "T4": 16e9,
+    "V100": 32e9,
+}
+
+
+def _first_match(table: dict[str, Any], sku: str | None, default: Any) -> Any:
+    if not sku:
+        return default
+    for key, value in table.items():
+        if key.lower() in sku.lower():
+            return value
+    return default
 
 
 def quant_peaks_for_sku(sku: str | None) -> dict[str, float]:
@@ -136,6 +199,10 @@ class PlannerContext:
     peak: HardwarePeak | None
     sku: str | None
     num_gpus: int
+    #: How the SKU was found, or what each source said when it was not. Read by
+    #: the graph.hardware degradation, so a run that falls back to A100 peaks
+    #: says which detection failed and how (L-18), instead of naming NVML alone.
+    sku_source: str = ""
 
 
 def _query_nvml() -> tuple[str | None, int | None]:
@@ -157,6 +224,156 @@ def _query_nvml() -> tuple[str | None, int | None]:
             pynvml.nvmlShutdown()
     except Exception:
         return None, None
+
+
+def _query_torch() -> tuple[str | None, int | None]:
+    """(device name, count) through torch, which speaks both vendors.
+
+    The fallback for :func:`_query_nvml`, which is pynvml and therefore NVIDIA
+    only. On ROCm, ``torch.cuda`` *is* the ROCm API and reports the AMD device —
+    ``"AMD Instinct MI355X"`` — which ``peak_for_sku`` matches on substring, so
+    the peaks already in the table become reachable without a second lookup
+    path.
+
+    Without this an 8x MI355X run resolved no SKU, fell through to
+    ``HardwareSpec()`` (A100-SXM4-80GB), and priced every roofline floor against
+    the wrong silicon while reporting that it had done so.
+
+    ``device_count`` is read before ``get_device_name`` so a box with the
+    runtime but no visible device returns ``(None, 0)`` instead of raising.
+    """
+    global _torch_probe_error
+    _torch_probe_error = None
+    try:
+        import torch
+
+        n = int(torch.cuda.device_count())
+        if n <= 0:
+            return None, 0
+        return str(torch.cuda.get_device_name(0)), n
+    except Exception as exc:
+        # Kept for the report: "the probe raised X" and "no device" have
+        # different fixes, and the returned (None, None) cannot tell them apart.
+        _torch_probe_error = f"{type(exc).__name__}: {exc}"
+        return None, None
+
+
+#: The exception the last torch probe raised, if it raised.
+_torch_probe_error: str | None = None
+
+
+def _torch_note(name: str | None, count: int | None) -> str:
+    """What the torch probe said, in words, for ``PlannerContext.sku_source``."""
+    if name is not None:
+        return f"torch reported {name!r}"
+    if count == 0:
+        return "torch saw no device (device_count=0)"
+    return f"torch probe failed ({_torch_probe_error or 'torch unavailable'})"
+
+
+def _engine_world_size(engine: Any) -> int | None:
+    """Ranks in this run, or ``None``.
+
+    Not the box's device count: ``num_gpus`` feeds ``has_collective``, which
+    gates levers declaring ``requires_collective``, and a TP=1 job on an
+    eight-GPU node has no collectives to speak of. Telling it otherwise admits
+    candidates whose whole premise is a collective that will never run — and on
+    a cluster that insists on full-node allocation, TP=1 on eight GPUs is a
+    normal thing to be doing.
+
+    Duck-typed across vLLM version drift, like every other engine read here.
+    """
+    if engine is None:
+        return None
+    # The same list of places the scheduler lookup reads, not a copy of it.
+    from gitm.tracer.vllm_stats import engine_config_value
+
+    val = engine_config_value(engine, "parallel_config", "world_size")
+    return int(val) if isinstance(val, int) and not isinstance(val, bool) and val > 0 else None
+
+
+#: One directory per kfd node, CPU sockets included. Tests point it at a fake tree.
+_KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
+
+_AMD_PCI_VENDOR = 0x1002
+
+#: PCI device id -> name as libdrm's ``data/amdgpu.ids`` (mesa/drm b97cbde1)
+#: spells it, which is where ROCm takes its marketing names from. MI350X and
+#: MI355X are both gfx950, so only the device id tells them apart. 0x74A2 and
+#: 0x74B6 are left out (libdrm names them by revision, which kfd does not
+#: expose), as are the "HF" ids.
+_AMD_DEVICE_NAMES: dict[int, str] = {
+    # gfx90a (CDNA2)
+    0x7408: "AMD Instinct MI250X",
+    0x740C: "AMD Instinct MI250X / MI250",
+    0x740F: "AMD Instinct MI210",
+    0x7410: "AMD Instinct MI210 VF",
+    # gfx942 (CDNA3)
+    0x74A0: "AMD Instinct MI300A",
+    0x74A1: "AMD Instinct MI300X",
+    0x74A5: "AMD Instinct MI325X",
+    0x74B5: "AMD Instinct MI300X VF",
+    0x74B9: "AMD Instinct MI325X VF",
+    # gfx950 (CDNA4)
+    0x75A0: "AMD Instinct MI350X",
+    0x75A3: "AMD Instinct MI355X",
+    0x75A8: "AMD Instinct MI350P",
+    0x75B0: "AMD Instinct MI350X VF",
+    0x75B3: "AMD Instinct MI355X VF",
+    0x75B8: "AMD Instinct MI350P VF",
+}
+
+
+def _kfd_properties(node: Path) -> dict[str, int]:
+    """A kfd node's ``properties`` file: one ``name value`` line each, decimal."""
+    props: dict[str, int] = {}
+    for line in (node / "properties").read_text().splitlines():
+        key, _, value = line.partition(" ")
+        if value.isdigit():
+            props[key] = int(value)
+    return props
+
+
+def _gfx_name(version: int) -> str:
+    """90500 -> "gfx950". Minor and stepping are hex: 90010 -> "gfx90a"."""
+    return f"gfx{version // 10000}{version // 100 % 100:x}{version % 100:x}"
+
+
+def _query_amd() -> tuple[str | None, int | None]:
+    """(device name, count) from the kfd topology, the fallback after torch.
+
+    A node is a GPU iff its ``gpu_id`` is non-zero. An unlisted device id is
+    named ``"AMD gfx950 device id 30127"``, decimal so it cannot spell a
+    ``_PEAKS`` key the way hex ``0xa100`` would. The count is every GPU node
+    the process can read (EPERM outside the container's device cgroup), with
+    ``ROCR_VISIBLE_DEVICES`` not applied. ``(None, None)`` without kfd,
+    ``(None, 0)`` with kfd and no GPU node.
+    """
+    try:
+        if not _KFD_NODES.is_dir():
+            return None, None
+        # Numeric order: node "10" after node "2".
+        nodes = sorted(_KFD_NODES.iterdir(), key=lambda p: (len(p.name), p.name))
+    except OSError:
+        return None, None
+    gpus = []
+    for node in nodes:
+        try:
+            if (node / "gpu_id").read_text().strip() in ("", "0"):
+                continue
+            gpus.append(_kfd_properties(node))
+        except (OSError, UnicodeDecodeError):
+            continue
+    if not gpus:
+        return None, 0
+    first = gpus[0]
+    if first.get("vendor_id") != _AMD_PCI_VENDOR:
+        return None, len(gpus)
+    device = first.get("device_id", 0)
+    name = _AMD_DEVICE_NAMES.get(device)
+    if name is None:
+        name = f"AMD {_gfx_name(first.get('gfx_target_version', 0))} device id {device}"
+    return name, len(gpus)
 
 
 def peak_for_sku(sku: str | None) -> HardwarePeak | None:
@@ -198,6 +415,8 @@ def hardware_spec_for(peak: HardwarePeak | None) -> HardwareSpec:
         peak_flops_fp32_per_s=quant.get("fp32", HardwareSpec.peak_flops_fp32_per_s),
         peak_mem_bw_bytes_per_s=peak.peak_bw_bytes_s,
         interconnect_bw_bytes_per_s=interconnect_bw_for_sku(peak.name),
+        arch=_first_match(_ARCH, peak.name, ""),
+        memory_bytes=_first_match(_MEMORY, peak.name, 0.0),
     )
 
 
@@ -242,13 +461,68 @@ def build_planner_context(
 
     ``GITM_GPU_SKU`` overrides NVML (useful in CI / on a box without pynvml).
     """
-    env_sku = os.environ.get("GITM_GPU_SKU")
+    # Empty is unset. `GITM_GPU_SKU=` in a manifest or an exported-but-unset
+    # shell variable arrives as "", which is not None — so every `is None` test
+    # below would read it as an answer, skip detection, and leave the SKU to the
+    # A100 default on a box NVML could have identified.
+    env_sku = (os.environ.get("GITM_GPU_SKU") or "").strip() or None
+    # Settle the count first, from what is already in hand. What gates a
+    # collective lever is whether *this run* has collectives, not what the box
+    # holds — so an explicit count, then the engine's world size, before any
+    # device is asked anything. Deciding this up front is also what keeps the
+    # probes below from running for a value already known: with GITM_GPU_SKU
+    # set and a live engine, nothing needs to be discovered at all.
+    world = num_gpus or _engine_world_size(engine)
+
     # Only touch NVML if something it provides is actually missing.
     nvml_name = nvml_count = None
-    if env_sku is None or num_gpus is None:
+    if env_sku is None or world is None:
         nvml_name, nvml_count = _query_nvml()
-    sku = env_sku or nvml_name
-    n = num_gpus or nvml_count or 1
+
+    # NVML answers for NVIDIA alone, so ask torch where it did not — and only
+    # for something still missing. The probe is not free: `get_device_name`
+    # initialises a CUDA/HIP context, which is a side effect the planner should
+    # not have when it already knows both answers.
+    need_sku = env_sku is None and nvml_name is None
+    need_count = world is None and nvml_count is None
+    torch_name = torch_count = None
+    torch_why = "torch not asked"
+    if need_sku or need_count:
+        torch_name, torch_count = _query_torch()
+        torch_why = _torch_note(torch_name, torch_count)
+
+    # kfd is read when no override is set and no name so far has a peak, or
+    # when nothing has counted the box. A torch name alone does not settle it:
+    # ROCm torch can say "AMD Radeon Graphics", or "", which prices nothing.
+    counts = (world, nvml_count, torch_count)
+    priced = any(peak_for_sku(name) for name in (nvml_name, torch_name))
+    amd_name = amd_count = None
+    if (env_sku is None and not priced) or all(c is None for c in counts):
+        amd_name, amd_count = _query_amd()
+
+    # The override, then the first name with a peak. Among the rest kfd's table
+    # name comes first: it is the same on every run, so history keys the box
+    # once however torch spelled it.
+    names = (nvml_name, torch_name, amd_name)
+    amd_listed = amd_name if amd_name in _AMD_DEVICE_NAMES.values() else None
+    sku = (
+        env_sku
+        or next((x for x in names if peak_for_sku(x)), None)
+        or next((x for x in (amd_listed, *names) if x), None)
+    )
+    if env_sku is not None:
+        sku_source = "GITM_GPU_SKU"
+    elif sku is not None and sku == nvml_name:
+        sku_source = "NVML"
+    elif sku is not None and sku == torch_name:
+        sku_source = torch_why
+    elif sku is not None:
+        sku_source = "kfd topology"
+    else:
+        kfd_why = "no kfd topology" if amd_count is None else f"kfd saw {amd_count} GPU node(s)"
+        sku_source = f"GITM_GPU_SKU unset; NVML gave no name; {torch_why}; {kfd_why}"
+    # torch's 0 (every device masked) is an answer kfd must not overrule.
+    n = next((c for c in (*counts, amd_count) if c is not None), None) or 1
     peak = peak_for_sku(sku)
     dtype = _engine_dtype(engine)
     kv_len = _engine_kv_len(engine)
@@ -262,4 +536,4 @@ def build_planner_context(
         has_collective=n > 1,
         has_interconnect=n > 1,  # refined later by NVLink/IB probe
     )
-    return PlannerContext(gate=gate, peak=peak, sku=sku, num_gpus=n)
+    return PlannerContext(gate=gate, peak=peak, sku=sku, num_gpus=n, sku_source=sku_source)
