@@ -186,17 +186,59 @@ def _effect(
 _MLP_OPS = ("moe_routed", "moe_shared", "mlp_gate_up", "mlp_down")
 
 
+def _h001_env_on(w: Workload, name: str, default: str) -> bool:
+    """vLLM's own bool parse (envs.py:1235-1237); ``None`` in ``serving`` is unset."""
+    value = w.serving.get(name)
+    return str(default if value is None else value).lower() in ("true", "1")
+
+
 def _h001_applies(w: Workload) -> str | None:
     fmt = quant_format(w.spec.dtype_for("moe_routed", w.spec.expert_dtype))
     if fmt is None or fmt.name not in ("nvfp4", "int4_g32"):
         return "experts are not a 1/16-B-per-weight-scale 4-bit format"
-    # Quark OCP-MX MoE emulates unless the platform reports MX support, and only
-    # ROCm gfx95x does (platforms/interface.py:577-581 returns False; rocm.py:
-    # 744-745). Emulation dequantises every local expert to bf16 each forward
-    # (fused_moe/fused_moe.py:1758-1762): a regression, not a recovery.
+    # Quark W4A4 MXFP4 MoE emulates unless AITER's fused MoE takes it, and only
+    # gfx950 can (vLLM v0.29.0 quark_moe.py:1102-1106; oracle/mxfp4.py:382-383,
+    # :443-456; experts/rocm_aiter_moe.py:475-479). Emulation dequantises every
+    # local expert to bf16 each forward (experts/ocp_mx_emulation_moe.py:202-208):
+    # a regression, not a recovery.
     if w.hw.arch != "cdna4":
-        return (f"MXFP4 (Quark OCP-MX) emulates on {w.hw.arch or 'unknown'}: "
-                "supports_mx() is False off ROCm gfx95x")
+        return (f"MXFP4 (Quark OCP-MX) MoE emulates on {w.hw.arch or 'unknown'}: "
+                "the only native W4A4 backend is AITER on gfx950")
+    # AiterExperts also needs is_fused_moe_enabled(), both flags (rocm_aiter_moe.py:
+    # 451-453; _aiter_ops.py:1892-1893).
+    for flag, default in (("VLLM_ROCM_USE_AITER", "False"), ("VLLM_ROCM_USE_AITER_MOE", "True")):
+        if not _h001_env_on(w, flag, default):
+            return (f"{flag} is off, so vLLM v0.29.0 emulates MXFP4 MoE even on gfx950; "
+                    "the prediction is for AITER")
+    # Fusion makes 385 experts, top-9 (routed_experts.py:987-993), served by a kernel
+    # family the planner does not model (aiter/fused_moe.py:2005-2022).
+    if _h001_env_on(w, "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "False"):
+        return ("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is on, so vLLM v0.29.0 runs "
+                "385 experts with top-9 on another AITER kernel family; the prediction "
+                "is for 384 experts with top-8")
+    # A forced MoE backend skips the auto list (oracle/mxfp4.py:534-560). A linear
+    # backend filters it, back to the whole list when it has no MXFP4 kernel
+    # (kernels/linear/__init__.py:341-386), so only "emulation" moves the linear.
+    # Both are refused, at the top level or in kernel_config, which vLLM keeps when
+    # the top level is auto (arg_utils.py:2534-2548); normalised as :1680-1685 does.
+    nested = _nested_config(w, "kernel_config")
+    if isinstance(nested, str):
+        return nested
+    for knob in ("moe_backend", "linear_backend"):
+        for name, backend in ((knob, w.serving.get(knob)), (f"kernel_config.{knob}", nested.get(knob))):
+            if backend is not None and str(backend).lower().replace("-", "_") != "auto":
+                return (f"{name}={backend} is set; the prediction is for what vLLM "
+                        "v0.29.0's auto selection picks")
+    # What is left is the emulation linear (kernels/linear/__init__.py:899-902). vLLM
+    # matches whole entries of the unstripped comma split (envs.py:1194-1198).
+    if "AiterMxfp4LinearKernel" in str(w.serving.get("VLLM_DISABLED_KERNELS") or "").split(","):
+        return ("VLLM_DISABLED_KERNELS turns off AiterMxfp4LinearKernel, so the shared "
+                "expert and dense layer 0 run the emulation linear; the prediction is "
+                "for AITER")
+    # resolve_execution refuses this (roofline._UNSUPPORTED); say so before predict raises.
+    if fmt.name == "nvfp4":
+        return ("NVFP4 MoE on ROCm at vLLM v0.29.0 runs the Triton emulation "
+                "(experts/nvfp4_emulation_moe.py), which the planner does not price")
     return None
 
 

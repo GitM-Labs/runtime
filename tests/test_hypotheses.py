@@ -9,12 +9,14 @@ wins. A performance verdict needs a measured run on hardware.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import yaml
 
 from gitm.agents.autoresearch import autoresearch_v0
 from gitm.agents.hypotheses import (
@@ -31,7 +33,7 @@ from gitm.optimizer.replay import predict_delta
 from gitm.planner.context import hardware_spec_for, peak_for_sku
 from gitm.planner.glm_graph import model_weight_bytes
 from gitm.planner.model_catalogue import load_spec
-from gitm.planner.roofline import BatchConfig, ShardingConfig
+from gitm.planner.roofline import BatchConfig, ShardingConfig, UnsupportedExecution
 from gitm.planner.roofline import BatchConfig as _BC  # noqa: F401
 
 from .conftest import make_kernel, make_trace
@@ -339,12 +341,148 @@ def test_h001_latency_effect_is_inside_its_own_band():
 
 
 def test_h001_is_excluded_where_mxfp4_emulates():
-    """Quark OCP-MX MoE emulates wherever supports_mx() is False, which is every
-    CUDA part: a full bf16 dequant of every local expert per forward."""
+    """Quark W4A4 MXFP4 MoE has one native backend, AITER on gfx950. Every CUDA
+    part gets the emulation: a full bf16 dequant of every local expert per
+    forward."""
     for sku in ("H200", "B200"):
         why = H001.applies(_k25(sku))
         assert why is not None and "emulates" in why
     assert H001.applies(_k25()) is None
+
+
+def _loop_vllm_env() -> dict[str, str]:
+    """The literal env of the vllm container in the MI355X loop deployment."""
+    path = Path(__file__).resolve().parents[1] / "deploy/k8s/mi355x-kimi-loop.yaml"
+    deploy = next(d for d in yaml.safe_load_all(path.read_text()) if d and d["kind"] == "Deployment")
+    vllm = next(c for c in deploy["spec"]["template"]["spec"]["containers"] if c["name"] == "vllm")
+    return {e["name"]: e["value"] for e in vllm["env"] if "value" in e}
+
+
+@pytest.mark.parametrize(("serving", "flag"), [
+    ({}, "VLLM_ROCM_USE_AITER"),
+    ({"VLLM_ROCM_USE_AITER": "0"}, "VLLM_ROCM_USE_AITER"),
+    ({"VLLM_ROCM_USE_AITER": "yes"}, "VLLM_ROCM_USE_AITER"),
+    ({"VLLM_ROCM_USE_AITER": "1", "VLLM_ROCM_USE_AITER_MOE": "0"}, "VLLM_ROCM_USE_AITER_MOE"),
+    ({"VLLM_ROCM_USE_AITER": "TRUE", "VLLM_ROCM_USE_AITER_MOE": "False"}, "VLLM_ROCM_USE_AITER_MOE"),
+])
+def test_h001_refuses_mi355x_without_aiter_fused_moe(serving, flag):
+    """AiterExperts' device check is VLLM_ROCM_USE_AITER (default off) and
+    VLLM_ROCM_USE_AITER_MOE (default on), each read as "1"/"true" in any case;
+    without both the oracle emulates."""
+    why = H001.applies(_k25(serving=serving))
+    assert why is not None and why.startswith(f"{flag} is off")
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", True, 1])
+def test_h001_refuses_aiter_shared_expert_fusion(value):
+    """VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS (default off) makes vLLM run
+    385 experts with top-9, served from other tuned rows by another kernel
+    family (csv :34-81; fused_moe.py:2005-2022): not the shape priced."""
+    why = H001.applies(_k25(serving={
+        "VLLM_ROCM_USE_AITER": "1", "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": value}))
+    assert why is not None
+    assert why.startswith("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS is on")
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", None])
+def test_h001_applies_with_aiter_shared_expert_fusion_off(value):
+    serving = {"VLLM_ROCM_USE_AITER": "1", "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": value}
+    assert H001.applies(_k25(serving=serving)) is None
+
+
+@pytest.mark.parametrize("knob", ["moe_backend", "linear_backend"])
+@pytest.mark.parametrize("value", ["triton", "aiter", "AITER", "flashinfer-cutlass", "emulation"])
+def test_h001_refuses_an_explicit_backend(knob, value):
+    """A forced MoE backend skips the auto list (oracle/mxfp4.py:534-560); a
+    linear backend filters it (kernels/linear/__init__.py:341-386). Even "aiter",
+    which picks the same kernels, is refused: the gate prices what auto picks."""
+    why = H001.applies(_k25(serving={"VLLM_ROCM_USE_AITER": "1", knob: value}))
+    assert why is not None and why.startswith(f"{knob}={value} is set")
+
+
+@pytest.mark.parametrize("knob", ["moe_backend", "linear_backend"])
+@pytest.mark.parametrize("value", ["emulation", "Emulation", "triton"])
+@pytest.mark.parametrize("top", [None, "auto"])
+def test_h001_refuses_a_backend_set_in_kernel_config(knob, value, top):
+    """vLLM keeps kernel_config's backend unless the top-level flag overrides it
+    (arg_utils.py:2534-2548), so a nested "emulation" still moves the kernels."""
+    for nested in ({knob: value}, json.dumps({knob: value})):
+        why = H001.applies(_k25(serving={
+            "VLLM_ROCM_USE_AITER": "1", knob: top, "kernel_config": nested}))
+        assert why is not None and why.startswith(f"kernel_config.{knob}={value} is set")
+
+
+@pytest.mark.parametrize("knob", ["moe_backend", "linear_backend"])
+@pytest.mark.parametrize("value", ["auto", "AUTO", None])
+def test_h001_applies_with_backend_auto_or_unset(knob, value):
+    assert H001.applies(_k25(serving={"VLLM_ROCM_USE_AITER": "1", knob: value})) is None
+    assert H001.applies(_k25(serving={"VLLM_ROCM_USE_AITER": "1", "kernel_config": {knob: value}})) is None
+    assert H001.applies(_k25(serving={
+        "VLLM_ROCM_USE_AITER": "1", "kernel_config": json.dumps({knob: value})})) is None
+
+
+@pytest.mark.parametrize("value", ["{not json", "[1]"])
+def test_h001_refuses_a_kernel_config_vllm_would_not_take(value):
+    why = H001.applies(_k25(serving={"VLLM_ROCM_USE_AITER": "1", "kernel_config": value}))
+    assert why is not None and why.startswith("kernel_config=")
+
+
+@pytest.mark.parametrize(("value", "refused"), [
+    ("AiterMxfp4LinearKernel", True),
+    ("MarlinMxFp4LinearKernel,AiterMxfp4LinearKernel", True),
+    ("MarlinMxFp4LinearKernel", False),
+    # vLLM matches whole entries and does not strip them (envs.py:1194-1198).
+    ("MarlinMxFp4LinearKernel, AiterMxfp4LinearKernel", False),
+    ("AiterMxfp4LinearKernelV2", False),
+])
+def test_h001_refuses_a_disabled_aiter_mxfp4_linear(value, refused):
+    """VLLM_DISABLED_KERNELS naming AiterMxfp4LinearKernel leaves the emulation
+    linear (kernels/linear/__init__.py:899-902), which dequantises the shared
+    expert and dense layer 0 to bf16 on every call."""
+    why = H001.applies(_k25(serving={"VLLM_ROCM_USE_AITER": "1", "VLLM_DISABLED_KERNELS": value}))
+    if refused:
+        assert why is not None and why.startswith("VLLM_DISABLED_KERNELS")
+    else:
+        assert why is None
+
+
+@pytest.mark.parametrize(("serving", "refused"), [
+    ({"VLLM_ROCM_USE_AITER": None}, "VLLM_ROCM_USE_AITER is off"),
+    ({"VLLM_ROCM_USE_AITER": "1", "VLLM_ROCM_USE_AITER_MOE": None}, None),
+    ({"VLLM_ROCM_USE_AITER": "1", "VLLM_ROCM_USE_AITER_MOE": "0"}, "VLLM_ROCM_USE_AITER_MOE is off"),
+])
+def test_h001_reads_an_explicit_none_env_as_unset(serving, refused):
+    """An unset variable takes vLLM's default (VLLM_ROCM_USE_AITER off,
+    VLLM_ROCM_USE_AITER_MOE on), so ``None`` is not "off"."""
+    why = H001.applies(_k25(serving=serving))
+    if refused is None:
+        assert why is None
+    else:
+        assert why is not None and why.startswith(refused)
+
+
+def test_h001_applies_to_the_loop_deployment_env():
+    env = _loop_vllm_env()
+    assert env["VLLM_ROCM_USE_AITER"] == "1" and "VLLM_ROCM_USE_AITER_MOE" not in env
+    assert H001.applies(_k25(serving=env)) is None
+    assert H001.applies(_k25(serving={**env, "VLLM_ROCM_USE_AITER": "True"})) is None
+
+
+def test_h001_refuses_an_nvfp4_baseline_on_mi355x():
+    """vLLM v0.29.0 serves NVFP4 MoE on ROCm through its Triton emulation, a
+    per-tile dequant inside the GEMM that streams the same 0.5625 B per weight
+    as INT4 W4A16. The planner has no rule for it, so ``predict`` raises and
+    the refusal has to come from ``applies``."""
+    k26 = replace(_k25(batch=128, kv_len=1024), model="kimi-k2.6", spec=load_spec("kimi-k2.6"))
+    with pytest.raises(UnsupportedExecution, match="^nvfp4 "):
+        H001.predict(k26)
+    proposer = _prop(k26, hypotheses=(replace(H001, proposable=True),))
+
+    assert proposer.propose("memory_bound") == []
+    assert proposer.predictions == {}
+    assert proposer.skipped == [("H-001", "NVFP4 MoE on ROCm at vLLM v0.29.0 runs the "
+                                 "Triton emulation (experts/nvfp4_emulation_moe.py), "
+                                 "which the planner does not price")]
 
 
 # ── the proposal path ────────────────────────────────────────────────────────
