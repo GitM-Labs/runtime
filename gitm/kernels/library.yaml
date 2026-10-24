@@ -556,7 +556,7 @@ interventions:
 
   - name: enable_eplb
     lever_class: 3
-    restart_cost: none
+    restart_cost: restart
     summary: Rebalance expert placement across ranks to cut routing-induced stragglers.
     knob: enable_eplb
     value: true
