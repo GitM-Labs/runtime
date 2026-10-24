@@ -31,6 +31,7 @@ import yaml
 
 from gitm.planner.glm_graph import (
     GlmMoeDsaModelSpec,
+    aiter_mxfp4_routed_quants,
     core_read_entries,
     is_glm_moe_dsa_config,
     kv_entry_bytes,
@@ -628,6 +629,27 @@ def test_act_quant_exists_only_where_a_gemm_is_actually_fp8():
     # Two per block: one ahead of the attention GEMMs, one ahead of the FFN —
     # the two groups of fp8 GEMMs, with bf16 work in between.
     assert len(_ops(predict_glm_graph(fp8, batch=batch), "act_quant")) == 2 * fp8.n_layers
+
+
+_TP8_FUSED = {8, 16, 128, 256, 512, 1024}  # kimik2_fp4_tuned_fmoe.csv :5-6, :9-12
+_TP4_FUSED = {2, 4, 8, 16, 128, 256, 512, 1024, 2048}  # :19-22, :25-29
+
+
+@pytest.mark.parametrize(("tp", "fused"), [
+    (8, _TP8_FUSED), (4, _TP4_FUSED),
+    # 128 and 64 per rank pad to 256 (oracle/mxfp4.py:759-761): the TP8 rows.
+    (16, _TP8_FUSED), (32, _TP8_FUSED),
+])
+def test_aiter_mxfp4_routed_quants_follow_the_tuned_kimi_rows(tp, fused):
+    """One routed quant where the tuned stage 1 (keyed on the padded token count)
+    ends ``_fp4`` and writes stage 2's input itself, two at every other padded
+    count. Every power of two is checked so a dropped or added row shows."""
+    spec = load_spec("kimi-k2.5")
+    for m in (1 << i for i in range(16)):
+        assert aiter_mxfp4_routed_quants(spec, m, ShardingConfig(tp=tp)) == (1 if m in fused else 2), m
+    assert aiter_mxfp4_routed_quants(spec, 100, ShardingConfig(tp=tp)) == (1 if 128 in fused else 2)
+    # 2,048 per rank under EP: not a tuned shape.
+    assert aiter_mxfp4_routed_quants(spec, 128, ShardingConfig(tp=tp, ep=8)) == 2
 
 
 def test_accepted_tokens_follow_a_prefix_chain():

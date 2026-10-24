@@ -166,9 +166,9 @@ Planner = sum of node bytes. Hand = weights read + KV read + KDA state read/writ
 | shape | planner | hand | planner vs hand |
 |---|---:|---:|---:|
 | B=1, S=8k | 82.9 GB | 138.1 GB | **−40.0 %** |
-| B=32, S=8k | 721.4 GB | 781.0 GB | −7.6 % |
-| B=256, S=8k | 1,740.4 GB | 1,831.3 GB | −5.0 % |
-| B=32, S=128k | 1,142.7 GB | 889.7 GB | **+28.4 %** |
+| B=32, S=8k | 721.6 GB | 781.0 GB | −7.6 % |
+| B=256, S=8k | 1,741.8 GB | 1,831.3 GB | −4.9 % |
+| B=32, S=128k | 1,142.9 GB | 889.7 GB | **+28.5 %** |
 
 At B=1 the step is all dense weights and the planner is missing 41.4 GB of KDA
 projections, 9.5 GB of latent projections and 4.2 GB of MLA gates. At B >= 32 the
