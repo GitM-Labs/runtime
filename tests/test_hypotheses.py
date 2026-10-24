@@ -31,7 +31,7 @@ from gitm.optimizer.replay import predict_delta
 from gitm.planner.context import hardware_spec_for, peak_for_sku
 from gitm.planner.glm_graph import model_weight_bytes
 from gitm.planner.model_catalogue import load_spec
-from gitm.planner.roofline import BatchConfig, ShardingConfig
+from gitm.planner.roofline import BatchConfig, ShardingConfig, UnsupportedExecution
 from gitm.planner.roofline import BatchConfig as _BC  # noqa: F401
 
 from .conftest import make_kernel, make_trace
@@ -382,6 +382,23 @@ def test_proposer_state_describes_only_the_latest_call():
     prop.propose("memory_bound")
     prop.propose("compute_bound")
     assert prop.predictions == {}
+
+
+def _refuse(w: Workload):
+    raise UnsupportedExecution("these experts have no kernel on this arch")
+
+
+def test_proposer_skips_a_workload_the_planner_refuses_to_price():
+    """Applicability passes before pricing, and only the graph build finds a
+    format with no kernel on the arch. That refusal is a skip reason, not an
+    exception out of ``propose``."""
+    w = _k25("H200")
+    assert H002.applies(w) is None
+    prop = _prop(w, hypotheses=(replace(H002, predict=_refuse),))
+    assert prop.propose("memory_bound") == []
+    assert prop.predictions == {}
+    assert dict(prop.skipped)["H-002"] == (
+        "cannot price this workload: these experts have no kernel on this arch")
 
 
 def test_proposer_emits_nothing_for_a_checkpoint_already_on_fp8():
