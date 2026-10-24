@@ -283,6 +283,26 @@ def test_a_sweep_reports_a_refused_config_per_row_like_a_single_plan(capsys, mon
     assert all(r.split(None, 1)[1] == single for r in rows)
 
 
+def test_a_sweep_keeps_planning_after_a_refused_row(capsys, monkeypatch):
+    """A refused row must not swallow the rows after it."""
+    from gitm.planner import registry
+
+    predict = registry._predict
+
+    def refuse_batch_8(spec, family, hw, batch, sharding):
+        if batch.batch == 8:
+            raise UnsupportedExecution("no kernel at this batch")
+        return predict(spec, family, hw, batch, sharding)
+
+    monkeypatch.setattr(registry, "_predict", refuse_batch_8)
+    argv = ["kimi-k2.6", "--gpu", "H200", "--tp", "8", "--kv-len", "8192", "--sweep", "8,32"]
+    assert main(argv) == 2
+    refused, planned = capsys.readouterr().out.splitlines()[2:]
+    assert refused.split(None, 1) == ["8", "cannot plan: no kernel at this batch"]
+    assert planned.split()[0] == "32" and "cannot plan" not in planned
+    float(planned.split()[1])
+
+
 def test_a_sweep_reports_a_sharding_the_graph_refuses_per_row(capsys):
     """The graphs refuse a TP that does not divide the heads with a plain
     ValueError, not UnsupportedExecution. Catching only the latter would turn
