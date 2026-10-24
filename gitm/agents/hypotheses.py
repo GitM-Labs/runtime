@@ -221,7 +221,9 @@ def _h001_applies(w: Workload) -> str | None:
     # (kernels/linear/__init__.py:341-386), so only "emulation" moves the linear.
     # Both are refused, at the top level or in kernel_config, which vLLM keeps when
     # the top level is auto (arg_utils.py:2534-2548); normalised as :1680-1685 does.
-    nested = w.serving.get("kernel_config") or {}
+    nested = _nested_config(w, "kernel_config")
+    if isinstance(nested, str):
+        return nested
     for knob in ("moe_backend", "linear_backend"):
         for name, backend in ((knob, w.serving.get(knob)), (f"kernel_config.{knob}", nested.get(knob))):
             if backend is not None and str(backend).lower().replace("-", "_") != "auto":
