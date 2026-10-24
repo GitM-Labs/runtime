@@ -9,6 +9,7 @@ wins. A performance verdict needs a measured run on hardware.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from dataclasses import replace
@@ -405,9 +406,10 @@ def test_h001_refuses_an_explicit_backend(knob, value):
 def test_h001_refuses_a_backend_set_in_kernel_config(knob, value, top):
     """vLLM keeps kernel_config's backend unless the top-level flag overrides it
     (arg_utils.py:2534-2548), so a nested "emulation" still moves the kernels."""
-    why = H001.applies(_k25(serving={
-        "VLLM_ROCM_USE_AITER": "1", knob: top, "kernel_config": {knob: value}}))
-    assert why is not None and why.startswith(f"kernel_config.{knob}={value} is set")
+    for nested in ({knob: value}, json.dumps({knob: value})):
+        why = H001.applies(_k25(serving={
+            "VLLM_ROCM_USE_AITER": "1", knob: top, "kernel_config": nested}))
+        assert why is not None and why.startswith(f"kernel_config.{knob}={value} is set")
 
 
 @pytest.mark.parametrize("knob", ["moe_backend", "linear_backend"])
@@ -415,6 +417,14 @@ def test_h001_refuses_a_backend_set_in_kernel_config(knob, value, top):
 def test_h001_applies_with_backend_auto_or_unset(knob, value):
     assert H001.applies(_k25(serving={"VLLM_ROCM_USE_AITER": "1", knob: value})) is None
     assert H001.applies(_k25(serving={"VLLM_ROCM_USE_AITER": "1", "kernel_config": {knob: value}})) is None
+    assert H001.applies(_k25(serving={
+        "VLLM_ROCM_USE_AITER": "1", "kernel_config": json.dumps({knob: value})})) is None
+
+
+@pytest.mark.parametrize("value", ["{not json", "[1]"])
+def test_h001_refuses_a_kernel_config_vllm_would_not_take(value):
+    why = H001.applies(_k25(serving={"VLLM_ROCM_USE_AITER": "1", "kernel_config": value}))
+    assert why is not None and why.startswith("kernel_config=")
 
 
 @pytest.mark.parametrize(("value", "refused"), [
