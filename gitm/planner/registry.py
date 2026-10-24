@@ -146,6 +146,40 @@ def predict_for_config(
 # re-import every name below and would have drifted from the dispatch order it
 # depends on.
 
+#: vLLM v0.29.0 ``--kv-cache-dtype`` spellings (config/cache.py:39-57) to the
+#: planner's labels: moe_graph prices its cache with weight_bytes, which would
+#: charge ``fp8_e5m2`` 2 B.
+_KV_CACHE_DTYPES: dict[str, str] = {
+    "bfloat16": "bf16", "float16": "fp16", "bf16": "bf16", "fp16": "fp16",
+    "fp8": "fp8", "fp8_e4m3": "fp8", "fp8_e5m2": "fp8",
+}
+
+#: Spellings no in-tree attention backend lists in ``supported_kv_cache_dtypes``
+#: (v1/attention/backend.py:289).
+_KV_CACHE_REFUSED: dict[str, str] = {
+    "fp8_inc": "the Intel Gaudi plugin's fp8 spelling (config/cache.py:122)",
+}
+
+#: A priced spelling can still be refused at launch: fp8_e5m2 has no CUDA MLA
+#: backend (mla/flashmla.py:49-55) and FLASHMLA_SPARSE takes no fp8_e4m3
+#: (mla/flashmla_sparse.py:92-97).
+_KV_BACKEND_CAVEAT = ("--kv-cache-dtype {}: priced by its bytes. Some vLLM v0.29.0 attention "
+                      "backend lists this spelling, but the planner does not check that the "
+                      "backend for this model and GPU does, so vLLM may refuse it")
+
+_KV_PLANNER_LABELS = {"bf16": "bfloat16", "fp16": "float16"}
+_KV_LABEL_CAVEAT = ("--kv-cache-dtype {}: the planner's label for {}, not a vLLM spelling; "
+                    "vllm serve rejects it")
+
+
+def _kv_caveat(dtype: str) -> str | None:
+    if dtype == "auto":
+        return None
+    if dtype in _KV_PLANNER_LABELS:
+        return _KV_LABEL_CAVEAT.format(dtype, _KV_PLANNER_LABELS[dtype])
+    return _KV_BACKEND_CAVEAT.format(dtype)
+
+
 def add_plan_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
     ap.add_argument("model", nargs="?", default=None,
                     help="Catalogue entry name, or a path to a checkpoint config.json.")
@@ -183,12 +217,19 @@ def add_plan_arguments(ap: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="Per-rank activation workspace + graph pools + comm buffers, "
                          "GB. Charged in the same ledger as KV; 0 prints as unstated.")
     ap.add_argument("--kv-cache-dtype", default="auto",
-                    choices=("auto", "bf16", "fp16", "fp8"),
+                    choices=("auto", *_KV_CACHE_DTYPES, *_KV_CACHE_REFUSED),
                     help="vLLM --kv-cache-dtype. 'auto' (the default) prices the "
-                         "catalogue's kv_dtype, which records what vLLM resolves auto "
-                         "to for that checkpoint: fp8 when its quantization_config "
-                         "declares a static fp8 kv_cache_scheme, the model dtype "
-                         "otherwise. 'fp8' is the generic one-byte layout.")
+                         "catalogue's kv_dtype; bf16 and fp16 are the planner's labels "
+                         "for bfloat16 and float16. An fp8 spelling prices one byte per "
+                         "cached element, RoPE key included (only 'auto' keeps an "
+                         "entry's wider RoPE key or scales; deepseek-v4.x keeps a bf16 "
+                         "RoPE key either way and prices fp8 at its 1.000244 B weight "
+                         "constant). On Hopper, vLLM's "
+                         "sparse-MLA backend stores a glm-5.x fp8 cache as fp8_ds_mla: "
+                         "656 B per GLM-5.2 entry against the 576 priced. fp8_inc is "
+                         "refused; the rest are priced without checking the backend "
+                         "for this model and GPU, so vLLM may still refuse it "
+                         "(fp8_e5m2 on a CUDA MLA model).")
     ap.add_argument("--tp", type=int, default=1, help="Tensor-parallel size.")
     ap.add_argument("--ep", type=int, default=1, help="Expert-parallel size.")
     ap.add_argument("--dp", type=int, default=1, help="Data-parallel size.")
@@ -447,6 +488,13 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, ValueError) as e:
         print(f"cannot plan: {e}")
         return 2
+    if args.kv_cache_dtype in _KV_CACHE_REFUSED:
+        print(f"cannot plan: --kv-cache-dtype {args.kv_cache_dtype} is "
+              f"{_KV_CACHE_REFUSED[args.kv_cache_dtype]}; no attention backend in "
+              "vLLM v0.29.0 accepts it")
+        return 2
+    caveat = _kv_caveat(args.kv_cache_dtype)
+
     if args.kv_cache_dtype != "auto":
         from dataclasses import fields as _fields
         from dataclasses import replace as _replace_spec
@@ -456,7 +504,8 @@ def main(argv: list[str] | None = None) -> int:
         # An explicit dtype overrides the cache on every family, and both halves
         # of an MLA entry where the spec splits them.
         names = {f.name for f in _fields(spec)}
-        kv = {n: args.kv_cache_dtype for n in ("kv_dtype", "kv_rope_dtype") if n in names}
+        label = _KV_CACHE_DTYPES[args.kv_cache_dtype]
+        kv = {n: label for n in ("kv_dtype", "kv_rope_dtype") if n in names}
         if not kv:
             print(f"cannot plan: --kv-cache-dtype does not apply to the {family} family")
             return 2
@@ -485,6 +534,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{getattr(spec, 'name', '?')} [{family}] on {hw.name}, "
               f"kv_len={args.kv_len}, TP={args.tp} EP={args.ep}")
         print(f"  {'batch':>7s} {'ms/step':>10s} {'tok/s':>12s} {'compute-bound':>14s}")
+        refused = priced = False
         for b in sizes:
             try:
                 g = _predict(spec, family, hw,
@@ -493,12 +543,16 @@ def main(argv: list[str] | None = None) -> int:
                                          acceptance_rate=args.acceptance_rate),
                              sharding)
             except ValueError as e:
-                print(f"cannot plan: {e}")
-                return 2
+                print(f"  {b:7d} cannot plan: {e}")
+                refused = True
+                continue
+            priced = True
             cb = sum(1 for n in g.nodes if n.prediction.bound == "compute")
             print(f"  {b:7d} {g.total_pred_s * 1e3:9.3f} "
                   f"{b / g.total_pred_s:12,.0f} {cb:9d}/{len(g.nodes)}")
-        return 0
+        if caveat and priced:
+            print(f"  ! {caveat}")
+        return 2 if refused else 0
 
     batch = BatchConfig(
         batch=args.batch, kv_cache_len=args.kv_len,
@@ -534,6 +588,7 @@ def main(argv: list[str] | None = None) -> int:
                       "prefill_requests": args.prefill_requests},
             "kv_cache_dtype": getattr(spec, "kv_dtype", None),
             "requested_kv_cache_dtype": args.kv_cache_dtype,
+            "kv_cache_dtype_caveat": caveat,
             "gpu_memory_utilization": args.gpu_mem_util,
             "workspace_bytes": args.workspace_gb * 1e9,
             "memory_fit": fit_data,
@@ -561,6 +616,8 @@ def main(argv: list[str] | None = None) -> int:
     print(_render_table(g, hw, spec, family, note))
     if family == "glm_moe_dsa":
         print(_render_precision_and_fit(spec, hw, batch, sharding, args))
+    if caveat:
+        print(f"  ! {caveat}")
     return 0
 
 

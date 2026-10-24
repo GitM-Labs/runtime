@@ -155,8 +155,14 @@ _WEIGHT_ALIASES: dict[str, str] = {
 }
 
 #: A KV cache is not a weight: ``fp8`` there means one scale per layer, not one
-#: per 128x128 block.
-_KV_ALIASES: dict[str, str] = {"fp8": "fp8_tensor", "fp8_e4m3": "fp8_tensor", "e4m3": "fp8_tensor"}
+#: per 128x128 block. vLLM's own spellings (v0.29.0 config/cache.py:39-57) resolve
+#: here too: every fp8 variant is one byte (utils/torch_utils.py:39-46), and
+#: ``nvfp4_4over6`` is NVFP4's layout (cache.py:126).
+_KV_ALIASES: dict[str, str] = {
+    "fp8": "fp8_tensor", "fp8_e4m3": "fp8_tensor", "e4m3": "fp8_tensor",
+    "fp8_e5m2": "fp8_tensor", "fp8_inc": "fp8_tensor",
+    "bfloat16": "bf16", "float16": "fp16", "nvfp4_4over6": "nvfp4",
+}
 
 
 def quant_format(dtype: str) -> QuantFormat | None:
@@ -195,8 +201,14 @@ def kv_elem_bytes(dtype: str) -> float:
     (1.000244 B); an ``fp8`` cache carries one scale per layer (1.0 B). Pricing
     the cache with the weight constant overstated GLM-5.2's fp8 KV by 10 B per
     token, the gap its design note flags against 52,608.
+
+    vLLM's turboquant and per-token-head caches raise ``ValueError``: no format
+    here describes their scale layout, and the fallback would price them at 2 B.
     """
     d = dtype.lower()
+    if d.startswith("turboquant_") or d.endswith("_per_token_head"):
+        raise ValueError(f"KV cache dtype {dtype!r} stores scales in a layout the "
+                         "planner does not price")
     fmt = QUANT_FORMATS.get(_KV_ALIASES.get(d, d))
     return fmt.bytes_per_elem if fmt is not None else weight_bytes(d)
 

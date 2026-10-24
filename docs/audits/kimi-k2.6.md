@@ -35,7 +35,7 @@ Each finding is also classified. A **missing modelled cost** is time the hardwar
   - The step is about 1.15 ms faster.
   - The recipe's TP4 shape still does not hold 32 x 8,192 with 4.5 GB of workspace: it needs 9.2 GB of KV against 7.3 GB available (208,227 tokens, 25 sequences).
 - **Residual caveat.** The checkpoint ships no `k_scale`/`v_scale` tensors, so the fp8 cache runs with scale 1.0 (`quantization/kv_cache.py:71-75`). That is an accuracy question, not a prediction error.
-- **Change made.** `gitm plan --kv-cache-dtype {auto,bf16,fp16,fp8}`. `auto` keeps the catalogue's resolved value, and an explicit dtype prices that cache instead.
+- **Change made.** `gitm plan --kv-cache-dtype {auto,bfloat16,float16,bf16,fp16,fp8,fp8_e4m3,fp8_e5m2,fp8_inc}`. `auto` keeps the catalogue's resolved value, and an explicit dtype prices that cache instead. `bf16` and `fp16` are the planner's labels for vLLM's `bfloat16` and `float16`; `fp8_inc` is refused because no vLLM v0.29.0 attention backend accepts it.
 - **Class.** No discrepancy in the entry. The error was in the case note, and the audit records it so that nobody reintroduces it.
 
 ### F2. NVFP4 on Hopper was priced at the fp8 peak; vLLM runs Marlin at bf16

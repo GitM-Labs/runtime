@@ -111,6 +111,160 @@ def test_fp8_kv_is_one_byte_not_the_weight_constant():
     assert kv_elem_bytes("bf16") == 2.0
 
 
+#: vLLM v0.29.0 --kv-cache-dtype values (config/cache.py:39-57) and their bytes per
+#: element: every fp8 variant 1 (utils/torch_utils.py:33-54), NVFP4 head_size / 2
+#: + head_size / 16 per head (:546-548). None: a scale layout the planner refuses.
+_VLLM_CACHE_DTYPES = {
+    "float16": 2.0, "bfloat16": 2.0,
+    "fp8": 1.0, "fp8_e4m3": 1.0, "fp8_e5m2": 1.0, "fp8_inc": 1.0,
+    "fp8_ds_mla": 1 + 4 / 128, "nvfp4": 0.5 + 1 / 16, "nvfp4_4over6": 0.5 + 1 / 16,
+    "turboquant_k8v4": None, "turboquant_4bit_nc": None, "turboquant_k3v4_nc": None,
+    "turboquant_3bit_nc": None, "int4_per_token_head": None,
+    "int8_per_token_head": None, "fp8_per_token_head": None,
+}
+
+
+@pytest.mark.parametrize("dtype,expected", _VLLM_CACHE_DTYPES.items())
+def test_every_vllm_cache_spelling_is_priced_or_refused(dtype, expected):
+    """Serving configs carry vLLM's spellings verbatim. fp8_e5m2, fp8_inc and
+    nvfp4_4over6 fell through to the 2 B weight fallback, and so did the
+    scale-carrying layouts the planner has no format for."""
+    if expected is None:
+        with pytest.raises(ValueError, match="does not price"):
+            kv_elem_bytes(dtype)
+    else:
+        assert kv_elem_bytes(dtype) == pytest.approx(expected)
+
+
+#: Bytes per token of context as the planner prices them. K2.6: 61 MLA layers of
+#: 512 latent + 64 RoPE dims at the cache width. V4.1: 29 latent-equivalents per
+#: token, each head_dim + rope = 576 dims (512 at the cache width + 64 bf16 RoPE)
+#: plus a 128-dim indexer key at the cache width, fp8 at the weight constant. The
+#: V4.1 terms are the planner's, not vLLM's: head_dim 512 already includes RoPE
+#: (C17, docs/deepseek-v4.1-flash/DESIGN-NOTE.md) and vLLM stores the indexer key
+#: as fp8 + an fp32 scale (132 B) whatever the cache dtype.
+_K26_BPT = {16: 61 * 576 * 2, 8: 61 * 576 * 1}
+_V41_BPT = {16: 29 * (512 * 2 + 64 * 2 + 128 * 2),
+            8: 29 * (512 * 1.000244140625 + 64 * 2 + 128 * 1.000244140625)}
+
+
+@pytest.mark.parametrize("model,dtype,bpt", [
+    *[("kimi-k2.6", d, _K26_BPT[16]) for d in ("bfloat16", "float16", "bf16", "fp16")],
+    *[("kimi-k2.6", d, _K26_BPT[8]) for d in ("fp8", "fp8_e4m3", "fp8_e5m2")],
+    *[("deepseek-v4.1-flash", d, _V41_BPT[16]) for d in ("bfloat16", "float16")],
+    *[("deepseek-v4.1-flash", d, _V41_BPT[8]) for d in ("fp8", "fp8_e4m3", "fp8_e5m2")],
+])
+def test_plan_prices_each_vllm_cache_spelling_by_its_bytes(capsys, model, dtype, bpt):
+    """Each spelling must price the bytes it names; the old check compared two
+    spellings mapped to the same label, so a wrong label for both passed. K2.6's
+    figure is the fit ledger's; V4.1 has no ledger, so moe_graph's is used."""
+    from gitm.planner import moe_graph
+    from gitm.planner.registry import main
+
+    assert main([model, "--gpu", "H200", "--batch", "32", "--kv-len", "8192",
+                 "--tp", "8", "--kv-cache-dtype", dtype, "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    fit = data["memory_fit"]
+    priced = (fit["kv_bytes_per_token"] if fit is not None
+              else moe_graph.kv_bytes_per_token(replace(load_spec(model),
+                                                        kv_dtype=data["kv_cache_dtype"])))
+    assert priced == pytest.approx(bpt)
+
+
+@pytest.mark.parametrize("dtype,width", [
+    *[(d, 2) for d in ("bfloat16", "float16", "bf16", "fp16")],
+    *[(d, 1) for d in ("fp8", "fp8_e4m3", "fp8_e5m2")],
+])
+def test_plan_graph_reads_the_cache_at_the_spellings_width(capsys, dtype, width):
+    """The fit ledger can be right while the graph prices the catalogue's cache.
+    K2.6's attention reads every cached token of every sequence once per layer:
+    61 layers of 576-dim entries."""
+    from gitm.planner.registry import main
+
+    assert main(["kimi-k2.6", "--gpu", "H200", "--batch", "32", "--kv-len", "8192",
+                 "--tp", "8", "--kv-cache-dtype", dtype, "--json"]) == 0
+    nodes = json.loads(capsys.readouterr().out)["nodes"]
+    read = sum(n["bytes"] for n in nodes if n["op"] == "attn_score_value")
+    assert read == 32 * 8192 * 61 * 576 * width
+
+
+def test_plan_refuses_a_cache_spelling_no_vllm_backend_accepts(capsys):
+    """fp8_inc is in vLLM v0.29.0's CacheDType but in no in-tree attention
+    backend's supported_kv_cache_dtypes, so no GPU run starts with it. The
+    command priced it as fp8 and exited 0."""
+    from gitm.planner.registry import main
+
+    assert main(["kimi-k2.6", "--gpu", "H200", "--kv-cache-dtype", "fp8_inc"]) == 2
+    out = capsys.readouterr().out
+    assert out.startswith("cannot plan: --kv-cache-dtype fp8_inc is the Intel Gaudi")
+    assert out.rstrip().endswith("no attention backend in vLLM v0.29.0 accepts it")
+
+
+_BACKEND_NOTE = ("--kv-cache-dtype {}: priced by its bytes. Some vLLM v0.29.0 attention "
+                 "backend lists this spelling, but the planner does not check that the "
+                 "backend for this model and GPU does, so vLLM may refuse it")
+_LABEL_NOTE = ("--kv-cache-dtype {0}: the planner's label for {1}, not a vLLM spelling; "
+               "vllm serve rejects it")
+
+
+@pytest.mark.parametrize("model,gpu,dtype,note", [
+    ("kimi-k2.6", "H200", "fp8", _BACKEND_NOTE.format("fp8")),
+    ("kimi-k2.6", "H200", "fp8_e5m2", _BACKEND_NOTE.format("fp8_e5m2")),
+    ("glm-5.2", "H200", "fp8_e5m2", _BACKEND_NOTE.format("fp8_e5m2")),
+    ("kimi-k2.6", "H200", "bfloat16", _BACKEND_NOTE.format("bfloat16")),
+    ("kimi-k2.6", "H200", "bf16", _LABEL_NOTE.format("bf16", "bfloat16")),
+    ("kimi-k2.6", "H200", "fp16", _LABEL_NOTE.format("fp16", "float16")),
+])
+def test_plan_says_it_did_not_check_backend_support_for_a_cache_dtype(
+        capsys, model, gpu, dtype, note):
+    """A priced spelling gets a note that the backend for this model and GPU is
+    not checked (fp8_e5m2: of the MLA backends only AITER's, on ROCm, list it).
+    The planner's own bf16 and fp16 labels get a different note. Text and JSON
+    carry it; 'auto' none."""
+    from gitm.planner.registry import main
+
+    argv = [model, "--gpu", gpu, "--tp", "8"]
+    assert main([*argv, "--kv-cache-dtype", dtype]) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == f"  ! {note}"
+    assert main([*argv, "--kv-cache-dtype", dtype, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["kv_cache_dtype_caveat"] == note
+    assert main(argv) == 0
+    assert "! --kv-cache-dtype" not in capsys.readouterr().out
+
+
+def test_plan_sweep_prints_the_cache_dtype_note_only_when_a_row_was_priced(capsys):
+    from gitm.planner.registry import main
+
+    note = f"  ! {_BACKEND_NOTE.format('fp8_e5m2')}"
+    assert main(["kimi-k2.6", "--gpu", "H200", "--tp", "8", "--sweep", "1,8",
+                 "--kv-cache-dtype", "fp8_e5m2"]) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == note
+    assert main(["kimi-k2.6", "--gpu", "H200", "--tp", "3", "--sweep", "1,2",
+                 "--kv-cache-dtype", "fp8_e5m2"]) == 2
+    out = capsys.readouterr().out
+    assert "cannot plan" in out and "priced by its bytes" not in out
+
+
+def test_plan_help_says_sparse_mla_stores_more_than_the_fp8_it_prices():
+    """FLASHMLA_SPARSE turns any quantised cache into fp8_ds_mla (v0.29.0
+    mla_attention.py:349-361): GLM-5.2 stores 656 B per entry where fp8 prices
+    576. The help claimed families keep RoPE wider, which only 'auto' does."""
+    from argparse import ArgumentParser
+
+    from gitm.planner.registry import add_plan_arguments
+
+    actions = add_plan_arguments(ArgumentParser())._actions
+    text = " ".join(next(a.help for a in actions if a.dest == "kv_cache_dtype").split())
+    spec = load_spec("glm-5.2")
+    priced = kv_entry_bytes(replace(spec, kv_dtype="fp8", kv_rope_dtype="fp8"))
+    stored = kv_entry_bytes(replace(spec, kv_dtype="fp8_ds_mla"))
+    assert f"{stored:.0f} B per GLM-5.2 entry against the {priced:.0f} priced" in text
+    assert "On Hopper, vLLM's sparse-MLA backend stores" in text
+    assert "one byte per cached element, RoPE key included" in text
+    assert "one-byte layout" not in text and "families keep" not in text
+    assert "vLLM may still refuse it (fp8_e5m2 on a CUDA MLA model)" in text
+
+
 def test_fp8_ds_mla_entry_is_656_bytes():
     """DeepSeek's sparse-MLA layout: 512 fp8 latent + one fp32 scale per 128 + 64 bf16 RoPE."""
     spec = replace(load_spec("kimi-k2.6"), kv_dtype="fp8_ds_mla", kv_rope_dtype="bf16")
