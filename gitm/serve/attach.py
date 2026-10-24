@@ -435,6 +435,8 @@ def _emit_predicted_graph(target: discover.Target, out_dir: Path) -> None:
     """
     from gitm.serve.model_config import LiveSpec, live_moe_spec
 
+    # A reused --out may hold another run's prediction; a skip must not leave it.
+    (out_dir / "predicted_moe_graph.json").unlink(missing_ok=True)
     try:
         resolved = live_moe_spec(target)
     except Exception as e:  # a prediction sidecar must never sink a real capture

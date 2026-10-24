@@ -131,6 +131,7 @@ def test_live_sidecar_skips_a_cache_dtype_the_planner_refuses(tmp_path, capsys):
     (tmp_path / "config.json").write_text(json.dumps(GLM_CONFIG))
     target = discover.Target(pid=1, cmdline=["vllm", "serve", str(tmp_path),
                                              "--kv-cache-dtype", "int8_per_token_head"])
+    (tmp_path / "predicted_moe_graph.json").write_text("{}")  # a prior run's, in a reused --out
     _emit_predicted_graph(target, tmp_path)
     assert "skipped (KV cache dtype 'int8_per_token_head'" in capsys.readouterr().out
     assert not (tmp_path / "predicted_moe_graph.json").exists()
