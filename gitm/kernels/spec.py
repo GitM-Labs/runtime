@@ -9,6 +9,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic.json_schema import SkipJsonSchema
 
 SafetyTier = Literal["low_risk", "moderate", "high_risk"]
+#: ENG-79. 1: changes rounding at most (kernels, backends, scheduling,
+#: parallelism). 2: changes the math (quantization, KV cache dtype, CPU
+#: offload) and needs a validator. 3: the loop reasons about topology or moves
+#: things at run time.
+LeverClass = Literal[1, 2, 3]
+#: ENG-79. What the engine allows, not what gitm does today (knob_kind()).
+#: none: set live. restart: new engine, same weights. rebuild: weights
+#: reloaded or re-sharded.
+RestartCost = Literal["none", "restart", "rebuild"]
 
 
 class Applicability(BaseModel):
@@ -103,6 +112,9 @@ class InterventionSpec(BaseModel):
     applicability: Applicability = Field(default_factory=Applicability)
     safety: SafetyGate = Field(default_factory=SafetyGate)
     review: str | None = None  # reviewer sign-off note (None until reviewed)
+    # Optional so specs built in code still validate; the library test requires them.
+    lever_class: LeverClass | None = None
+    restart_cost: RestartCost | None = None
     # An accuracy sentinel the apply path runs after measuring and before
     # keeping: None to pass, else the reason. The live keep gate sees throughput
     # alone, so a lever that can change model output carries its own check here
